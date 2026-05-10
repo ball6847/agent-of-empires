@@ -244,6 +244,18 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         preserve_files: &[],
         clean_files: &[],
     },
+    AgentConfigMount {
+        tool_name: "kimi",
+        host_rel: ".kimi",
+        container_suffix: ".kimi",
+        skip_entries: &["sandbox", "sessions", "credentials", "logs"],
+        seed_files: &[],
+        copy_dirs: &[],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        clean_files: &[],
+    },
 ];
 
 /// Sync host agent config into the shared sandbox directory. Copies top-level files
@@ -973,11 +985,12 @@ pub(crate) fn build_container_config(
         .unwrap_or(true);
     if let Some(agent) = crate::agents::get_agent(tool) {
         if hooks_enabled {
-            // Hermes (YAML) and Kiro (per-agent JSON) use schemas the generic
+            // Hermes (YAML) and Kiro/Kimi (per-agent JSON/TOML) use schemas the generic
             // hook_config path below cannot emit, so they're special-cased here.
             let hermes_hooks = tool == "hermes";
             let kiro_hooks = tool == "kiro";
-            if hermes_hooks || kiro_hooks || agent.hook_config.is_some() {
+            let kimi_hooks = tool == "kimi";
+            if hermes_hooks || kiro_hooks || kimi_hooks || agent.hook_config.is_some() {
                 let hook_dir = crate::hooks::hook_status_dir(instance_id);
                 if let Err(e) = std::fs::create_dir_all(&hook_dir) {
                     tracing::warn!(
@@ -1004,6 +1017,12 @@ pub(crate) fn build_container_config(
                 let config_file = sandbox_dir.join("agents").join("aoe-hooks.json");
                 if let Err(e) = crate::hooks::install_kiro_hooks(&config_file) {
                     tracing::warn!("Failed to install kiro hooks in sandbox: {}", e);
+                }
+            } else if kimi_hooks {
+                let sandbox_dir = home.join(".kimi").join(SANDBOX_SUBDIR);
+                let config_file = sandbox_dir.join("config.toml");
+                if let Err(e) = crate::hooks::install_kimi_hooks(&config_file) {
+                    tracing::warn!("Failed to install kimi hooks in sandbox: {}", e);
                 }
             } else if let Some(hook_cfg) = &agent.hook_config {
                 // Install hooks into sandbox settings.json for the containerized agent.

@@ -575,6 +575,12 @@ pub fn detect_settl_status(_content: &str) -> Status {
     Status::Idle
 }
 
+/// Kimi Code CLI status is detected via hooks (TOML-based), not tmux pane parsing.
+/// This stub exists so the agent registry has a valid function pointer.
+pub fn detect_kimi_status(_content: &str) -> Status {
+    Status::Idle
+}
+
 pub fn detect_gemini_status(raw_content: &str) -> Status {
     let content = raw_content.to_lowercase();
     let lines: Vec<&str> = content.lines().collect();

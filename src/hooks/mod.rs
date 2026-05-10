@@ -306,6 +306,103 @@ pub fn uninstall_settl_hooks() -> Result<bool> {
     Ok(true)
 }
 
+/// Kimi Code CLI hook events and the AoE status they map to.
+/// Kimi uses TOML config with `[[hooks]]` array entries, similar to settl.
+const KIMI_HOOKS: &[(&str, &str)] = &[
+    ("PreToolUse", "running"),
+    ("Stop", "idle"),
+    ("Notification", "waiting"),
+];
+
+/// Install AoE status hooks into Kimi's `~/.kimi/config.toml`.
+///
+/// Kimi uses TOML config with `[[hooks]]` array entries.
+pub fn install_kimi_hooks(_config_path: &Path) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory"))?;
+    let config_path = home.join(".kimi").join("config.toml");
+
+    let mut config: toml::Value = if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path)?;
+        toml::from_str(&content).unwrap_or_else(|e| {
+            tracing::warn!("Failed to parse {}: {}", config_path.display(), e);
+            toml::Value::Table(toml::map::Map::new())
+        })
+    } else {
+        toml::Value::Table(toml::map::Map::new())
+    };
+
+    let table = config
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("Config root is not a TOML table"))?;
+
+    let hooks = table
+        .entry("hooks")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let hooks_arr = hooks
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("hooks key is not a TOML array"))?;
+
+    hooks_arr.retain(|hook| {
+        !hook
+            .get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(is_aoe_hook_command)
+    });
+
+    for (event, status) in KIMI_HOOKS {
+        let mut entry = toml::map::Map::new();
+        entry.insert("event".into(), toml::Value::String((*event).into()));
+        entry.insert("command".into(), toml::Value::String(hook_command(status)));
+        hooks_arr.push(toml::Value::Table(entry));
+    }
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let formatted = toml::to_string_pretty(&config)?;
+    std::fs::write(&config_path, formatted)?;
+
+    tracing::info!("Installed AoE hooks in {}", config_path.display());
+    Ok(())
+}
+
+/// Remove AoE hooks from Kimi's `~/.kimi/config.toml`.
+pub fn uninstall_kimi_hooks(_config_path: &Path) -> Result<bool> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory"))?;
+    let config_path = home.join(".kimi").join("config.toml");
+
+    if !config_path.exists() {
+        return Ok(false);
+    }
+
+    let content = std::fs::read_to_string(&config_path)?;
+    let mut config: toml::Value = toml::from_str(&content).unwrap_or_else(|e| {
+        tracing::warn!("Failed to parse {}: {}", config_path.display(), e);
+        toml::Value::Table(toml::map::Map::new())
+    });
+
+    let Some(hooks_arr) = config.get_mut("hooks").and_then(|h| h.as_array_mut()) else {
+        return Ok(false);
+    };
+
+    let before = hooks_arr.len();
+    hooks_arr.retain(|hook| {
+        !hook
+            .get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(is_aoe_hook_command)
+    });
+
+    if hooks_arr.len() == before {
+        return Ok(false);
+    }
+
+    let formatted = toml::to_string_pretty(&config)?;
+    std::fs::write(&config_path, formatted)?;
+    tracing::info!("Removed AoE hooks from {}", config_path.display());
+    Ok(true)
+}
+
 /// Hermes hook events and the AoE status they map to. Hermes uses an
 /// event-keyed YAML schema (`hooks: { event_name: [ {command, ...} ] }`),
 /// not the flat array settl uses.
@@ -708,6 +805,14 @@ pub fn uninstall_all_hooks() {
             Ok(true) => println!("Removed AoE hooks from {}", kiro_config.display()),
             Ok(false) => {}
             Err(e) => tracing::warn!("Failed to remove kiro hooks: {}", e),
+        }
+
+        // Remove Kimi TOML hooks
+        let kimi_config = home.join(".kimi").join("config.toml");
+        match uninstall_kimi_hooks(&kimi_config) {
+            Ok(true) => println!("Removed AoE hooks from {}", kimi_config.display()),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("Failed to remove kimi hooks: {}", e),
         }
 
         for agent in crate::agents::AGENTS {
@@ -1506,6 +1611,113 @@ hooks_auto_accept: false
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("nonexistent.json");
         let modified = uninstall_kiro_hooks(&config_path).unwrap();
+        assert!(!modified);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_install_kimi_hooks_creates_new_file() {
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let config_path = tmp.path().join(".kimi").join("config.toml");
+
+        install_kimi_hooks(&config_path).unwrap();
+
+        assert!(config_path.exists());
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("[[hooks]]"));
+        assert!(content.contains("event = \"PreToolUse\""));
+        assert!(content.contains("event = \"Stop\""));
+        assert!(content.contains("event = \"Notification\""));
+        assert!(content.contains("aoe-hooks"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_install_kimi_hooks_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let config_path = tmp.path().join(".kimi").join("config.toml");
+
+        install_kimi_hooks(&config_path).unwrap();
+        install_kimi_hooks(&config_path).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let hooks_count = content.matches("event = \"PreToolUse\"").count();
+        assert_eq!(hooks_count, 1, "PreToolUse should appear only once");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_install_kimi_hooks_preserves_user_hooks() {
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let config_dir = tmp.path().join(".kimi");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[[hooks]]
+event = "PostToolUse"
+command = "echo user-hook"
+"#,
+        )
+        .unwrap();
+
+        install_kimi_hooks(&config_path).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("echo user-hook"));
+        assert!(content.contains("PreToolUse"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_uninstall_kimi_hooks_removes_aoe_entries() {
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let config_path = tmp.path().join(".kimi").join("config.toml");
+
+        install_kimi_hooks(&config_path).unwrap();
+        let modified = uninstall_kimi_hooks(&config_path).unwrap();
+        assert!(modified);
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!content.contains("aoe-hooks"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_uninstall_kimi_hooks_preserves_user_hooks() {
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let config_dir = tmp.path().join(".kimi");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"[[hooks]]
+event = "PostToolUse"
+command = "echo user-hook"
+"#,
+        )
+        .unwrap();
+
+        install_kimi_hooks(&config_path).unwrap();
+        let modified = uninstall_kimi_hooks(&config_path).unwrap();
+        assert!(modified);
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("echo user-hook"));
+        assert!(!content.contains("aoe-hooks"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_uninstall_kimi_hooks_nonexistent_file() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("nonexistent.toml");
+        let modified = uninstall_kimi_hooks(&config_path).unwrap();
         assert!(!modified);
     }
 }

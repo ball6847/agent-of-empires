@@ -79,7 +79,8 @@ fn status_hook_env_prefix(
     let has_hooks = agent.and_then(|a| a.hook_config.as_ref()).is_some()
         || tool == "settl"
         || tool == "hermes"
-        || tool == "kiro";
+        || tool == "kiro"
+        || tool == "kimi";
 
     if has_hooks {
         format!("AOE_INSTANCE_ID={} ", instance_id)
@@ -979,6 +980,14 @@ impl Instance {
                 match crate::hooks::install_kiro_hooks(&config_path) {
                     Ok(()) => crate::hooks::set_kiro_default_agent_if_builtin(),
                     Err(e) => tracing::warn!("Failed to install kiro hooks: {}", e),
+                }
+            }
+        } else if self.tool == "kimi" && !self.is_sandboxed() {
+            // Kimi uses TOML config; sandbox path is handled by build_container_config.
+            if let Some(home) = dirs::home_dir() {
+                let config_path = home.join(".kimi").join("config.toml");
+                if let Err(e) = crate::hooks::install_kimi_hooks(&config_path) {
+                    tracing::warn!("Failed to install kimi hooks: {}", e);
                 }
             }
         } else if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
@@ -2570,6 +2579,10 @@ mod tests {
         );
         assert_eq!(
             status_hook_env_prefix("abc123", "kiro", crate::agents::get_agent("kiro")),
+            "AOE_INSTANCE_ID=abc123 "
+        );
+        assert_eq!(
+            status_hook_env_prefix("abc123", "kimi", crate::agents::get_agent("kimi")),
             "AOE_INSTANCE_ID=abc123 "
         );
     }

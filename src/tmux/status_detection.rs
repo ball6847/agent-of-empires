@@ -964,6 +964,82 @@ pub fn detect_qwen_status(raw_content: &str) -> Status {
     Status::Idle
 }
 
+/// Kimi Code CLI status detection via tmux pane parsing.
+/// Kimi uses a Rich-based TUI that renders "Thinking" labels with animated
+/// bullets, dots spinners during composition, and approval modals for tool
+/// confirmations.
+pub fn detect_kimi_status(raw_content: &str) -> Status {
+    let content = raw_content.to_lowercase();
+    let lines: Vec<&str> = content.lines().collect();
+    let non_empty_lines: Vec<&str> = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .copied()
+        .collect();
+
+    let last_lines: String = non_empty_lines
+        .iter()
+        .rev()
+        .take(30)
+        .rev()
+        .copied()
+        .collect::<Vec<&str>>()
+        .join("\n");
+    let last_lines_lower = last_lines.to_lowercase();
+
+    // Running: interrupt hint
+    if last_lines_lower.contains("esc to interrupt")
+        || last_lines_lower.contains("ctrl+c to interrupt")
+    {
+        return Status::Running;
+    }
+
+    // Running: braille spinners (Rich's "dots" spinner uses braille frames)
+    if has_any_spinner(&lines) {
+        return Status::Running;
+    }
+
+    // Running: thinking indicator (Kimi shows "Thinking" with animated bullets)
+    // Also tool execution blocks and compaction / MCP loading spinners
+    let activity_indicators = [
+        "thinking",
+        "connecting to mcp servers",
+        "compacting",
+        "running command",
+        "executing",
+        "processing",
+    ];
+    for indicator in &activity_indicators {
+        if last_lines_lower.contains(indicator) {
+            return Status::Running;
+        }
+    }
+
+    // Waiting: approval prompts
+    if contains_approval_prompt(
+        &last_lines_lower,
+        &["continue?", "proceed?", "execute?", "enter to select", "esc to cancel"],
+    ) {
+        return Status::Waiting;
+    }
+
+    // Waiting: numbered selection menus (› 1. / ❯ 1.)
+    for line in &lines {
+        let trimmed = line.trim();
+        let after_cursor = trimmed
+            .strip_prefix("›")
+            .or_else(|| trimmed.strip_prefix("❯"));
+        if let Some(rest) = after_cursor {
+            let rest = rest.trim_start();
+            if rest.starts_with("1.") || rest.starts_with("2.") || rest.starts_with("3.") {
+                return Status::Waiting;
+            }
+        }
+    }
+
+    Status::Idle
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2058,6 +2134,58 @@ run this command? (y/n)
     fn test_detect_qwen_status_idle() {
         assert_eq!(detect_qwen_status("file saved"), Status::Idle);
         assert_eq!(detect_qwen_status("random output text"), Status::Idle);
+    }
+
+    #[test]
+    fn test_detect_kimi_status_running() {
+        assert_eq!(
+            detect_kimi_status("processing request\nesc to interrupt"),
+            Status::Running
+        );
+        assert_eq!(
+            detect_kimi_status("⠋ Thinking about your request"),
+            Status::Running
+        );
+        assert_eq!(detect_kimi_status("Thinking..."), Status::Running);
+        assert_eq!(detect_kimi_status("Connecting to MCP servers..."), Status::Running);
+        assert_eq!(detect_kimi_status("Compacting context..."), Status::Running);
+        assert_eq!(detect_kimi_status("Running command: cargo test"), Status::Running);
+        assert_eq!(detect_kimi_status("Executing bash command"), Status::Running);
+        assert_eq!(detect_kimi_status("⠧ Reading file.rs"), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_kimi_status_waiting() {
+        assert_eq!(
+            detect_kimi_status("run command? (y/n)"),
+            Status::Waiting
+        );
+        assert_eq!(
+            detect_kimi_status("Allow this tool to run?"),
+            Status::Waiting
+        );
+        assert_eq!(
+            detect_kimi_status("pick an option\nenter to select"),
+            Status::Waiting
+        );
+        assert_eq!(
+            detect_kimi_status("Select:\n❯ 1. Option A\n  2. Option B"),
+            Status::Waiting
+        );
+        assert_eq!(
+            detect_kimi_status("Select:\n› 1. Option A\n  2. Option B"),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_detect_kimi_status_idle() {
+        assert_eq!(detect_kimi_status("file saved"), Status::Idle);
+        assert_eq!(detect_kimi_status("random output text"), Status::Idle);
+        assert_eq!(
+            detect_kimi_status("Thought for 12s · 1,234 tokens"),
+            Status::Idle
+        );
     }
 
     #[test]

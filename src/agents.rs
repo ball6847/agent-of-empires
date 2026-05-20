@@ -731,10 +731,7 @@ mod tests {
             install_hint("kiro"),
             Some("curl -fsSL https://cli.kiro.dev/install | bash")
         );
-        assert_eq!(
-            install_hint("kimi"),
-            Some("pip install kimi-cli")
-        );
+        assert_eq!(install_hint("kimi"), Some("pip install kimi-cli"));
         assert!(install_hint("unknown").is_none());
     }
 }

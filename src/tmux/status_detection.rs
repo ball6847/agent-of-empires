@@ -6,10 +6,20 @@ use super::utils::strip_ansi;
 
 const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Rich's "moon" spinner frames — shown by Kimi when a turn is active but no
+/// content has arrived yet.
+const MOON_SPINNER_CHARS: &[&str] = &["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"];
+
 fn has_any_spinner(lines: &[&str]) -> bool {
     lines
         .iter()
         .any(|line| SPINNER_CHARS.iter().any(|s| line.contains(s)))
+}
+
+fn has_any_moon_spinner(lines: &[&str]) -> bool {
+    lines
+        .iter()
+        .any(|line| MOON_SPINNER_CHARS.iter().any(|s| line.contains(s)))
 }
 
 fn contains_approval_prompt(text_lower: &str, extra: &[&str]) -> bool {
@@ -987,27 +997,60 @@ pub fn detect_kimi_status(raw_content: &str) -> Status {
         .join("\n");
     let last_lines_lower = last_lines.to_lowercase();
 
-    // Running: interrupt hint
+    // Only look at the last ~15 non-empty lines for running signals.
+    // Earlier lines are scrollback from previous turns and must not leak
+    // into the current state.
+    let recent_lines: Vec<&str> = non_empty_lines.iter().rev().take(15).copied().collect();
+
+    // PRIORITY 1: Waiting — interactive panels take precedence over everything.
+    // When a question or approval panel is visible, the user must respond before
+    // the agent can continue. Stale "Using ..." or braille spinners from
+    // earlier in the turn must not mask the waiting state.
+    if last_lines_lower.contains("▲/▼ select")
+        || last_lines_lower.contains("◄/► switch question")
+        || last_lines_lower.contains("↵ confirm")
+    {
+        return Status::Waiting;
+    }
+
+    for line in &recent_lines {
+        let trimmed = line.trim();
+        // Kimi renders options inside Rich panels, so the line may start with a
+        // border character like "│" rather than the arrow itself.
+        if trimmed.contains("→ [")
+            && (trimmed.contains("1]")
+                || trimmed.contains("2]")
+                || trimmed.contains("3]")
+                || trimmed.contains("4]")
+                || trimmed.contains("5]")
+                || trimmed.contains("6]"))
+        {
+            return Status::Waiting;
+        }
+        // Multi-select questions use "[x] Option" for checked items.
+        // The trailing space after [x] keeps it distinct from normal text.
+        if trimmed.starts_with("[") && trimmed.contains("[x] ") {
+            return Status::Waiting;
+        }
+    }
+
+    // PRIORITY 2: Running — signals from the current turn only.
     if last_lines_lower.contains("esc to interrupt")
         || last_lines_lower.contains("ctrl+c to interrupt")
     {
         return Status::Running;
     }
 
-    // Running: braille spinners (Rich's "dots" spinner uses braille frames)
-    if has_any_spinner(&lines) {
+    if has_any_spinner(&recent_lines) || has_any_moon_spinner(&recent_lines) {
         return Status::Running;
     }
 
-    // Running: thinking indicator (Kimi shows "Thinking" with animated bullets)
-    // Also tool execution blocks and compaction / MCP loading spinners
+    // Specific live-spinner labels that never appear in normal conversation text.
     let activity_indicators = [
-        "thinking",
-        "connecting to mcp servers",
-        "compacting",
-        "running command",
-        "executing",
-        "processing",
+        "thinking...",
+        "composing...",
+        "connecting to mcp servers...",
+        "compacting...",
     ];
     for indicator in &activity_indicators {
         if last_lines_lower.contains(indicator) {
@@ -1015,26 +1058,23 @@ pub fn detect_kimi_status(raw_content: &str) -> Status {
         }
     }
 
-    // Waiting: approval prompts
-    if contains_approval_prompt(
-        &last_lines_lower,
-        &["continue?", "proceed?", "execute?", "enter to select", "esc to cancel"],
-    ) {
-        return Status::Waiting;
+    // Kimi's "Thinking" indicator shows animated bullets and a live token
+    // counter (e.g. "Thinking .   12s · 1,234 tokens · 45 tok/s").
+    // We only match when the token-counter shapes are present so that normal
+    // sentences like "I was thinking about..." do not falsely trigger Running.
+    for line in &recent_lines {
+        let line_lower = line.to_lowercase();
+        if line_lower.contains("thinking")
+            && (line_lower.contains("s ·") || line_lower.contains("tok/s"))
+        {
+            return Status::Running;
+        }
     }
 
-    // Waiting: numbered selection menus (› 1. / ❯ 1.)
-    for line in &lines {
-        let trimmed = line.trim();
-        let after_cursor = trimmed
-            .strip_prefix("›")
-            .or_else(|| trimmed.strip_prefix("❯"));
-        if let Some(rest) = after_cursor {
-            let rest = rest.trim_start();
-            if rest.starts_with("1.") || rest.starts_with("2.") || rest.starts_with("3.") {
-                return Status::Waiting;
-            }
-        }
+    // Live token-rate pulse (e.g. "5 tok/s") — only shown while actively
+    // streaming reasoning tokens.
+    if last_lines_lower.contains("tok/s") {
+        return Status::Running;
     }
 
     Status::Idle
@@ -2138,43 +2178,169 @@ run this command? (y/n)
 
     #[test]
     fn test_detect_kimi_status_running() {
+        // Interrupt hint
         assert_eq!(
             detect_kimi_status("processing request\nesc to interrupt"),
             Status::Running
         );
+        // Braille spinner (Rich "dots" spinner on tool calls / composing)
         assert_eq!(
             detect_kimi_status("⠋ Thinking about your request"),
             Status::Running
         );
-        assert_eq!(detect_kimi_status("Thinking..."), Status::Running);
-        assert_eq!(detect_kimi_status("Connecting to MCP servers..."), Status::Running);
-        assert_eq!(detect_kimi_status("Compacting context..."), Status::Running);
-        assert_eq!(detect_kimi_status("Running command: cargo test"), Status::Running);
-        assert_eq!(detect_kimi_status("Executing bash command"), Status::Running);
         assert_eq!(detect_kimi_status("⠧ Reading file.rs"), Status::Running);
+        assert_eq!(
+            detect_kimi_status("⠋ Using grep (pattern)"),
+            Status::Running
+        );
+        // Moon spinner (turn active but no content produced yet)
+        assert_eq!(detect_kimi_status("🌑 "), Status::Running);
+        assert_eq!(detect_kimi_status("🌕 "), Status::Running);
+        // Specific live-spinner labels
+        assert_eq!(detect_kimi_status("Thinking..."), Status::Running);
+        assert_eq!(detect_kimi_status("Composing..."), Status::Running);
+        assert_eq!(
+            detect_kimi_status("Connecting to MCP servers..."),
+            Status::Running
+        );
+        assert_eq!(detect_kimi_status("Compacting..."), Status::Running);
+        // Thinking indicator with live token counter
+        assert_eq!(
+            detect_kimi_status("Thinking  ..  2s · 12 tokens · 5 tok/s"),
+            Status::Running
+        );
     }
 
     #[test]
-    fn test_detect_kimi_status_waiting() {
+    fn test_detect_kimi_status_idle_no_false_positive_from_activity_words() {
+        // Regression: broad activity words in normal output must NOT trigger Running.
         assert_eq!(
-            detect_kimi_status("run command? (y/n)"),
-            Status::Waiting
+            detect_kimi_status("I was thinking about your question"),
+            Status::Idle
         );
         assert_eq!(
-            detect_kimi_status("Allow this tool to run?"),
-            Status::Waiting
+            detect_kimi_status("Executing the plan step by step"),
+            Status::Idle
+        );
+        assert_eq!(detect_kimi_status("Processing the data now"), Status::Idle);
+        assert_eq!(
+            detect_kimi_status("Using this approach works well"),
+            Status::Idle
         );
         assert_eq!(
-            detect_kimi_status("pick an option\nenter to select"),
+            detect_kimi_status("In the context of this problem"),
+            Status::Idle
+        );
+        assert_eq!(
+            detect_kimi_status("Running command: cargo test"),
+            Status::Idle
+        );
+        assert_eq!(
+            detect_kimi_status("context: 12.3% (1.2k/128k)"),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_detect_kimi_status_waiting_approval_panel() {
+        // Kimi approval panel uses "→ [N]" cursor and "▲/▼ select" hint
+        let approval_panel = "\
+approval
+
+→ [1] Approve once
+  [2] Approve for this session
+  [3] Reject
+
+▲/▼ select  1/2/3/4 choose  ↵ confirm";
+        assert_eq!(detect_kimi_status(approval_panel), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_kimi_status_waiting_question_panel() {
+        // Kimi question panel uses "→ [N]" cursor and "◄/► switch question" hint
+        let question_panel = "\
+question
+
+? Pick a fruit:
+
+→ [1] Apple
+  [2] Banana
+  [3] Orange
+
+◄/► switch question  ▲/▼ select  ↵ submit  esc exit";
+        assert_eq!(detect_kimi_status(question_panel), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_kimi_status_waiting_arrow_cursor_alone() {
+        // Bare "→ [N]" should also flip to Waiting
+        assert_eq!(
+            detect_kimi_status("→ [1] Yes\n  [2] No\n  [3] Maybe"),
             Status::Waiting
         );
+    }
+
+    #[test]
+    fn test_detect_kimi_status_waiting_with_rich_border() {
+        // Rich panels draw a "│" border before the content, so the cursor is
+        // not at the start of the captured line.
+        let panel = "\
+│ → [1] A programming language
+│       e.g., Rust, quantum computing
+│   [2] A creative skill
+│   [3] A physical discipline
+│   [4] A practical life skill
+│   [5] Other";
+        assert_eq!(detect_kimi_status(panel), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_kimi_status_waiting_multi_select() {
+        // Multi-select questions show [x] for checked items alongside [ ].
+        let multi = "\
+question
+
+? Pick your favourites:
+
+[x] Apple
+[ ] Banana
+[x] Cherry
+[ ] Durian";
+        assert_eq!(detect_kimi_status(multi), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_kimi_status_waiting_overrides_stale_running_scrollback() {
+        // Regression: "Using Ask" with a braille spinner in scrollback above a
+        // question panel must be detected as Waiting, not Running.
+        let pane = "\
+⠋ Composing... 2s · 12 tokens
+⠋ Using Ask
+
+? What would you like to know?
+
+→ [1] Yes
+  [2] No
+
+◄/► switch question  ▲/▼ select  ↵ submit  esc exit";
+        assert_eq!(detect_kimi_status(pane), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_kimi_status_idle_no_false_positive_from_approve() {
+        // Regression: "approve" / "allow" in normal output must NOT trigger Waiting.
+        assert_eq!(
+            detect_kimi_status("I will approve the changes for you"),
+            Status::Idle
+        );
+        assert_eq!(
+            detect_kimi_status("This will allow you to continue"),
+            Status::Idle
+        );
+        assert_eq!(detect_kimi_status("run command? (y/n)"), Status::Idle);
         assert_eq!(
             detect_kimi_status("Select:\n❯ 1. Option A\n  2. Option B"),
-            Status::Waiting
-        );
-        assert_eq!(
-            detect_kimi_status("Select:\n› 1. Option A\n  2. Option B"),
-            Status::Waiting
+            Status::Idle
         );
     }
 

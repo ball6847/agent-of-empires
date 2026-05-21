@@ -118,6 +118,7 @@ impl SettingsView {
                     }
                     SettingsScope::Repo => SettingsScope::Global,
                 };
+                self.rebuild_categories_for_scope();
                 self.rebuild_fields();
                 SettingsAction::Continue
             }
@@ -136,6 +137,7 @@ impl SettingsView {
                     SettingsScope::Profile => SettingsScope::Global,
                     SettingsScope::Repo => SettingsScope::Profile,
                 };
+                self.rebuild_categories_for_scope();
                 self.rebuild_fields();
                 SettingsAction::Continue
             }
@@ -777,6 +779,47 @@ impl SettingsView {
                     s.on_approval = None;
                 }
             }
+            // Status hooks
+            FieldKey::StatusHooksEnabled => {
+                if let Some(ref mut s) = config.status_hooks {
+                    s.enabled = None;
+                }
+            }
+            FieldKey::StatusHookDebounceMs => {
+                if let Some(ref mut s) = config.status_hooks {
+                    s.debounce_ms = None;
+                }
+            }
+            FieldKey::StatusHookOnStarting => {
+                if let Some(ref mut s) = config.status_hooks {
+                    s.on_starting = None;
+                }
+            }
+            FieldKey::StatusHookOnRunning => {
+                if let Some(ref mut s) = config.status_hooks {
+                    s.on_running = None;
+                }
+            }
+            FieldKey::StatusHookOnWaiting => {
+                if let Some(ref mut s) = config.status_hooks {
+                    s.on_waiting = None;
+                }
+            }
+            FieldKey::StatusHookOnIdle => {
+                if let Some(ref mut s) = config.status_hooks {
+                    s.on_idle = None;
+                }
+            }
+            FieldKey::StatusHookOnError => {
+                if let Some(ref mut s) = config.status_hooks {
+                    s.on_error = None;
+                }
+            }
+            FieldKey::StatusHookOnChange => {
+                if let Some(ref mut s) = config.status_hooks {
+                    s.on_change = None;
+                }
+            }
             // Hooks
             FieldKey::HookOnCreate => {
                 if let Some(ref mut h) = config.hooks {
@@ -853,6 +896,16 @@ impl SettingsView {
             FieldKey::CockpitForceEndTurnThresholdSecs => {
                 if let Some(c) = config.cockpit.as_mut() {
                     c.force_end_turn_threshold_secs = None;
+                }
+            }
+            FieldKey::CockpitSilentOrphanGraceSecs => {
+                if let Some(c) = config.cockpit.as_mut() {
+                    c.silent_orphan_grace_secs = None;
+                }
+            }
+            FieldKey::CockpitSilentOrphanFastGraceSecs => {
+                if let Some(c) = config.cockpit.as_mut() {
+                    c.silent_orphan_fast_grace_secs = None;
                 }
             }
             // Logging is global-only for v1 (no profile overrides); the

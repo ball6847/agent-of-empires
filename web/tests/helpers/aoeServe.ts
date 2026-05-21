@@ -46,6 +46,16 @@ export interface SpawnOptions {
   /** Override the spawn timeout (default 10s). */
   spawnTimeoutMs?: number;
   /**
+   * When true and `authMode === "passphrase"`, the harness POSTs
+   * `/api/login` itself after boot to mint a session cookie + record
+   * the device binding secret. Useful for fixtures that need a
+   * pre-authed browser context (e.g. a future cockpit-under-passphrase
+   * spec). Defaults to false: specs that drive LoginPage end-to-end
+   * (the `auth-login-passphrase` spec) want to start with no cookie
+   * so the LoginPage actually renders.
+   */
+  preloginViaHarness?: boolean;
+  /**
    * Token mode only. Sets `AOE_TEST_TOKEN_LIFETIME_SECS` on the server
    * subprocess; in debug builds the daemon enables the rotation task
    * even outside `--remote` and uses this lifetime. Ignored when
@@ -129,6 +139,18 @@ export interface ServeHandle {
    */
   tmuxPrefix: "aoe_" | "aoe_dev_";
   stop(): Promise<void>;
+  /**
+   * Kill the running `aoe serve` proc and respawn it with the same args
+   * on the same port. Used by connectivity-recovery specs (disconnect
+   * banner) that need to observe the dashboard's `setServerDown(true)`
+   * path on SIGTERM and then `setServerDown(false)` once the server is
+   * back. The captured port is reused after the dead listener releases
+   * it on `exit`. Token-mode reads the freshly written `serve.token`
+   * and updates `handle.authToken`. Does NOT re-run passphrase
+   * `preloginViaHarness` or cockpit master enable; specs that need
+   * those across a restart should call `spawnAoeServe` again.
+   */
+  restart(): Promise<void>;
 }
 
 /**
@@ -314,15 +336,19 @@ function writeFakeClaudeShim(binDir: string): void {
 }
 
 function writeFakeAcpShim(binDir: string, fakeAcpScript: string | undefined): void {
-  // The cockpit supervisor calls `claude` (or `aoe-agent`) and handshakes
-  // ACP over its stdio. The shim is a tiny bash wrapper that execs the
-  // fake ACP agent under node with the optional script env baked in.
+  // The cockpit supervisor resolves the agent through `AgentRegistry`
+  // (src/cockpit/agent_registry.rs): the `claude` tool key maps to
+  // command `claude-agent-acp`, not `claude`. `resolve_agent_command`
+  // walks $PATH and node-version dirs, so without a `claude-agent-acp`
+  // entry in the shim dir the supervisor falls through to the real
+  // installed adapter, which then surfaces "Authentication required"
+  // on the first prompt. Shim every name a cockpit test can land on.
   const fakeAgentJs = resolve(__dirname, "fakeAcpAgent.mjs");
   const scriptLine = fakeAcpScript
     ? `export FAKE_ACP_SCRIPT=${JSON.stringify(fakeAcpScript)}\n`
     : "";
   const script = `#!/bin/bash\n${scriptLine}exec node ${JSON.stringify(fakeAgentJs)} "$@"\n`;
-  for (const name of ["claude", "aoe-agent"]) {
+  for (const name of ["claude", "claude-agent-acp", "aoe-agent"]) {
     const path = join(binDir, name);
     writeFileSync(path, script);
     chmodSync(path, 0o755);
@@ -433,21 +459,34 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   const passphrase = authMode === "passphrase" ? opts.passphrase ?? DEFAULT_PASSPHRASE : undefined;
 
   const spawnTimeoutMs = opts.spawnTimeoutMs ?? 10_000;
-  let proc: ChildProcess | null = null;
-  let port = 0;
-  let baseUrl = "";
 
-  for (let attempt = 0; attempt < 5; attempt++) {
-    port = portFor(opts.workerIndex, opts.parallelIndex, attempt);
-    baseUrl = `http://127.0.0.1:${port}`;
-    const args = ["serve", "--host", "127.0.0.1", "--port", String(port)];
+  function buildArgs(boundPort: number): string[] {
+    const args = ["serve", "--host", "127.0.0.1", "--port", String(boundPort)];
     if (authMode === "none") args.push("--no-auth");
     if (authMode === "token") args.push("--auth", "token");
+    if (authMode === "passphrase") {
+      // `--passphrase X` alone leaves the auth mode at the default
+      // (Token + passphrase as 2FA). The Playwright browser has no
+      // token, so `/api/login/status` 401s on the no-token branch in
+      // `auth_middleware` before any login-exempt or loopback-bypass
+      // check, and the SPA renders TokenEntryPage instead of LoginPage.
+      // `--auth=passphrase` switches the server into the
+      // `run_passphrase_wall` path where `/api/login` and
+      // `/api/login/status` are login-exempt, so the SPA can bootstrap
+      // and LoginPage actually renders. See #1230.
+      args.push("--auth", "passphrase");
+    }
     if (passphrase) args.push("--passphrase", passphrase);
     if (opts.readOnly) args.push("--read-only");
     if (opts.extraArgs) args.push(...opts.extraArgs);
+    return args;
+  }
 
-    proc = spawn(aoeBinary, args, {
+  async function spawnOnce(
+    args: string[],
+    boundBaseUrl: string,
+  ): Promise<ChildProcess> {
+    const child = spawn(aoeBinary, args, {
       stdio: ["ignore", "pipe", "pipe"],
       env: seedEnv,
     });
@@ -460,26 +499,43 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
       const fs = await import("node:fs");
       const log = fs.createWriteStream(logPath, { flags: "a" });
       log.write(`\n=== spawn ${args.join(" ")} (home=${home}) ===\n`);
-      proc.stdout?.on("data", (b) => log.write(`[stdout] ${b}`));
-      proc.stderr?.on("data", (b) => log.write(`[stderr] ${b}`));
+      child.stdout?.on("data", (b) => log.write(`[stdout] ${b}`));
+      child.stderr?.on("data", (b) => log.write(`[stderr] ${b}`));
     }
 
     let spawnFailed = false;
-    proc.once("error", () => {
+    child.once("error", () => {
       spawnFailed = true;
     });
 
     try {
-      await waitForServer(baseUrl, spawnTimeoutMs, proc, authMode);
-      break;
+      await waitForServer(boundBaseUrl, spawnTimeoutMs, child, authMode);
+      return child;
     } catch (err) {
       try {
-        proc.kill("SIGKILL");
+        child.kill("SIGKILL");
       } catch {
         // ignore
       }
-      proc = null;
-      if (spawnFailed || attempt === 4) {
+      const wrapped = spawnFailed
+        ? new Error(`spawn failed before listen: ${String(err)}`)
+        : err;
+      throw wrapped;
+    }
+  }
+
+  let proc: ChildProcess | null = null;
+  let port = 0;
+  let baseUrl = "";
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    port = portFor(opts.workerIndex, opts.parallelIndex, attempt);
+    baseUrl = `http://127.0.0.1:${port}`;
+    try {
+      proc = await spawnOnce(buildArgs(port), baseUrl);
+      break;
+    } catch (err) {
+      if (attempt === 4) {
         rmSync(home, { recursive: true, force: true });
         throw err;
       }
@@ -499,6 +555,37 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     authToken = await readTokenFile(tokenFile, spawnTimeoutMs);
   }
 
+  async function killProc(child: ChildProcess): Promise<void> {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    child.kill("SIGTERM");
+    await new Promise<void>((resolveExit) => {
+      let resolved = false;
+      const done = () => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(escalate);
+        clearTimeout(backstop);
+        resolveExit();
+      };
+      // 2s after SIGTERM, escalate to SIGKILL. Do NOT resolve here:
+      // restart() reuses the same port and a too-early resolve races
+      // the kernel's TCP cleanup, so spawnOnce can land on EADDRINUSE.
+      // Wait for the real exit event (or the backstop below).
+      const escalate = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // ignore
+        }
+      }, 2000);
+      // Hard backstop so a pathologically uncooperative child can't
+      // hang the test forever. SIGKILL is uninterruptible on POSIX
+      // outside zombie/D-state, so this should not fire in practice.
+      const backstop = setTimeout(done, 4000);
+      child.once("exit", done);
+    });
+  }
+
   const handle: ServeHandle = {
     baseUrl,
     port,
@@ -510,26 +597,19 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     authToken,
     tokenFile,
     tmuxPrefix: tmuxPrefixFor(aoeBinary),
+    async restart() {
+      if (proc) await killProc(proc);
+      const next = await spawnOnce(buildArgs(port), baseUrl);
+      proc = next;
+      handle.proc = next;
+      if (authMode === "token" && tokenFile) {
+        const refreshed = await readTokenFile(tokenFile, spawnTimeoutMs);
+        handle.authToken = refreshed;
+      }
+    },
     async stop() {
       try {
-        if (proc && proc.exitCode === null && proc.signalCode === null) {
-          proc.kill("SIGTERM");
-          // Give the server 2s to drain, then SIGKILL.
-          await new Promise<void>((resolveExit) => {
-            const t = setTimeout(() => {
-              try {
-                proc!.kill("SIGKILL");
-              } catch {
-                // ignore
-              }
-              resolveExit();
-            }, 2000);
-            proc!.once("exit", () => {
-              clearTimeout(t);
-              resolveExit();
-            });
-          });
-        }
+        if (proc) await killProc(proc);
       } finally {
         // Best-effort: kill any tmux server bound to the isolated socket
         // before deleting the dir. Cockpit specs leave tmux child
@@ -561,7 +641,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     },
   };
 
-  if (authMode === "passphrase" && passphrase) {
+  if (authMode === "passphrase" && passphrase && opts.preloginViaHarness) {
     const deviceBindingSecret = randomBytes(32).toString("base64url");
     const { cookie } = await loginWithPassphrase(baseUrl, passphrase, deviceBindingSecret);
     handle.sessionCookie = cookie;

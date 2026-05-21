@@ -240,7 +240,31 @@ async fn drain_replay_into_socket(
     session_id: &str,
     since: u64,
 ) -> usize {
-    let entries = state.cockpit_event_store.replay_from(session_id, since);
+    // Offload the rusqlite read to the blocking pool. A session with
+    // a large retained history may iterate thousands of rows; running
+    // that on the runtime worker stalls every other concurrent task on
+    // the same worker for the duration of the read.
+    let store = Arc::clone(&state.cockpit_event_store);
+    let session_id_owned = session_id.to_string();
+    let entries = match tokio::task::spawn_blocking(move || {
+        store.replay_from(&session_id_owned, since)
+    })
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            // Blocking task panicked or was cancelled. Live broadcast still
+            // flows and the client dedupes by seq, so empty drain is benign,
+            // but the silent swallow would hide the panic from operators.
+            warn!(
+                target: "cockpit.ws",
+                session_id = %session_id,
+                error = %e,
+                "replay drain blocking task failed; sending zero frames"
+            );
+            Vec::new()
+        }
+    };
     let mut sent = 0usize;
     for (seq, event) in entries {
         let frame = CockpitBroadcastFrame {

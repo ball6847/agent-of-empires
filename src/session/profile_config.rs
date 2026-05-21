@@ -48,6 +48,9 @@ pub struct ProfileConfig {
     pub sound: Option<crate::sound::SoundConfigOverride>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_hooks: Option<crate::status_hooks::StatusHookConfigOverride>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cockpit: Option<CockpitConfigOverride>,
 
     /// Per-profile override for the host-side `environment` list. When
@@ -89,6 +92,10 @@ pub struct CockpitConfigOverride {
     pub max_concurrent_resumes: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force_end_turn_threshold_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silent_orphan_grace_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silent_orphan_fast_grace_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -302,6 +309,7 @@ pub fn profile_has_overrides(config: &ProfileConfig) -> bool {
         || config.session.is_some()
         || config.hooks.is_some()
         || config.sound.is_some()
+        || config.status_hooks.is_some()
         || config.cockpit.is_some()
         || config.environment.is_some()
 }
@@ -518,6 +526,13 @@ pub fn merge_configs(mut global: Config, profile: &ProfileConfig) -> Config {
         crate::sound::apply_sound_overrides(&mut global.sound, sound_override);
     }
 
+    if let Some(ref status_hook_override) = profile.status_hooks {
+        crate::status_hooks::apply_status_hook_overrides(
+            &mut global.status_hooks,
+            status_hook_override,
+        );
+    }
+
     if let Some(ref environment) = profile.environment {
         // Replace semantics (matches sandbox.environment override behaviour).
         global.environment = environment.clone();
@@ -556,6 +571,12 @@ pub fn merge_configs(mut global: Config, profile: &ProfileConfig) -> Config {
         }
         if let Some(v) = cockpit_override.force_end_turn_threshold_secs {
             global.cockpit.force_end_turn_threshold_secs = v;
+        }
+        if let Some(v) = cockpit_override.silent_orphan_grace_secs {
+            global.cockpit.silent_orphan_grace_secs = v;
+        }
+        if let Some(v) = cockpit_override.silent_orphan_fast_grace_secs {
+            global.cockpit.silent_orphan_fast_grace_secs = v;
         }
     }
 
@@ -695,6 +716,32 @@ mod tests {
         // notify_in_cli should retain global default since not overridden
         assert!(merged.updates.notify_in_cli);
         assert!(merged.worktree.enabled);
+    }
+
+    #[test]
+    fn test_merge_configs_with_status_hook_overrides() {
+        let mut global = Config::default();
+        global.status_hooks.enabled = false;
+        global.status_hooks.on_waiting = Some("global-waiting".to_string());
+        global.status_hooks.debounce_ms = 100;
+
+        let profile = ProfileConfig {
+            status_hooks: Some(crate::status_hooks::StatusHookConfigOverride {
+                enabled: Some(true),
+                debounce_ms: Some(500),
+                on_waiting: Some("profile-waiting".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = merge_configs(global, &profile);
+        assert!(merged.status_hooks.enabled);
+        assert_eq!(
+            merged.status_hooks.on_waiting.as_deref(),
+            Some("profile-waiting")
+        );
+        assert_eq!(merged.status_hooks.debounce_ms, 500);
     }
 
     #[test]

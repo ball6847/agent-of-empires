@@ -816,32 +816,45 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     {
         let gc_map = state.recently_restarted.clone();
         let shutdown = state.shutdown.clone();
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(crate::session::recovery::RECENTLY_RESTARTED_GC_INTERVAL);
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        crate::session::recovery::gc_recently_restarted(&gc_map);
+        crate::task_util::spawn_supervised(
+            "server.gc.recently_restarted",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                let mut interval =
+                    tokio::time::interval(crate::session::recovery::RECENTLY_RESTARTED_GC_INTERVAL);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            crate::session::recovery::gc_recently_restarted(&gc_map);
+                        }
+                        _ = shutdown.cancelled() => break,
                     }
-                    _ = shutdown.cancelled() => break,
                 }
-            }
-        });
+            },
+        );
     }
 
     if let Some((lock, candidates)) = recovery_inputs {
         let cascade_state = state.clone();
-        tokio::spawn(async move {
-            daemon_startup_recovery_cascade(cascade_state, lock, candidates).await;
-        });
+        crate::task_util::spawn_supervised(
+            "server.startup_recovery_cascade",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                daemon_startup_recovery_cascade(cascade_state, lock, candidates).await;
+            },
+        );
     }
 
     // Spawn background tasks
     let poll_state = state.clone();
-    tokio::spawn(async move {
-        status_poll_loop(poll_state).await;
-    });
+    crate::task_util::spawn_supervised(
+        "server.status_poll_loop",
+        crate::task_util::PanicPolicy::Log,
+        async move {
+            status_poll_loop(poll_state).await;
+        },
+    );
 
     // Cockpit broadcast listener: a single subscriber that handles
     // every in-process consumer of cockpit events. Status mirroring
@@ -852,9 +865,13 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // matter to both (e.g. AcpSessionAssigned).
     {
         let listener_state = state.clone();
-        tokio::spawn(async move {
-            cockpit_event_listener(listener_state).await;
-        });
+        crate::task_util::spawn_supervised(
+            "server.cockpit_event_listener",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                cockpit_event_listener(listener_state).await;
+            },
+        );
     }
 
     // Push-notification consumer: subscribes to status_tx, applies
@@ -1168,6 +1185,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/cockpit/spawn", post(api::spawn_cockpit))
         .route("/api/sessions/{id}/cockpit", delete(api::shutdown_cockpit))
         .route(
+            "/api/sessions/{id}/cockpit/switch-agent",
+            post(api::switch_cockpit_agent),
+        )
+        .route(
             "/api/sessions/{id}/cockpit/prompt",
             post(api::cockpit_prompt),
         )
@@ -1204,7 +1225,8 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/cockpit/approvals/{nonce}",
             post(api::resolve_approval),
         )
-        .route("/api/cockpit/master", patch(api::set_cockpit_master));
+        .route("/api/cockpit/master", patch(api::set_cockpit_master))
+        .route("/api/cockpit/agents", get(api::list_cockpit_agents));
 
     app
         // Static assets (Vite build output: assets/, manifest.json, sw.js, icons)
@@ -2362,6 +2384,12 @@ pub(crate) fn derive_cockpit_status(event: &crate::cockpit::Event) -> Option<Sta
             Some(StatusIntent::Set(Status::Running))
         }
         Event::ApprovalRequested { .. } => Some(StatusIntent::Set(Status::Waiting)),
+        // All Stopped reasons surface as Idle, including the
+        // rate-limit park: the worker is not crashed, the user just
+        // hit a provider quota and the session is waiting for reset
+        // (or for the user to switch to another ACP backend). The
+        // dedicated RateLimit banner carries the reset time, so the
+        // sidebar pill staying grey is the right signal. See #1281.
         Event::Stopped { .. } => Some(StatusIntent::Set(Status::Idle)),
         Event::AgentStartupError { .. } => Some(StatusIntent::Set(Status::Error)),
         // A successful session/new or session/load means the agent
@@ -2413,6 +2441,14 @@ mod tests {
         assert_eq!(
             derive_cockpit_status(&Event::Stopped {
                 reason: "prompt_complete".into()
+            }),
+            Some(StatusIntent::Set(Status::Idle))
+        );
+        // Rate-limit park: NOT an error; sidebar stays grey, the
+        // dedicated RateLimit banner carries the reset time. See #1281.
+        assert_eq!(
+            derive_cockpit_status(&Event::Stopped {
+                reason: "rate_limited".into()
             }),
             Some(StatusIntent::Set(Status::Idle))
         );

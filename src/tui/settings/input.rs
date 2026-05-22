@@ -295,8 +295,18 @@ impl SettingsView {
                     && !self.fields.is_empty()
                 {
                     let was_theme = self.fields[self.selected_field].key == FieldKey::ThemeName;
+                    // Clearing an override doesn't change which fields exist, only
+                    // their inherited values. rebuild_fields() resets scroll to 0,
+                    // which would yank the user away from the field they just reset.
+                    // Preserve the cursor and scroll position.
+                    let saved_selected = self.selected_field;
+                    let saved_scroll = self.fields_scroll_offset;
                     self.clear_profile_override(self.selected_field);
                     self.rebuild_fields();
+                    if saved_selected < self.fields.len() {
+                        self.selected_field = saved_selected;
+                    }
+                    self.fields_scroll_offset = saved_scroll;
 
                     if was_theme {
                         if let Some(field) =
@@ -554,9 +564,9 @@ impl SettingsView {
                 }
             }
             // Updates
-            FieldKey::CheckEnabled => {
+            FieldKey::UpdateCheckMode => {
                 if let Some(ref mut u) = config.updates {
-                    u.check_enabled = None;
+                    u.update_check_mode = None;
                 }
             }
             FieldKey::CheckIntervalHours => {
@@ -661,6 +671,21 @@ impl SettingsView {
             FieldKey::StrictHotkeys => {
                 if let Some(ref mut s) = config.session {
                     s.strict_hotkeys = None;
+                }
+            }
+            FieldKey::SnoozeDurationMinutes => {
+                if let Some(ref mut s) = config.session {
+                    s.snooze_duration_minutes = None;
+                }
+            }
+            FieldKey::RestartWakeMessage => {
+                if let Some(ref mut s) = config.session {
+                    s.restart_wake_message = None;
+                }
+            }
+            FieldKey::RowTag => {
+                if let Some(ref mut s) = config.session {
+                    s.row_tag = None;
                 }
             }
             FieldKey::AgentExtraArgs => {
@@ -910,6 +935,7 @@ impl SettingsView {
             }
             // Logging is global-only for v1 (no profile overrides); the
             // "clear override" gesture is a no-op for these keys.
+            // SessionIdPollerMaxThreads is also global-only.
             FieldKey::LoggingDefaultLevel
             | FieldKey::LoggingTarget(_)
             | FieldKey::LoggingOutput
@@ -917,7 +943,8 @@ impl SettingsView {
             | FieldKey::LoggingRotation
             | FieldKey::LoggingMaxSizeMib
             | FieldKey::LoggingKeepCount
-            | FieldKey::LoggingShowSpans => {}
+            | FieldKey::LoggingShowSpans
+            | FieldKey::SessionIdPollerMaxThreads => {}
             FieldKey::HostEnvironment => {
                 config.environment = None;
             }

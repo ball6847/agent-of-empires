@@ -42,7 +42,7 @@
 //! non-interactive and complete in <30s". Hardening is tracked as a follow-up
 //! (graceful timeout + force-kill path on the cascade).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "serve")]
 use std::sync::Arc;
 #[cfg(feature = "serve")]
@@ -70,7 +70,14 @@ pub struct RecoveryLock {
 /// The lock file lives at `<app_dir>/.recovery.lock`. It is created if
 /// missing and never deleted (the lock is on the file, not its existence).
 pub fn try_acquire_recovery_lock() -> Result<Option<RecoveryLock>> {
-    let path = recovery_lock_path()?;
+    try_acquire_recovery_lock_at(&recovery_lock_path()?)
+}
+
+/// Inner helper that takes the lock-file path directly. Split out so tests
+/// can exercise the flock logic without depending on the env-var-driven
+/// `get_app_dir()` resolution, which races with non-`#[serial]` readers of
+/// `HOME` / `XDG_CONFIG_HOME` elsewhere in the suite.
+fn try_acquire_recovery_lock_at(path: &Path) -> Result<Option<RecoveryLock>> {
     if let Some(parent) = path.parent() {
         // Propagate so an unwritable app dir surfaces here with the real
         // OS error (e.g. EACCES, EROFS) rather than as a confusing
@@ -82,7 +89,7 @@ pub fn try_acquire_recovery_lock() -> Result<Option<RecoveryLock>> {
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&path)?;
+        .open(path)?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(RecoveryLock { _file: file })),
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -96,11 +103,23 @@ fn recovery_lock_path() -> Result<PathBuf> {
 
 /// Pure predicate: should this instance go through the startup recovery
 /// cascade? Excludes cockpit-mode sessions (handled by `cockpit_reconciler`),
-/// sessions whose agent has `ResumeStrategy::Unsupported`, and sessions
-/// without a valid `agent_session_id`. Live tmux panes are filtered separately
-/// by the caller using `Instance::has_live_tmux_pane()`.
+/// sessions whose agent has `ResumeStrategy::Unsupported`, sessions without
+/// a valid `agent_session_id`, and sunk rows (archived or currently snoozed).
+/// Live tmux panes are filtered separately by the caller using
+/// `Instance::has_live_tmux_pane()`.
+///
+/// Archive and snooze are explicit "leave this session alone" signals; the
+/// archive path actively kills the tmux pane, so without this guard the next
+/// TUI launch (or daemon startup) would observe a dead pane on a resumable
+/// agent and respawn the row the user just dismissed. Snooze shares the
+/// guard because `is_snoozed()` returns false once the timer expires, so the
+/// row naturally re-enters recovery eligibility on its own schedule rather
+/// than the moment a pane goes missing.
 pub fn is_recovery_candidate(inst: &Instance) -> bool {
-    !inst.is_cockpit_mode() && should_attempt_resume(inst.agent_session_id.as_deref(), &inst.tool)
+    !inst.is_cockpit_mode()
+        && !inst.is_archived()
+        && !inst.is_snoozed()
+        && should_attempt_resume(inst.agent_session_id.as_deref(), &inst.tool)
 }
 
 /// Warm up the tmux server so that the first concurrent `new-session` from
@@ -233,18 +252,6 @@ pub fn run_recovery_for_instance(inst: &mut Instance) -> Result<StartOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
-
-    /// Point `HOME` (and `XDG_CONFIG_HOME` on Linux) at a temp dir so
-    /// `get_app_dir()` resolves into the sandbox instead of touching the
-    /// user's real app dir. Mirrors the helper in `session::tests`.
-    fn isolate_app_dir() -> tempfile::TempDir {
-        let temp_home = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
-        temp_home
-    }
 
     #[cfg(feature = "serve")]
     #[test]
@@ -288,6 +295,51 @@ mod tests {
         assert!(g.contains_key("fresh"));
     }
 
+    /// Regression: archiving a session kills its tmux pane, so the next
+    /// startup observes a dead pane on a resume-capable agent. Without an
+    /// archive guard on `is_recovery_candidate`, the cascade respawns the
+    /// row the user just dismissed (reported: "archive a session, leave
+    /// and re-enter the TUI, it restarts").
+    #[test]
+    fn archived_instance_is_not_recovery_candidate() {
+        let mut inst = Instance::new("archived", "/tmp/test");
+        inst.agent_session_id = Some("11111111-1111-4111-8111-111111111111".into());
+        assert!(
+            is_recovery_candidate(&inst),
+            "baseline: claude + valid sid is a recovery candidate"
+        );
+        inst.archive();
+        assert!(
+            !is_recovery_candidate(&inst),
+            "archived sessions must be excluded from startup recovery"
+        );
+        inst.unarchive();
+        assert!(
+            is_recovery_candidate(&inst),
+            "unarchive must restore recovery eligibility"
+        );
+    }
+
+    /// Snooze is the temporary sibling of archive. While the timer is in
+    /// the future, the row sits in tier 99 and must not be revived by a
+    /// pane-dead probe; once the timer expires, `is_snoozed()` flips to
+    /// false and the row naturally rejoins the recovery set.
+    #[test]
+    fn snoozed_instance_is_not_recovery_candidate_until_expiry() {
+        let mut inst = Instance::new("snoozed", "/tmp/test");
+        inst.agent_session_id = Some("22222222-2222-4222-8222-222222222222".into());
+        inst.snooze(30);
+        assert!(
+            !is_recovery_candidate(&inst),
+            "snoozed sessions must be excluded while the timer is live"
+        );
+        inst.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        assert!(
+            is_recovery_candidate(&inst),
+            "expired snooze must restore recovery eligibility"
+        );
+    }
+
     /// Cross-process exclusion is a POSIX `flock(2)` guarantee, not
     /// something this unit test can verify (BSD flock and Linux flock
     /// both treat all fds in the same process as one holder; only a
@@ -295,20 +347,24 @@ mod tests {
     /// the wrapper successfully creates the lock file and acquires/
     /// releases the lock without erroring. The cross-process behavior
     /// is exercised by the e2e suite (TUI + daemon spawned together).
+    ///
+    /// Driven through `try_acquire_recovery_lock_at` rather than the
+    /// public entry point so the lock path is fixed and independent of
+    /// `HOME` / `XDG_CONFIG_HOME`. The public function reads those env
+    /// vars via `dirs::config_dir()`; `getenv` and `setenv` are not
+    /// thread-safe, and non-`#[serial]` HOME readers elsewhere in the
+    /// suite have been observed to race a `set_var` from another test
+    /// and resolve the lock path under the wrong sandbox, surfacing as
+    /// a flaky "re-acquisition after drop" failure on CI.
     #[test]
-    #[serial]
     fn recovery_lock_acquires_and_releases() {
-        // Sandbox HOME/XDG_CONFIG_HOME so this never touches the real
-        // <app_dir>/.recovery.lock, where a concurrent `aoe` / `aoe serve`
-        // would otherwise either fail the test or have its own lock
-        // hijacked. `#[serial]` against the same env-var mutators in the
-        // rest of the suite.
-        let _sandbox = isolate_app_dir();
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = temp.path().join(".recovery.lock");
 
-        let first = try_acquire_recovery_lock().unwrap();
+        let first = try_acquire_recovery_lock_at(&path).unwrap();
         assert!(first.is_some(), "acquisition should succeed");
         drop(first);
-        let second = try_acquire_recovery_lock().unwrap();
+        let second = try_acquire_recovery_lock_at(&path).unwrap();
         assert!(second.is_some(), "re-acquisition after drop should succeed");
     }
 }

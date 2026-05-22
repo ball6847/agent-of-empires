@@ -115,7 +115,10 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/__tests__/TerminalSettings.test.tsx"],
-      "components": ["web/src/components/TerminalSettings.tsx"]
+      "components": [
+        "web/src/components/TerminalSettings.tsx",
+        "web/src/components/TerminalSessionStack.tsx"
+      ]
     },
     {
       "id": "app-shell.topbar-dev-badge",
@@ -123,6 +126,20 @@
       "risk": "low",
       "specs": ["src/components/__tests__/TopBar.test.tsx"],
       "components": ["web/src/components/TopBar.tsx"]
+    },
+    {
+      "id": "app-shell.routing",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/routing.spec.ts"],
+      "components": []
+    },
+    {
+      "id": "app-shell.sessions-loaded-sentinel",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/hooks/useSessions.test.ts"],
+      "components": []
     },
     {
       "id": "profiles.lifecycle",
@@ -167,6 +184,7 @@
         "tests/wizard-custom-agent.spec.ts"
       ],
       "components": [
+        "web/src/components/DirectoryBrowser.tsx",
         "web/src/components/session-wizard/SessionWizard.tsx",
         "web/src/components/session-wizard/StepIndicator.tsx",
         "web/src/components/session-wizard/steps/AgentStep.tsx",
@@ -198,10 +216,31 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.repo-appearance",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/sidebar-multi-session.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.workspace-ordering",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": ["tests/live/workspace-ordering.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.client-side-navigation",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-multi-session.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.favorite-indicator",
+      "kind": "deferred",
+      "issue": "https://github.com/njbrake/agent-of-empires/issues/986",
+      "risk": "low",
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
@@ -225,6 +264,21 @@
       "components": ["web/src/components/DeleteSessionDialog.tsx"]
     },
     {
+      "id": "storage.quota-crash-regression",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/sidebar-resize-quota.spec.ts",
+        "src/components/__tests__/ContentSplit.quota.test.tsx",
+        "src/lib/safeStorage.test.ts"
+      ],
+      "components": [
+        "web/src/lib/safeStorage.ts",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/ContentSplit.tsx"
+      ]
+    },
+    {
       "id": "right-panel.diff",
       "kind": "live-playwright",
       "risk": "medium",
@@ -245,6 +299,21 @@
         "web/src/components/diff/comments/CommentsBanner.tsx",
         "web/src/components/diff/comments/DiffCommentsUserCard.tsx",
         "web/src/components/diff/comments/SendCommentsDialog.tsx"
+      ]
+    },
+    {
+      "id": "right-panel.diff-line-visibility",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/diff/__tests__/DiffLine.test.tsx",
+        "src/components/diff/__tests__/StringDiff.test.tsx",
+        "src/hooks/__tests__/useHighlightedLines.test.tsx"
+      ],
+      "components": [
+        "web/src/components/diff/DiffLine.tsx",
+        "web/src/components/diff/StringDiff.tsx",
+        "web/src/hooks/useHighlightedLines.ts"
       ]
     },
     {
@@ -358,6 +427,104 @@
         "src/components/cockpit/__tests__/WorkerRestartingBanner.test.tsx"
       ],
       "components": []
+    },
+    {
+      "id": "cockpit.usage-baseline",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/cockpitTypes.test.ts"],
+      "components": ["web/src/lib/cockpitTypes.ts"]
+    },
+    {
+      "id": "cockpit.drafts",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/cockpitDrafts.test.ts"],
+      "components": ["web/src/lib/cockpitDrafts.ts"]
+    },
+    {
+      "id": "cockpit.queue-drain-clear-split",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/hooks/useCockpit.queue.test.ts",
+        "src/lib/agentProfiles.test.ts"
+      ],
+      "components": [
+        "web/src/hooks/useCockpit.ts",
+        "web/src/lib/agentProfiles.ts",
+        "web/src/components/cockpit/CockpitView.tsx"
+      ]
+    },
+    {
+      "id": "cockpit.files-index",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/cockpit/useFilesIndex.test.tsx"],
+      "components": ["web/src/components/cockpit/useFilesIndex.ts"]
+    },
+    {
+      "id": "cockpit.rattle",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/cockpitRattle.test.ts"],
+      "components": ["web/src/lib/cockpitRattle.ts"]
+    },
+    {
+      "id": "cockpit.args",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/cockpitArgs.test.ts"],
+      "components": ["web/src/lib/cockpitArgs.ts"]
+    },
+    {
+      "id": "cockpit.approval-card",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/cockpit/ApprovalCard.test.tsx"],
+      "components": ["web/src/components/cockpit/ApprovalCard.tsx"]
+    },
+    {
+      "id": "cockpit.markdown",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/cockpit/Markdown.test.tsx"],
+      "components": ["web/src/components/cockpit/Markdown.tsx"]
+    },
+    {
+      "id": "cockpit.tool-cards",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/cockpit/ToolCards.render.test.tsx"],
+      "components": ["web/src/components/cockpit/ToolCards.tsx"]
+    },
+    {
+      "id": "cockpit.context-primer-banner",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/cockpit/ContextPrimerBanner.test.tsx"],
+      "components": ["web/src/components/cockpit/ContextPrimerBanner.tsx"]
+    },
+    {
+      "id": "cockpit.switch-substrate-action",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/cockpit/SwitchSubstrateAction.test.tsx"],
+      "components": ["web/src/components/cockpit/SwitchSubstrateAction.tsx"]
+    },
+    {
+      "id": "cockpit.tool-error-body",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/cockpit/ToolErrorBody.test.tsx"],
+      "components": ["web/src/components/cockpit/ToolErrorBody.tsx"]
+    },
+    {
+      "id": "cockpit.startup-error-screen",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/cockpit/__tests__/StartupErrorScreen.test.tsx"],
+      "components": ["web/src/components/cockpit/StartupErrorScreen.tsx"]
     },
     {
       "id": "read-only.mode",

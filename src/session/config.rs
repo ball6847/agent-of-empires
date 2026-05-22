@@ -276,10 +276,22 @@ pub struct CockpitConfig {
     /// `session/cancel` and arms the existing cancel-escalation grace.
     /// Closes the gap where claude-agent-acp finishes streaming but
     /// never sends `PromptResponse` (upstream
-    /// agentclientprotocol/claude-agent-acp#688). Default 60s. `0`
-    /// disables the watchdog. Long-running tools are not affected; the
-    /// watchdog only fires when no in-flight tool call is open.
-    /// See #1240.
+    /// agentclientprotocol/claude-agent-acp#688). Upstream
+    /// agentclientprotocol/claude-agent-acp#706 (shipped in 0.37.0)
+    /// recovers the prompt stream after a failed turn for some cases,
+    /// reducing the false-positive rate, but cannot rescue every wedge
+    /// (transport-level stalls, child process hangs, lost terminal
+    /// frames), so the watchdog stays as the vendor-agnostic floor.
+    /// Default 120s; raised
+    /// from 60s in #1360 so async-agent flows (Claude SDK `Agent` tool
+    /// with `isAsync: true`) get a longer wait window before the
+    /// watchdog cancels them. `0` disables the watchdog. Long-running
+    /// tools are not affected; the watchdog only fires when no
+    /// in-flight tool call is open. The async-agent extension lifts the
+    /// effective grace to at least 30 minutes when the daemon observes
+    /// an async-agent launch in the current prompt. Nonzero values
+    /// below 120 clamp up at runtime so a typo cannot disable the
+    /// watchdog accidentally. See #1240, #1360.
     #[serde(default = "default_silent_orphan_grace_secs")]
     pub silent_orphan_grace_secs: u32,
     /// Silent-orphan watchdog: accelerated grace used when the current
@@ -302,7 +314,7 @@ fn default_force_end_turn_threshold_secs() -> u32 {
 }
 
 fn default_silent_orphan_grace_secs() -> u32 {
-    60
+    120
 }
 
 fn default_silent_orphan_fast_grace_secs() -> u32 {
@@ -386,6 +398,7 @@ fn default_replay_bytes() -> u64 {
 pub enum SortOrder {
     #[default]
     Newest,
+    Attention,
     LastActivity,
     Oldest,
     AZ,
@@ -395,7 +408,8 @@ pub enum SortOrder {
 impl SortOrder {
     pub fn cycle(self) -> Self {
         match self {
-            SortOrder::Newest => SortOrder::LastActivity,
+            SortOrder::Newest => SortOrder::Attention,
+            SortOrder::Attention => SortOrder::LastActivity,
             SortOrder::LastActivity => SortOrder::Oldest,
             SortOrder::Oldest => SortOrder::AZ,
             SortOrder::AZ => SortOrder::ZA,
@@ -406,7 +420,8 @@ impl SortOrder {
     pub fn cycle_reverse(self) -> Self {
         match self {
             SortOrder::Newest => SortOrder::ZA,
-            SortOrder::LastActivity => SortOrder::Newest,
+            SortOrder::Attention => SortOrder::Newest,
+            SortOrder::LastActivity => SortOrder::Attention,
             SortOrder::Oldest => SortOrder::LastActivity,
             SortOrder::AZ => SortOrder::Oldest,
             SortOrder::ZA => SortOrder::AZ,
@@ -416,6 +431,7 @@ impl SortOrder {
     pub fn label(self) -> &'static str {
         match self {
             SortOrder::Newest => "Newest",
+            SortOrder::Attention => "Attention",
             SortOrder::LastActivity => "Recent",
             SortOrder::Oldest => "Oldest",
             SortOrder::AZ => "A-Z",
@@ -457,11 +473,25 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub last_seen_version: Option<String>,
 
+    /// Latest version for which the user dismissed the update banner. The
+    /// banner stays hidden as long as the latest available version equals
+    /// this value; it returns automatically when a newer release ships.
+    /// Cleared by switching `update_check_mode` or upgrading past the
+    /// snoozed version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_update_version: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_list_width: Option<u16>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_file_list_width: Option<u16>,
+
+    /// Show the info header (profile/tool/path/status/sandbox/worktree) at
+    /// the top of the home preview pane. Defaults to `true` when absent;
+    /// users hide it with `i` when they want the full pane for live output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_preview_info: Option<bool>,
 
     #[serde(default)]
     pub has_seen_custom_instruction_warning: bool,
@@ -529,6 +559,64 @@ pub struct SessionConfig {
     /// Off by default; existing users keep the legacy single-letter UX.
     #[serde(default)]
     pub strict_hotkeys: bool,
+
+    /// How long (in minutes) to snooze a session when the user presses
+    /// `w`/`W` or runs `aoe session snooze`. During the snooze window the
+    /// session is treated like archive: sinks to the bottom, renders
+    /// italic+dim with a `z ` prefix, ignored by the attention sort,
+    /// then rejoins the active list automatically when the timer expires.
+    /// Default: 30 minutes.
+    #[serde(default = "default_snooze_duration_minutes")]
+    pub snooze_duration_minutes: u32,
+
+    /// Text sent to the agent after a successful `aoe session restart` /
+    /// `e`-keybind restart, once the post-restart readiness probe says the
+    /// pane is alive. Restart re-execs the agent at a blank prompt; this
+    /// nudge tells the agent to pick up where it left off. Set to an
+    /// empty string to disable the wake-up message entirely (the restart
+    /// itself still runs).
+    #[serde(default = "default_restart_wake_message")]
+    pub restart_wake_message: String,
+
+    /// Per-row label shown next to the session title in the home view.
+    /// `Auto` (default) preserves the historical UX: show a profile short
+    /// code in all-profiles view and nothing in filtered views. Other
+    /// variants override that to always show the chosen tag, or to
+    /// suppress the row label entirely.
+    #[serde(default)]
+    pub row_tag: RowTagMode,
+
+    /// Process-wide cap on concurrent session-id poller threads (one per
+    /// live session). Edited via the TUI Settings panel; saving in Global
+    /// scope pushes the new value into the runtime atomic for new sessions
+    /// to pick up immediately.
+    #[serde(default = "default_session_id_poller_max_threads")]
+    pub session_id_poller_max_threads: u32,
+}
+
+/// What to render in the per-row tag slot next to the session title.
+///
+/// Defaults to `None` so existing users see no behavior change. Power
+/// users opt in via Settings: pick `Auto` (profile tag in all-profiles
+/// view only), `Profile`, `Sandbox`, or `Branch`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowTagMode {
+    /// Never render a per-row tag. The historical behavior on `main`
+    /// before the row-tag feature landed; default so the feature is
+    /// fully opt-in.
+    #[default]
+    None,
+    /// Show the profile short code in all-profiles view, nothing in
+    /// filtered views.
+    Auto,
+    /// Always render the profile short code (`fb` for `forit-backup`).
+    Profile,
+    /// Render `sb` on sandboxed sessions, nothing on host sessions.
+    Sandbox,
+    /// Render the worktree branch name (last segment if `/`-namespaced,
+    /// truncated to 8 chars).
+    Branch,
 }
 
 impl Default for SessionConfig {
@@ -538,12 +626,44 @@ impl Default for SessionConfig {
             yolo_mode_default: false,
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
-            agent_status_hooks: default_true(),
+            agent_status_hooks: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
             strict_hotkeys: false,
+            snooze_duration_minutes: 30,
+            restart_wake_message: default_restart_wake_message(),
+            row_tag: RowTagMode::default(),
+            session_id_poller_max_threads: default_session_id_poller_max_threads(),
         }
     }
+}
+
+fn default_snooze_duration_minutes() -> u32 {
+    30
+}
+
+fn default_restart_wake_message() -> String {
+    "wake up: pick up what you were doing".to_string()
+}
+
+/// Upper bound on snooze duration: 30 days (43,200 minutes). Originally
+/// capped at 24 hours but the TUI snooze dialog now offers up to a 1-week
+/// preset and longer ad-hoc values via the API are reasonable for
+/// long-tail "circle back next month" workflows.
+pub const SNOOZE_MAX_MINUTES: u64 = 30 * 24 * 60;
+
+pub fn validate_snooze_duration(minutes: u64) -> Result<(), String> {
+    if !(1..=SNOOZE_MAX_MINUTES).contains(&minutes) {
+        return Err(format!(
+            "Snooze duration must be between 1 and {} minutes (got {})",
+            SNOOZE_MAX_MINUTES, minutes
+        ));
+    }
+    Ok(())
+}
+
+fn default_session_id_poller_max_threads() -> u32 {
+    crate::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS
 }
 
 impl SessionConfig {
@@ -673,8 +793,12 @@ impl Default for WebConfig {
     }
 }
 
+/// Serde default for `Config.default_profile`. Empty means "not explicitly
+/// chosen"; the active profile is then resolved at runtime by
+/// `resolve_default_profile`, which picks the first existing profile or
+/// bootstraps one. There is no magic profile name.
 fn default_profile() -> String {
-    "default".to_string()
+    String::new()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -729,10 +853,52 @@ fn default_idle_decay_minutes() -> u64 {
     0
 }
 
+/// Controls how the TUI and CLI surface update availability. See #1140.
+///
+/// `Auto` quietly installs new releases in the background on next launch
+/// after detection (mid-session restart is intentionally out of scope, the
+/// new binary is picked up next time `aoe` starts). `Notify` is the
+/// default: shows the TUI banner and, when `notify_in_cli` is true, the
+/// CLI eprintln nag. `Off` suppresses every check, banner, and fetch.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateCheckMode {
+    /// Silently install detected updates; user picks them up next launch.
+    Auto,
+    /// Surface the banner / CLI notice (default).
+    #[default]
+    Notify,
+    /// Skip every check, banner, and fetch.
+    Off,
+}
+
+impl UpdateCheckMode {
+    /// True when the runtime should call `check_for_update` at all.
+    /// Both `Auto` and `Notify` need the check to fire; only `Off`
+    /// short-circuits.
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, UpdateCheckMode::Off)
+    }
+
+    /// True when the user should see a TUI banner / CLI notice once a
+    /// newer version is detected.
+    pub fn notifies(self) -> bool {
+        matches!(self, UpdateCheckMode::Notify)
+    }
+
+    /// True when the runtime should kick off a background install on
+    /// detection (no banner; binary picked up next launch).
+    pub fn auto_installs(self) -> bool {
+        matches!(self, UpdateCheckMode::Auto)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdatesConfig {
-    #[serde(default = "default_true")]
-    pub check_enabled: bool,
+    /// How updates are surfaced (auto / notify / off). Replaces the
+    /// legacy `check_enabled` boolean (see migration `v009`).
+    #[serde(default)]
+    pub update_check_mode: UpdateCheckMode,
 
     #[serde(default = "default_check_interval")]
     pub check_interval_hours: u64,
@@ -752,7 +918,7 @@ pub struct UpdatesConfig {
 impl Default for UpdatesConfig {
     fn default() -> Self {
         Self {
-            check_enabled: true,
+            update_check_mode: UpdateCheckMode::default(),
             check_interval_hours: 24,
             notify_in_cli: true,
             web_poll_interval_minutes: 60,
@@ -1071,7 +1237,8 @@ impl Config {
         }
 
         let content = fs::read_to_string(&path)?;
-        let config: Config = toml::from_str(&content)?;
+        let mut config: Config = toml::from_str(&content)?;
+        config.normalize();
         Ok(config)
     }
 
@@ -1084,6 +1251,15 @@ impl Config {
                 tracing::warn!(target: "session.store", "Failed to load global config, using defaults: {e}");
                 Config::default()
             }
+        }
+    }
+
+    /// Clamp invariants that the type system can't enforce. Keeps config,
+    /// TUI, and runtime in agreement when a user hand-edits a value below
+    /// its minimum (zero would silently disable session-id polling).
+    fn normalize(&mut self) {
+        if self.session.session_id_poller_max_threads == 0 {
+            self.session.session_id_poller_max_threads = 1;
         }
     }
 }
@@ -1103,14 +1279,38 @@ pub fn save_config(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Load the user's default profile name, falling back to "default" on error.
+/// Resolve the active profile name.
+///
+/// If the user has explicitly set `config.default_profile`, that name is
+/// returned verbatim. Otherwise this returns the first profile directory
+/// found under `<app_dir>/profiles/` (sorted, so the choice is
+/// deterministic). On a genuine first run, when no profile directory exists
+/// yet, one is bootstrapped (see `ensure_bootstrap_profile`).
 pub fn resolve_default_profile() -> String {
     let config = Config::load_or_warn();
-    if config.default_profile.is_empty() {
-        "default".to_string()
-    } else {
-        config.default_profile
+    if !config.default_profile.is_empty() {
+        return config.default_profile;
     }
+    match super::list_profiles() {
+        Ok(profiles) => match profiles.into_iter().next() {
+            Some(first) => first,
+            None => ensure_bootstrap_profile(),
+        },
+        Err(_) => ensure_bootstrap_profile(),
+    }
+}
+
+/// Name of the profile created on a genuine first run.
+const BOOTSTRAP_PROFILE: &str = "main";
+
+/// Create the first profile on a genuine first run and return its name.
+///
+/// AoE always needs at least one profile (somewhere to file sessions). When
+/// `profiles/` has no entries, this creates `main`. It is idempotent: calling
+/// it when `main` already exists just returns the name.
+fn ensure_bootstrap_profile() -> String {
+    let _ = super::get_profile_dir(BOOTSTRAP_PROFILE);
+    BOOTSTRAP_PROFILE.to_string()
 }
 
 /// Return `profile` if non-empty, otherwise the user's globally configured
@@ -1205,19 +1405,20 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = Config::default();
-        // default_profile uses default_profile() function which returns "default"
-        // but Default derive gives empty string, so check deserialize case works
+        // An unset default_profile deserializes empty: "not explicitly
+        // chosen". The active profile is resolved at runtime, not baked in
+        // as a magic name here.
         let deserialized: Config = toml::from_str("").unwrap();
-        assert_eq!(deserialized.default_profile, "default");
+        assert_eq!(deserialized.default_profile, "");
         assert!(!config.worktree.enabled);
         assert!(!config.sandbox.enabled_by_default);
-        assert!(config.updates.check_enabled);
+        assert_eq!(config.updates.update_check_mode, UpdateCheckMode::Notify);
     }
 
     #[test]
     fn test_config_deserialize_empty_toml() {
         let config: Config = toml::from_str("").unwrap();
-        assert_eq!(config.default_profile, "default");
+        assert_eq!(config.default_profile, "");
     }
 
     #[test]
@@ -1279,7 +1480,7 @@ mod tests {
     #[test]
     fn test_updates_config_default() {
         let updates = UpdatesConfig::default();
-        assert!(updates.check_enabled);
+        assert_eq!(updates.update_check_mode, UpdateCheckMode::Notify);
         assert_eq!(updates.check_interval_hours, 24);
         assert!(updates.notify_in_cli);
     }
@@ -1287,41 +1488,56 @@ mod tests {
     #[test]
     fn test_updates_config_deserialize() {
         let toml = r#"
-            check_enabled = false
+            update_check_mode = "off"
             check_interval_hours = 12
             notify_in_cli = false
         "#;
         let updates: UpdatesConfig = toml::from_str(toml).unwrap();
-        assert!(!updates.check_enabled);
+        assert_eq!(updates.update_check_mode, UpdateCheckMode::Off);
         assert_eq!(updates.check_interval_hours, 12);
         assert!(!updates.notify_in_cli);
     }
 
     #[test]
     fn test_updates_config_partial_deserialize() {
-        let toml = r#"check_enabled = false"#;
+        let toml = r#"update_check_mode = "auto""#;
         let updates: UpdatesConfig = toml::from_str(toml).unwrap();
-        assert!(!updates.check_enabled);
-        // Defaults for other fields
+        assert_eq!(updates.update_check_mode, UpdateCheckMode::Auto);
         assert_eq!(updates.check_interval_hours, 24);
     }
 
-    /// Regression: a previous schema had `auto_update = bool` on
-    /// UpdatesConfig (it was wired through profiles but never read).
-    /// The field is gone now, so old configs that still set it must
-    /// deserialize cleanly with the field silently dropped by serde.
     #[test]
-    fn test_legacy_auto_update_field_is_silently_ignored() {
+    fn test_update_check_mode_helpers() {
+        assert!(UpdateCheckMode::Notify.is_enabled());
+        assert!(UpdateCheckMode::Notify.notifies());
+        assert!(!UpdateCheckMode::Notify.auto_installs());
+
+        assert!(UpdateCheckMode::Auto.is_enabled());
+        assert!(!UpdateCheckMode::Auto.notifies());
+        assert!(UpdateCheckMode::Auto.auto_installs());
+
+        assert!(!UpdateCheckMode::Off.is_enabled());
+        assert!(!UpdateCheckMode::Off.notifies());
+        assert!(!UpdateCheckMode::Off.auto_installs());
+    }
+
+    /// Regression: the previous schema had `check_enabled = bool` and
+    /// `auto_update = bool` on UpdatesConfig. Both fields are gone now;
+    /// the on-disk migration runs at startup, but configs read between
+    /// upgrade and migration must still deserialize cleanly with the
+    /// unknown fields silently dropped by serde.
+    #[test]
+    fn test_legacy_check_enabled_and_auto_update_are_ignored() {
         let old_toml = r#"
-            check_enabled = true
+            check_enabled = false
             auto_update = true
             check_interval_hours = 12
             notify_in_cli = true
         "#;
         let updates: UpdatesConfig =
-            toml::from_str(old_toml).expect("old auto_update field should not error");
+            toml::from_str(old_toml).expect("legacy fields should not error");
         assert_eq!(updates.check_interval_hours, 12);
-        assert!(updates.check_enabled);
+        assert_eq!(updates.update_check_mode, UpdateCheckMode::Notify);
         assert!(updates.notify_in_cli);
     }
 
@@ -1459,6 +1675,7 @@ mod tests {
         let app = AppStateConfig::default();
         assert!(!app.has_seen_welcome);
         assert!(app.last_seen_version.is_none());
+        assert!(app.dismissed_update_version.is_none());
     }
 
     #[test]
@@ -1466,10 +1683,12 @@ mod tests {
         let toml = r#"
             has_seen_welcome = true
             last_seen_version = "1.0.0"
+            dismissed_update_version = "1.0.0"
         "#;
         let app: AppStateConfig = toml::from_str(toml).unwrap();
         assert!(app.has_seen_welcome);
         assert_eq!(app.last_seen_version, Some("1.0.0".to_string()));
+        assert_eq!(app.dismissed_update_version, Some("1.0.0".to_string()));
     }
 
     // Full config serialization roundtrip
@@ -1524,7 +1743,7 @@ mod tests {
             enabled_by_default = true
 
             [updates]
-            check_enabled = true
+            update_check_mode = "notify"
             check_interval_hours = 12
 
             [app_state]
@@ -1537,7 +1756,7 @@ mod tests {
         assert!(config.worktree.enabled);
         assert_eq!(config.worktree.path_template, "../wt/{branch}");
         assert!(config.sandbox.enabled_by_default);
-        assert!(config.updates.check_enabled);
+        assert_eq!(config.updates.update_check_mode, UpdateCheckMode::Notify);
         assert_eq!(config.updates.check_interval_hours, 12);
         assert!(config.app_state.has_seen_welcome);
     }
@@ -1547,7 +1766,7 @@ mod tests {
     fn test_get_update_settings_returns_defaults_when_no_config() {
         // This test doesn't access the filesystem, so it should return defaults
         let settings = UpdatesConfig::default();
-        assert!(settings.check_enabled);
+        assert_eq!(settings.update_check_mode, UpdateCheckMode::Notify);
         assert_eq!(settings.check_interval_hours, 24);
     }
 
@@ -1747,6 +1966,48 @@ mod tests {
     }
 
     #[test]
+    fn test_session_config_default_session_id_poller_max_threads() {
+        let cfg = SessionConfig::default();
+        assert_eq!(
+            cfg.session_id_poller_max_threads,
+            crate::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS
+        );
+    }
+
+    #[test]
+    fn test_session_config_session_id_poller_max_threads_roundtrip() {
+        let mut config = Config::default();
+        config.session.session_id_poller_max_threads = 137;
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.session.session_id_poller_max_threads, 137);
+    }
+
+    #[test]
+    fn test_session_config_session_id_poller_max_threads_defaults_when_absent() {
+        let toml = r#"
+            [session]
+            default_tool = "claude"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.session.session_id_poller_max_threads,
+            crate::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS
+        );
+    }
+
+    #[test]
+    fn test_session_config_normalize_clamps_zero_poller_threads() {
+        let mut cfg = Config::default();
+        cfg.session.session_id_poller_max_threads = 0;
+        cfg.normalize();
+        assert_eq!(
+            cfg.session.session_id_poller_max_threads, 1,
+            "normalize() must clamp zero to 1 to keep config, UI, and runtime aligned"
+        );
+    }
+
+    #[test]
     fn test_resolve_tool_command_prefers_command_override() {
         let mut config = SessionConfig::default();
         config
@@ -1786,6 +2047,41 @@ mod tests {
     fn test_resolve_tool_command_returns_empty_for_unknown() {
         let config = SessionConfig::default();
         assert_eq!(config.resolve_tool_command("nonexistent"), "");
+    }
+
+    #[test]
+    fn test_session_config_default_snooze_duration_is_30() {
+        let config = SessionConfig::default();
+        assert_eq!(
+            config.snooze_duration_minutes, 30,
+            "default snooze duration must be 30 minutes"
+        );
+    }
+
+    #[test]
+    fn test_validate_snooze_duration_accepts_valid_range() {
+        assert!(validate_snooze_duration(1).is_ok());
+        assert!(validate_snooze_duration(30).is_ok());
+        assert!(validate_snooze_duration(1440).is_ok());
+    }
+
+    #[test]
+    fn test_validate_snooze_duration_rejects_out_of_range() {
+        assert!(validate_snooze_duration(0).is_err());
+        assert!(validate_snooze_duration(SNOOZE_MAX_MINUTES + 1).is_err());
+    }
+
+    #[test]
+    fn test_validate_snooze_duration_accepts_dialog_presets() {
+        // The TUI dialog presets must all pass the validator; otherwise
+        // the API silently rejects what the UI offered. Presets:
+        // 1-6h (60-360 min), 24h (1 day), 1 week.
+        for &m in &[60u64, 120, 180, 240, 300, 360, 1440, 7 * 1440] {
+            assert!(
+                validate_snooze_duration(m).is_ok(),
+                "preset {m} min must pass validator"
+            );
+        }
     }
 
     #[test]

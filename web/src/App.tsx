@@ -3,11 +3,14 @@ import { useMatch, useNavigate } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { useSessions } from "./hooks/useSessions";
 import { clearCockpitCache } from "./hooks/useCockpit";
+import { clearDraft, sweepOrphanDrafts } from "./lib/cockpitDrafts";
 import { CockpitPrefsProvider } from "./lib/cockpitPrefs";
+import { safeGetItem, safeSetItem } from "./lib/safeStorage";
 import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useRepoGroups } from "./hooks/useRepoGroups";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useResolvedTheme } from "./hooks/useResolvedTheme";
+import { useWebSettings } from "./hooks/useWebSettings";
 import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
@@ -39,7 +42,7 @@ import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { TopBar } from "./components/TopBar";
 import { ContentSplit } from "./components/ContentSplit";
-import { TerminalView } from "./components/TerminalView";
+import { TerminalSessionStack } from "./components/TerminalSessionStack";
 // Lazy-load the cockpit surface so non-cockpit users never download
 // the @assistant-ui/react, shiki, and in-house StringDiff/DiffLine
 // dependency tree. Cuts ~hundreds of KB off the cold-start bundle
@@ -180,6 +183,7 @@ function isInsideEditable(target: EventTarget | null): boolean {
 function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLogout: () => void }) {
   const navigate = useNavigate();
   const idleDecayWindowMs = useIdleDecayWindowMs();
+  const { settings: webSettings } = useWebSettings();
   const sessionMatch = useMatch("/session/:sessionId");
   const settingsRootMatch = useMatch("/settings");
   const settingsTabMatch = useMatch("/settings/:tab");
@@ -195,12 +199,30 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     setWorkspaceOrdering,
     markLocalOrderingUpdate,
     error,
+    loaded: sessionsLoaded,
     injectSession,
     setSessionStatus,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
 
-  const { groups, toggleRepoCollapsed } = useRepoGroups(
+  // One-shot orphan-draft sweep once useSessions has settled its first
+  // fetch (success or null). Catches cockpit:draft:<id> keys left behind
+  // by deletions that happened in another tab or on another device since
+  // the last load (#1358). The local-tab delete path calls clearDraft
+  // directly so it does not need to wait for this. Gating on
+  // `sessionsLoaded` rather than `sessions.length > 0` covers the
+  // legitimate empty-server case: a brand-new user with zero sessions
+  // must still get prior orphan drafts swept. Bounded by localStorage
+  // entry count; cheap.
+  const sweptDraftsRef = useRef(false);
+  useEffect(() => {
+    if (sweptDraftsRef.current) return;
+    if (!sessionsLoaded) return;
+    sweptDraftsRef.current = true;
+    sweepOrphanDrafts(new Set(sessions.map((s) => s.id)));
+  }, [sessionsLoaded, sessions]);
+
+  const { groups, toggleRepoCollapsed, updateRepoAppearance } = useRepoGroups(
     workspaces,
     workspaceOrdering,
   );
@@ -232,13 +254,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const selectedFilePath = selectedFile?.path ?? null;
   const selectedRepoName = selectedFile?.repoName;
   const [diffCollapsed, setDiffCollapsed] = useState(() => {
-    const stored = localStorage.getItem(RIGHT_PANEL_COLLAPSED_KEY);
+    const stored = safeGetItem(RIGHT_PANEL_COLLAPSED_KEY);
     if (stored === "1") return true;
     if (stored === "0") return false;
     return window.innerWidth < 768;
   });
   useEffect(() => {
-    localStorage.setItem(RIGHT_PANEL_COLLAPSED_KEY, diffCollapsed ? "1" : "0");
+    safeSetItem(RIGHT_PANEL_COLLAPSED_KEY, diffCollapsed ? "1" : "0");
   }, [diffCollapsed]);
   const [showSessionWizard, setShowSessionWizard] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
@@ -410,6 +432,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     // the same id doesn't briefly show the prior transcript on
     // remount before fetchReplay clears it.
     clearCockpitCache(sessionId);
+    // Drop the persisted composer draft for the deleted session so its
+    // localStorage key doesn't linger (#1358). Cross-tab / cross-device
+    // deletes go through the startup sweep instead.
+    clearDraft(sessionId);
 
     toastBus.handler?.info("Session deleted");
   }, [deletingSession, activeSessionId, setSessionStatus, navigate]);
@@ -646,6 +672,16 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       );
     }
 
+    // Refresh on `/session/<id>` paints once with `sessions === []` before
+    // the first poll resolves. Without this guard the lookup misses, the
+    // dashboard fallback renders, and the cockpit/terminal view only
+    // reappears once the fetch lands. Hold the minimal pre-auth shell
+    // until the first fetch settles, then let the real fallback decide.
+    // See #1351.
+    if (activeSessionId && !sessionsLoaded) {
+      return <div className="h-dvh bg-surface-900 safe-area-inset" />;
+    }
+
     if (!activeWorkspace || !activeSession) {
       return (
         <Dashboard
@@ -683,11 +719,15 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                     />
                   </Suspense>
                 ) : (
-                  <TerminalView
-                    key={activeSessionId}
-                    session={activeSession}
+                  <TerminalSessionStack
+                    activeSessionId={activeSessionId!}
+                    sessions={sessions.filter((session) => !session.cockpit_mode)}
                     cockpitMasterEnabled={
                       !!serverAbout?.cockpit_master_enabled
+                    }
+                    persistent={webSettings.persistentTerminals}
+                    maxPersistentTerminals={
+                      webSettings.maxPersistentTerminals
                     }
                   />
                 )}
@@ -833,6 +873,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             onToggle={() => setSidebarOpen(false)}
             onSelect={handleSelectWorkspace}
             onToggleRepo={toggleRepoCollapsed}
+            onUpdateRepoAppearance={updateRepoAppearance}
             onNew={() => { setWizardPrefill(undefined); setShowSessionWizard(true); }}
             onCreateSession={handleCreateSession}
             onSettings={handleOpenSettings}

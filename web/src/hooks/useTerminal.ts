@@ -145,8 +145,10 @@ export function useTerminal(
   wsPath: string = "ws",
   autoFocus: boolean = true,
   claudeFullscreen: boolean = false,
+  claimPrimary: boolean = true,
 ) {
   const { settings, update } = useWebSettings();
+  const claimPrimaryRef = useRef(claimPrimary);
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -200,6 +202,10 @@ export function useTerminal(
     isPrimary: true,
     isInScrollback: false,
   });
+
+  useEffect(() => {
+    claimPrimaryRef.current = claimPrimary;
+  }, [claimPrimary]);
 
   useEffect(() => {
     if (!sessionId || !containerRef.current) return;
@@ -490,10 +496,12 @@ export function useTerminal(
           isPrimary: true,
         }));
         if (autoFocus) term.focus();
-        // Claim primary immediately so this client's resize is applied.
-        // Without this, the first resize lands in "vacant" state (which
-        // works) but a race with focus/visibility events could delay it.
-        ws.send(JSON.stringify({ type: "activate" } as ActivateMessage));
+        // Claim primary immediately for visible terminals so this
+        // client's resize is applied. Hidden persistent terminals keep
+        // their socket warm without stealing primary from the active tab.
+        if (claimPrimaryRef.current) {
+          ws.send(JSON.stringify({ type: "activate" } as ActivateMessage));
+        }
         // Send initial PTY dimensions only if FitAddon has actually
         // measured the container. Reading term.cols/term.rows directly
         // would yield xterm's 80x24 default before fit() runs, and
@@ -668,10 +676,64 @@ export function useTerminal(
     //
     // Pause/resume apply to BOTH platforms: claude's continued output
     // shifts scrollback under the reader regardless of client size.
-    const WHEEL_UP_SEQ = "\x1b[<64;1;1M";
-    const WHEEL_DOWN_SEQ = "\x1b[<65;1;1M";
+    const wheelSeq = (
+      dir: "up" | "down",
+      cell: { col: number; row: number },
+    ) => `\x1b[<${dir === "up" ? 64 : 65};${cell.col};${cell.row}M`;
+    const wheelGrid = () => {
+      const sentGrid =
+        lastSentCols > 0 && lastSentRows > 0
+          ? { cols: lastSentCols, rows: lastSentRows }
+          : null;
+      // While reading tmux scrollback, resize messages are deferred to
+      // avoid SIGWINCH redraws. xterm may still refit to a new monitor
+      // size, so mouse coordinates must stay in the pane size tmux
+      // actually knows about.
+      if (isInScrollbackRef.current && sentGrid) return sentGrid;
+      return {
+        cols: Math.max(1, term.cols),
+        rows: Math.max(1, term.rows),
+      };
+    };
+    const cellFromClientPoint = (
+      clientX: number,
+      clientY: number,
+      eventTarget?: EventTarget | null,
+    ) => {
+      const targetEl =
+        eventTarget instanceof HTMLElement ? eventTarget : null;
+      const targetRect = targetEl?.getBoundingClientRect();
+      const el =
+        targetRect && targetRect.width > 0 && targetRect.height > 0
+          ? targetEl
+          : term.element;
+      if (!el) return { col: 1, row: 1 };
+      const rect = el.getBoundingClientRect();
+      const grid = wheelGrid();
+      const cellWidth = rect.width > 0 ? rect.width / grid.cols : 0;
+      const cellHeight = rect.height > 0 ? rect.height / grid.rows : 0;
+      const rawCol =
+        cellWidth > 0 ? Math.floor((clientX - rect.left) / cellWidth) + 1 : 1;
+      const rawRow =
+        cellHeight > 0 ? Math.floor((clientY - rect.top) / cellHeight) + 1 : 1;
+      return {
+        col: Math.max(1, Math.min(grid.cols, rawCol)),
+        row: Math.max(1, Math.min(grid.rows, rawRow)),
+      };
+    };
+    const centerCell = () => {
+      const grid = wheelGrid();
+      return {
+        col: Math.max(1, Math.ceil(grid.cols / 2)),
+        row: Math.max(1, Math.ceil(grid.rows / 2)),
+      };
+    };
     let scrollbackDepth = 0;
-    const sendWheel = (dir: "up" | "down", count: number) => {
+    const sendWheel = (
+      dir: "up" | "down",
+      count: number,
+      cell = centerCell(),
+    ) => {
       const ws = wsRef.current;
       if (ws?.readyState !== WebSocket.OPEN) return;
 
@@ -682,7 +744,7 @@ export function useTerminal(
       // them. isInScrollback stays false; downstream UI (BackToLiveButton)
       // hides itself accordingly.
       if (claudeFullscreen) {
-        const seq = dir === "up" ? WHEEL_UP_SEQ : WHEEL_DOWN_SEQ;
+        const seq = wheelSeq(dir, cell);
         for (let i = 0; i < count; i++) {
           ws.send(new TextEncoder().encode(seq));
         }
@@ -703,7 +765,7 @@ export function useTerminal(
         // so the resume transition fires when the user scrolls back.
         scrollbackDepth = Math.max(0, scrollbackDepth - sendCount);
       }
-      const seq = dir === "up" ? WHEEL_UP_SEQ : WHEEL_DOWN_SEQ;
+      const seq = wheelSeq(dir, cell);
       for (let i = 0; i < sendCount; i++) {
         ws.send(new TextEncoder().encode(seq));
       }
@@ -752,7 +814,9 @@ export function useTerminal(
     let pinchStartDist = 0;
     let pinchStartSize = DEFAULT_FONT_SIZE;
     let pinchStartMidY = 0;
+    let touchMidX = 0;
     let singleStartY = 0;
+    let singleX = 0;
     let singleY = 0;
     let singleAccum = 0;
     let singleLastTs = 0;
@@ -843,6 +907,7 @@ export function useTerminal(
       if (e.touches.length === 1) {
         const t = e.touches[0]!;
         singleStartY = t.clientY;
+        singleX = t.clientX;
         singleY = t.clientY;
         singleAccum = 0;
         singleLastTs = performance.now();
@@ -853,6 +918,7 @@ export function useTerminal(
 
       if (e.touches.length === 2) {
         gestureMode = null;
+        touchMidX = (e.touches[0]!.clientX + e.touches[1]!.clientX) / 2;
         touchMidY = midpointY(e);
         touchAccum = 0;
         velocity = 0;
@@ -872,6 +938,7 @@ export function useTerminal(
         const t = e.touches[0]!;
         const y = t.clientY;
         const now = performance.now();
+        singleX = t.clientX;
 
         if (gestureMode === null) {
           if (Math.abs(y - singleStartY) < GESTURE_LOCK_PX) {
@@ -894,7 +961,11 @@ export function useTerminal(
           Math.min(MAX_WHEELS_PER_FRAME, rawWheels),
         );
         if (wheels !== 0) {
-          sendWheel(wheels > 0 ? "up" : "down", Math.abs(wheels));
+          sendWheel(
+            wheels > 0 ? "up" : "down",
+            Math.abs(wheels),
+            cellFromClientPoint(singleX, y, e.currentTarget),
+          );
           singleAccum -= wheels * step;
           const dt = Math.max(1, now - singleLastTs);
           velocity = clampV(dy / dt);
@@ -906,6 +977,7 @@ export function useTerminal(
       // Two-finger gesture (scroll or pinch)
       if (e.touches.length !== 2) return;
       e.preventDefault();
+      touchMidX = (e.touches[0]!.clientX + e.touches[1]!.clientX) / 2;
       const y = midpointY(e);
       const now = performance.now();
       const dist = touchDistance(e);
@@ -939,7 +1011,11 @@ export function useTerminal(
         Math.min(MAX_WHEELS_PER_FRAME, rawWheels),
       );
       if (wheels !== 0) {
-        sendWheel(wheels > 0 ? "up" : "down", Math.abs(wheels));
+        sendWheel(
+          wheels > 0 ? "up" : "down",
+          Math.abs(wheels),
+          cellFromClientPoint(touchMidX, y, e.currentTarget),
+        );
         touchAccum -= wheels * step;
         const dt = Math.max(1, now - lastMoveTs);
         velocity = clampV(dy / dt);
@@ -980,7 +1056,7 @@ export function useTerminal(
           Math.min(MAX_WHEELS_PER_FRAME, rawW),
         );
         if (w !== 0) {
-          sendWheel(w > 0 ? "up" : "down", Math.abs(w));
+          sendWheel(w > 0 ? "up" : "down", Math.abs(w), centerCell());
           carry -= w * step;
         }
         if (Math.abs(v) > 0.05) {
@@ -1024,6 +1100,18 @@ export function useTerminal(
     let wheelAccum = 0;
     let scrollWheelAccum = 0;
     let wheelPersistTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastCapturedWheelCell: { col: number; row: number } | null = null;
+    const onWheelCapture = (e: WheelEvent) => {
+      lastCapturedWheelCell = cellFromClientPoint(
+        e.clientX,
+        e.clientY,
+        e.currentTarget ?? e.target,
+      );
+    };
+    viewport.addEventListener("wheel", onWheelCapture, {
+      capture: true,
+      passive: true,
+    });
     term.attachCustomWheelEventHandler((e: WheelEvent) => {
       e.preventDefault();
 
@@ -1055,7 +1143,20 @@ export function useTerminal(
         Math.min(MAX_WHEELS_PER_FRAME, rawWheels),
       );
       if (wheels !== 0) {
-        sendWheel(wheels > 0 ? "down" : "up", Math.abs(wheels));
+        const eventCell = cellFromClientPoint(
+          e.clientX,
+          e.clientY,
+          e.currentTarget ?? e.target,
+        );
+        const cell =
+          eventCell.col === 1 && eventCell.row === 1 && lastCapturedWheelCell
+            ? lastCapturedWheelCell
+            : eventCell;
+        sendWheel(
+          wheels > 0 ? "down" : "up",
+          Math.abs(wheels),
+          cell,
+        );
         scrollWheelAccum -= wheels * step;
       }
       return false;
@@ -1064,6 +1165,7 @@ export function useTerminal(
     // When the user switches to this tab/window, tell the server so it
     // can claim primary and resize the PTY to match this viewport.
     const sendActivate = () => {
+      if (!claimPrimaryRef.current) return;
       const ws = wsRef.current;
       if (ws?.readyState === WebSocket.OPEN) {
         const msg: ActivateMessage = { type: "activate" };
@@ -1130,6 +1232,7 @@ export function useTerminal(
       viewport.removeEventListener("touchend", onTouchEnd, touchOpts);
       viewport.removeEventListener("touchcancel", onTouchEnd, touchOpts);
       viewport.removeEventListener("click", onClickCapture, true);
+      viewport.removeEventListener("wheel", onWheelCapture, true);
       if (wheelPersistTimer) clearTimeout(wheelPersistTimer);
       if (resizeDebounceTimer) clearTimeout(resizeDebounceTimer);
       if (fontSizeRaf !== null) cancelAnimationFrame(fontSizeRaf);

@@ -1,8 +1,8 @@
 //! Setting field definitions and config mapping
 
 use crate::session::{
-    validate_check_interval, Config, ContainerRuntimeName, DefaultTerminalMode, ProfileConfig,
-    TmuxClipboardMode, TmuxMouseMode, TmuxStatusBarMode,
+    validate_check_interval, validate_snooze_duration, Config, ContainerRuntimeName,
+    DefaultTerminalMode, ProfileConfig, TmuxClipboardMode, TmuxMouseMode, TmuxStatusBarMode,
 };
 use crate::sound::{
     validate_sound_exists, volume_from_option, volume_options, volume_to_index, SoundMode,
@@ -57,7 +57,7 @@ pub enum FieldKey {
     ThemeColorMode,
     IdleDecayMinutes,
     // Updates
-    CheckEnabled,
+    UpdateCheckMode,
     CheckIntervalHours,
     NotifyInCli,
     WebPollIntervalMinutes,
@@ -91,12 +91,16 @@ pub enum FieldKey {
     // Session
     DefaultTool,
     StrictHotkeys,
+    SnoozeDurationMinutes,
+    RestartWakeMessage,
+    RowTag,
     AgentExtraArgs,
     AgentCommandOverride,
     AgentStatusHooks,
     CustomAgents,
     AgentDetectAs,
     HostEnvironment,
+    SessionIdPollerMaxThreads,
     // Sound
     SoundEnabled,
     SoundMode,
@@ -153,6 +157,24 @@ pub enum FieldKey {
     LoggingMaxSizeMib,
     LoggingKeepCount,
     LoggingShowSpans,
+}
+
+/// Map `UpdateCheckMode` to the Select index used by the settings TUI.
+/// Order matches the labels in `build_update_fields()`.
+fn update_check_mode_to_index(mode: crate::session::config::UpdateCheckMode) -> usize {
+    match mode {
+        crate::session::config::UpdateCheckMode::Auto => 0,
+        crate::session::config::UpdateCheckMode::Notify => 1,
+        crate::session::config::UpdateCheckMode::Off => 2,
+    }
+}
+
+fn update_check_mode_from_index(idx: usize) -> crate::session::config::UpdateCheckMode {
+    match idx {
+        0 => crate::session::config::UpdateCheckMode::Auto,
+        2 => crate::session::config::UpdateCheckMode::Off,
+        _ => crate::session::config::UpdateCheckMode::Notify,
+    }
 }
 
 /// Resolve a field value from global config and optional profile override.
@@ -271,6 +293,10 @@ impl SettingField {
                 validate_check_interval(*n)?;
                 Ok(())
             }
+            (FieldKey::SnoozeDurationMinutes, FieldValue::Number(n)) => {
+                validate_snooze_duration(*n)?;
+                Ok(())
+            }
             (FieldKey::MemoryLimit, FieldValue::OptionalText(Some(v))) => {
                 crate::session::validate_memory_limit(v)?;
                 Ok(())
@@ -326,6 +352,33 @@ const LOG_LEVEL_OVERRIDE_OPTIONS: &[&str] =
     &["(default)", "trace", "debug", "info", "warn", "error"];
 const SINK_OPTIONS: &[&str] = &["file", "stdout"];
 const ROTATION_OPTIONS: &[&str] = &["size", "never"];
+
+/// Display labels for `RowTagMode` in the Settings picker. Order must match
+/// `row_tag_to_index` / `index_to_row_tag` so the index round-trips. `None`
+/// is first because it is the default; existing users see no tag.
+const ROW_TAG_OPTIONS: &[&str] = &["None", "Auto", "Profile", "Sandbox", "Branch"];
+
+fn row_tag_to_index(mode: crate::session::config::RowTagMode) -> usize {
+    use crate::session::config::RowTagMode::*;
+    match mode {
+        None => 0,
+        Auto => 1,
+        Profile => 2,
+        Sandbox => 3,
+        Branch => 4,
+    }
+}
+
+fn index_to_row_tag(idx: usize) -> crate::session::config::RowTagMode {
+    use crate::session::config::RowTagMode::*;
+    match idx {
+        1 => Auto,
+        2 => Profile,
+        3 => Sandbox,
+        4 => Branch,
+        _ => None,
+    }
+}
 
 fn level_index(level: &str, opts: &[&str]) -> usize {
     opts.iter().position(|&o| o == level).unwrap_or(0)
@@ -642,7 +695,7 @@ fn build_cockpit_fields(
         SettingField {
             key: FieldKey::CockpitSilentOrphanGraceSecs,
             label: "Silent-orphan grace (s)",
-            description: "Daemon-side watchdog that detects when the agent finishes streaming but the adapter never resolves the session/prompt request. Fires after this many seconds of no progress notifications, when no in-flight tool call is open and the prompt has produced at least one progress event. On fire, sends best-effort session/cancel and reuses the existing cancel-escalation path to SIGTERM + session/load respawn. Default 60s. Set 0 to disable. Long-running tools are not affected (watchdog suppresses while any tool call is active). See #1240.",
+            description: "Daemon-side watchdog that detects when the agent finishes streaming but the adapter never resolves the session/prompt request. Fires after this many seconds of no progress notifications, when no in-flight tool call is open and the prompt has produced at least one progress event. On fire, sends best-effort session/cancel and reuses the existing cancel-escalation path to SIGTERM + session/load respawn. Default 120s; raised from 60s in #1360 so async-agent flows (Claude SDK Agent tool with isAsync) survive normal sub-agent waits. Nonzero values below 120 clamp up to 120 at runtime. Set 0 to disable. Long-running tools are not affected (watchdog suppresses while any tool call is active). When the daemon detects an async-agent launch in the current prompt, the effective grace lifts to at least 30 minutes. See #1240, #1360.",
             value: FieldValue::Number(u64::from(silent_orphan_grace_secs)),
             category: SettingsCategory::Cockpit,
             has_override: sog_override,
@@ -838,10 +891,10 @@ fn build_updates_fields(
 ) -> Vec<SettingField> {
     let updates = profile.updates.as_ref();
 
-    let (check_enabled, o1) = resolve_value(
+    let (mode_val, o1) = resolve_value(
         scope,
-        global.updates.check_enabled,
-        updates.and_then(|u| u.check_enabled),
+        global.updates.update_check_mode,
+        updates.and_then(|u| u.update_check_mode),
     );
     let (check_interval, o2) = resolve_value(
         scope,
@@ -859,15 +912,30 @@ fn build_updates_fields(
         updates.and_then(|u| u.web_poll_interval_minutes),
     );
 
+    let mode_options: Vec<String> =
+        vec!["auto".to_string(), "notify".to_string(), "off".to_string()];
+    let mode_index = update_check_mode_to_index(mode_val);
+    let global_mode_index = update_check_mode_to_index(global.updates.update_check_mode);
+
     vec![
         SettingField {
-            key: FieldKey::CheckEnabled,
-            label: "Check for Updates",
-            description: "Automatically check for updates on startup",
-            value: FieldValue::Bool(check_enabled),
+            key: FieldKey::UpdateCheckMode,
+            label: "Update Check Mode",
+            description: "auto = install in background on detection (picked up next launch). \
+                          notify = show banner / CLI notice (default). off = skip every check.",
+            value: FieldValue::Select {
+                selected: mode_index,
+                options: mode_options.clone(),
+            },
             category: SettingsCategory::Updates,
             has_override: o1,
-            inherited_display: inherited_if(o1, FieldValue::Bool(global.updates.check_enabled)),
+            inherited_display: inherited_if(
+                o1,
+                FieldValue::Select {
+                    selected: global_mode_index,
+                    options: mode_options,
+                },
+            ),
         },
         SettingField {
             key: FieldKey::CheckIntervalHours,
@@ -1433,6 +1501,26 @@ fn build_session_fields(
         session.and_then(|s| s.strict_hotkeys),
     );
 
+    let (snooze_duration_minutes, snooze_duration_override) = resolve_value(
+        scope,
+        global.session.snooze_duration_minutes as u64,
+        session
+            .and_then(|s| s.snooze_duration_minutes)
+            .map(|v| v as u64),
+    );
+
+    let (restart_wake_message, restart_wake_message_override) = resolve_value(
+        scope,
+        global.session.restart_wake_message.clone(),
+        session.and_then(|s| s.restart_wake_message.clone()),
+    );
+
+    let (row_tag, row_tag_override) = resolve_value(
+        scope,
+        global.session.row_tag,
+        session.and_then(|s| s.row_tag),
+    );
+
     let (agent_status_hooks, status_hooks_override) = resolve_value(
         scope,
         global.session.agent_status_hooks,
@@ -1549,7 +1637,7 @@ fn build_session_fields(
         items
     };
 
-    vec![
+    let mut fields = vec![
         SettingField {
             key: FieldKey::DefaultTool,
             label: "Default Tool",
@@ -1591,6 +1679,50 @@ fn build_session_fields(
             inherited_display: inherited_if(
                 strict_hotkeys_override,
                 FieldValue::Bool(global.session.strict_hotkeys),
+            ),
+        },
+        SettingField {
+            key: FieldKey::SnoozeDurationMinutes,
+            label: "Snooze Duration (minutes)",
+            description: "Default snooze for `aoe session snooze` (1-43200 min, picker overrides)",
+            value: FieldValue::Number(snooze_duration_minutes),
+            category: SettingsCategory::Session,
+            has_override: snooze_duration_override,
+            inherited_display: inherited_if(
+                snooze_duration_override,
+                FieldValue::Number(global.session.snooze_duration_minutes as u64),
+            ),
+        },
+        SettingField {
+            key: FieldKey::RestartWakeMessage,
+            label: "Restart Wake Message",
+            description: "Sent to the agent after restart to resume work. Empty = no wake nudge.",
+            value: FieldValue::Text(restart_wake_message),
+            category: SettingsCategory::Session,
+            has_override: restart_wake_message_override,
+            inherited_display: inherited_if(
+                restart_wake_message_override,
+                FieldValue::Text(global.session.restart_wake_message.clone()),
+            ),
+        },
+        SettingField {
+            key: FieldKey::RowTag,
+            label: "Row Tag",
+            description:
+                "What to show next to each session title: Auto (profile in all-profiles view), \
+                 None, Profile (always), Sandbox (sb on sandboxed rows), or Branch.",
+            value: FieldValue::Select {
+                selected: row_tag_to_index(row_tag),
+                options: ROW_TAG_OPTIONS.iter().map(|s| s.to_string()).collect(),
+            },
+            category: SettingsCategory::Session,
+            has_override: row_tag_override,
+            inherited_display: inherited_if(
+                row_tag_override,
+                FieldValue::Select {
+                    selected: row_tag_to_index(global.session.row_tag),
+                    options: ROW_TAG_OPTIONS.iter().map(|s| s.to_string()).collect(),
+                },
             ),
         },
         SettingField {
@@ -1667,7 +1799,24 @@ fn build_session_fields(
                 FieldValue::List(global.environment.clone()),
             ),
         },
-    ]
+    ];
+
+    if scope == SettingsScope::Global {
+        fields.push(SettingField {
+            key: FieldKey::SessionIdPollerMaxThreads,
+            label: "Max Session-ID Poller Threads",
+            description:
+                "Process-wide cap on threads polling the tmux session ID for live sessions \
+                 (one thread per session). When the cap is reached, new sessions are not \
+                 polled and their session ID will not refresh.",
+            value: FieldValue::Number(u64::from(global.session.session_id_poller_max_threads)),
+            category: SettingsCategory::Session,
+            has_override: false,
+            inherited_display: None,
+        });
+    }
+
+    fields
 }
 
 fn build_sound_fields(
@@ -2108,7 +2257,9 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
             config.theme.idle_decay_minutes = *v;
         }
         // Updates
-        (FieldKey::CheckEnabled, FieldValue::Bool(v)) => config.updates.check_enabled = *v,
+        (FieldKey::UpdateCheckMode, FieldValue::Select { selected, .. }) => {
+            config.updates.update_check_mode = update_check_mode_from_index(*selected);
+        }
         (FieldKey::CheckIntervalHours, FieldValue::Number(v)) => {
             config.updates.check_interval_hours = *v
         }
@@ -2136,6 +2287,15 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         }
         (FieldKey::YoloModeDefault, FieldValue::Bool(v)) => config.session.yolo_mode_default = *v,
         (FieldKey::StrictHotkeys, FieldValue::Bool(v)) => config.session.strict_hotkeys = *v,
+        (FieldKey::SnoozeDurationMinutes, FieldValue::Number(v)) => {
+            config.session.snooze_duration_minutes = *v as u32;
+        }
+        (FieldKey::RestartWakeMessage, FieldValue::Text(v)) => {
+            config.session.restart_wake_message = v.clone();
+        }
+        (FieldKey::RowTag, FieldValue::Select { selected, .. }) => {
+            config.session.row_tag = index_to_row_tag(*selected);
+        }
         (FieldKey::AgentStatusHooks, FieldValue::Bool(v)) => {
             config.session.agent_status_hooks = *v;
         }
@@ -2384,6 +2544,9 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
             config.logging.show_spans = *v;
         }
         (FieldKey::HostEnvironment, FieldValue::List(v)) => config.environment = v.clone(),
+        (FieldKey::SessionIdPollerMaxThreads, FieldValue::Number(v)) => {
+            config.session.session_id_poller_max_threads = (*v).clamp(1, u32::MAX as u64) as u32;
+        }
         _ => {}
     }
 }
@@ -2428,8 +2591,11 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
             t.idle_decay_minutes = Some(*v);
         }
         // Updates
-        (FieldKey::CheckEnabled, FieldValue::Bool(v)) => {
-            set_profile_override(*v, &mut config.updates, |s, val| s.check_enabled = val);
+        (FieldKey::UpdateCheckMode, FieldValue::Select { selected, .. }) => {
+            let mode = update_check_mode_from_index(*selected);
+            set_profile_override(mode, &mut config.updates, |s, val| {
+                s.update_check_mode = val
+            });
         }
         (FieldKey::CheckIntervalHours, FieldValue::Number(v)) => {
             set_profile_override(*v, &mut config.updates, |s, val| {
@@ -2586,6 +2752,23 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
         }
         (FieldKey::StrictHotkeys, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.session, |s, val| s.strict_hotkeys = val);
+        }
+        (FieldKey::SnoozeDurationMinutes, FieldValue::Number(v)) => {
+            set_profile_override(*v as u32, &mut config.session, |s, val| {
+                s.snooze_duration_minutes = val
+            });
+        }
+        (FieldKey::RestartWakeMessage, FieldValue::Text(v)) => {
+            set_profile_override(v.clone(), &mut config.session, |s, val| {
+                s.restart_wake_message = val
+            });
+        }
+        (FieldKey::RowTag, FieldValue::Select { selected, .. }) => {
+            set_profile_override(
+                index_to_row_tag(*selected),
+                &mut config.session,
+                |s, val| s.row_tag = val,
+            );
         }
         (FieldKey::AgentStatusHooks, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.session, |s, val| {
@@ -2819,6 +3002,7 @@ mod tests {
 
     #[test]
     fn test_profile_field_has_no_override_after_global_change() {
+        use crate::session::config::UpdateCheckMode;
         // Start with default configs
         let mut global = Config::default();
         let profile = ProfileConfig::default();
@@ -2831,17 +3015,17 @@ mod tests {
             &profile,
         );
 
-        let check_enabled_field = fields
+        let mode_field = fields
             .iter()
-            .find(|f| f.key == FieldKey::CheckEnabled)
+            .find(|f| f.key == FieldKey::UpdateCheckMode)
             .unwrap();
         assert!(
-            !check_enabled_field.has_override,
+            !mode_field.has_override,
             "Profile should not show override initially"
         );
 
         // Change global setting
-        global.updates.check_enabled = !global.updates.check_enabled;
+        global.updates.update_check_mode = UpdateCheckMode::Off;
 
         // Rebuild profile fields - should still show no override
         let fields = build_fields_for_category(
@@ -2851,18 +3035,19 @@ mod tests {
             &profile,
         );
 
-        let check_enabled_field = fields
+        let mode_field = fields
             .iter()
-            .find(|f| f.key == FieldKey::CheckEnabled)
+            .find(|f| f.key == FieldKey::UpdateCheckMode)
             .unwrap();
         assert!(
-            !check_enabled_field.has_override,
+            !mode_field.has_override,
             "Profile should NOT show override after global change - it should inherit"
         );
     }
 
     #[test]
     fn test_profile_field_shows_override_after_profile_change() {
+        use crate::session::config::UpdateCheckMode;
         let global = Config::default();
         let mut profile = ProfileConfig::default();
 
@@ -2873,15 +3058,15 @@ mod tests {
             &global,
             &profile,
         );
-        let check_enabled_field = fields
+        let mode_field = fields
             .iter()
-            .find(|f| f.key == FieldKey::CheckEnabled)
+            .find(|f| f.key == FieldKey::UpdateCheckMode)
             .unwrap();
-        assert!(!check_enabled_field.has_override);
+        assert!(!mode_field.has_override);
 
         // Set a profile override
         profile.updates = Some(crate::session::UpdatesConfigOverride {
-            check_enabled: Some(false),
+            update_check_mode: Some(UpdateCheckMode::Off),
             ..Default::default()
         });
 
@@ -2892,12 +3077,12 @@ mod tests {
             &global,
             &profile,
         );
-        let check_enabled_field = fields
+        let mode_field = fields
             .iter()
-            .find(|f| f.key == FieldKey::CheckEnabled)
+            .find(|f| f.key == FieldKey::UpdateCheckMode)
             .unwrap();
         assert!(
-            check_enabled_field.has_override,
+            mode_field.has_override,
             "Profile SHOULD show override after explicit profile change"
         );
     }
@@ -2951,9 +3136,9 @@ mod tests {
         let mut profile = ProfileConfig::default();
 
         // Set a profile override that matches the global value
-        let global_check_enabled = global.updates.check_enabled;
+        let global_mode = global.updates.update_check_mode;
         profile.updates = Some(crate::session::UpdatesConfigOverride {
-            check_enabled: Some(global_check_enabled),
+            update_check_mode: Some(global_mode),
             ..Default::default()
         });
 
@@ -2966,7 +3151,7 @@ mod tests {
         );
         let field = fields
             .iter()
-            .find(|f| f.key == FieldKey::CheckEnabled)
+            .find(|f| f.key == FieldKey::UpdateCheckMode)
             .unwrap();
 
         // Re-apply the field (simulates user saving without changing the value)
@@ -2977,30 +3162,39 @@ mod tests {
             profile
                 .updates
                 .as_ref()
-                .and_then(|u| u.check_enabled)
+                .and_then(|u| u.update_check_mode)
                 .is_some(),
             "Profile override should be preserved even when value matches global"
         );
     }
 
     #[test]
-    fn test_bool_toggle_back_to_global_preserves_override() {
+    fn test_select_toggle_back_to_global_preserves_override() {
+        use crate::session::config::UpdateCheckMode;
         let global = Config::default();
         let mut profile = ProfileConfig::default();
-        let original = global.updates.check_enabled;
+        let original = global.updates.update_check_mode;
 
-        // Toggle to non-global value
+        // Toggle to non-global value (Off when default is Notify)
+        let other = if original == UpdateCheckMode::Off {
+            UpdateCheckMode::Notify
+        } else {
+            UpdateCheckMode::Off
+        };
         profile.updates = Some(crate::session::UpdatesConfigOverride {
-            check_enabled: Some(!original),
+            update_check_mode: Some(other),
             ..Default::default()
         });
 
         // Now toggle back to match global
         let field = SettingField {
-            key: FieldKey::CheckEnabled,
-            label: "Check Enabled",
+            key: FieldKey::UpdateCheckMode,
+            label: "Update Check Mode",
             description: "",
-            value: FieldValue::Bool(original),
+            value: FieldValue::Select {
+                selected: update_check_mode_to_index(original),
+                options: vec!["auto".to_string(), "notify".to_string(), "off".to_string()],
+            },
             category: SettingsCategory::Updates,
             has_override: true,
             inherited_display: None,
@@ -3013,12 +3207,12 @@ mod tests {
             profile
                 .updates
                 .as_ref()
-                .and_then(|u| u.check_enabled)
+                .and_then(|u| u.update_check_mode)
                 .is_some(),
             "Toggling back to match global should preserve the override, not silently clear it"
         );
         assert_eq!(
-            profile.updates.as_ref().unwrap().check_enabled,
+            profile.updates.as_ref().unwrap().update_check_mode,
             Some(original),
             "Override value should match what was set"
         );

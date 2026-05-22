@@ -1,3 +1,5 @@
+import type { RepoColor } from "./repoAppearance";
+
 /** Session data returned by the API */
 export interface SessionResponse {
   id: string;
@@ -27,6 +29,11 @@ export interface SessionResponse {
    *  diff header. See #970. */
   base_branch_override?: string | null;
   is_sandboxed: boolean;
+  /** True when the session is marked as a user favorite. Mirrors
+   *  `Instance::is_favorited()` server-side. The sidebar pins favorited
+   *  rows and prepends a `*` marker. Toggled via the TUI `f`/`F` keybind
+   *  or `aoe session favorite|unfavorite`. */
+  favorited: boolean;
   has_managed_worktree: boolean;
   has_terminal: boolean;
   profile: string;
@@ -204,6 +211,9 @@ export interface RepoGroup {
   id: string;
   repoPath: string;
   displayName: string;
+  defaultDisplayName: string;
+  alias: string | null;
+  color: RepoColor | null;
   remoteOwner: string | null;
   workspaces: Workspace[];
   status: WorkspaceStatus;

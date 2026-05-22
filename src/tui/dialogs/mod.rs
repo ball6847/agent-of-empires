@@ -14,9 +14,11 @@ mod no_agents;
 mod profile_picker;
 mod projects;
 mod rename;
+mod restart;
 mod send_message;
 #[cfg(feature = "serve")]
 mod serve;
+mod snooze_duration;
 mod tool_picker;
 mod update_confirm;
 mod welcome;
@@ -37,9 +39,11 @@ pub use no_agents::{NoAgentsAction, NoAgentsDialog};
 pub use profile_picker::{ProfileEntry, ProfilePickerAction, ProfilePickerDialog};
 pub use projects::ProjectsDialog;
 pub use rename::{RenameData, RenameDialog, RenameMode};
+pub use restart::{RestartData, RestartDialog};
 pub use send_message::SendMessageDialog;
 #[cfg(feature = "serve")]
 pub use serve::{ServeAction, ServeView};
+pub use snooze_duration::SnoozeDurationDialog;
 pub use tool_picker::ToolPickerDialog;
 pub use update_confirm::UpdateConfirmDialog;
 pub use welcome::WelcomeDialog;

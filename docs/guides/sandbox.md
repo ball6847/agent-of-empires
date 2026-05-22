@@ -2,7 +2,7 @@
 
 ## Overview
 
-Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi, Kiro CLI, Qwen Code) inside isolated Docker containers while maintaining access to your project files and credentials.
+Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Kiro CLI, Qwen Code) inside isolated Docker containers while maintaining access to your project files and credentials.
 
 > **Linux users:** AoE also supports [Podman](podman.md) as a daemonless, rootless-friendly alternative to Docker.
 >
@@ -132,7 +132,7 @@ Example: `aoe-sandbox-a1b2c3d4`
 
 Cockpit-mode sessions can run inside the sandbox container. When both are enabled, the cockpit runner wraps the ACP agent in `docker exec`, so the adapter binary must exist inside the container. The published `aoe-sandbox` image bundles the npm-distributed ACP adapters for this:
 
-- `claude-agent-acp` (`@agentclientprotocol/claude-agent-acp`)
+- `claude-agent-acp` (`@agentclientprotocol/claude-agent-acp@^0.37.0`, floor pin)
 - `codex-acp` (`@zed-industries/codex-acp`)
 - `pi-acp`
 

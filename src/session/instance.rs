@@ -295,10 +295,35 @@ pub struct Instance {
     ///
     /// Named `idle_entered_at` rather than `idle_since` to avoid collision
     /// with `DwellState::idle_since` in `src/server/push.rs`, which is an
-    /// in-process `Instant` for push-notification dwell timing — a
+    /// in-process `Instant` for push-notification dwell timing, a
     /// different concept with a different type and lifetime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_entered_at: Option<DateTime<Utc>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<DateTime<Utc>>,
+
+    /// Favorite marker; sibling of archive. When set AND the session is in
+    /// a "needs help" status (Waiting, Error, Idle, Unknown), the session
+    /// pre-empts all non-favorited peers in the same status tier, pinning it
+    /// to the top of the Attention sort. In Running / Stopped / transient
+    /// statuses the flag is visible (⭐ glyph + bold) but does NOT re-rank
+    /// since live work isn't interrupted by a decoration. Opposite of archive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favorited_at: Option<DateTime<Utc>>,
+
+    /// Snooze marker, a "temporary archive." When `snoozed_until` is in the
+    /// future, the session sorts to tier 99 alongside archived rows and
+    /// renders italic+dim with a `z ` prefix plus a remaining-time readout
+    /// in the age column. When the timestamp falls into the past, the
+    /// `is_snoozed()` predicate returns false and the row naturally rejoins
+    /// the active attention sort (the stale timestamp stays on disk until
+    /// the next mutation rewrites it, which is harmless). Mutually compatible with
+    /// `favorited_at`: a snoozed favorite keeps its star when it wakes up.
+    /// Archive wins over snooze (archiving a snoozed session clears nothing
+    /// but renders as archive since is_archived() is checked first).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snoozed_until: Option<DateTime<Utc>>,
 
     // Git worktree integration
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -406,6 +431,16 @@ pub struct Instance {
     /// worth the schema cost.
     #[serde(skip)]
     pub(crate) retroactive_capture_excludes: HashSet<String>,
+
+    /// Cached `is_pane_dead()` reading from the most recent status_poller
+    /// tick. Lets the Attention comparator treat dead-pane rows as sunk
+    /// (tier 99) without re-querying tmux on every sort. Field name avoids
+    /// `pane_dead` to prevent shadowing `tmux::Session::is_pane_dead()` at
+    /// call sites that take both. Refreshed by status_poller; not persisted
+    /// (clears to false on TUI restart, which is correct; a fresh poll
+    /// will re-set it within one tick if the pane is genuinely dead).
+    #[serde(skip)]
+    pub pane_dead_observed: bool,
 }
 
 /// Append yolo-mode flags or environment variables to a launch command.
@@ -605,6 +640,9 @@ impl Instance {
             created_at: Utc::now(),
             last_accessed_at: None,
             idle_entered_at: None,
+            archived_at: None,
+            favorited_at: None,
+            snoozed_until: None,
             worktree_info: None,
             workspace_info: None,
             sandbox_info: None,
@@ -628,14 +666,125 @@ impl Instance {
             last_error: None,
             session_id_poller: None,
             retroactive_capture_excludes: HashSet::new(),
+            pane_dead_observed: false,
         }
     }
 
-    /// Stamp `last_accessed_at` to the current time. Call this on
-    /// user-initiated interactions (attach, send keys, etc.) so the
-    /// timestamp reflects actual activity, not just status transitions.
+    /// Stamp `last_accessed_at` to the current time AND wake the session
+    /// from any sink state. Call this on user-initiated interactions
+    /// (attach, send keys, etc.); every existing call site already does.
+    ///
+    /// Auto-unarchive/unsnooze: sending a message or attaching is the user
+    /// explicitly saying "I care about this now." Leaving `archived_at` or
+    /// `snoozed_until` set after such interaction is incoherent; the row
+    /// would render italic+dim at tier 99 even while live traffic flows.
+    /// User rule (2026-04-23): "messaging should unarchive."
+    ///
+    /// `favorited_at` is preserved: fav is a positive "care more" signal,
+    /// orthogonal to the sink states. A favorited session that was snoozed
+    /// stays favorited when the user wakes it.
     pub fn touch_last_accessed(&mut self) {
         self.last_accessed_at = Some(Utc::now());
+        self.archived_at = None;
+        self.snoozed_until = None;
+    }
+
+    /// Mark the session archived. Archived sessions sink to the bottom of
+    /// the Attention sort and render in italic+dim style, but remain
+    /// visible. Auto-cleared by the attention-signal hook on Waiting/Error.
+    ///
+    /// Mutual exclusion with `favorite`: archiving clears `favorited_at`.
+    /// Archive is the strongest dismiss; keeping a stale favorite pin on a
+    /// row the user just sunk produces contradictory "pinned + dismissed"
+    /// state. The user's explicit rule: "archived removes fav."
+    pub fn archive(&mut self) {
+        self.archived_at = Some(Utc::now());
+        self.favorited_at = None;
+    }
+
+    pub fn unarchive(&mut self) {
+        self.archived_at = None;
+    }
+
+    pub fn is_archived(&self) -> bool {
+        self.archived_at.is_some()
+    }
+
+    /// Mark the session favorite. Sibling of `archive`, with opposite semantics.
+    /// Pinning logic lives in `attention_session_key`: favorite is a
+    /// within-tier pin (top of its respective category), not a cross-tier
+    /// promoter. A favorited Running stays in the Running bucket but sorts
+    /// above non-favorited Running peers.
+    ///
+    /// Mutual exclusion with the sink states: favoriting clears `archived_at`
+    /// AND `snoozed_until`. Favorite's whole purpose is "surface this row";
+    /// leaving either sink-state flag set would force the row to tier 99 and
+    /// the favorite bias would be suppressed; user presses `f` and sees
+    /// nothing change. The user's explicit rule: "marking as favorite
+    /// unarchives," extended to snooze because snooze shares tier 99 and
+    /// shares the burial outcome.
+    pub fn favorite(&mut self) {
+        self.favorited_at = Some(Utc::now());
+        self.archived_at = None;
+        self.snoozed_until = None;
+    }
+
+    pub fn unfavorite(&mut self) {
+        self.favorited_at = None;
+    }
+
+    pub fn is_favorited(&self) -> bool {
+        self.favorited_at.is_some()
+    }
+
+    /// Read the agent-raised urgent flag from `attention.json`. Sourced
+    /// on-demand from `/tmp/aoe-hooks/{id}/attention.json` so it picks up
+    /// changes the running agent makes (via the `attention-urgent` script)
+    /// without an Instance state mutation. Suppressed for archived/snoozed
+    /// rows so a sunk session can't claw its way back to the top.
+    pub fn is_urgent(&self) -> bool {
+        if self.is_archived() || self.is_snoozed() {
+            return false;
+        }
+        crate::hooks::read_hook_urgent(&self.id)
+    }
+
+    /// Temporarily defer this session for `minutes`; sets `snoozed_until`
+    /// to `Utc::now() + minutes`. Behaves like a timed archive: the row
+    /// sinks to tier 99, renders italic+dim with a `z ` prefix, and shows
+    /// remaining time in the age column. When the timestamp expires the
+    /// row rejoins the active attention sort automatically (next render
+    /// tick); no timer task needed. Resolution of `minutes` happens at
+    /// snooze time, not render time, so changing the config default mid-
+    /// snooze does NOT extend currently-sleeping rows.
+    pub fn snooze(&mut self, minutes: u32) {
+        self.snoozed_until = Some(Utc::now() + chrono::Duration::minutes(minutes as i64));
+    }
+
+    pub fn unsnooze(&mut self) {
+        self.snoozed_until = None;
+    }
+
+    /// True if `snoozed_until` is set AND in the future. Expired snoozes
+    /// return false so the row naturally rejoins the main sort on the next
+    /// render; the stale timestamp stays on disk until the next mutation
+    /// rewrites the session (harmless; `snoozed_until` is always compared
+    /// against `Utc::now()`).
+    pub fn is_snoozed(&self) -> bool {
+        self.snoozed_until.map(|t| t > Utc::now()).unwrap_or(false)
+    }
+
+    /// Remaining snooze duration as a `chrono::Duration`, or `None` if the
+    /// session isn't snoozed (or the timestamp has already expired).
+    pub fn snooze_remaining(&self) -> Option<chrono::Duration> {
+        self.snoozed_until.and_then(|t| {
+            let delta = t - Utc::now();
+            if delta > chrono::Duration::zero() {
+                Some(delta)
+            } else {
+                None
+            }
+        })
     }
 
     /// Time elapsed since this session most recently transitioned into
@@ -1088,7 +1237,38 @@ impl Instance {
         }
 
         let profile = self.effective_profile();
-        let on_launch_hooks = self.resolve_on_launch_hooks(skip_on_launch, &profile);
+        let cmd = self.build_launch_command(skip_on_launch, &profile)?;
+
+        tracing::debug!(target: "session.store",
+            "container cmd: {}",
+            cmd.as_ref().map_or("none".to_string(), |v| {
+                super::environment::redact_env_values(v)
+            })
+        );
+        session.create_with_size(&self.project_path, cmd.as_deref(), size)?;
+
+        self.finalize_launch(session.name(), &profile);
+
+        Ok(())
+    }
+
+    /// Build the launch command string the way `start_with_size_opts` would,
+    /// but without creating a tmux session. Returns `None` for cockpit or
+    /// other modes where there is no command to launch.
+    ///
+    /// Currently only called from `start_with_size_opts`; a future dead-pane
+    /// respawn path could route through here so `tmux respawn-pane` receives
+    /// the same command `tmux new-session` would have. For now the helper is
+    /// preparatory and has one caller.
+    ///
+    /// Side effects mirror the start path: agent status hooks are installed,
+    /// and (for sandboxed sessions) on_launch hooks run inside the container.
+    fn build_launch_command(
+        &mut self,
+        skip_on_launch: bool,
+        profile: &str,
+    ) -> Result<Option<String>> {
+        let on_launch_hooks = self.resolve_on_launch_hooks(skip_on_launch, profile);
 
         let agent = crate::agents::get_agent(&self.tool)
             .or_else(|| crate::agents::get_agent(&self.detect_as));
@@ -1097,12 +1277,14 @@ impl Instance {
         let cmd = if self.is_sandboxed() {
             let container = self.get_container_for_instance()?;
             if let Some(ref hook_cmds) = on_launch_hooks {
+                let hook_env = super::repo_config::lifecycle_env_vars(self);
                 if let Some(ref sandbox) = self.sandbox_info {
                     let workdir = self.container_workdir();
                     if let Err(e) = super::repo_config::execute_hooks_in_container(
                         hook_cmds,
                         &sandbox.container_name,
                         &workdir,
+                        &hook_env,
                     ) {
                         tracing::warn!(target: "session.store", "on_launch hook failed in container: {}", e);
                     }
@@ -1143,6 +1325,7 @@ impl Instance {
             }
 
             self.apply_session_flags(&mut tool_cmd, "sandboxed");
+            apply_agent_launch_env(&mut tool_cmd, agent);
 
             let sandbox = self
                 .sandbox_info
@@ -1163,17 +1346,7 @@ impl Instance {
             self.build_host_command(agent, &on_launch_hooks)
         };
 
-        tracing::debug!(target: "session.store",
-            "container cmd: {}",
-            cmd.as_ref().map_or("none".to_string(), |v| {
-                super::environment::redact_env_values(v)
-            })
-        );
-        session.create_with_size(&self.project_path, cmd.as_deref(), size)?;
-
-        self.finalize_launch(session.name(), &profile);
-
-        Ok(())
+        Ok(cmd)
     }
 
     /// Resolve on_launch hooks from the full config chain (global > profile > repo).
@@ -1298,9 +1471,12 @@ impl Instance {
     ) -> Option<String> {
         // Run on_launch hooks on host for non-sandboxed sessions
         if let Some(ref hook_cmds) = on_launch_hooks {
-            if let Err(e) =
-                super::repo_config::execute_hooks(hook_cmds, Path::new(&self.project_path))
-            {
+            let hook_env = super::repo_config::lifecycle_env_vars(self);
+            if let Err(e) = super::repo_config::execute_hooks(
+                hook_cmds,
+                Path::new(&self.project_path),
+                &hook_env,
+            ) {
                 tracing::warn!(target: "session.store", "on_launch hook failed: {}", e);
             }
         }
@@ -1334,6 +1510,7 @@ impl Instance {
                     }
                 }
                 self.apply_session_flags(&mut cmd, "host agent");
+                apply_agent_launch_env(&mut cmd, agent);
                 wrap_command_ignore_suspend(&format!("{}{}", env_prefix, cmd))
             })
         } else {
@@ -1347,6 +1524,7 @@ impl Instance {
                 }
             }
             self.apply_session_flags(&mut cmd, "host custom");
+            apply_agent_launch_env(&mut cmd, agent);
             Some(wrap_command_ignore_suspend(&format!(
                 "{}{}",
                 env_prefix, cmd
@@ -2426,6 +2604,21 @@ fn format_env_var_prefix(key: &str, value: &str, cmd: &str) -> String {
     format!("{}={} {}", key, escaped, cmd)
 }
 
+/// Prepend agent-specific environment overrides to a launch command.
+///
+/// Antigravity inherits the parent tmux env, which can carry `NO_COLOR=1` and
+/// silently disable its terminal palette even though the web renderer handles
+/// ANSI fine. Unsetting `NO_COLOR` and forcing `FORCE_COLOR=1` /
+/// `COLORTERM=truecolor` at launch keeps color on without leaking the override
+/// to other agents.
+fn apply_agent_launch_env(cmd: &mut String, agent: Option<&'static crate::agents::AgentDef>) {
+    if !matches!(agent.map(|a| a.name), Some("antigravity")) {
+        return;
+    }
+
+    *cmd = format!("env -u NO_COLOR FORCE_COLOR=1 COLORTERM=truecolor {}", cmd);
+}
+
 /// Wrap a command to disable Ctrl-Z (SIGTSTP) suspension.
 ///
 /// When running agents directly as tmux session commands (without a parent shell),
@@ -2673,6 +2866,41 @@ mod tests {
 
         inst.parent_session_id = Some("parent123".to_string());
         assert!(inst.is_sub_session());
+    }
+
+    /// `touch_last_accessed` is what `aoe send` and the TUI dispatch path
+    /// call when the user interacts with a session. It must auto-wake
+    /// archived and snoozed rows so sending a message to a sunk session
+    /// brings it back, while preserving the favorite flag (favorite is a
+    /// positive "care more" signal, not a sink state).
+    #[test]
+    fn test_touch_last_accessed_clears_archived() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.archive();
+        assert!(inst.is_archived());
+        inst.touch_last_accessed();
+        assert!(!inst.is_archived());
+        assert!(inst.last_accessed_at.is_some());
+    }
+
+    #[test]
+    fn test_touch_last_accessed_clears_snooze() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.snooze(30);
+        assert!(inst.is_snoozed());
+        inst.touch_last_accessed();
+        assert!(!inst.is_snoozed());
+    }
+
+    #[test]
+    fn test_touch_last_accessed_preserves_favorite() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.favorite();
+        assert!(inst.is_favorited());
+        inst.touch_last_accessed();
+        // Favorite is orthogonal to sink states; user interaction must not
+        // clear it.
+        assert!(inst.is_favorited());
     }
 
     #[test]
@@ -3618,6 +3846,45 @@ mod tests {
         let cmd_str = cmd.unwrap();
         assert!(cmd_str.contains("ses_abc123def456"));
         assert!(cmd_str.contains("--session-id") || cmd_str.contains("--resume"));
+    }
+
+    #[test]
+    fn test_build_host_command_antigravity_forces_color() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "antigravity".to_string();
+        let cmd = inst.build_host_command(crate::agents::get_agent("antigravity"), &None);
+        let cmd_str = cmd.unwrap();
+
+        assert!(cmd_str.contains("env -u NO_COLOR"));
+        assert!(cmd_str.contains("FORCE_COLOR=1"));
+        assert!(cmd_str.contains("COLORTERM=truecolor"));
+        assert!(cmd_str.contains("agy"));
+    }
+
+    #[test]
+    fn test_build_host_custom_command_antigravity_forces_color() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "antigravity".to_string();
+        inst.command = "agy --some-flag".to_string();
+        let cmd = inst.build_host_command(crate::agents::get_agent("antigravity"), &None);
+        let cmd_str = cmd.unwrap();
+
+        assert!(cmd_str.contains("env -u NO_COLOR"));
+        assert!(cmd_str.contains("FORCE_COLOR=1"));
+        assert!(cmd_str.contains("COLORTERM=truecolor"));
+        assert!(cmd_str.contains("agy --some-flag"));
+    }
+
+    #[test]
+    fn test_build_host_command_color_env_is_antigravity_only() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "codex".to_string();
+        let cmd = inst.build_host_command(crate::agents::get_agent("codex"), &None);
+        let cmd_str = cmd.unwrap();
+
+        assert!(!cmd_str.contains("env -u NO_COLOR"));
+        assert!(!cmd_str.contains("FORCE_COLOR=1"));
+        assert!(!cmd_str.contains("COLORTERM=truecolor"));
     }
 
     #[test]

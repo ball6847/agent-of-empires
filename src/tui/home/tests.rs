@@ -180,6 +180,18 @@ fn test_help_closes_on_q() {
 
 #[test]
 #[serial]
+fn test_help_closes_on_uppercase_q_for_strict_mode() {
+    // Strict mode binds quit to uppercase Q; the help overlay must
+    // accept it too so strict-mode users can dismiss the dialog with
+    // the same key they use to quit.
+    let mut env = create_test_env_empty();
+    env.view.show_help = true;
+    env.view.handle_key(key(KeyCode::Char('Q')), None);
+    assert!(!env.view.show_help);
+}
+
+#[test]
+#[serial]
 fn test_has_dialog_returns_true_for_help() {
     let mut env = create_test_env_empty();
     assert!(!env.view.has_dialog());
@@ -772,6 +784,75 @@ fn test_select_session_by_id_nonexistent() {
     assert_eq!(env.view.cursor, 0);
     env.view.select_session_by_id("nonexistent-id");
     assert_eq!(env.view.cursor, 0);
+}
+
+#[test]
+#[serial]
+fn test_select_top_attention_lands_on_first_session() {
+    let mut env = create_test_env_with_sessions(3);
+    env.view.cursor = 2;
+    env.view.update_selected();
+    assert_eq!(env.view.cursor, 2);
+
+    env.view.select_top_attention(None);
+
+    assert_eq!(env.view.cursor, 0);
+    if let Item::Session { id, .. } = &env.view.flat_items[0] {
+        assert_eq!(env.view.selected_session.as_deref(), Some(id.as_str()));
+    } else {
+        panic!("expected first flat_items row to be a Session");
+    }
+}
+
+#[test]
+#[serial]
+fn test_select_top_attention_skips_returning_session() {
+    let mut env = create_test_env_with_sessions(3);
+
+    // Grab id of first session (the one we're "returning from").
+    let first_id = if let Item::Session { id, .. } = &env.view.flat_items[0] {
+        id.clone()
+    } else {
+        panic!("expected first flat_items row to be a Session");
+    };
+    let second_id = if let Item::Session { id, .. } = &env.view.flat_items[1] {
+        id.clone()
+    } else {
+        panic!("expected second flat_items row to be a Session");
+    };
+
+    env.view.cursor = 0;
+    env.view.update_selected();
+
+    // Simulate returning from `first_id`: skip it, land on the next session.
+    env.view.select_top_attention(Some(&first_id));
+
+    assert_eq!(env.view.cursor, 1);
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(second_id.as_str())
+    );
+}
+
+#[test]
+#[serial]
+fn test_select_top_attention_falls_back_to_returning_when_only_session() {
+    let mut env = create_test_env_with_sessions(1);
+
+    let only_id = if let Item::Session { id, .. } = &env.view.flat_items[0] {
+        id.clone()
+    } else {
+        panic!("expected first flat_items row to be a Session");
+    };
+
+    env.view.cursor = 0;
+    env.view.update_selected();
+
+    // Only one session; skip would leave nothing; must fall back to it.
+    env.view.select_top_attention(Some(&only_id));
+
+    assert_eq!(env.view.cursor, 0);
+    assert_eq!(env.view.selected_session.as_deref(), Some(only_id.as_str()));
 }
 
 #[test]
@@ -1557,19 +1638,19 @@ fn test_grow_list_clamps_at_maximum() {
 
 #[test]
 #[serial]
-fn test_uppercase_h_shrinks_list() {
+fn test_lt_shrinks_list() {
     let mut env = create_test_env_empty();
     assert_eq!(env.view.list_width, 35);
-    env.view.handle_key(key(KeyCode::Char('H')), None);
+    env.view.handle_key(key(KeyCode::Char('<')), None);
     assert_eq!(env.view.list_width, 30);
 }
 
 #[test]
 #[serial]
-fn test_uppercase_l_grows_list() {
+fn test_gt_grows_list() {
     let mut env = create_test_env_empty();
     assert_eq!(env.view.list_width, 35);
-    env.view.handle_key(key(KeyCode::Char('L')), None);
+    env.view.handle_key(key(KeyCode::Char('>')), None);
     assert_eq!(env.view.list_width, 40);
 }
 
@@ -1591,6 +1672,9 @@ fn test_o_key_cycles_sort_order_forward() {
     assert_eq!(env.view.sort_order, SortOrder::Newest);
 
     env.view.handle_key(key(KeyCode::Char('o')), None);
+    assert_eq!(env.view.sort_order, SortOrder::Attention);
+
+    env.view.handle_key(key(KeyCode::Char('o')), None);
     assert_eq!(env.view.sort_order, SortOrder::LastActivity);
 
     env.view.handle_key(key(KeyCode::Char('o')), None);
@@ -1604,6 +1688,212 @@ fn test_o_key_cycles_sort_order_forward() {
 
     env.view.handle_key(key(KeyCode::Char('o')), None);
     assert_eq!(env.view.sort_order, SortOrder::Newest);
+}
+
+#[test]
+#[serial]
+fn test_shift_o_cycles_sort_in_strict_mode() {
+    // Regression guard: normalize_strict_key maps Shift+O → bare 'o'. The main
+    // match must handle 'o' without an `if !self.strict_hotkeys` guard,
+    // otherwise the key falls through to capture_letter_to_compose and opens
+    // the message dialog instead of cycling sort.
+    use crate::session::config::SortOrder;
+
+    let mut env = create_test_env_with_mixed_sessions();
+    env.view.strict_hotkeys = true;
+    assert_eq!(env.view.sort_order, SortOrder::Newest);
+
+    // Shift+O: Char('O') with SHIFT modifier. Normalizer lowercases to 'o',
+    // main match cycles forward.
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::SHIFT), None);
+    assert_eq!(env.view.sort_order, SortOrder::Attention);
+
+    // Some terminals drop the SHIFT modifier and send bare uppercase. Cover
+    // that too.
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Char('O'), KeyModifiers::NONE), None);
+    assert_eq!(env.view.sort_order, SortOrder::LastActivity);
+
+    // Ctrl+o must still cycle backward in strict mode.
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert_eq!(env.view.sort_order, SortOrder::Attention);
+
+    // Sanity: message dialog must NOT have been opened as a side effect.
+    assert!(env.view.send_message_dialog.is_none());
+}
+
+#[test]
+#[serial]
+fn test_bare_lowercase_o_does_not_cycle_sort_in_strict_mode() {
+    // Regression guard (2026-04-22): in strict_hotkeys mode, plain lowercase 'o'
+    // MUST NOT cycle sort; it must fall through to the typing-guard catch-all
+    // (message dialog) per the "no destructive lowercase" rule. Only Shift+O
+    // (Char('O')) and Ctrl+O should change sort order in strict mode.
+    //
+    // The previous implementation collapsed the two sort arms into a single
+    // unguarded `Char('o') => cycle`, which fired for bare 'o' too, breaking
+    // the contract and silently changing the user's sort order whenever they
+    // tried to type 'o' as text input.
+    use crate::session::config::SortOrder;
+
+    let mut env = create_test_env_with_mixed_sessions();
+    env.view.strict_hotkeys = true;
+    let initial = env.view.sort_order;
+    assert_eq!(initial, SortOrder::Newest);
+
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), None);
+
+    assert_eq!(
+        env.view.sort_order, initial,
+        "bare 'o' in strict mode must NOT cycle sort; expected it to stay at Newest"
+    );
+}
+
+#[test]
+#[serial]
+fn test_strict_mode_h_collapses_group() {
+    // Regression guard: the help overlay lists "h/←" for Collapse group in
+    // strict mode. Bare lowercase `h` must walk through the dispatch and
+    // collapse the cursor's group, mirroring `l`/Right for expand. Without
+    // the explicit `Char('h')` arm next to `KeyCode::Left`, `h` would fall
+    // into the strict-mode typing-guard catch-all and the advertised
+    // navigation hotkey would silently open the compose dialog.
+    let mut env = create_test_env_with_groups();
+    env.view.strict_hotkeys = true;
+
+    let group_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { .. }))
+        .expect("setup should produce a group");
+
+    if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx] {
+        assert!(!collapsed, "group should start expanded");
+    }
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+
+    env.view.handle_key(key(KeyCode::Char('h')), None);
+
+    if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx] {
+        assert!(
+            *collapsed,
+            "bare 'h' in strict mode must collapse the group"
+        );
+    }
+    assert!(
+        env.view.pending_paste.is_none(),
+        "bare 'h' in strict mode must not leak into the typing-guard catch-all"
+    );
+}
+
+#[test]
+#[serial]
+fn test_strict_mode_h_still_snoozes_in_non_strict() {
+    // Companion guard for the strict-mode `h` collapse fix: making `h` an
+    // unconditional navigation key would steal the lowercase Snooze binding
+    // in default (non-strict) mode. The earlier `Char('h') if !strict` arm
+    // catches first, so the collapse arm only fires in strict mode.
+    let mut env = create_test_env_with_groups();
+    env.view.strict_hotkeys = false;
+
+    let group_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Group { .. }))
+        .expect("setup should produce a group");
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+
+    env.view.handle_key(key(KeyCode::Char('h')), None);
+
+    if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx] {
+        assert!(
+            !collapsed,
+            "non-strict 'h' must remain bound to snooze, not collapse"
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn test_strict_mode_ctrl_g_toggles_group_by() {
+    // Regression guard: the help overlay lists "Ctrl+G" for Toggle group by
+    // project in strict mode. Previously normalize_strict_key stripped CTRL
+    // and routed the result into the typing-guard catch-all, so the
+    // advertised hotkey was a no-op (the bare 'g' landed in pending_paste).
+    // Ctrl+G must now keep its modifier and toggle group-by, while bare 'g'
+    // continues to fall into the typing-guard catch-all.
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_with_sessions(3);
+    env.view.strict_hotkeys = true;
+    env.view.group_by = GroupByMode::Manual;
+
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert_eq!(
+        env.view.group_by,
+        GroupByMode::Project,
+        "Ctrl+G in strict mode should toggle group-by"
+    );
+    assert!(
+        env.view.pending_paste.is_none(),
+        "Ctrl+G must not leak into the typing-guard catch-all"
+    );
+
+    env.view.handle_key(key(KeyCode::Char('g')), None);
+    assert_eq!(
+        env.view.group_by,
+        GroupByMode::Project,
+        "bare 'g' in strict mode must NOT toggle group-by (typing-guard contract)"
+    );
+    assert_eq!(
+        env.view.pending_paste.as_deref(),
+        Some("g"),
+        "bare 'g' in strict mode falls through to the typing-guard catch-all"
+    );
+}
+
+#[test]
+#[serial]
+fn test_f5_and_e_both_open_restart_dialog() {
+    // Pin the equivalence: F5 and `e`/`E` all open the restart dialog. The
+    // help overlay collapses them onto one row as "Restart session (also
+    // F5)", which is only honest if both bindings keep hitting the same
+    // dispatch (open_restart_dialog).
+    let mut env = create_test_env_with_sessions(1);
+    env.view.cursor = 0;
+    env.view.update_selected();
+
+    env.view.handle_key(key(KeyCode::F(5)), None);
+    let f5_opened = env.view.restart_dialog.is_some();
+    env.view.restart_dialog = None;
+
+    env.view.strict_hotkeys = false;
+    env.view.handle_key(key(KeyCode::Char('e')), None);
+    let lower_e_opened = env.view.restart_dialog.is_some();
+    env.view.restart_dialog = None;
+
+    env.view.strict_hotkeys = true;
+    env.view.handle_key(key(KeyCode::Char('E')), None);
+    let upper_e_opened = env.view.restart_dialog.is_some();
+
+    assert!(f5_opened, "F5 should open the restart dialog");
+    assert!(
+        lower_e_opened,
+        "non-strict 'e' should open the restart dialog"
+    );
+    assert!(upper_e_opened, "strict 'E' should open the restart dialog");
 }
 
 #[test]
@@ -1644,6 +1934,12 @@ fn test_ctrl_o_key_cycles_sort_order_backward() {
         KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
         None,
     );
+    assert_eq!(env.view.sort_order, SortOrder::Attention);
+
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        None,
+    );
     assert_eq!(env.view.sort_order, SortOrder::Newest);
 }
 
@@ -1655,7 +1951,8 @@ fn test_o_key_flat_items_sorted_az() {
     let mut env = create_test_env_with_mixed_sessions();
     assert_eq!(env.view.sort_order, SortOrder::Newest);
 
-    // Press 'o' three times to get to AZ (Newest -> LastActivity -> Oldest -> AZ)
+    // Press 'o' four times to get to AZ (Newest -> Attention -> LastActivity -> Oldest -> AZ)
+    env.view.handle_key(key(KeyCode::Char('o')), None);
     env.view.handle_key(key(KeyCode::Char('o')), None);
     env.view.handle_key(key(KeyCode::Char('o')), None);
     env.view.handle_key(key(KeyCode::Char('o')), None);
@@ -1688,8 +1985,9 @@ fn test_o_key_flat_items_sorted_za() {
 
     let mut env = create_test_env_with_mixed_sessions();
 
-    // Press 'o' four times to get to ZA
-    // (Newest -> LastActivity -> Oldest -> AZ -> ZA)
+    // Press 'o' five times to get to ZA
+    // (Newest -> Attention -> LastActivity -> Oldest -> AZ -> ZA)
+    env.view.handle_key(key(KeyCode::Char('o')), None);
     env.view.handle_key(key(KeyCode::Char('o')), None);
     env.view.handle_key(key(KeyCode::Char('o')), None);
     env.view.handle_key(key(KeyCode::Char('o')), None);
@@ -1723,8 +2021,9 @@ fn test_o_key_flat_items_newest_preserves_insertion_order() {
 
     let mut env = create_test_env_with_mixed_sessions();
 
-    // Press 'o' five times to wrap back to Newest
-    // (Newest -> LastActivity -> Oldest -> AZ -> ZA -> Newest)
+    // Press 'o' six times to wrap back to Newest
+    // (Newest -> Attention -> LastActivity -> Oldest -> AZ -> ZA -> Newest)
+    env.view.handle_key(key(KeyCode::Char('o')), None);
     env.view.handle_key(key(KeyCode::Char('o')), None);
     env.view.handle_key(key(KeyCode::Char('o')), None);
     env.view.handle_key(key(KeyCode::Char('o')), None);
@@ -1772,7 +2071,7 @@ fn test_o_key_clamps_cursor_when_list_shrinks() {
     assert!(filtered_count < initial_items);
 
     env.view.handle_key(key(KeyCode::Char('o')), None);
-    assert_eq!(env.view.sort_order, SortOrder::LastActivity);
+    assert_eq!(env.view.sort_order, SortOrder::Attention);
 
     let valid_max = env.view.flat_items.len().saturating_sub(1);
     assert!(env.view.cursor <= valid_max);
@@ -1919,6 +2218,283 @@ fn test_all_profiles_view_shows_all_sessions_flat() {
     for item in &view.flat_items {
         if let Item::Session { depth, .. } = item {
             assert_eq!(*depth, 0, "sessions in all view should be at depth 0");
+        }
+    }
+}
+
+/// Flatten a rendered row into its plain text, dropping styling.
+fn rendered_row_text(view: &HomeView, item: &Item) -> String {
+    use crate::tui::styles::Theme;
+    let theme = Theme::default();
+    view.render_item_line(item, false, false, &theme, 200)
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect()
+}
+
+/// Default `RowTagMode::None` renders no tag in any view; existing users
+/// see no change from the row-tag feature being added.
+#[test]
+#[serial]
+fn test_default_row_tag_mode_renders_no_tag() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let storage_a = Storage::new("alpha").unwrap();
+    let instances_a = vec![Instance::new("A1", "/tmp/a")];
+    let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
+    storage_a.commit(&instances_a, &group_tree_a).unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+
+    // Default `row_tag_mode` is `None`; no row should carry a bracketed tag.
+    for item in &view.flat_items {
+        if let Item::Session { .. } = item {
+            let text = rendered_row_text(&view, item);
+            assert!(
+                !text.contains('['),
+                "default RowTagMode::None must render no tag: {text:?}"
+            );
+        }
+    }
+}
+
+/// `RowTagMode::Auto` shows the profile short code in all-profiles view.
+#[test]
+#[serial]
+fn test_row_tag_auto_renders_profile_in_all_profiles_view() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let storage_a = Storage::new("alpha").unwrap();
+    let instances_a = vec![Instance::new("A1", "/tmp/a")];
+    let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
+    storage_a.commit(&instances_a, &group_tree_a).unwrap();
+
+    let storage_b = Storage::new("beta").unwrap();
+    let instances_b = vec![Instance::new("B1", "/tmp/b")];
+    let group_tree_b = GroupTree::new_with_groups(&instances_b, &[]);
+    storage_b.commit(&instances_b, &group_tree_b).unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.row_tag_mode = crate::session::config::RowTagMode::Auto;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+
+    let mut seen = 0;
+    for item in &view.flat_items {
+        if let Item::Session { id, .. } = item {
+            let profile = view.get_instance(id).unwrap().source_profile.clone();
+            let code = super::render::profile_short_code(&profile);
+            let text = rendered_row_text(&view, item);
+            assert!(
+                text.contains(&format!("[{code}]")),
+                "all-view row for profile {profile} missing tag [{code}]: {text:?}"
+            );
+            seen += 1;
+        }
+    }
+    assert_eq!(seen, 2, "expected both profile sessions to render");
+}
+
+/// `RowTagMode::Auto` does not render in a filtered view (profile already
+/// in the list title).
+#[test]
+#[serial]
+fn test_row_tag_auto_omits_tag_in_filtered_view() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let storage_a = Storage::new("alpha").unwrap();
+    let instances_a = vec![Instance::new("A1", "/tmp/a")];
+    let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
+    storage_a.commit(&instances_a, &group_tree_a).unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(Some("alpha".to_string()), tools).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.row_tag_mode = crate::session::config::RowTagMode::Auto;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+
+    let code = super::render::profile_short_code("alpha");
+    for item in &view.flat_items {
+        if let Item::Session { .. } = item {
+            let text = rendered_row_text(&view, item);
+            assert!(
+                !text.contains(&format!("[{code}]")),
+                "Auto in filtered view should omit the tag: {text:?}"
+            );
+        }
+    }
+}
+
+/// `RowTagMode::Profile` renders the profile tag in BOTH views (unlike
+/// Auto which gates on all-profiles view).
+#[test]
+#[serial]
+fn test_row_tag_profile_renders_in_filtered_view() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let storage_a = Storage::new("alpha").unwrap();
+    let instances_a = vec![Instance::new("A1", "/tmp/a")];
+    let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
+    storage_a.commit(&instances_a, &group_tree_a).unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(Some("alpha".to_string()), tools).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.row_tag_mode = crate::session::config::RowTagMode::Profile;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+
+    let code = super::render::profile_short_code("alpha");
+    let mut seen = 0;
+    for item in &view.flat_items {
+        if let Item::Session { .. } = item {
+            let text = rendered_row_text(&view, item);
+            assert!(
+                text.contains(&format!("[{code}]")),
+                "Profile mode should always render the tag: {text:?}"
+            );
+            seen += 1;
+        }
+    }
+    assert!(seen > 0);
+}
+
+/// `RowTagMode::Branch` complements the existing branch-on-divergence
+/// display rather than duplicating it: when `worktree.branch != title`
+/// the divergence display already shows the branch (in `theme.branch`
+/// color, earlier in the row), so the Branch tag suppresses itself to
+/// avoid showing the same information twice.
+#[test]
+#[serial]
+fn test_row_tag_branch_dedups_with_divergence_display() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let storage = Storage::new("alpha").unwrap();
+    // Title and branch DIFFER, so the existing divergence display
+    // would render the branch.
+    let mut inst = Instance::new("my-session", "/tmp/a");
+    inst.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "feature/foo".to_string(),
+        main_repo_path: "/tmp/a-main".to_string(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+    let instances = vec![inst];
+    let group_tree = GroupTree::new_with_groups(&instances, &[]);
+    storage.commit(&instances, &group_tree).unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.row_tag_mode = crate::session::config::RowTagMode::Branch;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+
+    // No bracketed `[...]` tag on this row: divergence display owns the
+    // branch label here. The plain `feature/foo` from the divergence
+    // display is still expected in the rendered text.
+    for item in &view.flat_items {
+        if let Item::Session { .. } = item {
+            let text = rendered_row_text(&view, item);
+            assert!(
+                !text.contains('['),
+                "Branch mode must suppress its tag when divergence display already shows the branch: {text:?}"
+            );
+            assert!(
+                text.contains("feature/foo"),
+                "the existing divergence display should still render: {text:?}"
+            );
+        }
+    }
+}
+
+/// `RowTagMode::Branch` DOES render the tag when title matches branch
+/// (the divergence display stays quiet, so the user would otherwise not
+/// know which branch this session is on).
+#[test]
+#[serial]
+fn test_row_tag_branch_renders_when_title_matches_branch() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let storage = Storage::new("alpha").unwrap();
+    // Title and branch MATCH, so the divergence display stays quiet.
+    let mut inst = Instance::new("feature/foo", "/tmp/a");
+    inst.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "feature/foo".to_string(),
+        main_repo_path: "/tmp/a-main".to_string(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+    let instances = vec![inst];
+    let group_tree = GroupTree::new_with_groups(&instances, &[]);
+    storage.commit(&instances, &group_tree).unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.row_tag_mode = crate::session::config::RowTagMode::Branch;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+
+    // The tag uses the last `/`-segment of the branch, truncated to 8
+    // chars, so `feature/foo` becomes `[foo]`.
+    for item in &view.flat_items {
+        if let Item::Session { .. } = item {
+            let text = rendered_row_text(&view, item);
+            assert!(
+                text.contains("[foo]"),
+                "Branch mode must render the tag when divergence display is quiet: {text:?}"
+            );
+        }
+    }
+}
+
+/// Legacy `Instance::new` left `source_profile` empty before the per-profile
+/// plumbing landed. The render branch must skip the tag entirely in that
+/// case rather than emit a literal `  []`.
+#[test]
+#[serial]
+fn test_row_tag_auto_skips_for_empty_source_profile() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let storage = Storage::new("legacy").unwrap();
+    let mut inst = Instance::new("Legacy1", "/tmp/legacy");
+    inst.source_profile = String::new();
+    let instances = vec![inst];
+    let group_tree = GroupTree::new_with_groups(&instances, &[]);
+    storage.commit(&instances, &group_tree).unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.row_tag_mode = crate::session::config::RowTagMode::Auto;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+
+    for item in &view.flat_items {
+        if let Item::Session { .. } = item {
+            let text = rendered_row_text(&view, item);
+            assert!(
+                !text.contains("[]"),
+                "row with empty source_profile must not render a literal []: {text:?}"
+            );
         }
     }
 }
@@ -2723,6 +3299,18 @@ fn test_cursor_follows_session_after_deletion() {
 
 #[test]
 #[serial]
+fn home_defaults_to_agent_when_config_unset() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new("test").unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    assert_eq!(view.view_mode, ViewMode::Agent);
+}
+
+#[test]
+#[serial]
 fn wants_text_selection_tracks_copy_friendly_surfaces() {
     use crate::tui::dialogs::ChangelogDialog;
 
@@ -2789,6 +3377,8 @@ fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
         status: Status::Idle,
         last_error: None,
         idle_entered_at: Some(now),
+        last_accessed_at: None,
+        pane_dead: false,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
@@ -2815,6 +3405,8 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         status: Status::Idle,
         last_error: None,
         idle_entered_at: Some(stop_time),
+        last_accessed_at: None,
+        pane_dead: false,
     });
     assert_eq!(
         env.view.get_instance(&id).unwrap().idle_entered_at,
@@ -2830,6 +3422,8 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         status: Status::Running,
         last_error: None,
         idle_entered_at: None,
+        last_accessed_at: None,
+        pane_dead: false,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
@@ -2837,6 +3431,69 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
     assert_eq!(inst.idle_entered_at, None);
     // And `idle_age()` must not synthesize one out of stale state.
     assert_eq!(inst.idle_age(), None);
+}
+
+#[test]
+#[serial]
+fn archived_running_session_renders_stopped_icon_not_spinner() {
+    // Regression for af711cb: pre-fix, archived/snoozed rows still cycled
+    // through animated spinner frames driven by their underlying Running
+    // status, making sunk rows read as "still alive" and pulling the eye
+    // away from real attention items. Pin the icon to ICON_STOPPED for
+    // archived rows even when status is Running.
+    use super::render::agent_row_icon;
+    use super::ICON_STOPPED;
+    use crate::session::Status;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected one session"),
+    };
+
+    // Archive the session AND keep its underlying status as Running so the
+    // spinner branch would fire in the absence of the override.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Running;
+        inst.archived_at = Some(chrono::Utc::now());
+    });
+
+    let inst = env.view.get_instance(&id).expect("session present");
+    let icon = agent_row_icon(inst);
+
+    assert_eq!(
+        icon, ICON_STOPPED,
+        "archived row must render stopped icon, not animated spinner"
+    );
+
+    // Same expectation for snooze: a row snoozed into the future must not
+    // animate even if it's also Running underneath.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Running;
+        inst.archived_at = None;
+        inst.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::minutes(15));
+    });
+    let inst = env.view.get_instance(&id).expect("session present");
+    assert_eq!(
+        agent_row_icon(inst),
+        ICON_STOPPED,
+        "snoozed row must render stopped icon, not animated spinner"
+    );
+
+    // Sanity: a plain Running row (no archive, no snooze) must NOT collapse
+    // to ICON_STOPPED; otherwise the test would pass trivially because the
+    // helper always returned the stopped glyph.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Running;
+        inst.archived_at = None;
+        inst.snoozed_until = None;
+    });
+    let inst = env.view.get_instance(&id).expect("session present");
+    assert_ne!(
+        agent_row_icon(inst),
+        ICON_STOPPED,
+        "non-archived Running row should keep its spinner; helper would be a no-op otherwise"
+    );
 }
 
 #[test]
@@ -2862,6 +3519,8 @@ fn apply_status_update_skips_terminal_states() {
         status: Status::Idle,
         last_error: None,
         idle_entered_at: Some(stale_ts),
+        last_accessed_at: None,
+        pane_dead: false,
     });
 
     // Status and timestamp should both stay untouched.
@@ -2896,6 +3555,8 @@ fn apply_status_update_runs_status_hook_on_transition() {
         status: Status::Waiting,
         last_error: None,
         idle_entered_at: None,
+        last_accessed_at: None,
+        pane_dead: false,
     });
 
     let launches = take_recorded_launches();
@@ -2959,6 +3620,8 @@ fn apply_status_update_does_not_run_status_hook_for_same_status() {
         status: Status::Idle,
         last_error: None,
         idle_entered_at: None,
+        last_accessed_at: None,
+        pane_dead: false,
     });
 
     assert!(take_recorded_launches().is_empty());
@@ -2990,6 +3653,8 @@ fn apply_status_updates_without_hooks_does_not_run_status_hook() {
             status: Status::Waiting,
             last_error: None,
             idle_entered_at: None,
+            last_accessed_at: None,
+            pane_dead: false,
         }]);
 
     assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Waiting);
@@ -3176,4 +3841,984 @@ fn pollable_instances_recovers_after_inflight_clear() {
     env.view.recovery_in_flight.remove(&id);
 
     assert_eq!(env.view.pollable_instances().len(), 1);
+}
+
+/// Footer hides Archive/Fav/Snooze hints unless `sort_order` is Attention.
+/// The underlying keybinds still work in any mode; only the discoverability
+/// hints in `render_status_bar` adapt so the footer doesn't waste width on
+/// shortcuts that don't visibly reorder the list in Newest/Created/LastAccessed.
+#[test]
+#[serial]
+fn footer_hides_attention_workflow_hints_outside_attention_sort() {
+    use crate::session::config::SortOrder;
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let theme = load_theme("empire");
+
+    let render_footer = |env: &mut TestEnv| -> String {
+        let backend = TestBackend::new(200, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    };
+
+    // Newest sort: footer should NOT advertise attention-workflow shortcuts.
+    env.view.sort_order = SortOrder::Newest;
+    let newest_out = render_footer(&mut env);
+    assert!(
+        !newest_out.contains("Snooze"),
+        "Snooze hint should be hidden in Newest sort.\n{newest_out}"
+    );
+    assert!(
+        !newest_out.contains("Fav"),
+        "Fav hint should be hidden in Newest sort.\n{newest_out}"
+    );
+    assert!(
+        !newest_out.contains("Archive"),
+        "Archive hint should be hidden in Newest sort.\n{newest_out}"
+    );
+
+    // Attention sort: footer should advertise them.
+    env.view.sort_order = SortOrder::Attention;
+    let attention_out = render_footer(&mut env);
+    assert!(
+        attention_out.contains("Snooze"),
+        "Snooze hint should appear in Attention sort.\n{attention_out}"
+    );
+    assert!(
+        attention_out.contains("Fav"),
+        "Fav hint should appear in Attention sort.\n{attention_out}"
+    );
+    assert!(
+        attention_out.contains("Archive"),
+        "Archive hint should appear in Attention sort.\n{attention_out}"
+    );
+}
+
+/// `toggle_favorite_at_cursor` flips the cursor's instance favorited state
+/// and persists the change. No toast: the row's visual treatment (bold +
+/// leading `* ` glyph) is the feedback.
+#[test]
+#[serial]
+fn toggle_favorite_at_cursor_round_trip() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    // Initial state: not favorited.
+    assert!(!env.view.instances[0].is_favorited());
+
+    env.view.toggle_favorite_at_cursor().unwrap();
+    assert!(env.view.instances[0].is_favorited());
+
+    env.view.toggle_favorite_at_cursor().unwrap();
+    assert!(!env.view.instances[0].is_favorited());
+}
+
+/// When no session is selected, the toggle is a silent no-op.
+#[test]
+#[serial]
+fn toggle_favorite_at_cursor_noop_with_no_selection() {
+    let mut env = create_test_env_empty();
+    env.view.selected_session = None;
+    env.view.toggle_favorite_at_cursor().unwrap();
+}
+
+/// `toggle_archive_at_cursor` flips the cursor's instance archived state
+/// and persists the change. No toast: the row sinks to tier 99 and that
+/// visible reordering is the feedback.
+#[test]
+#[serial]
+fn toggle_archive_at_cursor_round_trip() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    // Initial state: not archived.
+    assert!(!env.view.instances[0].is_archived());
+
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(env.view.instances[0].is_archived());
+
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(!env.view.instances[0].is_archived());
+}
+
+/// When no session is selected, the toggle is a silent no-op.
+#[test]
+#[serial]
+fn toggle_archive_at_cursor_noop_with_no_selection() {
+    let mut env = create_test_env_empty();
+    env.view.selected_session = None;
+    env.view.toggle_archive_at_cursor().unwrap();
+}
+
+/// `restart_selected_session` must drop the press silently when nothing is
+/// selected. No restart_with_size call, no save, no cooldown insertion.
+#[test]
+#[serial]
+fn restart_selected_session_noop_with_no_selection() {
+    let mut env = create_test_env_empty();
+    env.view.selected_session = None;
+    let result = env.view.restart_selected_session(None, None);
+    assert!(result.is_ok());
+    assert!(env.view.restart_cooldown_at.is_empty());
+}
+
+/// Sunk rows (`archived` / `snoozed` / `pane_dead_observed`) and transient
+/// lifecycle states (`Creating` / `Deleting`) must skip the restart path.
+/// Archive's contract is "don't auto-revive"; restart should respect that.
+#[test]
+#[serial]
+fn restart_selected_session_skips_archived_row() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.mutate_instance(&id, |inst| inst.archive());
+
+    let result = env.view.restart_selected_session(None, None);
+    assert!(result.is_ok());
+    assert!(
+        env.view.instances[0].is_archived(),
+        "archive bit should still be set: restart must not unarchive"
+    );
+    assert!(
+        env.view.restart_cooldown_at.is_empty(),
+        "cooldown should not be set on a skipped restart"
+    );
+}
+
+#[test]
+#[serial]
+fn restart_selected_session_skips_snoozed_row() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.mutate_instance(&id, |inst| inst.snooze(30));
+
+    let result = env.view.restart_selected_session(None, None);
+    assert!(result.is_ok());
+    assert!(env.view.instances[0].is_snoozed());
+    assert!(env.view.restart_cooldown_at.is_empty());
+}
+
+#[test]
+#[serial]
+fn restart_selected_session_skips_creating_row() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view
+        .mutate_instance(&id, |inst| inst.status = crate::session::Status::Creating);
+
+    let result = env.view.restart_selected_session(None, None);
+    assert!(result.is_ok());
+    assert!(env.view.restart_cooldown_at.is_empty());
+}
+
+/// The cooldown map debounces rapid presses. A second press within the
+/// cooldown window must be dropped before the restart_with_size call
+/// would otherwise tear down a still-booting tmux pane.
+///
+/// We cannot exercise the full restart path under unit tests (no tmux),
+/// so this test confirms the cooldown bookkeeping: after the first call
+/// inserts an entry, a second call with the same id within the window
+/// returns immediately and does not overwrite the timestamp.
+#[test]
+#[serial]
+fn restart_selected_session_debounces_via_cooldown_map() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    // Seed the cooldown so the next press is debounced. This stands in
+    // for the "first restart already ran" precondition: we cannot run
+    // restart_with_size in a unit test (no tmux), but the debounce check
+    // happens before that, on the cooldown map.
+    let now = std::time::Instant::now();
+    env.view.restart_cooldown_at.insert(id.clone(), now);
+
+    let result = env.view.restart_selected_session(None, None);
+    assert!(result.is_ok());
+    let stored = env.view.restart_cooldown_at.get(&id).copied().unwrap();
+    assert_eq!(
+        stored, now,
+        "cooldown timestamp must not be overwritten on a debounced press"
+    );
+}
+
+/// Build a HomeView seeded with two distinct projects, each containing
+/// sessions with different attention statuses. Helper for the Project +
+/// Attention combination tests below.
+fn create_test_env_two_projects_mixed_attention() -> TestEnv {
+    use crate::session::Status;
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let storage = Storage::new("test").unwrap();
+
+    let mut alpha_waiting = Instance::new("alpha-waiting", "/repos/alpha");
+    alpha_waiting.status = Status::Waiting;
+    let mut alpha_running = Instance::new("alpha-running", "/repos/alpha");
+    alpha_running.status = Status::Running;
+
+    let mut beta_running = Instance::new("beta-running", "/repos/beta");
+    beta_running.status = Status::Running;
+    let mut beta_error = Instance::new("beta-error", "/repos/beta");
+    beta_error.status = Status::Error;
+
+    let instances = vec![alpha_waiting, alpha_running, beta_running, beta_error];
+    storage
+        .commit(&instances, &GroupTree::new_with_groups(&instances, &[]))
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    TestEnv { _temp: temp, view }
+}
+
+/// Project grouping must survive Attention sort. Previously `build_flat_items`
+/// short-circuited on `SortOrder::Attention` before checking `GroupByMode`,
+/// flattening the list and dropping project headers. The headers are the
+/// whole point of project mode; users want attention triage WITHIN their
+/// project boundaries, not a flat firehose across projects.
+#[test]
+#[serial]
+fn project_grouping_survives_attention_sort() {
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.sort_order = SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let group_count = env
+        .view
+        .flat_items
+        .iter()
+        .filter(|i| matches!(i, Item::Group { .. }))
+        .count();
+    assert_eq!(
+        group_count, 2,
+        "Project + Attention must keep both project headers (alpha, beta), \
+         got flat_items: {:?}",
+        env.view.flat_items
+    );
+
+    let group_names: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        group_names.iter().any(|n| n == "alpha") && group_names.iter().any(|n| n == "beta"),
+        "expected alpha and beta project headers, got {group_names:?}"
+    );
+}
+
+/// Within a project group under Attention sort, sessions must order by
+/// attention tier: Waiting (tier 0) above Running (tier 4). Confirms that
+/// the existing `sort_sessions` helper, already reached by the project
+/// flatten path via `flatten_tree`, is doing its job once we stopped
+/// short-circuiting it.
+#[test]
+#[serial]
+fn project_grouping_sorts_sessions_by_attention_within_group() {
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.sort_order = SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let mut current_group: Option<String> = None;
+    let mut alpha_session_order: Vec<String> = Vec::new();
+    for item in &env.view.flat_items {
+        match item {
+            Item::Group { name, .. } => current_group = Some(name.clone()),
+            Item::Session { id, .. } => {
+                if current_group.as_deref() == Some("alpha") {
+                    if let Some(inst) = env.view.instances.iter().find(|i| &i.id == id) {
+                        alpha_session_order.push(inst.title.clone());
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        alpha_session_order,
+        vec!["alpha-waiting".to_string(), "alpha-running".to_string()],
+        "Waiting session must rank above Running within the alpha group"
+    );
+}
+
+/// The most-attention-urgent project floats to the top. `attention_group_key`
+/// scores groups by their best member's tier; beta has an Error (tier 1)
+/// while alpha's best is Waiting (tier 0), so alpha sorts first. This
+/// confirms that the existing group-sort path is reached for project mode
+/// under Attention sort.
+#[test]
+#[serial]
+fn project_groups_sort_by_top_attention_member() {
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.sort_order = SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let group_order: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        group_order,
+        vec!["alpha".to_string(), "beta".to_string()],
+        "alpha (Waiting=tier 0) must sort above beta (Error=tier 1)"
+    );
+}
+
+/// Pressing `g` to flip `group_by` keeps the cursor on the previously
+/// selected session, even when the list reshapes (Manual flat list →
+/// Project grouped list). Previously `apply_group_by` clamped by index,
+/// which landed the cursor on whatever row slid into the old slot once
+/// project headers got inserted. The fix seeks `selected_session` by id
+/// after the rebuild.
+#[test]
+#[serial]
+fn group_by_toggle_preserves_selected_session() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Manual;
+    env.view.sort_order = crate::session::config::SortOrder::Newest;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Pick the last session in the Manual flat list; that's the row whose
+    // index is most likely to be invalidated when project headers get
+    // inserted in front of it.
+    let target_id = env
+        .view
+        .flat_items
+        .iter()
+        .rev()
+        .find_map(|i| match i {
+            Item::Session { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("manual flat list should contain at least one session");
+    env.view.select_session_by_id(&target_id);
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(target_id.as_str())
+    );
+
+    env.view.handle_key(key(KeyCode::Char('g')), None);
+    assert_eq!(env.view.group_by, GroupByMode::Project);
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(target_id.as_str()),
+        "cursor must stay on the same session after group_by flip"
+    );
+    let cursor_item = env
+        .view
+        .flat_items
+        .get(env.view.cursor)
+        .expect("cursor must point into flat_items");
+    match cursor_item {
+        Item::Session { id, .. } => assert_eq!(id, &target_id),
+        Item::Group { .. } => panic!("cursor landed on a group header, not the session"),
+    }
+}
+
+/// Pressing `o` to flip `sort_order` keeps the cursor on the previously
+/// selected session. Most visible when going Newest → Attention with
+/// Project grouping on, since Attention reorders both groups (by top
+/// member) and sessions within each group, so the target session is very
+/// unlikely to keep its index across the rebuild.
+#[test]
+#[serial]
+fn sort_order_toggle_preserves_selected_session() {
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.sort_order = SortOrder::Newest;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Pin the Running session inside alpha. Under Attention sort it sinks
+    // below alpha-waiting, so its index will shift on the rebuild.
+    let target_id = env
+        .view
+        .instances
+        .iter()
+        .find(|i| i.title == "alpha-running")
+        .map(|i| i.id.clone())
+        .expect("fixture provides alpha-running");
+    env.view.select_session_by_id(&target_id);
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(target_id.as_str())
+    );
+
+    env.view.handle_key(key(KeyCode::Char('o')), None);
+    assert_eq!(env.view.sort_order, SortOrder::Attention);
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(target_id.as_str()),
+        "cursor must stay on the same session after sort_order flip"
+    );
+}
+
+/// `reseat_cursor_after_rebuild` falls back to index clamping when there
+/// is no prior session selection. Guards against the helper accidentally
+/// regressing the empty-or-group-only path, where the original clamp
+/// logic was correct.
+#[test]
+#[serial]
+fn reseat_cursor_clamps_when_no_session_selected() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.selected_session = None;
+    env.view.cursor = env.view.flat_items.len() + 50; // intentionally out of range
+
+    env.view.reseat_cursor_after_rebuild();
+    assert!(
+        env.view.cursor < env.view.flat_items.len(),
+        "cursor must be clamped into the flat_items range"
+    );
+}
+
+/// Manual grouping + Attention sort must still flatten. The cross-cutting
+/// flat priority view is the original Attention design and is the right
+/// behavior when the user has not opted into project grouping. Guards
+/// against an over-eager refactor flipping both modes to grouped.
+#[test]
+#[serial]
+fn manual_grouping_attention_sort_stays_flat() {
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Manual;
+    env.view.sort_order = SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let group_count = env
+        .view
+        .flat_items
+        .iter()
+        .filter(|i| matches!(i, Item::Group { .. }))
+        .count();
+    assert_eq!(
+        group_count, 0,
+        "Manual + Attention should produce a flat list, no group headers"
+    );
+}
+
+mod scroll_pane_isolation {
+    //! Wheel events are confined to whichever pane the mouse is over.
+    //! In particular, a wheel over the preview pane never moves the list
+    //! cursor: not when the preview is at its scroll boundary, and not
+    //! when no session is selected. See issue #1361.
+
+    use super::*;
+    use ratatui::layout::Rect;
+
+    fn setup_panes(env: &mut TestEnv) {
+        env.view.list_area = Rect::new(0, 0, 30, 40);
+        env.view.preview_area = Rect::new(30, 0, 100, 40);
+    }
+
+    /// Wheel-down over preview when offset is already at the bottom (0)
+    /// must NOT advance the list cursor.
+    #[test]
+    #[serial]
+    fn wheel_down_over_preview_at_bottom_does_not_move_list() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+        env.view.preview_scroll_offset = 0;
+
+        let handled = env.view.handle_scroll_down(50, 10);
+
+        assert!(
+            !handled,
+            "expected no-op when preview is at bottom boundary"
+        );
+        assert_eq!(env.view.cursor, 0, "list cursor must not move");
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// Wheel-up over preview when there is nothing more to scroll into
+    /// (no captured history) must NOT retreat the list cursor.
+    #[test]
+    #[serial]
+    fn wheel_up_over_preview_at_top_does_not_move_list() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        env.view.preview_scroll_offset = 0;
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_cache.captured_lines = 10;
+
+        let handled = env.view.handle_scroll_up(50, 10);
+
+        assert!(
+            !handled,
+            "expected no-op when preview has no history to reveal"
+        );
+        assert_eq!(env.view.cursor, 1, "list cursor must not move");
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// Wheel over preview when no session is selected must NOT move the
+    /// list cursor; scroll events stay in the preview pane.
+    #[test]
+    #[serial]
+    fn wheel_over_preview_with_no_session_does_not_move_list() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 1;
+        env.view.selected_session = None;
+
+        let down_handled = env.view.handle_scroll_down(50, 10);
+        assert!(!down_handled);
+        assert_eq!(env.view.cursor, 1);
+
+        let up_handled = env.view.handle_scroll_up(50, 10);
+        assert!(!up_handled);
+        assert_eq!(env.view.cursor, 1);
+    }
+
+    /// Wheel over preview with scrollable content moves the preview
+    /// offset, not the list cursor.
+    #[test]
+    #[serial]
+    fn wheel_over_preview_with_scrollable_content_moves_preview_only() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_cache.captured_lines = 200;
+        env.view.preview_scroll_offset = 10;
+
+        let cursor_before = env.view.cursor;
+
+        let up_handled = env.view.handle_scroll_up(50, 10);
+        assert!(up_handled);
+        assert_eq!(env.view.cursor, cursor_before, "list cursor must not move");
+        assert!(
+            env.view.preview_scroll_offset > 10,
+            "preview should scroll back into history"
+        );
+
+        let offset_after_up = env.view.preview_scroll_offset;
+        let down_handled = env.view.handle_scroll_down(50, 10);
+        assert!(down_handled);
+        assert_eq!(env.view.cursor, cursor_before, "list cursor must not move");
+        assert!(
+            env.view.preview_scroll_offset < offset_after_up,
+            "preview should scroll forward"
+        );
+    }
+
+    /// Wheel over the list pane still moves the list cursor (regression
+    /// guard so the fix above doesn't accidentally kill list scrolling).
+    #[test]
+    #[serial]
+    fn wheel_over_list_still_moves_list_cursor() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+
+        let handled = env.view.handle_scroll_down(5, 10);
+        assert!(handled);
+        assert_eq!(env.view.cursor, 1, "wheel over list should advance cursor");
+
+        let handled = env.view.handle_scroll_up(5, 10);
+        assert!(handled);
+        assert_eq!(env.view.cursor, 0, "wheel over list should retreat cursor");
+    }
+}
+
+mod click_to_select {
+    //! Left-click on a session row in the list selects it (same effect as
+    //! arrow-key navigation). Clicks outside the inner list rect, clicks on
+    //! a row past the last item, and clicks while a dialog is open are
+    //! no-ops.
+
+    use super::*;
+    use ratatui::layout::Rect;
+
+    /// Inner rect chosen with comfortable headroom so all sessions fit
+    /// without "[N more above/below]" indicators consuming a row.
+    fn setup_inner(env: &mut TestEnv) {
+        env.view.list_inner_area = Rect::new(1, 1, 28, 10);
+    }
+
+    #[test]
+    #[serial]
+    fn click_selects_session_at_clicked_row() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+
+        // Click the third visible row (inner.y + 2 == 3) -> flat_items[2].
+        let action = env.view.handle_click(5, 3);
+        assert!(action.is_none(), "single click should not activate");
+        assert_eq!(env.view.cursor, 2);
+    }
+
+    #[test]
+    #[serial]
+    fn click_on_already_selected_row_does_not_move_cursor() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 1;
+        env.view.update_selected();
+
+        let action = env.view.handle_click(5, 2);
+        assert!(action.is_none());
+        assert_eq!(env.view.cursor, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn click_below_last_item_is_noop() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+
+        // inner.y=1, three items occupy rows 1..=3. Row 5 is inside the
+        // inner rect but past the last item.
+        let action = env.view.handle_click(5, 5);
+        assert!(action.is_none());
+        assert_eq!(env.view.cursor, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn click_outside_inner_rect_is_noop() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+
+        // Row 0 is above inner.y; column 50 is past inner.x + inner.width.
+        assert!(env.view.handle_click(5, 0).is_none());
+        assert!(env.view.handle_click(50, 2).is_none());
+        assert_eq!(env.view.cursor, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn click_with_dialog_open_is_noop() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+        env.view.show_help = true;
+
+        let action = env.view.handle_click(5, 3);
+        assert!(action.is_none(), "dialog should swallow the click");
+        assert_eq!(env.view.cursor, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn double_click_on_session_returns_attach_action() {
+        use std::time::{Duration, Instant};
+
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let expected_id = match &env.view.flat_items[2] {
+            crate::session::Item::Session { id, .. } => id.clone(),
+            _ => panic!("flat_items[2] should be a session"),
+        };
+
+        let t0 = Instant::now();
+        let first = env.view.handle_click_at(t0, 5, 3);
+        assert!(first.is_none(), "first click only selects");
+        assert_eq!(env.view.cursor, 2);
+
+        let t1 = t0 + Duration::from_millis(150);
+        let second = env.view.handle_click_at(t1, 5, 3);
+        assert_eq!(
+            second,
+            Some(crate::tui::app::Action::AttachSession(expected_id)),
+            "second click within threshold should activate the session"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn two_clicks_on_different_rows_do_not_activate() {
+        use std::time::{Duration, Instant};
+
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+
+        let t0 = Instant::now();
+        env.view.handle_click_at(t0, 5, 2);
+        let t1 = t0 + Duration::from_millis(100);
+        let action = env.view.handle_click_at(t1, 5, 3);
+        assert!(
+            action.is_none(),
+            "different-row second click is a fresh single click, not a double-click"
+        );
+        assert_eq!(env.view.cursor, 2);
+    }
+
+    #[test]
+    #[serial]
+    fn click_after_threshold_does_not_activate() {
+        use std::time::{Duration, Instant};
+
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+
+        let t0 = Instant::now();
+        env.view.handle_click_at(t0, 5, 3);
+        let t1 = t0 + Duration::from_millis(1500);
+        let action = env.view.handle_click_at(t1, 5, 3);
+        assert!(
+            action.is_none(),
+            "second click past threshold should not activate"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn double_click_activates_clicked_row_even_if_cursor_moved_between_clicks() {
+        use std::time::{Duration, Instant};
+
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+
+        // Capture the id at flat_items[2] so we know which session
+        // the row-3 click is targeting.
+        let clicked_id = match &env.view.flat_items[2] {
+            crate::session::Item::Session { id, .. } => id.clone(),
+            _ => panic!("flat_items[2] should be a session"),
+        };
+
+        let t0 = Instant::now();
+        env.view.handle_click_at(t0, 5, 3);
+        assert_eq!(env.view.cursor, 2);
+
+        // Simulate the cursor drifting away between clicks (e.g., a
+        // keyboard arrow press or an async list refresh that selected
+        // a different row).
+        env.view.cursor = 0;
+        env.view.update_selected();
+
+        let t1 = t0 + Duration::from_millis(150);
+        let action = env.view.handle_click_at(t1, 5, 3);
+        assert_eq!(
+            action,
+            Some(crate::tui::app::Action::AttachSession(clicked_id)),
+            "double-click must activate the row that was clicked, \
+             not whatever the cursor drifted to"
+        );
+        assert_eq!(
+            env.view.cursor, 2,
+            "double-click should also re-sync cursor onto the clicked row"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn double_click_on_creating_session_returns_no_action() {
+        use std::time::{Duration, Instant};
+
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+
+        // Force the target session into Creating; activation must bail.
+        let target_id = match &env.view.flat_items[2] {
+            crate::session::Item::Session { id, .. } => id.clone(),
+            _ => panic!("flat_items[2] should be a session"),
+        };
+        env.view.mutate_instance(&target_id, |inst| {
+            inst.status = crate::session::Status::Creating;
+        });
+
+        let t0 = Instant::now();
+        env.view.handle_click_at(t0, 5, 3);
+        let t1 = t0 + Duration::from_millis(150);
+        let action = env.view.handle_click_at(t1, 5, 3);
+        assert!(
+            action.is_none(),
+            "Creating sessions are not attachable; double-click should noop"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn hover_sets_resolved_index_for_row_under_mouse() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+
+        let changed = env.view.handle_hover(5, 3);
+        assert!(
+            changed,
+            "first hover over a fresh row should request redraw"
+        );
+        assert_eq!(env.view.hovered_index(), Some(2));
+    }
+
+    #[test]
+    #[serial]
+    fn hover_moving_to_a_new_row_requests_redraw() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+
+        env.view.handle_hover(5, 1);
+        let changed = env.view.handle_hover(5, 2);
+        assert!(changed);
+        assert_eq!(env.view.hovered_index(), Some(1));
+    }
+
+    #[test]
+    #[serial]
+    fn hover_pixel_twitch_on_same_row_is_noop() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+
+        env.view.handle_hover(5, 2);
+        let changed = env.view.handle_hover(6, 2);
+        assert!(
+            !changed,
+            "same-row movement should not trigger a redraw request"
+        );
+        assert_eq!(env.view.hovered_index(), Some(1));
+    }
+
+    #[test]
+    #[serial]
+    fn hover_leaving_list_clears_resolved_index() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+
+        env.view.handle_hover(5, 2);
+        assert_eq!(env.view.hovered_index(), Some(1));
+
+        // Row 0 is above the inner rect (inner.y = 1).
+        let changed = env.view.handle_hover(5, 0);
+        assert!(changed, "leaving the list should request a redraw");
+        assert_eq!(env.view.hovered_index(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn hover_resolves_to_none_when_dialog_open() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+
+        env.view.show_help = true;
+        env.view.handle_hover(5, 2);
+        assert_eq!(env.view.hovered_index(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn hover_below_last_item_resolves_to_none() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+
+        env.view.handle_hover(5, 5);
+        assert_eq!(env.view.hovered_index(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn click_on_group_row_toggles_collapsed() {
+        let mut env = create_test_env_with_mixed_sessions();
+        setup_inner(&mut env);
+
+        // Find the first group row in flat_items; record initial collapsed.
+        let (group_idx, group_path) = env
+            .view
+            .flat_items
+            .iter()
+            .enumerate()
+            .find_map(|(i, item)| match item {
+                crate::session::Item::Group { path, .. } => Some((i, path.clone())),
+                _ => None,
+            })
+            .expect("mixed env should produce at least one group row");
+
+        let click_row = env.view.list_inner_area.y + group_idx as u16;
+        let was_collapsed = env
+            .view
+            .flat_items
+            .iter()
+            .find_map(|item| match item {
+                crate::session::Item::Group {
+                    path, collapsed, ..
+                } if path == &group_path => Some(*collapsed),
+                _ => None,
+            })
+            .unwrap();
+
+        let action = env.view.handle_click(5, click_row);
+        assert!(
+            action.is_none(),
+            "single click on a group should not activate"
+        );
+
+        let now_collapsed = env
+            .view
+            .flat_items
+            .iter()
+            .find_map(|item| match item {
+                crate::session::Item::Group {
+                    path, collapsed, ..
+                } if path == &group_path => Some(*collapsed),
+                _ => None,
+            })
+            .expect("group row should still be present after toggle");
+        assert_ne!(was_collapsed, now_collapsed, "group collapsed state flips");
+    }
 }

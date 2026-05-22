@@ -318,14 +318,19 @@ pub async fn list_profiles(State(state): State<Arc<AppState>>) -> Json<Vec<Profi
     // feedback on #1274.
     let active_profile = state.profile.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let profiles = crate::session::list_profiles().unwrap_or_default();
-        // Treat empty profile (server launched without --profile) as "default"
-        let active: &str = if active_profile.is_empty() {
-            "default"
+        // Resolve the active profile *before* enumerating. A server launched
+        // without --profile carries an empty profile; resolution then picks
+        // the first profile, bootstrapping `main` on a genuine first run.
+        // That bootstrap creates the profile directory as a side effect, so
+        // it must run before `list_profiles()` or the freshly bootstrapped
+        // profile would be absent from the returned list.
+        let active: String = if active_profile.is_empty() {
+            crate::session::config::resolve_default_profile()
         } else {
-            &active_profile
+            active_profile
         };
-        let mut result: Vec<ProfileInfo> = profiles
+        let profiles = crate::session::list_profiles().unwrap_or_default();
+        profiles
             .into_iter()
             .map(|name| {
                 let is_default = name == active;
@@ -338,21 +343,7 @@ pub async fn list_profiles(State(state): State<Arc<AppState>>) -> Json<Vec<Profi
                     description,
                 }
             })
-            .collect();
-        // Ensure the active profile appears even if list_profiles missed it
-        if !active.is_empty() && !result.iter().any(|p| p.name == active) {
-            result.insert(
-                0,
-                ProfileInfo {
-                    name: active.to_string(),
-                    is_default: true,
-                    description: crate::session::load_profile_config(active)
-                        .ok()
-                        .and_then(|c| c.description),
-                },
-            );
-        }
-        result
+            .collect::<Vec<ProfileInfo>>()
     })
     .await
     .unwrap_or_default();
@@ -363,6 +354,7 @@ pub async fn list_profiles(State(state): State<Arc<AppState>>) -> Json<Vec<Profi
 pub struct BrowseQuery {
     pub path: String,
     pub limit: Option<usize>,
+    pub filter: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -399,6 +391,7 @@ pub async fn browse_filesystem(
 ) -> impl IntoResponse {
     let result = tokio::task::spawn_blocking(move || {
         let limit = query.limit.unwrap_or(100);
+        let filter = query.filter.map(|f| f.trim().to_lowercase());
         let path = std::path::Path::new(&query.path);
         let canonical = path.canonicalize().map_err(|_| "Path does not exist")?;
 
@@ -425,6 +418,11 @@ pub async fn browse_filesystem(
             let is_dir = entry_path.is_dir();
             if !is_dir {
                 continue;
+            }
+            if let Some(filter) = filter.as_deref() {
+                if !filter.is_empty() && !name.to_lowercase().contains(filter) {
+                    continue;
+                }
             }
             let is_git_repo = entry_path.join(".git").exists();
             entries.push(DirEntry {
@@ -619,14 +617,16 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
 
 // --- Update status ---
 
-/// Web-facing snapshot of `update::check_for_update`. `check_enabled`
-/// mirrors `updates.check_enabled` so the frontend can hide its banner
-/// without separately fetching settings. `web_poll_interval_minutes`
-/// echoes the configured frontend re-poll cadence so the dashboard
-/// doesn't need a second settings round-trip. See #984.
+/// Web-facing snapshot of `update::check_for_update`. `update_check_mode`
+/// mirrors `updates.update_check_mode` so the frontend can hide its banner
+/// (mode = `off`) or skip nagging while a background install runs
+/// (mode = `auto`) without separately fetching settings.
+/// `web_poll_interval_minutes` echoes the configured frontend re-poll cadence
+/// so the dashboard doesn't need a second settings round-trip. See #984 and
+/// #1140.
 #[derive(Serialize)]
 pub struct UpdateStatusResponse {
-    pub check_enabled: bool,
+    pub update_check_mode: crate::session::config::UpdateCheckMode,
     pub current_version: String,
     pub latest_version: Option<String>,
     pub update_available: bool,
@@ -642,10 +642,11 @@ pub struct UpdateStatusResponse {
 pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<UpdateStatusResponse> {
     let cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile);
     let current = env!("CARGO_PKG_VERSION").to_string();
+    let mode = cfg.updates.update_check_mode;
 
-    if !cfg.updates.check_enabled {
+    if !mode.is_enabled() {
         return Json(UpdateStatusResponse {
-            check_enabled: false,
+            update_check_mode: mode,
             current_version: current,
             latest_version: None,
             update_available: false,
@@ -663,7 +664,7 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
                 Some(crate::update::release_page_url(&info.latest_version))
             };
             Json(UpdateStatusResponse {
-                check_enabled: true,
+                update_check_mode: mode,
                 current_version: info.current_version,
                 latest_version: if info.latest_version.is_empty() {
                     None
@@ -677,7 +678,7 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             })
         }
         Err(e) => Json(UpdateStatusResponse {
-            check_enabled: true,
+            update_check_mode: mode,
             current_version: current,
             latest_version: None,
             update_available: false,

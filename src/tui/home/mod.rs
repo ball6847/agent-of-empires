@@ -15,8 +15,8 @@ use tui_input::Input;
 
 use crate::session::{
     config::{load_config, save_config, GroupByMode, SortOrder},
-    flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn, DefaultTerminalMode,
-    EnsureReadyOutcome, Group, GroupTree, Instance, Item, Storage,
+    flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn,
+    DefaultTerminalMode, EnsureReadyOutcome, Group, GroupTree, Instance, Item, Storage,
 };
 use crate::tmux::AvailableTools;
 
@@ -27,8 +27,8 @@ use super::dialogs::ServeView;
 use super::dialogs::{
     ChangelogDialog, CommandPaletteDialog, ConfirmDialog, GroupDeleteOptionsDialog,
     HookTrustDialog, HooksInstallDialog, InfoDialog, NewSessionData, NewSessionDialog,
-    NoAgentsDialog, ProfilePickerDialog, ProjectsDialog, RenameDialog, UnifiedDeleteDialog,
-    UpdateConfirmDialog, WelcomeDialog,
+    NoAgentsDialog, ProfilePickerDialog, ProjectsDialog, RenameDialog, RestartDialog,
+    SnoozeDurationDialog, UnifiedDeleteDialog, UpdateConfirmDialog, WelcomeDialog,
 };
 use super::diff::DiffView;
 use super::settings::SettingsView;
@@ -164,16 +164,23 @@ pub struct HomeView {
     pub(super) view_mode: ViewMode,
     pub(super) sort_order: SortOrder,
     pub(super) group_by: GroupByMode,
+    /// Per-row tag config; what to show next to each session title.
+    /// Cached from resolved SessionConfig at construction + reload_settings;
+    /// the render layer reads this rather than re-resolving the config on
+    /// every paint.
+    pub(super) row_tag_mode: crate::session::config::RowTagMode,
     /// Collapsed state for project-mode groups (persists across rebuilds)
     pub(super) project_group_collapsed: HashMap<String, bool>,
 
     // Dialogs
     pub(super) show_help: bool,
+    pub(super) help_scroll: u16,
     pub(super) new_dialog: Option<NewSessionDialog>,
     pub(super) confirm_dialog: Option<ConfirmDialog>,
     pub(super) unified_delete_dialog: Option<UnifiedDeleteDialog>,
     pub(super) group_delete_options_dialog: Option<GroupDeleteOptionsDialog>,
     pub(super) rename_dialog: Option<RenameDialog>,
+    pub(super) restart_dialog: Option<RestartDialog>,
     pub(super) group_rename_context: Option<GroupRenameContext>,
     pub(super) hook_trust_dialog: Option<HookTrustDialog>,
     /// Session data pending hook trust approval
@@ -185,6 +192,10 @@ pub struct HomeView {
     pub(super) no_agents_dialog: Option<NoAgentsDialog>,
     pub(super) changelog_dialog: Option<ChangelogDialog>,
     pub(super) info_dialog: Option<InfoDialog>,
+    pub(super) snooze_duration_dialog: Option<SnoozeDurationDialog>,
+    /// Session id the snooze duration picker targets. Set when the dialog
+    /// opens, consumed on submit.
+    pub(super) pending_snooze_session: Option<String>,
     pub(super) profile_picker_dialog: Option<ProfilePickerDialog>,
     pub(super) projects_dialog: Option<ProjectsDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
@@ -244,6 +255,23 @@ pub struct HomeView {
     pub(super) preview_scroll_offset: u16,
     pub(super) preview_area: Rect,
     pub(super) diff_area: Rect,
+    pub(super) list_area: Rect,
+    /// Inner content rect of the session list (borders/padding stripped).
+    /// Used to map a click coordinate to a `flat_items` index. The outer
+    /// `list_area` still drives `hit_list` so wheel events over the border
+    /// keep working; clicks use the inner rect so we don't try to select
+    /// the border row.
+    pub(super) list_inner_area: Rect,
+    /// Last reported mouse position when it was over `list_inner_area`,
+    /// `None` when the cursor is outside the list. Stored as a position
+    /// rather than a resolved item index so wheel scrolls implicitly
+    /// re-resolve the hovered item without an extra event round-trip.
+    pub(super) mouse_pos: Option<(u16, u16)>,
+    /// Timestamp and row of the previous left-click. The next click is
+    /// classified as a double-click when it lands within
+    /// `DOUBLE_CLICK_THRESHOLD` on the same row, which then activates the
+    /// session (same as pressing Enter on the selected row).
+    pub(super) last_click: Option<(std::time::Instant, u16, u16)>,
 
     // Terminal mode for sandboxed sessions (per-session, ephemeral)
     pub(super) terminal_modes: HashMap<String, TerminalMode>,
@@ -276,6 +304,11 @@ pub struct HomeView {
     // Resizable list column width (percentage-like units)
     pub(super) list_width: u16,
 
+    /// Show the info header (profile/tool/path/status/sandbox/worktree) at
+    /// the top of the preview pane. Toggled with `i` and persisted to
+    /// `app_state.show_preview_info`.
+    pub(super) show_preview_info: bool,
+
     /// Channel that startup-recovery workers send results back on. `None`
     /// when no recovery was attempted at construction (live tmux, daemon
     /// owns recovery, lock contended, or no candidates). Drained on every
@@ -294,6 +327,13 @@ pub struct HomeView {
     /// (success, error, or panic). Mirrors the `on_launch_hooks_ran`
     /// HashSet pattern: TUI-local, event-driven, no TTL needed.
     recovery_in_flight: std::collections::HashSet<String>,
+
+    /// Spam-debounce for the `e` / `E` / `F5` restart keybind: maps
+    /// session id to the wall-clock instant of the last restart attempt.
+    /// Presses arriving within 1.5s of the prior entry are dropped so
+    /// rapid key-repeat doesn't race overlapping `restart_with_size`
+    /// calls and tear down the still-booting tmux pane.
+    pub(super) restart_cooldown_at: std::collections::HashMap<String, std::time::Instant>,
 
     // Tool sessions config (lazygit, yazi, etc.)
     pub(super) tool_configs: HashMap<String, crate::session::config::ToolSessionConfig>,
@@ -342,9 +382,12 @@ impl HomeView {
             .map(|i| (i.id.clone(), i.clone()))
             .collect();
 
-        // In unified mode, config comes from "default" profile
-        let config_profile = active_profile.as_deref().unwrap_or("default");
-        let resolved = resolve_config_or_warn(config_profile);
+        // In unified mode there is no single active profile, so config is
+        // resolved from the user's default profile.
+        let config_profile = active_profile
+            .clone()
+            .unwrap_or_else(crate::session::config::resolve_default_profile);
+        let resolved = resolve_config_or_warn(&config_profile);
         let default_terminal_mode = match resolved.sandbox.default_terminal_mode {
             DefaultTerminalMode::Host => TerminalMode::Host,
             DefaultTerminalMode::Container => TerminalMode::Container,
@@ -355,7 +398,7 @@ impl HomeView {
             &storages,
         ));
         let status_hook_config = status_hook_configs
-            .get(config_profile)
+            .get(&config_profile)
             .cloned()
             .unwrap_or_else(|| resolved.status_hooks.clone());
         let strict_hotkeys = resolved.session.strict_hotkeys;
@@ -382,6 +425,7 @@ impl HomeView {
             .as_ref()
             .and_then(|c| c.app_state.group_by)
             .unwrap_or(default_group_by);
+        let view_mode = ViewMode::default();
 
         let mut view = Self {
             storages,
@@ -394,16 +438,19 @@ impl HomeView {
             selected_session: None,
             selected_group: None,
             selected_group_profile: None,
-            view_mode: ViewMode::default(),
+            view_mode,
             sort_order,
             group_by,
+            row_tag_mode: resolved.session.row_tag,
             project_group_collapsed: HashMap::new(),
             show_help: false,
+            help_scroll: 0,
             new_dialog: None,
             confirm_dialog: None,
             unified_delete_dialog: None,
             group_delete_options_dialog: None,
             rename_dialog: None,
+            restart_dialog: None,
             group_rename_context: None,
             hook_trust_dialog: None,
             pending_hook_trust_data: None,
@@ -413,6 +460,8 @@ impl HomeView {
             no_agents_dialog: None,
             changelog_dialog: None,
             info_dialog: None,
+            snooze_duration_dialog: None,
+            pending_snooze_session: None,
             profile_picker_dialog: None,
             projects_dialog: None,
             command_palette: None,
@@ -445,6 +494,10 @@ impl HomeView {
             preview_scroll_offset: 0,
             preview_area: Rect::default(),
             diff_area: Rect::default(),
+            list_area: Rect::default(),
+            list_inner_area: Rect::default(),
+            mouse_pos: None,
+            last_click: None,
             terminal_modes: HashMap::new(),
             default_terminal_mode,
             sound_config,
@@ -459,9 +512,14 @@ impl HomeView {
                 .as_ref()
                 .and_then(|c| c.app_state.home_list_width)
                 .unwrap_or(35),
+            show_preview_info: user_config
+                .as_ref()
+                .and_then(|c| c.app_state.show_preview_info)
+                .unwrap_or(true),
             recovery_rx: None,
             recovery_lock: None,
             recovery_in_flight: std::collections::HashSet::new(),
+            restart_cooldown_at: std::collections::HashMap::new(),
             tool_configs: user_config
                 .as_ref()
                 .map(|c| c.tools.clone())
@@ -786,28 +844,49 @@ impl HomeView {
                 && s != Status::Stopped
                 && update.status != Status::Stopped
         });
-        if !should_update {
-            return;
-        }
 
-        let new_status = update.status;
-        let new_error = update.last_error;
-        let new_idle_entered_at = update.idle_entered_at;
-        self.mutate_instance(&update.id, |inst| {
-            inst.status = new_status;
-            inst.last_error = new_error;
-            // Propagate the timestamp the polling clone wrote;
-            // see StatusPoller for why this isn't a simple
-            // `inst.idle_entered_at = …` from inside the poll.
-            inst.idle_entered_at = new_idle_entered_at;
-        });
+        let new_last_accessed = update.last_accessed_at;
+        let new_pane_dead = update.pane_dead;
 
-        if let Some(old) = old_status {
-            if old != new_status {
-                if let Some(inst) = self.get_instance(&update.id).cloned() {
-                    self.handle_status_transition(&inst, old, new_status, play_sound, run_hooks);
+        if should_update {
+            let new_status = update.status;
+            let new_error = update.last_error;
+            let new_idle_entered_at = update.idle_entered_at;
+            self.mutate_instance(&update.id, |inst| {
+                inst.status = new_status;
+                inst.last_error = new_error;
+                // Propagate the timestamp the polling clone wrote;
+                // see StatusPoller for why this isn't a simple
+                // `inst.idle_entered_at = …` from inside the poll.
+                inst.idle_entered_at = new_idle_entered_at;
+                if new_last_accessed.is_some() {
+                    inst.last_accessed_at = new_last_accessed;
+                }
+                inst.pane_dead_observed = new_pane_dead;
+            });
+
+            if let Some(old) = old_status {
+                if old != new_status {
+                    if let Some(inst) = self.get_instance(&update.id).cloned() {
+                        self.handle_status_transition(
+                            &inst, old, new_status, play_sound, run_hooks,
+                        );
+                    }
                 }
             }
+        } else if new_last_accessed.is_some() {
+            self.mutate_instance(&update.id, |inst| {
+                inst.last_accessed_at = new_last_accessed;
+                inst.pane_dead_observed = new_pane_dead;
+            });
+        } else {
+            // No status change AND no fresh activity stamp. We still
+            // need to refresh pane_dead_observed: a corpse can sit
+            // unchanged for hours and the sort tier should reflect
+            // current reality. Cheap mutate (one bool write).
+            self.mutate_instance(&update.id, |inst| {
+                inst.pane_dead_observed = new_pane_dead;
+            });
         }
     }
 
@@ -1422,7 +1501,7 @@ impl HomeView {
                 let target_profile = self.creation_poller.last_profile().unwrap_or_else(|| {
                     self.active_profile
                         .clone()
-                        .unwrap_or_else(|| "default".to_string())
+                        .unwrap_or_else(crate::session::config::resolve_default_profile)
                 });
                 instance.source_profile = target_profile.clone();
 
@@ -1653,12 +1732,14 @@ impl HomeView {
             || self.unified_delete_dialog.is_some()
             || self.group_delete_options_dialog.is_some()
             || self.rename_dialog.is_some()
+            || self.restart_dialog.is_some()
             || self.hook_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
             || self.welcome_dialog.is_some()
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()
             || self.info_dialog.is_some()
+            || self.snooze_duration_dialog.is_some()
             || self.profile_picker_dialog.is_some()
             || self.projects_dialog.is_some()
             || self.command_palette.is_some()
@@ -1715,6 +1796,16 @@ impl HomeView {
         }
     }
 
+    pub fn toggle_preview_info(&mut self) {
+        self.show_preview_info = !self.show_preview_info;
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            config.app_state.show_preview_info = Some(self.show_preview_info);
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
+            }
+        }
+    }
+
     pub fn show_welcome(&mut self) {
         tracing::info!(target: "tui.dialog", dialog = "welcome", "opening");
         self.welcome_dialog = Some(WelcomeDialog::new());
@@ -1762,8 +1853,33 @@ impl HomeView {
     }
 
     pub(super) fn build_flat_items(&self) -> Vec<Item> {
+        // Project grouping is honored across every sort order. Combined with
+        // Attention sort, sessions sort by tier within each project and the
+        // project headers float by their top-attention member (driven by
+        // sort_groups + attention_group_key in flatten_tree). Check this
+        // first so Project + Attention doesn't fall through to the flat
+        // Attention branch and lose the project headers.
         if self.group_by == GroupByMode::Project {
             return self.build_flat_items_by_project();
+        }
+
+        // Manual grouping + Attention sort is the cross-cutting flat
+        // priority view: skip groups entirely so Waiting/Error rows from
+        // different groups can interleave by tier instead of being walled
+        // off behind group headers. Project grouping above opts into a
+        // different shape on purpose (attention triage within explicit
+        // project boundaries).
+        if self.sort_order == SortOrder::Attention {
+            let filtered: Vec<Instance> = if let Some(profile) = &self.active_profile {
+                self.instances
+                    .iter()
+                    .filter(|i| i.source_profile == *profile)
+                    .cloned()
+                    .collect()
+            } else {
+                self.instances.clone()
+            };
+            return flatten_sessions_by_attention(&filtered);
         }
 
         if let Some(profile) = &self.active_profile {
@@ -1859,7 +1975,8 @@ impl HomeView {
             .active_profile
             .clone()
             .unwrap_or_else(|| "all".to_string());
-        let profiles = list_profiles().unwrap_or_else(|_| vec!["default".to_string()]);
+        let profiles = list_profiles()
+            .unwrap_or_else(|_| vec![crate::session::config::resolve_default_profile()]);
         let mut entries: Vec<ProfileEntry> = profiles
             .iter()
             .map(|name| {
@@ -1956,6 +2073,13 @@ impl HomeView {
             return None;
         }
         self.stamp_last_accessed(session_id);
+        if let Err(e) = self.save() {
+            tracing::error!("Failed to save after send: {}", e);
+        }
+        if self.sort_order == crate::session::config::SortOrder::Attention {
+            self.select_top_attention(None);
+            self.selected_session = None;
+        }
         stale_sid
     }
 
@@ -2147,6 +2271,36 @@ impl HomeView {
         }
     }
 
+    pub fn sort_order(&self) -> SortOrder {
+        self.sort_order
+    }
+
+    /// Move the cursor to the highest-priority session row, skipping
+    /// `returning_id` if provided. Used after returning from an attach while
+    /// sort_order=Attention: `stamp_last_accessed` bumps the returning session
+    /// to the top of its tier, so picking row 0 blindly would leave the cursor
+    /// on the session the user just handled. Skip it and land on the next
+    /// session that actually needs attention. Falls back to the returning
+    /// session itself if it's the only one in the list.
+    pub fn select_top_attention(&mut self, returning_id: Option<&str>) {
+        let mut fallback: Option<usize> = None;
+        for (idx, item) in self.flat_items.iter().enumerate() {
+            if let Item::Session { id, .. } = item {
+                if returning_id.is_some_and(|r| r == id) {
+                    fallback.get_or_insert(idx);
+                    continue;
+                }
+                self.cursor = idx;
+                self.update_selected();
+                return;
+            }
+        }
+        if let Some(idx) = fallback {
+            self.cursor = idx;
+            self.update_selected();
+        }
+    }
+
     /// Get the terminal mode for a session (uses config default if not set)
     pub fn get_terminal_mode(&self, session_id: &str) -> TerminalMode {
         self.terminal_modes
@@ -2155,11 +2309,20 @@ impl HomeView {
             .unwrap_or(self.default_terminal_mode)
     }
 
+    /// The profile whose config the view should resolve. The active profile
+    /// when one is selected, otherwise (all-profiles mode) the user's default
+    /// profile. Never an empty string and never a hard-coded name.
+    pub(super) fn config_profile(&self) -> String {
+        self.active_profile
+            .clone()
+            .unwrap_or_else(crate::session::config::resolve_default_profile)
+    }
+
     /// Refresh all config-dependent state from the current profile's config.
     /// Call this after settings are saved to pick up any changes.
     pub fn refresh_from_config(&mut self) {
-        let profile = self.active_profile.as_deref().unwrap_or("default");
-        let config = resolve_config_or_warn(profile);
+        let profile = self.config_profile();
+        let config = resolve_config_or_warn(&profile);
         self.default_terminal_mode = match config.sandbox.default_terminal_mode {
             DefaultTerminalMode::Host => TerminalMode::Host,
             DefaultTerminalMode::Container => TerminalMode::Container,
@@ -2168,6 +2331,7 @@ impl HomeView {
         self.status_hook_config = config.status_hooks.clone();
         self.refresh_status_hook_config_cache();
         self.strict_hotkeys = config.session.strict_hotkeys;
+        self.row_tag_mode = config.session.row_tag;
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
         self.tool_configs = config.tools;
@@ -2189,8 +2353,11 @@ impl HomeView {
             Some(profile) => vec![profile.to_string()],
             None => storages.keys().cloned().collect(),
         };
-        if !profile_names.iter().any(|profile| profile == "default") {
-            profile_names.push("default".to_string());
+        // Make sure the user's default profile is always probed so its status
+        // hooks load even when it currently has no sessions on disk.
+        let default_profile = crate::session::config::resolve_default_profile();
+        if !profile_names.contains(&default_profile) {
+            profile_names.push(default_profile);
         }
         profile_names.sort();
         profile_names.dedup();
@@ -2213,8 +2380,8 @@ impl HomeView {
         let profile_names =
             Self::status_hook_profile_names(self.active_profile.as_deref(), &self.storages);
         self.status_hook_configs = Self::load_status_hook_configs(profile_names);
-        let profile = self.active_profile.as_deref().unwrap_or("default");
-        if let Some(status_hooks) = self.status_hook_configs.get(profile) {
+        let profile = self.config_profile();
+        if let Some(status_hooks) = self.status_hook_configs.get(&profile) {
             self.status_hook_config = status_hooks.clone();
         }
     }

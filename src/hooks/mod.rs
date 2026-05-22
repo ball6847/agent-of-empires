@@ -15,7 +15,9 @@ use anyhow::{Context, Result};
 use fs2::FileExt as _;
 use serde_json::Value;
 
-pub use status_file::{cleanup_hook_status_dir, hook_status_dir, read_hook_status};
+pub use status_file::{
+    cleanup_hook_status_dir, hook_status_dir, read_hook_status, read_hook_urgent,
+};
 
 /// Base directory for all AoE hook status files.
 pub(crate) const HOOK_STATUS_BASE: &str = "/tmp/aoe-hooks";
@@ -72,10 +74,20 @@ pub(crate) fn codex_config_path_display_for_host_environment(entries: &[String])
 }
 
 /// Build the shell command for a hook that writes a status value.
+///
+/// The command must never exit non-zero, otherwise the agent treats the hook
+/// as a blocking failure and refuses to run further tool calls. `/tmp/aoe-hooks/<id>`
+/// can disappear mid-session (OS /tmp cleanup, transient FS hiccup, external
+/// tooling), so both mkdir and printf must tolerate a missing parent dir. We
+/// swallow stderr and force a final `exit 0`: at worst the status file is one
+/// tick stale and the next hook call recreates the dir.
 fn hook_command(status: &str) -> String {
+    hook_command_with_base(status, HOOK_STATUS_BASE)
+}
+
+fn hook_command_with_base(status: &str, base: &str) -> String {
     format!(
-        "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; mkdir -p /tmp/aoe-hooks/$AOE_INSTANCE_ID && printf {} > /tmp/aoe-hooks/$AOE_INSTANCE_ID/status'",
-        status
+        "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; mkdir -p {base}/$AOE_INSTANCE_ID 2>/dev/null; printf {status} > {base}/$AOE_INSTANCE_ID/status 2>/dev/null; exit 0'"
     )
 }
 
@@ -1806,6 +1818,54 @@ command = "echo user-hook"
         let cmd = hook_command("idle");
         assert!(cmd.contains("AOE_INSTANCE_ID"));
         assert!(cmd.contains("printf idle"));
+    }
+
+    #[test]
+    fn test_hook_command_tolerates_unwritable_base_dir() {
+        // Regression for #1390: if /tmp/aoe-hooks/<id> disappears mid-session
+        // (OS /tmp cleanup, transient FS hiccup, external tooling), the hook
+        // must still exit 0 so the agent doesn't treat it as blocking and
+        // freeze further tool calls.
+        use std::process::Command;
+
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("aoe-hooks-blocked");
+        // Pre-create base as a regular file so mkdir -p can never succeed.
+        std::fs::write(&base, "i am a file, not a dir").unwrap();
+
+        let cmd = hook_command_with_base("running", base.to_str().unwrap());
+
+        let output = Command::new("sh")
+            .args(["-c", &cmd])
+            .env("AOE_INSTANCE_ID", "regression_1390")
+            .output()
+            .expect("spawn sh");
+
+        assert!(
+            output.status.success(),
+            "hook must exit 0 even when its dir cannot be created: {:?}",
+            output
+        );
+    }
+
+    #[test]
+    fn test_hook_command_writes_status_on_happy_path() {
+        use std::process::Command;
+
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("aoe-hooks");
+
+        let cmd = hook_command_with_base("waiting", base.to_str().unwrap());
+
+        let output = Command::new("sh")
+            .args(["-c", &cmd])
+            .env("AOE_INSTANCE_ID", "happy_path")
+            .output()
+            .expect("spawn sh");
+
+        assert!(output.status.success(), "happy-path hook should exit 0");
+        let status_path = base.join("happy_path").join("status");
+        assert_eq!(std::fs::read_to_string(&status_path).unwrap(), "waiting");
     }
 
     #[test]

@@ -256,6 +256,18 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         preserve_files: &[],
         clean_files: &[],
     },
+    AgentConfigMount {
+        tool_name: "antigravity",
+        host_rel: ".gemini/antigravity-cli",
+        container_suffix: ".gemini/antigravity-cli",
+        skip_entries: &["sandbox", "logs", "cache"],
+        seed_files: &[],
+        copy_dirs: &["plugins"],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &["antigravity-oauth-token"],
+        clean_files: &[],
+    },
 ];
 
 /// Sync host agent config into the shared sandbox directory. Copies top-level files
@@ -1944,6 +1956,17 @@ mod tests {
         assert_eq!(hermes_mounts.len(), 1);
         assert_eq!(hermes_mounts[0].host_rel, ".hermes");
 
+        let antigravity_mounts: Vec<_> = AGENT_CONFIG_MOUNTS
+            .iter()
+            .filter(|m| m.tool_name == "antigravity")
+            .collect();
+        assert_eq!(antigravity_mounts.len(), 1);
+        assert_eq!(antigravity_mounts[0].host_rel, ".gemini/antigravity-cli");
+        assert_eq!(
+            antigravity_mounts[0].container_suffix,
+            ".gemini/antigravity-cli"
+        );
+
         // Unknown tool should match nothing
         let unknown_mounts: Vec<_> = AGENT_CONFIG_MOUNTS
             .iter()
@@ -3133,8 +3156,10 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
             return; // git not available, skip
         }
 
-        // Write repo-level config with volume_ignores
-        let config_dir = worktree_path.join(".agent-of-empires");
+        // Write repo-level config in the main repo dir, since
+        // resolve_config_with_repo loads it from there (find_main_repo) even
+        // when the session targets a sibling worktree.
+        let config_dir = repo_path.join(".agent-of-empires");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
             config_dir.join("config.toml"),
@@ -3224,8 +3249,10 @@ volume_ignores = ["target", "node_modules"]
             return; // git worktree add failed, skip
         }
 
-        // Write repo-level config with volume_ignores
-        let config_dir = worktree_path.join(".agent-of-empires");
+        // Write repo-level config in the main repo dir, since
+        // resolve_config_with_repo loads it from there (find_main_repo) even
+        // when the session targets a sibling worktree.
+        let config_dir = main_repo_path.join(".agent-of-empires");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
             config_dir.join("config.toml"),

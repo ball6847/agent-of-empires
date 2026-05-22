@@ -10,7 +10,6 @@ import {
   type MutableRefObject,
 } from "react";
 import { createPortal } from "react-dom";
-import { Link } from "react-router-dom";
 import { Pencil } from "lucide-react";
 import {
   DndContext,
@@ -35,6 +34,12 @@ import type {
   Workspace,
 } from "../lib/types";
 import { MULTI_REPO_GROUP_ID } from "../hooks/useRepoGroups";
+import { safeGetItem, safeSetItem } from "../lib/safeStorage";
+import {
+  REPO_COLOR_OPTIONS,
+  type RepoAppearanceUpdate,
+  type RepoColor,
+} from "../lib/repoAppearance";
 import {
   STATUS_DOT_CLASS,
   getStatusTextClass,
@@ -71,6 +76,7 @@ interface Props {
   onToggle: () => void;
   onSelect: (workspaceId: string) => void;
   onToggleRepo: (repoId: string) => void;
+  onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   onNew: () => void;
   onCreateSession: (repoPath: string) => void;
   onSettings: () => void;
@@ -126,14 +132,10 @@ function detectNotifyPreset(
 }
 
 function loadSavedWidth(): number {
-  try {
-    const saved = localStorage.getItem(SIDEBAR_WIDTH_KEY);
-    if (saved) {
-      const w = parseInt(saved, 10);
-      if (w >= MIN_WIDTH && w <= MAX_WIDTH) return w;
-    }
-  } catch {
-    // ignore
+  const saved = safeGetItem(SIDEBAR_WIDTH_KEY);
+  if (saved) {
+    const w = parseInt(saved, 10);
+    if (w >= MIN_WIDTH && w <= MAX_WIDTH) return w;
   }
   return DEFAULT_WIDTH;
 }
@@ -228,17 +230,6 @@ function formatDurationSecondsShort(seconds: number): string {
   return remM === 0 ? `${h}h` : `${h}h ${remM}m`;
 }
 
-function isPlainLeftClick(event: React.MouseEvent<HTMLAnchorElement>): boolean {
-  return (
-    event.button === 0 &&
-    !event.defaultPrevented &&
-    !event.metaKey &&
-    !event.altKey &&
-    !event.ctrlKey &&
-    !event.shiftKey
-  );
-}
-
 // Wraps a SessionRow with @dnd-kit sortable plumbing. The row itself
 // is the drag handle: a short tap/click navigates as before, but a
 // press-and-hold (sensor delay) lifts the row so the user can reorder.
@@ -259,6 +250,27 @@ function useDragSuppressRef(): MutableRefObject<number> {
   return ref;
 }
 
+const REPO_COLOR_TOKENS: Record<RepoColor, string> = {
+  amber: "--color-status-waiting",
+  teal: "--color-terminal-active",
+  sky: "--color-sandbox",
+  violet: "--color-diff-header",
+  rose: "--color-status-error",
+  slate: "--color-surface-700",
+};
+
+function repoColorStyle(color: RepoColor | null): React.CSSProperties | undefined {
+  if (!color) return undefined;
+  const token = REPO_COLOR_TOKENS[color];
+  return {
+    backgroundColor: `color-mix(in srgb, var(${token}) 14%, transparent)`,
+  };
+}
+
+function repoSwatchStyle(color: RepoColor): React.CSSProperties {
+  return { backgroundColor: `var(${REPO_COLOR_TOKENS[color]})` };
+}
+
 function useSuppressClickAfterDrag(ref: MutableRefObject<number>) {
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -269,9 +281,9 @@ function useSuppressClickAfterDrag(ref: MutableRefObject<number>) {
       }
     };
     // The click Chromium dispatches after a drag-release can bypass
-    // React's event delegation and land on the inner Link without
-    // firing any wrapping capture handler. A document-level capture
-    // listener catches it before navigation kicks in.
+    // React's event delegation and land on the inner row without firing
+    // any wrapping capture handler. A document-level capture listener
+    // catches it before row activation kicks in.
     document.addEventListener("click", handler, true);
     return () => document.removeEventListener("click", handler, true);
   }, [ref]);
@@ -370,10 +382,10 @@ const SessionRow = memo(function SessionRow({
     },
     idleDecayWindowMs,
   );
+  const firstSession = workspace.sessions[0];
   const runningSession = workspace.sessions.find((s) =>
     isSessionActive(s, idleDecayWindowMs),
   );
-  const firstSession = workspace.sessions[0];
   const singleSession = workspace.sessions.length === 1;
   const sessionTitle = firstSession?.title.trim() ?? "";
   const branchLabel = workspace.branch ?? null;
@@ -387,6 +399,11 @@ const SessionRow = memo(function SessionRow({
   const subtitleTitle = subtitle && baseBranch
     ? `${subtitle} (based on ${baseBranch})`
     : subtitle;
+  // Workspace renders as favorited when any of its sessions are
+  // favorited. Mirrors the TUI's within-tier pin: the star promotes the
+  // row visually so the user can find their starred work fast. Toggled
+  // via TUI `f`/`F` or `aoe session favorite|unfavorite`.
+  const isFavorited = workspace.sessions.some((s) => s.favorited);
   const sessionId = firstSession?.id;
   const navigationSessionId = runningSession?.id ?? firstSession?.id ?? null;
   const sessionPath = navigationSessionId
@@ -543,23 +560,32 @@ const SessionRow = memo(function SessionRow({
 
   return (
     <>
-      <Link
-        to={sessionPath}
+      <a
+        href={sessionPath}
+        tabIndex={isDeleting ? -1 : undefined}
+        aria-disabled={isDeleting || undefined}
         data-testid="sidebar-session-row"
-        // Anchors are HTML5-draggable by default; the browser would
-        // start its own drag-the-link gesture in parallel with dnd-kit
-        // and finish with a synthetic click that bypassed React's event
-        // delegation, navigating despite our suppression. See #1169.
         draggable={false}
         onClick={(e) => {
+          if (
+            e.button !== 0 ||
+            e.metaKey ||
+            e.ctrlKey ||
+            e.shiftKey ||
+            e.altKey
+          ) {
+            return;
+          }
+          if (isDeleting) {
+            e.preventDefault();
+            return;
+          }
           if (longPressFired.current) {
             e.preventDefault();
             return;
           }
-          if (isPlainLeftClick(e)) {
-            e.preventDefault();
-            onClick();
-          }
+          e.preventDefault();
+          onClick();
         }}
         onContextMenu={handleContextMenu}
         onTouchStart={handleTouchStart}
@@ -585,7 +611,16 @@ const SessionRow = memo(function SessionRow({
             />
           </span>
           <div className="min-w-0 flex-1">
-            <span className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${isSessionActive({ status: sessionStatus, idle_entered_at: idleEnteredAt }, idleDecayWindowMs) ? textClass : isActive ? "text-text-primary" : "text-text-secondary"}`}>
+            <span className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${isSessionActive({ status: sessionStatus, idle_entered_at: idleEnteredAt }, idleDecayWindowMs) ? textClass : isActive ? "text-text-primary" : "text-text-secondary"} ${isFavorited ? "font-semibold" : ""}`}>
+              {isFavorited && (
+                <span
+                  title="Favorited"
+                  aria-label="Favorited"
+                  className="shrink-0 text-amber-300"
+                >
+                  *
+                </span>
+              )}
               <span className="truncate" title={label}>{label}</span>
               {hasDraft && (
                 <span
@@ -656,7 +691,7 @@ const SessionRow = memo(function SessionRow({
             )}
           </div>
         </div>
-      </Link>
+      </a>
       {contextMenu && createPortal(
         <div
           ref={menuRef}
@@ -722,63 +757,227 @@ const RepoGroupHeader = memo(function RepoGroupHeader({
   hasActiveChild,
   onClick,
   onNewSession,
+  onUpdateAppearance,
   offline,
 }: {
   group: RepoGroup;
   hasActiveChild: boolean;
   onClick: () => void;
   onNewSession: () => void;
+  onUpdateAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   offline: boolean;
 }) {
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
+  const [renaming, setRenaming] = useState(false);
+  const [renameValue, setRenameValue] = useState(group.alias ?? group.displayName);
+  const renameRef = useRef<HTMLInputElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const dotClass =
     STATUS_DOT_CLASS[
       group.status === "active" ? "Running" : "Idle"
     ] ?? "bg-status-idle";
+  const headerStyle = repoColorStyle(group.color);
+  const headerHoverClass = group.color ? "" : "hover:bg-surface-800/50";
+
+  const openMenuAt = useCallback((x: number, y: number) => {
+    closeOtherContextMenus();
+    setContextMenu({ x, y });
+  }, []);
+
+  const handleHeaderKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.target !== e.currentTarget) return;
+    if (
+      e.key !== "Enter" &&
+      e.key !== " " &&
+      e.key !== "ContextMenu" &&
+      !(e.shiftKey && e.key === "F10")
+    ) {
+      return;
+    }
+    e.preventDefault();
+    const rect = e.currentTarget.getBoundingClientRect();
+    openMenuAt(rect.left + 12, rect.bottom + 4);
+  };
+
+  useEffect(() => {
+    if (renaming) renameRef.current?.select();
+  }, [renaming]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    const onDocClick = (e: MouseEvent) => {
+      if (menuRef.current?.contains(e.target as Node)) return;
+      close();
+    };
+    const id = requestAnimationFrame(() => {
+      document.addEventListener("click", onDocClick);
+      document.addEventListener("contextmenu", close);
+    });
+    menuBus.addEventListener("close", close);
+    return () => {
+      cancelAnimationFrame(id);
+      document.removeEventListener("click", onDocClick);
+      document.removeEventListener("contextmenu", close);
+      menuBus.removeEventListener("close", close);
+    };
+  }, [contextMenu]);
+
+  const commitRename = () => {
+    setRenaming(false);
+    const trimmed = renameValue.trim();
+    onUpdateAppearance(group.id, { alias: trimmed || null });
+  };
+
+  if (renaming) {
+    return (
+      <div
+        data-testid="sidebar-group-header"
+        data-group-id={group.id}
+        className={`flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary ${headerHoverClass} ${
+          hasActiveChild ? "border-l-2 border-brand-600" : ""
+        }`}
+        style={headerStyle}
+      >
+        <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
+        <input
+          ref={renameRef}
+          type="text"
+          value={renameValue}
+          onChange={(e) => setRenameValue(e.target.value)}
+          onBlur={commitRename}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitRename();
+            if (e.key === "Escape") setRenaming(false);
+          }}
+          data-testid="sidebar-group-rename-input"
+          className="min-w-0 flex-1 rounded border border-brand-600 bg-surface-900 px-2 py-1 text-[13px] md:text-[14px] font-mono text-text-primary focus:outline-none"
+        />
+      </div>
+    );
+  }
 
   return (
-    <div
-      data-testid="sidebar-group-header"
-      data-group-id={group.id}
-      className={`flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary hover:bg-surface-800/50 ${
-        hasActiveChild ? "border-l-2 border-brand-600" : ""
-      }`}
-    >
-      <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
-      <button
-        onClick={onClick}
-        aria-expanded={!group.collapsed}
-        className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer"
+    <>
+      <div
+        data-testid="sidebar-group-header"
+        data-group-id={group.id}
+        tabIndex={0}
+        aria-haspopup="menu"
+        aria-label={`Project actions for ${group.displayName}`}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          openMenuAt(e.clientX, e.clientY);
+        }}
+        onKeyDown={handleHeaderKeyDown}
+        className={`flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${headerHoverClass} ${
+          hasActiveChild ? "border-l-2 border-brand-600" : ""
+        }`}
+        style={headerStyle}
       >
-        <svg
-          width="10"
-          height="10"
-          viewBox="0 0 10 10"
-          fill="currentColor"
-          className={`shrink-0 text-text-dim transition-transform duration-75 ${
-            group.collapsed ? "-rotate-90" : ""
-          }`}
-        >
-          <path d="M2 3 L5 6.5 L8 3" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-        </svg>
-        <OwnerAvatar owner={group.remoteOwner} size={16} />
-        <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={group.repoPath}>
-          {group.displayName}
-        </span>
-      </button>
-      <Tooltip text={offline ? OFFLINE_TITLE : "New session"}>
+        <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
         <button
-          onClick={onNewSession}
-          disabled={offline}
-          className="w-8 h-8 flex items-center justify-center shrink-0 rounded-md transition-colors text-text-muted hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-muted disabled:hover:bg-transparent"
-          aria-label={`New session in ${group.displayName}`}
+          onClick={onClick}
+          aria-expanded={!group.collapsed}
+          className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer"
         >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
-            <line x1="12" y1="5" x2="12" y2="19" />
-            <line x1="5" y1="12" x2="19" y2="12" />
+          <svg
+            width="10"
+            height="10"
+            viewBox="0 0 10 10"
+            fill="currentColor"
+            className={`shrink-0 text-text-dim transition-transform duration-75 ${
+              group.collapsed ? "-rotate-90" : ""
+            }`}
+          >
+            <path d="M2 3 L5 6.5 L8 3" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
+          <OwnerAvatar owner={group.remoteOwner} size={16} />
+          <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={group.repoPath}>
+            {group.displayName}
+          </span>
         </button>
-      </Tooltip>
-    </div>
+        <Tooltip text={offline ? OFFLINE_TITLE : "New session"}>
+          <button
+            onClick={onNewSession}
+            disabled={offline}
+            className="w-8 h-8 flex items-center justify-center shrink-0 rounded-md transition-colors text-text-muted hover:text-text-secondary hover:bg-surface-700/50 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-muted disabled:hover:bg-transparent"
+            aria-label={`New session in ${group.displayName}`}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+              <line x1="12" y1="5" x2="12" y2="19" />
+              <line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+          </button>
+        </Tooltip>
+      </div>
+      {contextMenu && createPortal(
+        <div
+          ref={menuRef}
+          data-testid="sidebar-group-context-menu"
+          className="fixed z-50 bg-surface-800 border border-surface-700 rounded-lg shadow-lg py-1 min-w-[190px]"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+        >
+          <button
+            onClick={() => {
+              setContextMenu(null);
+              setRenameValue(group.alias ?? group.defaultDisplayName);
+              setRenaming(true);
+            }}
+            data-testid="sidebar-group-context-menu-rename"
+            className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+          >
+            Rename
+          </button>
+          {group.alias && (
+            <button
+              onClick={() => {
+                setContextMenu(null);
+                onUpdateAppearance(group.id, { alias: null });
+              }}
+              className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+            >
+              Clear alias
+            </button>
+          )}
+          <div className="border-t border-surface-700/20 my-1" />
+          <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+            Background
+          </div>
+          <div className="grid grid-cols-4 gap-1 px-3 py-1.5">
+            {REPO_COLOR_OPTIONS.map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => {
+                  setContextMenu(null);
+                  onUpdateAppearance(group.id, { color: option.id });
+                }}
+                data-testid={`sidebar-group-color-${option.id}`}
+                aria-label={`Set ${option.label} background`}
+                className={`h-8 rounded-md border cursor-pointer transition-colors ${
+                  group.color === option.id ? "border-text-primary" : "border-surface-700"
+                }`}
+                style={repoSwatchStyle(option.id)}
+              />
+            ))}
+            <button
+              type="button"
+              onClick={() => {
+                setContextMenu(null);
+                onUpdateAppearance(group.id, { color: null });
+              }}
+              data-testid="sidebar-group-color-clear"
+              aria-label="Clear background"
+              className="h-8 rounded-md border border-surface-700 bg-surface-900 text-[10px] font-mono text-text-dim cursor-pointer hover:bg-surface-700/40"
+            >
+              None
+            </button>
+          </div>
+        </div>,
+        document.body,
+      )}
+    </>
   );
 });
 
@@ -811,6 +1010,7 @@ export function WorkspaceSidebar({
   onToggle,
   onSelect,
   onToggleRepo,
+  onUpdateRepoAppearance,
   onNew,
   onCreateSession,
   onSettings,
@@ -824,18 +1024,28 @@ export function WorkspaceSidebar({
   const [width, setWidth] = useState(loadSavedWidth);
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterQuery, setFilterQuery] = useState("");
+  const [optimisticActive, setOptimisticActive] = useState<{
+    id: string;
+    fromActiveId: string | null;
+  } | null>(null);
   const filterRef = useRef<HTMLInputElement>(null);
   const dragging = useRef(false);
+  // Drop the optimistic hint once the parent's activeId has moved off
+  // fromActiveId. Otherwise a later navigation back to fromActiveId
+  // (e.g. browser back, deep link) would re-engage the stale id and
+  // highlight the wrong row. Adjusting state during render is the
+  // pattern React docs recommend for derived resets like this.
+  if (optimisticActive && optimisticActive.fromActiveId !== activeId) {
+    setOptimisticActive(null);
+  }
+  const displayedActiveId =
+    optimisticActive?.fromActiveId === activeId ? optimisticActive.id : activeId;
 
-  // Whole-row press-and-hold drag. The delay lets a quick click or tap
-  // pass through to the row's navigation link unchanged; only a held
-  // pointer (150ms with <8px movement) flips the row into drag mode.
-  // 150ms is the iOS Reminders/Notes ballpark: long enough to filter
-  // out scroll-flicks and accidental taps, short enough that the lift
-  // feels immediate. Same delay on mouse and touch so the gesture is
-  // identical on desktop and mobile.
+  // Whole-row drag. Desktop uses distance activation so a deliberate
+  // but stationary click still navigates; touch keeps a long-press delay
+  // so scroll-flicks and taps do not reorder rows.
   const sensors = useSensors(
-    useSensor(MouseSensor, { activationConstraint: { delay: 150, tolerance: 8 } }),
+    useSensor(MouseSensor, { activationConstraint: { distance: 8 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 8 } }),
   );
 
@@ -918,7 +1128,7 @@ export function WorkspaceSidebar({
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
       setWidth((w) => {
-        localStorage.setItem(SIDEBAR_WIDTH_KEY, String(w));
+        safeSetItem(SIDEBAR_WIDTH_KEY, String(w));
         return w;
       });
     };
@@ -1031,7 +1241,7 @@ export function WorkspaceSidebar({
             {filteredGroups.map((group) => {
               const showExpanded = q ? true : !group.collapsed;
               const hasActiveChild = group.workspaces.some(
-                (ws) => ws.id === activeId,
+                (ws) => ws.id === displayedActiveId,
               );
               return (
                 <div key={group.id}>
@@ -1039,6 +1249,7 @@ export function WorkspaceSidebar({
                     group={{ ...group, collapsed: !showExpanded }}
                     hasActiveChild={!showExpanded && hasActiveChild}
                     onClick={() => !q && onToggleRepo(group.id)}
+                    onUpdateAppearance={onUpdateRepoAppearance}
                     onNewSession={() =>
                       group.id === MULTI_REPO_GROUP_ID
                         ? onNew()
@@ -1055,8 +1266,11 @@ export function WorkspaceSidebar({
                         <SortableSessionRow
                           key={ws.id}
                           workspace={ws}
-                          isActive={ws.id === activeId}
-                          onClick={() => onSelect(ws.id)}
+                          isActive={ws.id === displayedActiveId}
+                          onClick={() => {
+                            setOptimisticActive({ id: ws.id, fromActiveId: activeId });
+                            onSelect(ws.id);
+                          }}
                           onDelete={onDeleteSession}
                           readOnly={readOnly}
                         />
@@ -1122,6 +1336,7 @@ export function WorkspaceSidebar({
       </div>
       {/* Resize handle (desktop only) */}
       <div
+        data-testid="sidebar-resize-handle"
         onMouseDown={handleMouseDown}
         className="hidden md:block w-1 cursor-col-resize shrink-0 bg-surface-800 hover:bg-brand-600/50 transition-colors duration-75"
       />

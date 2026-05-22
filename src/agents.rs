@@ -487,6 +487,22 @@ pub const AGENTS: &[AgentDef] = &[
         send_keys_enter_delay_ms: 0,
         install_hint: "pip install kimi-cli",
     },
+    AgentDef {
+        name: "antigravity",
+        binary: "agy",
+        aliases: &["agy"],
+        detection: DetectionMethod::Which("agy"),
+        yolo: Some(YoloMode::CliFlag("--dangerously-skip-permissions")),
+        instruction_flag: None,
+        set_default_command: false,
+        detect_status: status_detection::detect_antigravity_status,
+        container_env: &[],
+        hook_config: None,
+        resume_strategy: ResumeStrategy::Unsupported,
+        host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
+    },
 ];
 
 /// Look up an agent by canonical name.
@@ -573,6 +589,7 @@ mod tests {
         assert_eq!(get_agent("kiro").unwrap().binary, "kiro-cli");
         assert_eq!(get_agent("qwen").unwrap().binary, "qwen");
         assert_eq!(get_agent("kimi").unwrap().binary, "kimi");
+        assert_eq!(get_agent("antigravity").unwrap().binary, "agy");
     }
 
     #[test]
@@ -603,8 +620,21 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "claude", "opencode", "vibe", "codex", "gemini", "cursor", "copilot", "pi",
-                "droid", "settl", "hermes", "kiro", "qwen", "kimi"
+                "claude",
+                "opencode",
+                "vibe",
+                "codex",
+                "gemini",
+                "cursor",
+                "copilot",
+                "pi",
+                "droid",
+                "settl",
+                "hermes",
+                "kiro",
+                "qwen",
+                "kimi",
+                "antigravity"
             ]
         );
     }
@@ -632,6 +662,8 @@ mod tests {
         assert_eq!(resolve_tool_name("kimi"), Some("kimi"));
         assert_eq!(resolve_tool_name("kimi-cli"), Some("kimi"));
         assert_eq!(resolve_tool_name("kimi-code"), Some("kimi"));
+        assert_eq!(resolve_tool_name("antigravity"), Some("antigravity"));
+        assert_eq!(resolve_tool_name("agy"), Some("antigravity"));
         assert_eq!(resolve_tool_name(""), Some("claude"));
         assert_eq!(resolve_tool_name("agent"), Some("cursor"));
         assert_eq!(resolve_tool_name("unknown-tool"), None);
@@ -651,6 +683,7 @@ mod tests {
         assert_eq!(settings_index_from_name(Some("kiro")), 12);
         assert_eq!(settings_index_from_name(Some("qwen")), 13);
         assert_eq!(settings_index_from_name(Some("kimi")), 14);
+        assert_eq!(settings_index_from_name(Some("antigravity")), 15);
 
         assert_eq!(name_from_settings_index(0), None);
         assert_eq!(name_from_settings_index(1), Some("claude"));
@@ -664,6 +697,7 @@ mod tests {
         assert_eq!(name_from_settings_index(12), Some("kiro"));
         assert_eq!(name_from_settings_index(13), Some("qwen"));
         assert_eq!(name_from_settings_index(14), Some("kimi"));
+        assert_eq!(name_from_settings_index(15), Some("antigravity"));
         assert_eq!(name_from_settings_index(99), None);
     }
 
@@ -687,6 +721,7 @@ mod tests {
         assert_eq!(send_keys_enter_delay("opencode"), 0);
         assert_eq!(send_keys_enter_delay("hermes"), 0);
         assert_eq!(send_keys_enter_delay("kiro"), 0);
+        assert_eq!(send_keys_enter_delay("antigravity"), 0);
         assert_eq!(send_keys_enter_delay("unknown_agent"), 0);
     }
 
@@ -732,6 +767,10 @@ mod tests {
             Some("curl -fsSL https://cli.kiro.dev/install | bash")
         );
         assert_eq!(install_hint("kimi"), Some("pip install kimi-cli"));
+        assert_eq!(
+            install_hint("antigravity"),
+            Some("curl -fsSL https://antigravity.google/cli/install.sh | bash")
+        );
         assert!(install_hint("unknown").is_none());
     }
 }

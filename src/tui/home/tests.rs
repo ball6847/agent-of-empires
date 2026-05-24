@@ -52,7 +52,11 @@ fn create_test_env_with_sessions(count: usize) -> TestEnv {
         ));
     }
     storage
-        .commit(&instances, &GroupTree::new_with_groups(&instances, &[]))
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
@@ -82,7 +86,11 @@ fn create_test_env_with_groups() -> TestEnv {
     instances.push(inst3);
 
     storage
-        .commit(&instances, &GroupTree::new_with_groups(&instances, &[]))
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
@@ -117,7 +125,13 @@ fn create_test_env_with_mixed_sessions() -> TestEnv {
     instances.push(inst3);
 
     let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage.commit(&instances, &group_tree).unwrap();
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = group_tree.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
@@ -386,7 +400,11 @@ fn test_enter_on_cockpit_session_opens_cockpit_view() {
     ];
     instances[1].cockpit_mode = true;
     storage
-        .commit(&instances, &GroupTree::new_with_groups(&instances, &[]))
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
@@ -1092,7 +1110,13 @@ fn create_test_env_with_group_sessions() -> TestEnv {
 
     // Build group tree from instances and save with groups
     let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage.commit(&instances, &group_tree).unwrap();
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = group_tree.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
@@ -1128,7 +1152,11 @@ fn test_group_has_managed_worktrees() {
     {
         let xs: Vec<Instance> = vec![inst1, inst2];
         storage
-            .commit(&xs, &GroupTree::new_with_groups(&xs, &[]))
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
             .unwrap();
     }
 
@@ -1168,7 +1196,11 @@ fn test_group_has_containers() {
     {
         let xs: Vec<Instance> = vec![inst1, inst2];
         storage
-            .commit(&xs, &GroupTree::new_with_groups(&xs, &[]))
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
             .unwrap();
     }
 
@@ -1314,7 +1346,11 @@ fn test_delete_group_with_sessions_respects_worktree_option() {
     {
         let xs: Vec<Instance> = vec![inst1];
         storage
-            .commit(&xs, &GroupTree::new_with_groups(&xs, &[]))
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
             .unwrap();
     }
 
@@ -1368,7 +1404,11 @@ fn test_delete_group_with_sessions_respects_container_option() {
     {
         let xs: Vec<Instance> = vec![inst1];
         storage
-            .commit(&xs, &GroupTree::new_with_groups(&xs, &[]))
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
             .unwrap();
     }
 
@@ -2087,7 +2127,11 @@ fn test_all_profiles_view_loads_from_multiple_profiles() {
     {
         let xs = vec![Instance::new("Alpha Session", "/tmp/a")];
         storage_a
-            .commit(&xs, &GroupTree::new_with_groups(&xs, &[]))
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
             .unwrap();
     }
 
@@ -2095,7 +2139,11 @@ fn test_all_profiles_view_loads_from_multiple_profiles() {
     {
         let xs = vec![Instance::new("Beta Session", "/tmp/b")];
         storage_b
-            .commit(&xs, &GroupTree::new_with_groups(&xs, &[]))
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
             .unwrap();
     }
 
@@ -2125,7 +2173,11 @@ fn test_filtered_view_loads_single_profile() {
     {
         let xs = vec![Instance::new("Alpha Session", "/tmp/a")];
         storage_a
-            .commit(&xs, &GroupTree::new_with_groups(&xs, &[]))
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
             .unwrap();
     }
 
@@ -2133,7 +2185,11 @@ fn test_filtered_view_loads_single_profile() {
     {
         let xs = vec![Instance::new("Beta Session", "/tmp/b")];
         storage_b
-            .commit(&xs, &GroupTree::new_with_groups(&xs, &[]))
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
             .unwrap();
     }
 
@@ -2158,7 +2214,11 @@ fn test_all_profiles_view_has_no_profile_headers() {
     {
         let xs = vec![Instance::new("A1", "/tmp/a")];
         storage_a
-            .commit(&xs, &GroupTree::new_with_groups(&xs, &[]))
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
             .unwrap();
     }
 
@@ -2166,7 +2226,11 @@ fn test_all_profiles_view_has_no_profile_headers() {
     {
         let xs = vec![Instance::new("B1", "/tmp/b")];
         storage_b
-            .commit(&xs, &GroupTree::new_with_groups(&xs, &[]))
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
             .unwrap();
     }
 
@@ -2196,7 +2260,11 @@ fn test_all_profiles_view_shows_all_sessions_flat() {
     {
         let xs = vec![Instance::new("A1", "/tmp/a")];
         storage_a
-            .commit(&xs, &GroupTree::new_with_groups(&xs, &[]))
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
             .unwrap();
     }
 
@@ -2204,7 +2272,11 @@ fn test_all_profiles_view_shows_all_sessions_flat() {
     {
         let xs = vec![Instance::new("B1", "/tmp/b")];
         storage_b
-            .commit(&xs, &GroupTree::new_with_groups(&xs, &[]))
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
             .unwrap();
     }
 
@@ -2244,7 +2316,13 @@ fn test_default_row_tag_mode_renders_no_tag() {
     let storage_a = Storage::new("alpha").unwrap();
     let instances_a = vec![Instance::new("A1", "/tmp/a")];
     let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
-    storage_a.commit(&instances_a, &group_tree_a).unwrap();
+    storage_a
+        .update(|i, g| {
+            *i = instances_a.to_vec();
+            *g = group_tree_a.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(None, tools).unwrap();
@@ -2274,12 +2352,24 @@ fn test_row_tag_auto_renders_profile_in_all_profiles_view() {
     let storage_a = Storage::new("alpha").unwrap();
     let instances_a = vec![Instance::new("A1", "/tmp/a")];
     let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
-    storage_a.commit(&instances_a, &group_tree_a).unwrap();
+    storage_a
+        .update(|i, g| {
+            *i = instances_a.to_vec();
+            *g = group_tree_a.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let storage_b = Storage::new("beta").unwrap();
     let instances_b = vec![Instance::new("B1", "/tmp/b")];
     let group_tree_b = GroupTree::new_with_groups(&instances_b, &[]);
-    storage_b.commit(&instances_b, &group_tree_b).unwrap();
+    storage_b
+        .update(|i, g| {
+            *i = instances_b.to_vec();
+            *g = group_tree_b.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(None, tools).unwrap();
@@ -2315,7 +2405,13 @@ fn test_row_tag_auto_omits_tag_in_filtered_view() {
     let storage_a = Storage::new("alpha").unwrap();
     let instances_a = vec![Instance::new("A1", "/tmp/a")];
     let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
-    storage_a.commit(&instances_a, &group_tree_a).unwrap();
+    storage_a
+        .update(|i, g| {
+            *i = instances_a.to_vec();
+            *g = group_tree_a.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(Some("alpha".to_string()), tools).unwrap();
@@ -2347,7 +2443,13 @@ fn test_row_tag_profile_renders_in_filtered_view() {
     let storage_a = Storage::new("alpha").unwrap();
     let instances_a = vec![Instance::new("A1", "/tmp/a")];
     let group_tree_a = GroupTree::new_with_groups(&instances_a, &[]);
-    storage_a.commit(&instances_a, &group_tree_a).unwrap();
+    storage_a
+        .update(|i, g| {
+            *i = instances_a.to_vec();
+            *g = group_tree_a.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(Some("alpha".to_string()), tools).unwrap();
@@ -2395,7 +2497,13 @@ fn test_row_tag_branch_dedups_with_divergence_display() {
     });
     let instances = vec![inst];
     let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage.commit(&instances, &group_tree).unwrap();
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = group_tree.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(None, tools).unwrap();
@@ -2443,7 +2551,13 @@ fn test_row_tag_branch_renders_when_title_matches_branch() {
     });
     let instances = vec![inst];
     let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage.commit(&instances, &group_tree).unwrap();
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = group_tree.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(None, tools).unwrap();
@@ -2479,7 +2593,13 @@ fn test_row_tag_auto_skips_for_empty_source_profile() {
     inst.source_profile = String::new();
     let instances = vec![inst];
     let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage.commit(&instances, &group_tree).unwrap();
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = group_tree.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(None, tools).unwrap();
@@ -2512,7 +2632,11 @@ fn test_create_session_in_all_mode_is_findable() {
     {
         let xs = vec![Instance::new("Existing", "/tmp/a")];
         storage
-            .commit(&xs, &GroupTree::new_with_groups(&xs, &[]))
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
             .unwrap();
     }
 
@@ -2571,14 +2695,26 @@ fn test_save_preserves_per_profile_collapsed_state() {
     inst_a.group_path = "work".to_string();
     let mut tree_a = GroupTree::new_with_groups(&[inst_a.clone()], &[]);
     tree_a.toggle_collapsed("work");
-    storage_a.commit(&[inst_a], &tree_a).unwrap();
+    storage_a
+        .update(|i, g| {
+            *i = [inst_a].to_vec();
+            *g = tree_a.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     // Create beta with group "work" (expanded, the default)
     let storage_b = Storage::new("beta").unwrap();
     let mut inst_b = Instance::new("B1", "/tmp/b");
     inst_b.group_path = "work".to_string();
     let tree_b = GroupTree::new_with_groups(&[inst_b.clone()], &[]);
-    storage_b.commit(&[inst_b], &tree_b).unwrap();
+    storage_b
+        .update(|i, g| {
+            *i = [inst_b].to_vec();
+            *g = tree_b.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     // Load unified view
     let tools = AvailableTools::with_tools(&["claude"]);
@@ -2667,14 +2803,26 @@ fn test_delete_group_scoped_to_owning_profile() {
     let mut inst_a = Instance::new("A1", "/tmp/a");
     inst_a.group_path = "work".to_string();
     let tree_a = GroupTree::new_with_groups(&[inst_a.clone()], &[]);
-    storage_a.commit(&[inst_a], &tree_a).unwrap();
+    storage_a
+        .update(|i, g| {
+            *i = [inst_a].to_vec();
+            *g = tree_a.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     // Create beta with the same group name "work"
     let storage_b = Storage::new("beta").unwrap();
     let mut inst_b = Instance::new("B1", "/tmp/b");
     inst_b.group_path = "work".to_string();
     let tree_b = GroupTree::new_with_groups(&[inst_b.clone()], &[]);
-    storage_b.commit(&[inst_b], &tree_b).unwrap();
+    storage_b
+        .update(|i, g| {
+            *i = [inst_b].to_vec();
+            *g = tree_b.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(None, tools).unwrap();
@@ -2817,7 +2965,11 @@ fn test_shift_n_prefills_main_repo_path_for_worktree_session() {
     {
         let xs: Vec<Instance> = vec![inst];
         storage
-            .commit(&xs, &GroupTree::new_with_groups(&xs, &[]))
+            .update(|i, g| {
+                *i = xs.to_vec();
+                *g = GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                Ok(())
+            })
             .unwrap();
     }
 
@@ -2933,7 +3085,13 @@ fn test_rename_selected_group_with_children() {
     inst2.group_path = "work/frontend".to_string();
     let instances = vec![inst1, inst2];
     let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage.commit(&instances, &group_tree).unwrap();
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = group_tree.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
@@ -2961,6 +3119,36 @@ fn test_rename_selected_group_with_children() {
         .find(|i| i.title == "child-session")
         .unwrap();
     assert_eq!(child.group_path, "projects/frontend");
+
+    // Disk-state regression check: the rename must drop both old_path
+    // and its descendant rows, leaving only the renamed paths on disk.
+    let disk_groups: Vec<String> = storage
+        .load_with_groups()
+        .unwrap()
+        .1
+        .into_iter()
+        .map(|g| g.path)
+        .collect();
+    assert!(
+        !disk_groups.contains(&"work".to_string()),
+        "old parent path must not survive on disk: {:?}",
+        disk_groups
+    );
+    assert!(
+        !disk_groups.contains(&"work/frontend".to_string()),
+        "old descendant path must not survive on disk: {:?}",
+        disk_groups
+    );
+    assert!(
+        disk_groups.contains(&"projects".to_string()),
+        "renamed parent must be on disk: {:?}",
+        disk_groups
+    );
+    assert!(
+        disk_groups.contains(&"projects/frontend".to_string()),
+        "renamed descendant must be on disk: {:?}",
+        disk_groups
+    );
 }
 
 #[test]
@@ -3000,7 +3188,13 @@ fn test_rename_group_removes_old_path() {
     inst.group_path = "work".to_string();
     let instances = vec![inst];
     let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage.commit(&instances, &group_tree).unwrap();
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = group_tree.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
@@ -3032,7 +3226,13 @@ fn test_rename_group_empty_group() {
     let instances: Vec<Instance> = vec![];
     let mut group_tree = GroupTree::new_with_groups(&instances, &[]);
     group_tree.create_group("empty-group");
-    storage.commit(&instances, &group_tree).unwrap();
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = group_tree.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
@@ -3074,7 +3274,13 @@ fn test_rename_group_duplicate_returns_error() {
     inst2.group_path = "personal".to_string();
     let instances = vec![inst1, inst2];
     let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage.commit(&instances, &group_tree).unwrap();
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = group_tree.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
@@ -3112,7 +3318,13 @@ fn test_rename_group_resort_az() {
     inst2.group_path = "mmm".to_string();
     let instances = vec![inst1, inst2];
     let group_tree = GroupTree::new_with_groups(&instances, &[]);
-    storage.commit(&instances, &group_tree).unwrap();
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = group_tree.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
@@ -4084,7 +4296,11 @@ fn create_test_env_two_projects_mixed_attention() -> TestEnv {
 
     let instances = vec![alpha_waiting, alpha_running, beta_running, beta_error];
     storage
-        .commit(&instances, &GroupTree::new_with_groups(&instances, &[]))
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
@@ -4820,5 +5036,601 @@ mod click_to_select {
             })
             .expect("group row should still be present after toggle");
         assert_ne!(was_collapsed, now_collapsed, "group collapsed state flips");
+    }
+}
+
+mod divider_drag {
+    //! Click-and-drag on the list/preview divider resizes `list_width`.
+    //! Persistence is checked via `load_config()` (the same path the
+    //! keyboard `<`/`>` tests exercise indirectly via save_list_width).
+
+    use super::*;
+    use crate::session::config::load_config;
+    use ratatui::layout::Rect;
+
+    /// Stage the geometry a real side-by-side render would produce: a
+    /// list at column 0, divider at column 35, terminal 100 wide. The
+    /// list area mirrors what `render_list` would assign.
+    fn stage_side_by_side(env: &mut TestEnv) {
+        env.view.list_area = Rect::new(0, 0, 35, 20);
+        env.view.divider_col = Some(35);
+        env.view.main_area_width = 100;
+        env.view.list_width = 35;
+    }
+
+    #[test]
+    #[serial]
+    fn hit_divider_matches_only_the_divider_column() {
+        let mut env = create_test_env_empty();
+        stage_side_by_side(&mut env);
+        assert!(env.view.hit_divider(35, 5));
+        assert!(!env.view.hit_divider(34, 5), "list inner shouldn't hit");
+        assert!(!env.view.hit_divider(36, 5), "preview shouldn't hit");
+        assert!(!env.view.hit_divider(35, 99), "row past list_area is out");
+    }
+
+    #[test]
+    #[serial]
+    fn hit_divider_is_false_in_stacked_mode() {
+        let mut env = create_test_env_empty();
+        stage_side_by_side(&mut env);
+        // Stacked layout clears divider_col at render time; emulate.
+        env.view.divider_col = None;
+        assert!(!env.view.hit_divider(35, 5));
+    }
+
+    #[test]
+    #[serial]
+    fn drag_updates_list_width_relative_to_start() {
+        let mut env = create_test_env_empty();
+        stage_side_by_side(&mut env);
+        assert!(
+            env.view.handle_drag_start(35, 5),
+            "divider click starts drag"
+        );
+        // Drag 10 cols right.
+        assert!(env.view.handle_drag_move(45));
+        assert_eq!(env.view.list_width, 45);
+        // Drag back 5 cols (from start).
+        assert!(env.view.handle_drag_move(40));
+        assert_eq!(env.view.list_width, 40);
+    }
+
+    #[test]
+    #[serial]
+    fn drag_clamps_at_preview_min_width_ceiling() {
+        let mut env = create_test_env_empty();
+        stage_side_by_side(&mut env);
+        // main_area_width=100, PREVIEW_MIN_WIDTH=40 -> ceiling=60.
+        env.view.handle_drag_start(35, 5);
+        env.view.handle_drag_move(200);
+        assert_eq!(env.view.list_width, 60);
+    }
+
+    #[test]
+    #[serial]
+    fn drag_clamps_at_floor_without_underflow() {
+        let mut env = create_test_env_empty();
+        stage_side_by_side(&mut env);
+        env.view.handle_drag_start(35, 5);
+        // Drag far to the left of column 0; the i32 math must absorb
+        // the negative without wrapping u16.
+        env.view.handle_drag_move(0);
+        assert_eq!(env.view.list_width, 10);
+    }
+
+    #[test]
+    #[serial]
+    fn dialog_opening_mid_drag_ends_drag_and_persists() {
+        // If a modal opens while the user is still holding the mouse
+        // (e.g. a hotkey was pressed mid-drag), further Drag events must
+        // not keep updating list_width invisibly under the modal. The
+        // width achieved up to that point is persisted so the user's
+        // work isn't silently lost on Up.
+        let mut env = create_test_env_empty();
+        stage_side_by_side(&mut env);
+        env.view.handle_drag_start(35, 5);
+        env.view.handle_drag_move(50);
+        // Open a modal.
+        env.view.info_dialog = Some(InfoDialog::new("title", "body"));
+        // Next drag event sees the dialog and bails.
+        let changed = env.view.handle_drag_move(60);
+        assert!(!changed);
+        assert!(env.view.drag_state.is_none());
+        assert_eq!(
+            env.view.list_width, 50,
+            "width frozen at last pre-dialog value"
+        );
+        let config = load_config().unwrap().expect("config saved");
+        assert_eq!(config.app_state.home_list_width, Some(50));
+        // Subsequent Up is now a no-op (drag_state was cleared early).
+        assert!(!env.view.handle_drag_end());
+    }
+
+    #[test]
+    #[serial]
+    fn drag_end_persists_list_width_once() {
+        let mut env = create_test_env_empty();
+        stage_side_by_side(&mut env);
+        env.view.handle_drag_start(35, 5);
+        env.view.handle_drag_move(50);
+        assert!(env.view.handle_drag_end());
+        let config = load_config().unwrap().expect("config saved");
+        assert_eq!(config.app_state.home_list_width, Some(50));
+        // Subsequent Up with no active drag is a no-op.
+        assert!(!env.view.handle_drag_end());
+    }
+
+    #[test]
+    #[serial]
+    fn drag_move_without_drag_start_is_noop() {
+        let mut env = create_test_env_empty();
+        stage_side_by_side(&mut env);
+        assert!(!env.view.handle_drag_move(50));
+        assert_eq!(env.view.list_width, 35);
+    }
+
+    #[test]
+    #[serial]
+    fn drag_start_misses_off_divider_column() {
+        let mut env = create_test_env_empty();
+        stage_side_by_side(&mut env);
+        assert!(!env.view.handle_drag_start(34, 5));
+        assert!(env.view.drag_state.is_none());
+    }
+}
+
+mod preview_click {
+    //! Left-click on the preview pane opens the Send Message dialog
+    //! targeting the currently-selected running session. No-op when no
+    //! valid target exists (group selected, non-running session, empty
+    //! list).
+
+    use super::*;
+
+    #[test]
+    #[serial]
+    fn click_with_no_session_does_not_open_dialog() {
+        let mut env = create_test_env_empty();
+        let changed = env.view.handle_preview_click();
+        assert!(!changed);
+        assert!(env.view.send_message_dialog.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn click_with_non_running_session_does_not_open_dialog() {
+        // Created via create_test_env_with_sessions: instances default to
+        // Status::Creating, which resolve_paste_target rejects.
+        let mut env = create_test_env_with_sessions(1);
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let changed = env.view.handle_preview_click();
+        assert!(!changed);
+        assert!(env.view.send_message_dialog.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn click_while_dialog_open_is_swallowed() {
+        // has_dialog() must short-circuit so a stray click on the preview
+        // never opens a second dialog on top of an existing one. Use the
+        // info dialog as a stand-in modal so this test doesn't depend on
+        // tmux state (the actual send-message path needs a live tmux
+        // session, which unit tests can't stage).
+        let mut env = create_test_env_empty();
+        env.view.info_dialog = Some(InfoDialog::new("title", "body"));
+        let changed = env.view.handle_preview_click();
+        assert!(!changed);
+        assert!(env.view.send_message_dialog.is_none());
+    }
+}
+
+mod save_field_merge {
+    use super::*;
+    use chrono::Utc;
+
+    fn boot_view_with_one_session(title: &str, path: &str) -> (TempDir, HomeView, String) {
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+        let storage = Storage::new("test").unwrap();
+        let inst = Instance::new(title, path);
+        let id = inst.id.clone();
+        storage
+            .update(|i, g| {
+                i.push(inst.clone());
+                *g = GroupTree::new_with_groups(&[inst], &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        let tools = AvailableTools::with_tools(&["claude"]);
+        let view = HomeView::new(Some("test".to_string()), tools).unwrap();
+        (temp, view, id)
+    }
+
+    #[test]
+    #[serial]
+    fn test_save_preserves_peer_field_update() {
+        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
+
+        let peer_storage = Storage::new("test").unwrap();
+        let peer_archived_at = Utc::now();
+        peer_storage
+            .update(|insts, _| {
+                if let Some(inst) = insts.iter_mut().find(|i| i.id == id) {
+                    inst.archived_at = Some(peer_archived_at);
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        view.save().expect("save must merge peer-owned field write");
+
+        let reloaded = Storage::new("test").unwrap().load().unwrap();
+        let row = reloaded.iter().find(|i| i.id == id).expect("row present");
+        assert_eq!(
+            row.archived_at,
+            Some(peer_archived_at),
+            "peer's archive must survive a TUI save with stale view"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_save_preserves_peer_added_row() {
+        let (_temp, mut view, _id) = boot_view_with_one_session("a", "/tmp/a");
+
+        let peer_storage = Storage::new("test").unwrap();
+        peer_storage
+            .update(|insts, _| {
+                insts.push(Instance::new("peer-added", "/tmp/peer"));
+                Ok(())
+            })
+            .unwrap();
+
+        view.save()
+            .expect("save must not delete rows the TUI does not know about");
+
+        let reloaded = Storage::new("test").unwrap().load().unwrap();
+        assert!(
+            reloaded.iter().any(|i| i.title == "peer-added"),
+            "peer-added row must survive TUI save"
+        );
+        assert!(
+            reloaded.iter().any(|i| i.title == "a"),
+            "TUI's known row must remain"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_save_drops_explicitly_deleted_row() {
+        let (_temp, mut view, id) = boot_view_with_one_session("victim", "/tmp/victim");
+
+        view.remove_instance(&id);
+        view.save().expect("save must propagate the delete");
+
+        let reloaded = Storage::new("test").unwrap().load().unwrap();
+        assert!(
+            !reloaded.iter().any(|i| i.id == id),
+            "tombstoned row must be removed from disk"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_save_drains_pending_deletions_on_ok() {
+        let (_temp, mut view, id) = boot_view_with_one_session("victim", "/tmp/victim");
+
+        view.remove_instance(&id);
+        assert!(
+            view.pending_deletions
+                .get("test")
+                .is_some_and(|s| s.contains(&id)),
+            "remove_instance must populate pending_deletions"
+        );
+
+        view.save().unwrap();
+
+        assert!(
+            !view.pending_deletions.contains_key("test"),
+            "pending_deletions must drain on Ok save"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_save_preserves_peer_added_group() {
+        let (_temp, mut view, _id) = boot_view_with_one_session("a", "/tmp/a");
+
+        let peer_storage = Storage::new("test").unwrap();
+        peer_storage
+            .update(|_insts, groups| {
+                groups.push(crate::session::Group::new("peer-grp", "peer-grp"));
+                Ok(())
+            })
+            .unwrap();
+
+        view.save()
+            .expect("save must not clobber groups the TUI does not know about");
+
+        let reloaded = Storage::new("test").unwrap().load_with_groups().unwrap().1;
+        assert!(
+            reloaded.iter().any(|g| g.path == "peer-grp"),
+            "peer-added group must survive TUI save"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_apply_user_action_persists_atomically() {
+        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
+
+        view.apply_user_action(&id, |inst| inst.archive())
+            .expect("apply_user_action must persist");
+
+        let reloaded = Storage::new("test").unwrap().load().unwrap();
+        let row = reloaded.iter().find(|i| i.id == id).expect("row present");
+        assert!(
+            row.archived_at.is_some(),
+            "apply_user_action must persist archived_at to disk"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_apply_user_action_does_not_clobber_peer_field() {
+        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
+
+        let peer_storage = Storage::new("test").unwrap();
+        peer_storage
+            .update(|insts, _| {
+                if let Some(inst) = insts.iter_mut().find(|i| i.id == id) {
+                    inst.notify_on_waiting = Some(true);
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        view.apply_user_action(&id, |inst| inst.archive())
+            .expect("archive must persist");
+
+        let reloaded = Storage::new("test").unwrap().load().unwrap();
+        let row = reloaded.iter().find(|i| i.id == id).expect("row present");
+        assert!(row.archived_at.is_some(), "TUI archive landed");
+        assert_eq!(
+            row.notify_on_waiting,
+            Some(true),
+            "peer's notify_on_waiting must survive an apply_user_action that does not touch it"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_apply_user_action_disk_and_memory_share_one_timestamp() {
+        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
+
+        view.apply_user_action(&id, |inst| inst.archive())
+            .expect("apply_user_action must persist");
+
+        let mem_ts = view
+            .get_instance(&id)
+            .expect("in-memory row present")
+            .archived_at;
+        let disk_ts = Storage::new("test")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == id)
+            .expect("disk row present")
+            .archived_at;
+        assert_eq!(
+            mem_ts, disk_ts,
+            "single Utc::now() snapshot, no microsecond drift between memory and disk"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_apply_user_action_preserves_peer_user_action_field() {
+        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
+
+        let peer_storage = Storage::new("test").unwrap();
+        peer_storage
+            .update(|insts, _| {
+                if let Some(inst) = insts.iter_mut().find(|i| i.id == id) {
+                    inst.snooze(30);
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        // archive() touches archived_at + favorited_at only; the peer-set
+        // snoozed_until must NOT be clobbered by the diff-splice.
+        view.apply_user_action(&id, |inst| inst.archive())
+            .expect("archive must persist");
+
+        let reloaded = Storage::new("test").unwrap().load().unwrap();
+        let row = reloaded.iter().find(|i| i.id == id).expect("row present");
+        assert!(row.archived_at.is_some(), "TUI archive landed");
+        assert!(
+            row.snoozed_until.is_some(),
+            "peer-written snoozed_until must survive a TUI archive that does not touch the field"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_save_drops_peer_deleted_row_from_mirror() {
+        let (_temp, mut view, id) = boot_view_with_one_session("victim", "/tmp/peer-rm");
+
+        // Simulate `aoe session remove victim` from another process: peer
+        // deletes the row from disk while TUI still has it in memory.
+        Storage::new("test")
+            .unwrap()
+            .update(|insts, _g| {
+                insts.retain(|i| i.id != id);
+                Ok(())
+            })
+            .unwrap();
+
+        view.save()
+            .expect("save must not error on peer-deleted rows");
+
+        assert!(
+            !view.instances().iter().any(|i| i.id == id),
+            "peer-deleted row must be dropped from in-memory instances"
+        );
+        assert!(
+            view.get_instance(&id).is_none(),
+            "peer-deleted row must be dropped from instance_map"
+        );
+        let disk = Storage::new("test").unwrap().load().unwrap();
+        assert!(
+            !disk.iter().any(|i| i.id == id),
+            "save() must not resurrect the peer-deleted row on disk"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_save_pushes_tui_added_row_to_disk() {
+        let (_temp, mut view, _) = boot_view_with_one_session("seed", "/tmp/seed");
+
+        let mut new_inst = Instance::new("tui-added", "/tmp/added");
+        new_inst.source_profile = "test".to_string();
+        let new_id = new_inst.id.clone();
+        view.add_instance(new_inst);
+
+        view.save().expect("save must persist TUI-added row");
+
+        let disk = Storage::new("test").unwrap().load().unwrap();
+        assert!(
+            disk.iter().any(|i| i.id == new_id),
+            "TUI-added row must be persisted to disk"
+        );
+        assert!(
+            !view.pending_added.contains_key("test"),
+            "pending_added must drain on Ok save"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_save_add_then_remove_in_same_cycle_does_not_persist() {
+        let (_temp, mut view, _) = boot_view_with_one_session("seed", "/tmp/seed");
+
+        let mut new_inst = Instance::new("ephemeral", "/tmp/ephemeral");
+        new_inst.source_profile = "test".to_string();
+        let new_id = new_inst.id.clone();
+        view.add_instance(new_inst);
+        view.remove_instance(&new_id);
+
+        view.save().expect("save must succeed");
+
+        let disk = Storage::new("test").unwrap().load().unwrap();
+        assert!(
+            !disk.iter().any(|i| i.id == new_id),
+            "add+remove in same save cycle must not leak the row to disk"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_move_to_profile_marks_tombstone_and_pending_added() {
+        let (_temp, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
+        view.storages
+            .insert("target".to_string(), Storage::new("target").unwrap());
+
+        view.move_to_profile(&id, "target", "moved/group".to_string())
+            .unwrap();
+
+        assert!(
+            view.pending_deletions
+                .get("test")
+                .is_some_and(|s| s.contains(&id)),
+            "old profile must have tombstone"
+        );
+        assert!(
+            view.pending_added
+                .get("target")
+                .is_some_and(|s| s.contains(&id)),
+            "new profile must have pending_added entry"
+        );
+        let inst = view.get_instance(&id).unwrap();
+        assert_eq!(inst.source_profile, "target");
+        assert_eq!(inst.group_path, "moved/group");
+    }
+
+    #[test]
+    #[serial]
+    fn test_move_to_profile_save_roundtrip_persists_under_target() {
+        let (_temp, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
+        view.storages
+            .insert("target".to_string(), Storage::new("target").unwrap());
+
+        view.move_to_profile(&id, "target", String::new()).unwrap();
+        view.save().expect("save must succeed across profiles");
+
+        let old_disk = Storage::new("test").unwrap().load().unwrap();
+        let new_disk = Storage::new("target").unwrap().load().unwrap();
+        assert!(
+            !old_disk.iter().any(|i| i.id == id),
+            "old profile disk must NOT contain the moved row"
+        );
+        assert!(
+            new_disk.iter().any(|i| i.id == id),
+            "new profile disk MUST contain the moved row"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_move_to_profile_same_profile_only_updates_group_path() {
+        let (_temp, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
+
+        view.move_to_profile(&id, "test", "newgrp".to_string())
+            .unwrap();
+
+        assert!(
+            !view.pending_deletions.contains_key("test")
+                || !view.pending_deletions.get("test").unwrap().contains(&id),
+            "same-profile move must NOT tombstone the row"
+        );
+        assert_eq!(view.get_instance(&id).unwrap().group_path, "newgrp");
+    }
+
+    #[test]
+    #[serial]
+    fn test_reload_honors_peer_cleared_session_id() {
+        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/sid");
+
+        // Seed a stale sid via the in-memory mirror + persist.
+        view.mutate_instance(&id, |inst| {
+            inst.agent_session_id = Some("stale_X".to_string());
+        });
+        view.save().unwrap();
+
+        // Peer clears the sid on disk (simulates `aoe session set-session-id ""`).
+        Storage::new("test")
+            .unwrap()
+            .update(|insts, _g| {
+                if let Some(inst) = insts.iter_mut().find(|i| i.id == id) {
+                    inst.agent_session_id = None;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        view.reload().unwrap();
+
+        assert!(
+            view.get_instance(&id)
+                .and_then(|i| i.agent_session_id.clone())
+                .is_none(),
+            "reload must honor peer-cleared sid; carrying memory would re-pass --resume <stale>"
+        );
     }
 }

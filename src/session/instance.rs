@@ -525,10 +525,16 @@ fn append_resume_flags(
 /// Used during synchronous pre-launch (e.g. `persist_session_id` for Claude)
 /// when no poller is active yet. Post-launch persistence goes exclusively
 /// through the poller channel -> `apply_session_id_updates()` in the TUI
-/// thread. Concurrent calls within the same process are serialised via
-/// `Storage::update`'s per-profile lock; cross-process races between TUI
-/// and `aoe serve` remain a known limitation (see #1175).
-fn persist_session_to_storage(profile: &str, instance_id: &str, session_id: &str) {
+/// thread. Concurrent calls within and across processes are serialised via
+/// `Storage::update`'s two-layer lock (in-process mutex + cross-process
+/// flock; see `storage.rs` module rustdoc).
+///
+/// Fire-and-forget: errors are logged at warn level. The poller dedupes
+/// on its `last_known` and `apply_session_id_updates` dedupes on in-memory
+/// state, so a transient persist failure stays disk-out-of-sync until the
+/// process restarts (which reloads from disk and re-emits via the agent's
+/// own session log on next start).
+pub(crate) fn persist_session_to_storage(profile: &str, instance_id: &str, session_id: &str) {
     if !is_valid_session_id(session_id) {
         tracing::warn!(target: "session.store",
             "Refusing to persist invalid session ID {:?} for {}",
@@ -575,9 +581,11 @@ fn persist_session_to_storage(profile: &str, instance_id: &str, session_id: &str
 /// Tier 2's `finalize_launch`, the next launch would otherwise re-load the
 /// bad sid from disk and pass `--resume <bad>` again, looping.
 ///
-/// Concurrent in-process callers (TUI tick, server `spawn_blocking` workers,
-/// CLI `restart --all` JoinSet workers) are serialised via `Storage::update`'s
-/// per-profile lock; cross-process races remain out of scope (see #1175).
+/// Concurrent callers within and across processes (TUI tick, server
+/// `spawn_blocking` workers, CLI `restart --all` JoinSet workers, peer
+/// `aoe` invocations) are serialised via `Storage::update`'s two-layer
+/// lock (in-process mutex + cross-process flock; see `storage.rs` module
+/// rustdoc).
 fn clear_session_id_on_disk(profile: &str, instance_id: &str) {
     let storage = match super::storage::Storage::new(profile) {
         Ok(s) => s,
@@ -687,6 +695,101 @@ impl Instance {
         self.last_accessed_at = Some(Utc::now());
         self.archived_at = None;
         self.snoozed_until = None;
+    }
+
+    /// Mutates: `status`, `sandbox_info`. Field set must match what
+    /// `start_with_size_opts` writes; missing fields re-introduce the
+    /// wholesale-replace clobber.
+    pub fn merge_post_start(&mut self, src: &Self) {
+        self.status = src.status;
+        self.sandbox_info = src.sandbox_info.clone();
+    }
+
+    /// Same fields as `merge_post_start`. When `stale_sid` is `Some`, the
+    /// resume-fallback cascade just invalidated that exact sid; clear
+    /// `self.agent_session_id` only if it still matches the stale value, so
+    /// a peer poller's freshly-discovered sid (landed between phase 2 and
+    /// phase 3 of the restart) survives intact.
+    pub fn merge_post_restart(&mut self, src: &Self, stale_sid: Option<&str>) {
+        self.merge_post_start(src);
+        if let Some(stale) = stale_sid {
+            if self.agent_session_id.as_deref() == Some(stale) {
+                self.agent_session_id = src.agent_session_id.clone();
+            }
+        }
+    }
+
+    /// Splice TUI-mirrored, persisted fields from `src` onto `self`. Used by
+    /// `HomeView::save` for fields the TUI is the canonical disk writer of
+    /// (the daemon's `status_poll_loop` keeps these in memory only). The
+    /// server's `send_message` respawn briefly writes `status` via
+    /// `apply_post_restart_sync`; the resulting transient mis-paint
+    /// converges on the next `status_poll` tick.
+    /// User-action fields (archived/favorited/snoozed/title/group_path/...)
+    /// are NOT here; they go through `apply_user_action` per-action so peer
+    /// writers (CLI) cannot be clobbered by a stale TUI snapshot.
+    pub fn merge_from_tui(&mut self, src: &Self) {
+        self.status = src.status;
+        self.last_accessed_at = self.last_accessed_at.max(src.last_accessed_at);
+        self.idle_entered_at = src.idle_entered_at;
+    }
+
+    /// Per-field-conditional splice: copy `post.X` onto `self.X` only when
+    /// `pre.X != post.X`. Peer writes to fields the mutation did not touch
+    /// survive even when the field is in the user-action set.
+    /// `last_accessed_at` is monotone-max (no diff guard).
+    /// `source_profile` is excluded; cross-profile moves bypass this path.
+    /// Post-splice rules enforce the same cross-field invariants the
+    /// per-mutation methods enforce (archive XOR favorite, touch unarchives)
+    /// so concurrent peer writes cannot violate them.
+    pub fn merge_user_action_diff(&mut self, pre: &Self, post: &Self) {
+        debug_assert_eq!(
+            pre.source_profile, post.source_profile,
+            "apply_user_action must not change source_profile; cross-profile moves go through mutate_instance"
+        );
+        if pre.title != post.title {
+            self.title = post.title.clone();
+        }
+        if pre.group_path != post.group_path {
+            self.group_path = post.group_path.clone();
+        }
+        if pre.archived_at != post.archived_at {
+            self.archived_at = post.archived_at;
+        }
+        if pre.favorited_at != post.favorited_at {
+            self.favorited_at = post.favorited_at;
+        }
+        if pre.snoozed_until != post.snoozed_until {
+            self.snoozed_until = post.snoozed_until;
+        }
+        if pre.base_branch_override != post.base_branch_override {
+            self.base_branch_override = post.base_branch_override.clone();
+        }
+        if pre.status != post.status {
+            self.status = post.status;
+        }
+        self.last_accessed_at = self.last_accessed_at.max(post.last_accessed_at);
+
+        let archived_changed = pre.archived_at != post.archived_at;
+        let favorited_changed = pre.favorited_at != post.favorited_at;
+        // Touch is an event invariant: any advance of last_accessed_at
+        // (TUI-side or peer-side) dethrones a concurrent archive.
+        let touched = self.last_accessed_at > pre.last_accessed_at;
+
+        // archive(): archived=Some => favorited=None
+        if archived_changed && post.archived_at.is_some() {
+            self.favorited_at = None;
+        }
+        // favorite(): favorited=Some => archived=None, snoozed=None
+        if favorited_changed && post.favorited_at.is_some() {
+            self.archived_at = None;
+            self.snoozed_until = None;
+        }
+        // touch_last_accessed(): clears archived + snoozed.
+        if touched {
+            self.archived_at = None;
+            self.snoozed_until = None;
+        }
     }
 
     /// Mark the session archived. Archived sessions sink to the bottom of
@@ -2469,40 +2572,20 @@ impl Instance {
             );
             shell_check
         };
-        self.status = match detected {
-            Status::Idle if self.has_command_override() => {
-                // Custom commands run agents through wrapper scripts that appear
-                // as shell processes to tmux. Only declare Error when the pane is
-                // actually dead; don't use is_shell_stale() since the shell IS
-                // the expected wrapper process.
-                if is_dead {
-                    Status::Error
-                } else {
-                    Status::Unknown
-                }
-            }
-            Status::Idle if is_dead => Status::Error,
-            Status::Idle if is_shell_stale() => {
-                // A shell is the foreground process but the pane is alive.
-                // Check captured pane content: if it contains the agent's
-                // UI the agent is still alive; only declare Error when the
-                // content looks like a bare shell prompt.
-                if pane_has_agent_content(&pane_content, &self.tool) {
-                    tracing::trace!(target: "session.store",
-                        "status '{}': shell stale but pane has agent content, staying Idle",
-                        self.title,
-                    );
-                    Status::Idle
-                } else {
-                    tracing::trace!(target: "session.store",
-                        "status '{}': shell stale, no agent content, setting Error",
-                        self.title,
-                    );
-                    Status::Error
-                }
-            }
-            other => other,
+        let has_command_override = self.has_command_override();
+        let shell_stale = if detected == Status::Idle && !has_command_override && !is_dead {
+            is_shell_stale()
+        } else {
+            false
         };
+        self.status = resolve_detected_status(
+            detected,
+            is_dead,
+            shell_stale,
+            has_command_override,
+            &pane_content,
+            &self.tool,
+        );
 
         tracing::trace!(target: "session.store", "status '{}': final={:?}", self.title, self.status);
 
@@ -2667,6 +2750,51 @@ fn prepend_exports(exports: &[String], wrapped: String) -> String {
     }
 }
 
+fn resolve_detected_status(
+    detected: Status,
+    is_dead: bool,
+    is_shell_stale: bool,
+    has_command_override: bool,
+    pane_content: &str,
+    tool: &str,
+) -> Status {
+    match detected {
+        Status::Idle if has_command_override => {
+            // Custom commands run agents through wrapper scripts that appear
+            // as shell processes to tmux. Only declare Error when the pane is
+            // actually dead; don't use shell-stale since the shell IS the
+            // expected wrapper process.
+            if is_dead {
+                Status::Error
+            } else {
+                Status::Unknown
+            }
+        }
+        Status::Idle if is_dead => Status::Error,
+        Status::Idle if is_shell_stale => resolve_shell_stale_status(pane_content, tool),
+        other => other,
+    }
+}
+
+fn resolve_shell_stale_status(pane_content: &str, tool: &str) -> Status {
+    if pane_has_agent_content(pane_content, tool) {
+        Status::Idle
+    } else if pane_looks_like_bare_shell_prompt(pane_content) {
+        Status::Error
+    } else {
+        Status::Unknown
+    }
+}
+
+fn pane_looks_like_bare_shell_prompt(raw_content: &str) -> bool {
+    let clean = crate::tmux::utils::strip_ansi(raw_content);
+    let Some(last) = clean.lines().rev().find(|l| !l.trim().is_empty()) else {
+        return false;
+    };
+    let last = last.trim();
+    last.ends_with('$') || last.ends_with('#') || last.ends_with('%') || last.ends_with('\u{276f}')
+}
+
 /// Check whether captured pane content indicates a living agent rather than
 /// a bare shell prompt. Used to prevent `is_shell_stale()` from producing
 /// false `Error` status when the agent binary is a shell wrapper or spawns
@@ -2679,15 +2807,10 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
         return false;
     }
 
-    // If the last visible line looks like a shell prompt, the agent
-    // likely exited and the shell took over. This catches servers with
-    // verbose MOTD that would otherwise exceed the line-count threshold.
-    let last = non_empty.last().unwrap().trim();
-    if last.ends_with('$')
-        || last.ends_with('#')
-        || last.ends_with('%')
-        || last.ends_with('\u{276f}')
-    {
+    // If the last visible line looks like a shell prompt, the agent likely
+    // exited and the shell took over. This catches servers with verbose MOTD
+    // that would otherwise exceed the line-count threshold.
+    if pane_looks_like_bare_shell_prompt(raw_content) {
         return false;
     }
 
@@ -2700,11 +2823,17 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
 
     // Use word-boundary matching so short names like "pi" don't produce
     // false positives inside words like "api" or "pipeline".
-    let tool_lower = tool.to_lowercase();
+    let mut tool_names = vec![tool.to_lowercase()];
+    if let Some(agent) = crate::agents::get_agent(tool) {
+        let binary = agent.binary.to_lowercase();
+        if !tool_names.contains(&binary) {
+            tool_names.push(binary);
+        }
+    }
     let lower = clean.to_lowercase();
     if lower
         .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-        .any(|word| word == tool_lower)
+        .any(|word| tool_names.iter().any(|name| word == name))
     {
         return true;
     }
@@ -2901,6 +3030,312 @@ mod tests {
         // Favorite is orthogonal to sink states; user interaction must not
         // clear it.
         assert!(inst.is_favorited());
+    }
+
+    #[test]
+    fn test_merge_post_start_preserves_peer_field_writes() {
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.archive();
+        stored.agent_session_id = Some("daemon-sid".to_string());
+
+        let mut working = Instance::new("session", "/tmp/test");
+        working.id = stored.id.clone();
+        working.status = Status::Starting;
+
+        stored.merge_post_start(&working);
+
+        assert_eq!(stored.status, Status::Starting);
+        assert!(stored.is_archived(), "peer archive must survive merge");
+        assert_eq!(
+            stored.agent_session_id.as_deref(),
+            Some("daemon-sid"),
+            "peer-written sid must survive merge"
+        );
+    }
+
+    #[test]
+    fn test_merge_post_restart_no_fallback_preserves_sid() {
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.agent_session_id = Some("peer-fresh-sid".to_string());
+        stored.snooze(15);
+
+        let mut working = Instance::new("session", "/tmp/test");
+        working.id = stored.id.clone();
+        working.status = Status::Idle;
+        working.agent_session_id = Some("phase1-stale-sid".to_string());
+
+        stored.merge_post_restart(&working, None);
+
+        assert_eq!(stored.status, Status::Idle);
+        assert_eq!(
+            stored.agent_session_id.as_deref(),
+            Some("peer-fresh-sid"),
+            "no-fallback restart must not clobber peer sid write"
+        );
+        assert!(stored.is_snoozed(), "peer snooze must survive merge");
+    }
+
+    #[test]
+    fn test_merge_post_restart_fallback_clears_matching_sid() {
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.agent_session_id = Some("phase1-stale-sid".to_string());
+
+        let mut working = Instance::new("session", "/tmp/test");
+        working.id = stored.id.clone();
+        working.status = Status::Starting;
+        working.agent_session_id = None;
+
+        stored.merge_post_restart(&working, Some("phase1-stale-sid"));
+
+        assert!(
+            stored.agent_session_id.is_none(),
+            "stored sid still equals stale; cascade invalidation propagates"
+        );
+    }
+
+    #[test]
+    fn test_merge_post_restart_preserves_poller_sid_landed_during_phase_2() {
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.agent_session_id = Some("poller-fresh-sid".to_string());
+
+        let mut working = Instance::new("session", "/tmp/test");
+        working.id = stored.id.clone();
+        working.status = Status::Starting;
+        working.agent_session_id = None;
+
+        stored.merge_post_restart(&working, Some("phase1-stale-sid"));
+
+        assert_eq!(
+            stored.agent_session_id.as_deref(),
+            Some("poller-fresh-sid"),
+            "poller wrote a fresh sid between phase 2 and phase 3; CAS preserves it"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_peer_archive_loses_to_tui_favorite() {
+        let pre = Instance::new("s", "/tmp/x");
+        let mut post = pre.clone();
+        post.favorite();
+
+        let mut disk = pre.clone();
+        disk.archive();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(disk.favorited_at.is_some(), "TUI favorite landed");
+        assert!(
+            disk.archived_at.is_none(),
+            "favorite() invariant must clear concurrent peer archive"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_peer_favorite_loses_to_tui_archive() {
+        let pre = Instance::new("s", "/tmp/x");
+        let mut post = pre.clone();
+        post.archive();
+
+        let mut disk = pre.clone();
+        disk.favorite();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(disk.archived_at.is_some(), "TUI archive landed");
+        assert!(
+            disk.favorited_at.is_none(),
+            "archive() invariant must clear concurrent peer favorite"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_peer_archive_loses_to_tui_touch() {
+        let pre = Instance::new("s", "/tmp/x");
+        let mut post = pre.clone();
+        post.touch_last_accessed();
+
+        let mut disk = pre.clone();
+        disk.archive();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(
+            disk.archived_at.is_none(),
+            "touch_last_accessed() invariant must clear concurrent peer archive"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_peer_touch_clears_tui_archive() {
+        let mut pre = Instance::new("s", "/tmp/x");
+        pre.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60));
+
+        let mut post = pre.clone();
+        post.archive();
+
+        let mut disk = pre.clone();
+        disk.touch_last_accessed();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(
+            disk.archived_at.is_none(),
+            "peer touch (newer last_accessed_at) must dethrone TUI archive per messaging-unarchives rule"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_archive_and_snooze_coexist() {
+        let pre = Instance::new("s", "/tmp/x");
+        let mut post = pre.clone();
+        post.snooze(15);
+
+        let mut disk = pre.clone();
+        disk.archive();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(disk.archived_at.is_some(), "peer archive survives");
+        assert!(disk.snoozed_until.is_some(), "TUI snooze landed");
+    }
+
+    #[test]
+    fn test_merge_diff_tui_unfavorite_does_not_resurrect_peer_archive() {
+        let mut pre = Instance::new("s", "/tmp/x");
+        pre.favorite();
+
+        let mut post = pre.clone();
+        post.unfavorite();
+
+        let mut disk = pre.clone();
+        disk.archive();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(disk.favorited_at.is_none(), "TUI unfavorite landed");
+        assert!(
+            disk.archived_at.is_some(),
+            "post.favorited_at == None; favorite-invariant rule must NOT fire"
+        );
+    }
+
+    #[test]
+    fn test_merge_diff_uses_self_not_post_for_touch_detection() {
+        let mut pre = Instance::new("s", "/tmp/x");
+        pre.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        pre.archived_at = Some(Utc::now() - chrono::Duration::seconds(120));
+
+        let mut post = pre.clone();
+        post.title = "renamed".into();
+
+        let mut disk = pre.clone();
+        disk.touch_last_accessed();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert_eq!(disk.title, "renamed");
+        assert!(disk.archived_at.is_none());
+    }
+
+    #[test]
+    fn test_merge_from_tui_copies_status_pipeline() {
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.status = Status::Idle;
+
+        let mut src = Instance::new("session", "/tmp/test");
+        src.id = stored.id.clone();
+        src.status = Status::Running;
+        src.idle_entered_at = Some(Utc::now());
+
+        stored.merge_from_tui(&src);
+
+        assert_eq!(stored.status, Status::Running);
+        assert_eq!(stored.idle_entered_at, src.idle_entered_at);
+    }
+
+    #[test]
+    fn test_merge_from_tui_takes_max_last_accessed() {
+        let earlier = Utc::now() - chrono::Duration::minutes(5);
+        let later = Utc::now();
+
+        let mut stored = Instance::new("a", "/tmp/a");
+        stored.last_accessed_at = Some(later);
+        let mut src = Instance::new("a", "/tmp/a");
+        src.id = stored.id.clone();
+        src.last_accessed_at = Some(earlier);
+        stored.merge_from_tui(&src);
+        assert_eq!(
+            stored.last_accessed_at,
+            Some(later),
+            "peer's freshest activity timestamp must survive a stale TUI src"
+        );
+
+        let mut stored = Instance::new("b", "/tmp/b");
+        stored.last_accessed_at = Some(earlier);
+        let mut src = Instance::new("b", "/tmp/b");
+        src.id = stored.id.clone();
+        src.last_accessed_at = Some(later);
+        stored.merge_from_tui(&src);
+        assert_eq!(stored.last_accessed_at, Some(later));
+    }
+
+    #[test]
+    fn test_merge_from_tui_does_not_touch_user_action_fields() {
+        let peer_archived = Some(Utc::now());
+        let peer_favorited = Some(Utc::now() - chrono::Duration::minutes(2));
+        let peer_snoozed = Some(Utc::now() + chrono::Duration::minutes(30));
+
+        let mut stored = Instance::new("session", "/tmp/test");
+        stored.archived_at = peer_archived;
+        stored.favorited_at = peer_favorited;
+        stored.snoozed_until = peer_snoozed;
+        stored.title = "peer-renamed".to_string();
+        stored.group_path = "peer/group".to_string();
+        stored.agent_session_id = Some("daemon-sid".to_string());
+        stored.notify_on_waiting = Some(true);
+        stored.base_branch_override = Some("upstream/main".to_string());
+
+        let mut src = Instance::new("session", "/tmp/test");
+        src.id = stored.id.clone();
+        src.archived_at = None;
+        src.favorited_at = None;
+        src.snoozed_until = None;
+        src.title = "tui-stale".to_string();
+        src.group_path = "tui/stale".to_string();
+        src.agent_session_id = Some("tui-stale-sid".to_string());
+        src.notify_on_waiting = Some(false);
+        src.base_branch_override = None;
+
+        stored.merge_from_tui(&src);
+
+        assert_eq!(stored.archived_at, peer_archived);
+        assert_eq!(stored.favorited_at, peer_favorited);
+        assert_eq!(stored.snoozed_until, peer_snoozed);
+        assert_eq!(stored.title, "peer-renamed");
+        assert_eq!(stored.group_path, "peer/group");
+        assert_eq!(stored.agent_session_id.as_deref(), Some("daemon-sid"));
+        assert_eq!(stored.notify_on_waiting, Some(true));
+        assert_eq!(
+            stored.base_branch_override.as_deref(),
+            Some("upstream/main")
+        );
+    }
+
+    #[test]
+    fn test_merge_from_tui_preserves_immutable_identity() {
+        let mut stored = Instance::new("session", "/tmp/test");
+        let immutable_id = stored.id.clone();
+        let immutable_path = stored.project_path.clone();
+        let immutable_created = stored.created_at;
+
+        let mut src = Instance::new("renamed", "/tmp/different");
+        src.id = "different-id".to_string();
+
+        stored.merge_from_tui(&src);
+
+        assert_eq!(stored.id, immutable_id);
+        assert_eq!(stored.project_path, immutable_path);
+        assert_eq!(stored.created_at, immutable_created);
     }
 
     #[test]
@@ -3895,6 +4330,69 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_detected_status_shell_stale_agent_content_stays_idle() {
+        let content = "ctrl+p commands \u{2022} OpenCode 1.3.13+650d0db";
+        assert_eq!(
+            resolve_detected_status(Status::Idle, false, true, false, content, "opencode"),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_resolve_detected_status_shell_stale_bare_prompt_is_error() {
+        assert_eq!(
+            resolve_detected_status(
+                Status::Idle,
+                false,
+                true,
+                false,
+                "Welcome\nuser@host:~$ ",
+                "opencode",
+            ),
+            Status::Error
+        );
+    }
+
+    #[test]
+    fn test_resolve_detected_status_shell_stale_unclear_is_unknown() {
+        assert_eq!(
+            resolve_detected_status(
+                Status::Idle,
+                false,
+                true,
+                false,
+                "Restoring previous session...",
+                "opencode",
+            ),
+            Status::Unknown
+        );
+        assert_eq!(
+            resolve_detected_status(Status::Idle, false, true, false, "", "opencode"),
+            Status::Unknown
+        );
+    }
+
+    #[test]
+    fn test_resolve_detected_status_keeps_hard_failures_as_error() {
+        assert_eq!(
+            resolve_detected_status(Status::Idle, true, false, false, "", "opencode"),
+            Status::Error
+        );
+        assert_eq!(
+            resolve_detected_status(Status::Idle, true, true, true, "", "opencode"),
+            Status::Error
+        );
+    }
+
+    #[test]
+    fn test_resolve_detected_status_live_command_override_is_unknown() {
+        assert_eq!(
+            resolve_detected_status(Status::Idle, false, true, true, "$ ", "opencode"),
+            Status::Unknown
+        );
+    }
+
+    #[test]
     fn test_pane_has_agent_content_agent_ui() {
         let opencode_idle = "ctrl+p commands \u{2022} OpenCode 1.3.13+650d0db";
         assert!(pane_has_agent_content(opencode_idle, "opencode"));
@@ -3951,6 +4449,11 @@ mod tests {
 
         // Longer names like "opencode" should still match.
         assert!(pane_has_agent_content("OpenCode v1.0", "opencode"));
+    }
+
+    #[test]
+    fn test_pane_has_agent_content_matches_agent_binary_alias() {
+        assert!(pane_has_agent_content("agy ready", "antigravity"));
     }
 
     mod kill_terminal_if_dead {
@@ -4146,7 +4649,11 @@ mod tests {
             assert!(inst.agent_session_id.is_none());
             let xs = vec![inst];
             storage
-                .commit(&xs, &crate::session::GroupTree::new_with_groups(&xs, &[]))
+                .update(|i, g| {
+                    *i = xs.to_vec();
+                    *g = crate::session::GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                    Ok(())
+                })
                 .unwrap();
 
             clear_session_id_on_disk("test-profile-already-none", &id);
@@ -4171,7 +4678,11 @@ mod tests {
             let id = inst.id.clone();
             let xs = vec![inst];
             storage
-                .commit(&xs, &crate::session::GroupTree::new_with_groups(&xs, &[]))
+                .update(|i, g| {
+                    *i = xs.to_vec();
+                    *g = crate::session::GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                    Ok(())
+                })
                 .unwrap();
 
             clear_session_id_on_disk("clear-test", &id);
@@ -4233,7 +4744,11 @@ mod tests {
 
             let xs = vec![inst.clone()];
             storage
-                .commit(&xs, &crate::session::GroupTree::new_with_groups(&xs, &[]))
+                .update(|i, g| {
+                    *i = xs.to_vec();
+                    *g = crate::session::GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                    Ok(())
+                })
                 .unwrap();
 
             let outcome = inst.start_with_resume_fallback(None, true);

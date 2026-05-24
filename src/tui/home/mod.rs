@@ -57,6 +57,18 @@ fn project_group_name(inst: &Instance) -> String {
         })
 }
 
+/// Kinds of in-progress mouse drags. Today only the list/preview divider
+/// is draggable; the enum keeps future drag targets (diff split, group
+/// reorder) from churning the `Option<...>` shape on `HomeView`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DragKind {
+    /// Resizing the side-by-side list/preview divider. `start_col` is the
+    /// column where the user pressed; `start_width` is the requested
+    /// `list_width` at that moment. The new requested width is
+    /// `start_width + (current_col - start_col)`, clamped on apply.
+    ListDivider { start_col: u16, start_width: u16 },
+}
+
 pub(super) struct GroupRenameContext {
     pub(super) old_path: String,
     pub(super) old_profile: String,
@@ -152,6 +164,19 @@ pub struct HomeView {
     pub(super) active_profile: Option<String>,
     instances: Vec<Instance>,
     instance_map: HashMap<String, Instance>,
+    /// Per-profile tombstones for ids removed since last `save`. Drained
+    /// on Ok return so the next save retries on transient failure.
+    pending_deletions: HashMap<String, HashSet<String>>,
+    /// Per-profile tombstones for group paths removed since last `save`.
+    /// Mirrors `pending_deletions` for groups so concurrent peer-added
+    /// groups (e.g. `aoe add --group X`) survive the next save.
+    pending_group_deletions: HashMap<String, HashSet<String>>,
+    /// Per-profile ids added via `add_instance` since last save. In
+    /// `save()`, only ids present here are pushed when the disk row is
+    /// missing; TUI rows absent from disk AND absent from this set are
+    /// treated as peer-deleted (CLI/`aoe serve`) and dropped from the
+    /// in-memory mirror. Drained on Ok save.
+    pending_added: HashMap<String, HashSet<String>>,
     pub(super) group_trees: HashMap<String, GroupTree>,
     pub(super) flat_items: Vec<Item>,
 
@@ -304,6 +329,21 @@ pub struct HomeView {
     // Resizable list column width (percentage-like units)
     pub(super) list_width: u16,
 
+    /// Visible column of the list/preview divider in side-by-side mode,
+    /// `None` in stacked layout or while the diff view is open. Set in
+    /// `render()` after the layout split; read by mouse handlers to
+    /// hit-test divider clicks and clamp drag updates.
+    pub(super) divider_col: Option<u16>,
+    /// Width of the main horizontal area (list + preview) captured at the
+    /// last render. Used as the clamp ceiling when a divider drag updates
+    /// `list_width`, so the new width can't push the preview below
+    /// `PREVIEW_MIN_WIDTH`.
+    pub(super) main_area_width: u16,
+    /// Active mouse-drag state, `None` when no button is held. Set on
+    /// `Down(Left)` over a draggable target (the list/preview divider
+    /// today), updated on each `Drag(Left)`, cleared on `Up(Left)`.
+    pub(super) drag_state: Option<DragKind>,
+
     /// Show the info header (profile/tool/path/status/sandbox/worktree) at
     /// the top of the preview pane. Toggled with `i` and persisted to
     /// `app_state.show_preview_info`.
@@ -432,6 +472,9 @@ impl HomeView {
             active_profile,
             instances: all_instances,
             instance_map,
+            pending_deletions: HashMap::new(),
+            pending_group_deletions: HashMap::new(),
+            pending_added: HashMap::new(),
             group_trees,
             flat_items: Vec::new(),
             cursor: 0,
@@ -512,6 +555,9 @@ impl HomeView {
                 .as_ref()
                 .and_then(|c| c.app_state.home_list_width)
                 .unwrap_or(35),
+            divider_col: None,
+            main_area_width: 0,
+            drag_state: None,
             show_preview_info: user_config
                 .as_ref()
                 .and_then(|c| c.app_state.show_preview_info)
@@ -667,13 +713,8 @@ impl HomeView {
                     // freshness state when the user toggles a setting
                     // that triggers a reload mid-window.
                     inst.idle_entered_at = prev.idle_entered_at;
-                    // Use in-memory session_id if present; fallback to disk.
-                    // In-memory state takes priority over disk: the poller
-                    // may have updated the ID since last save.
-                    inst.agent_session_id = prev
-                        .agent_session_id
-                        .clone()
-                        .or(inst.agent_session_id.take());
+                    // agent_session_id is disk-authoritative; writers persist
+                    // synchronously through Storage::update before reload runs.
                     // Carry the resume-fallback exclusion set across
                     // reloads. Without this, a stale sid that the cascade
                     // just cleared would be re-imported on the next 5s reload
@@ -988,27 +1029,50 @@ impl HomeView {
         }
 
         if !updates.is_empty() {
-            let prev: Vec<(String, Option<String>)> = updates
-                .iter()
-                .filter_map(|(id, _)| {
-                    self.get_instance(id)
-                        .map(|inst| (id.clone(), inst.agent_session_id.clone()))
-                })
-                .collect();
-
             for (id, session_id) in &updates {
                 self.mutate_instance(id, |inst| {
                     inst.agent_session_id = Some(session_id.clone());
                 });
             }
-            if let Err(e) = self.save() {
-                tracing::error!(target: "tui.home", "Failed to save after session ID update: {}", e);
-                for (id, old_val) in &prev {
-                    self.mutate_instance(id, |inst| {
-                        inst.agent_session_id = old_val.clone();
-                    });
+            // Group by profile so each affected sessions.json is rewritten
+            // once, regardless of how many sids the poller delivered this tick.
+            let mut by_profile: HashMap<String, Vec<(String, String)>> = HashMap::new();
+            for (id, session_id) in &updates {
+                if let Some(profile) = self.instance_map.get(id).map(|i| i.source_profile.clone()) {
+                    by_profile
+                        .entry(profile)
+                        .or_default()
+                        .push((id.clone(), session_id.clone()));
                 }
-                return false;
+            }
+            for (profile, items) in by_profile {
+                if let Some(storage) = self.storages.get(&profile) {
+                    if let Err(e) = storage.update(|insts, _g| {
+                        for (id, session_id) in &items {
+                            if let Some(inst) = insts.iter_mut().find(|i| i.id == *id) {
+                                inst.agent_session_id = Some(session_id.clone());
+                            }
+                        }
+                        Ok(())
+                    }) {
+                        tracing::error!(
+                            target: "session.store",
+                            "Bulk sid persist failed for profile {}: {}",
+                            profile,
+                            e
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        target: "tui.home",
+                        profile = %profile,
+                        count = items.len(),
+                        "apply_session_id_updates: no storage registered for profile; falling back to per-id persist (N flock cycles)"
+                    );
+                    for (id, session_id) in &items {
+                        crate::session::persist_session_to_storage(&profile, id, session_id);
+                    }
+                }
             }
         }
         !updates.is_empty()
@@ -2083,23 +2147,106 @@ impl HomeView {
         stale_sid
     }
 
-    pub fn save(&self) -> anyhow::Result<()> {
+    pub fn save(&mut self) -> anyhow::Result<()> {
+        let mut all_peer_deleted: Vec<String> = Vec::new();
+
         for (profile_name, storage) in &self.storages {
-            let profile_instances: Vec<Instance> = self
+            let tui_rows: Vec<Instance> = self
                 .instances
                 .iter()
                 .filter(|i| i.source_profile == *profile_name)
                 .cloned()
                 .collect();
-            // Each profile has its own GroupTree with correct collapsed state
-            let tree = self
-                .group_trees
+            let dels: HashSet<String> = self
+                .pending_deletions
                 .get(profile_name)
                 .cloned()
-                .unwrap_or_else(|| GroupTree::new_with_groups(&profile_instances, &[]));
-            storage.commit(&profile_instances, &tree)?;
+                .unwrap_or_default();
+            let added: HashSet<String> = self
+                .pending_added
+                .get(profile_name)
+                .cloned()
+                .unwrap_or_default();
+            let group_dels: HashSet<String> = self
+                .pending_group_deletions
+                .get(profile_name)
+                .cloned()
+                .unwrap_or_default();
+            let groups_target = self
+                .group_trees
+                .get(profile_name)
+                .map(|t| t.get_all_groups())
+                .unwrap_or_default();
+
+            let peer_deleted: Vec<String> = storage.update(|disk_instances, disk_groups| {
+                disk_instances.retain(|d| !dels.contains(&d.id));
+                let mut peer_deleted: Vec<String> = Vec::new();
+                for tui_inst in &tui_rows {
+                    if let Some(disk_inst) = disk_instances.iter_mut().find(|d| d.id == tui_inst.id)
+                    {
+                        disk_inst.merge_from_tui(tui_inst);
+                    } else if added.contains(&tui_inst.id) {
+                        disk_instances.push(tui_inst.clone());
+                    } else {
+                        // Disk had no row with this id and we did not add it
+                        // this session: a peer (CLI / aoe serve) removed it.
+                        peer_deleted.push(tui_inst.id.clone());
+                    }
+                }
+                disk_groups.retain(|g| !group_dels.contains(&g.path));
+                for tui_g in &groups_target {
+                    if let Some(disk_g) = disk_groups.iter_mut().find(|g| g.path == tui_g.path) {
+                        disk_g.name = tui_g.name.clone();
+                        disk_g.collapsed = tui_g.collapsed;
+                        disk_g.archived_at = tui_g.archived_at;
+                    } else {
+                        disk_groups.push(tui_g.clone());
+                    }
+                }
+                Ok(peer_deleted)
+            })?;
+
+            self.pending_deletions.remove(profile_name);
+            self.pending_group_deletions.remove(profile_name);
+            self.pending_added.remove(profile_name);
+            all_peer_deleted.extend(peer_deleted);
+        }
+
+        if !all_peer_deleted.is_empty() {
+            self.drop_peer_deleted_rows(&all_peer_deleted);
+            tracing::info!(
+                target: "tui.home",
+                count = all_peer_deleted.len(),
+                "Dropped peer-deleted rows from TUI mirror"
+            );
         }
         Ok(())
+    }
+
+    /// Drop in-memory mirror rows that no longer exist on disk (peer-deleted
+    /// via CLI / aoe serve). Rebuilds derived UI state so callers don't
+    /// render or target removed rows.
+    fn drop_peer_deleted_rows(&mut self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        let drop: HashSet<&String> = ids.iter().collect();
+        self.instances.retain(|i| !drop.contains(&i.id));
+        for id in ids {
+            self.instance_map.remove(id);
+        }
+        if self
+            .selected_session
+            .as_ref()
+            .is_some_and(|s| drop.contains(s))
+        {
+            self.selected_session = None;
+        }
+        self.rebuild_group_trees();
+        self.flat_items = self.build_flat_items();
+        if self.cursor >= self.flat_items.len() {
+            self.cursor = self.flat_items.len().saturating_sub(1);
+        }
     }
 
     /// Rebuild all per-profile GroupTrees from the current instances,
@@ -2163,18 +2310,62 @@ impl HomeView {
     }
 
     /// Centralized instance addition: adds to both the `instances` vec
-    /// and `instance_map` to keep both collections in sync.
+    /// and `instance_map` to keep both collections in sync. Records the
+    /// id in `pending_added` so the next `save` distinguishes TUI-new
+    /// rows from peer-deleted ones (which look identical at the disk
+    /// layer: missing from sessions.json).
     pub(super) fn add_instance(&mut self, instance: Instance) {
+        self.pending_added
+            .entry(instance.source_profile.clone())
+            .or_default()
+            .insert(instance.id.clone());
         self.instance_map
             .insert(instance.id.clone(), instance.clone());
         self.instances.push(instance);
     }
 
     /// Centralized instance removal: removes from both the `instances` vec
-    /// and `instance_map` to keep both collections in sync.
+    /// and `instance_map`, records the id in `pending_deletions` so the
+    /// next `save` propagates the removal under the flock, and clears any
+    /// `pending_added` entry so an add+remove in the same save cycle does
+    /// not end up persisted.
     pub(super) fn remove_instance(&mut self, id: &str) {
+        if let Some(inst) = self.instance_map.get(id) {
+            let profile = inst.source_profile.clone();
+            self.pending_deletions
+                .entry(profile.clone())
+                .or_default()
+                .insert(id.to_string());
+            if let Some(set) = self.pending_added.get_mut(&profile) {
+                set.remove(id);
+            }
+        }
         self.instances.retain(|i| i.id != id);
         self.instance_map.remove(id);
+    }
+
+    /// Tombstones `path` and every descendant from the per-profile tree so
+    /// `save()` drops them under the flock instead of wholesale-replacing.
+    pub(super) fn delete_group_in_profile(&mut self, profile: &str, path: &str) {
+        let prefix = format!("{}/", path);
+        let descendants: Vec<String> = self
+            .group_trees
+            .get(profile)
+            .map(|tree| {
+                tree.get_all_groups()
+                    .into_iter()
+                    .filter(|g| g.path == path || g.path.starts_with(&prefix))
+                    .map(|g| g.path)
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![path.to_string()]);
+        if let Some(tree) = self.group_trees.get_mut(profile) {
+            tree.delete_group(path);
+        }
+        self.pending_group_deletions
+            .entry(profile.to_string())
+            .or_default()
+            .extend(descendants);
     }
 
     /// Centralized instance mutation: applies `f` once to the `instances` vec
@@ -2185,6 +2376,178 @@ impl HomeView {
             f(inst);
             self.instance_map.insert(id.to_string(), inst.clone());
         }
+    }
+
+    /// Cross-profile move: structurally distinct from `mutate_instance`
+    /// because the row must be tombstoned in the old profile's disk file
+    /// AND marked as TUI-new for the target profile. Without this, save()'s
+    /// per-profile loop misclassifies the row as peer-deleted in the new
+    /// profile and leaves the old profile's disk row, which next reload
+    /// resurrects under the original profile.
+    pub(super) fn move_to_profile(
+        &mut self,
+        id: &str,
+        target: &str,
+        new_group_path: String,
+    ) -> anyhow::Result<()> {
+        let Some(old_profile) = self.instance_map.get(id).map(|i| i.source_profile.clone()) else {
+            return Ok(());
+        };
+        if old_profile == target {
+            self.mutate_instance(id, |inst| inst.group_path = new_group_path);
+            return Ok(());
+        }
+
+        if !self.storages.contains_key(target) {
+            self.storages
+                .insert(target.to_string(), Storage::new(target)?);
+        }
+
+        self.pending_deletions
+            .entry(old_profile.clone())
+            .or_default()
+            .insert(id.to_string());
+        if let Some(set) = self.pending_added.get_mut(&old_profile) {
+            set.remove(id);
+        }
+        self.pending_added
+            .entry(target.to_string())
+            .or_default()
+            .insert(id.to_string());
+
+        if let Some(inst) = self.instances.iter_mut().find(|i| i.id == id) {
+            inst.group_path = new_group_path;
+            inst.source_profile = target.to_string();
+            self.instance_map.insert(id.to_string(), inst.clone());
+        }
+        Ok(())
+    }
+
+    /// Atomic per-action mutate: in-memory once, disk via
+    /// `Instance::merge_user_action_diff` under the flock. On disk persist
+    /// failure, in-memory is rolled back to `pre` so memory and disk stay
+    /// consistent.
+    pub(super) fn apply_user_action<F>(&mut self, id: &str, mutate: F) -> anyhow::Result<()>
+    where
+        F: FnOnce(&mut Instance),
+    {
+        let Some(profile) = self.instance_map.get(id).map(|i| i.source_profile.clone()) else {
+            return Ok(());
+        };
+        let Some(in_mem) = self.instances.iter_mut().find(|i| i.id == id) else {
+            return Ok(());
+        };
+        let pre = in_mem.clone();
+        mutate(in_mem);
+        let post = in_mem.clone();
+        self.instance_map.insert(id.to_string(), post.clone());
+
+        let id_owned = id.to_string();
+        let res = if let Some(storage) = self.storages.get(&profile) {
+            storage.update(|insts, _groups| {
+                if let Some(disk) = insts.iter_mut().find(|i| i.id == id_owned) {
+                    disk.merge_user_action_diff(&pre, &post);
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            })
+        } else {
+            tracing::warn!(
+                target: "tui.home",
+                profile = %profile,
+                id = %id_owned,
+                "apply_user_action: no storage registered for profile; in-memory mutation will not persist"
+            );
+            Ok(true)
+        };
+        match res {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                let added = self
+                    .pending_added
+                    .get(&profile)
+                    .is_some_and(|s| s.contains(id));
+                if !added {
+                    self.drop_peer_deleted_rows(&[id.to_string()]);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if let Some(slot) = self.instances.iter_mut().find(|i| i.id == id) {
+                    *slot = pre.clone();
+                }
+                self.instance_map.insert(id.to_string(), pre);
+                Err(e)
+            }
+        }
+    }
+
+    /// Bulk `apply_user_action`: one `Storage::update` per affected
+    /// profile (single flock cycle), grouping ids by `source_profile`.
+    pub(super) fn bulk_apply_user_action<F>(
+        &mut self,
+        ids: &[String],
+        mutate: F,
+    ) -> anyhow::Result<()>
+    where
+        F: Fn(&mut Instance),
+    {
+        let mut by_profile: HashMap<String, Vec<(String, Instance, Instance)>> = HashMap::new();
+        for id in ids {
+            let Some(inst) = self.instances.iter_mut().find(|i| i.id == *id) else {
+                continue;
+            };
+            let pre = inst.clone();
+            mutate(inst);
+            let post = inst.clone();
+            self.instance_map.insert(id.clone(), post.clone());
+            by_profile
+                .entry(post.source_profile.clone())
+                .or_default()
+                .push((id.clone(), pre, post));
+        }
+        let mut peer_deleted: Vec<String> = Vec::new();
+        for (profile, items) in &by_profile {
+            let Some(storage) = self.storages.get(profile) else {
+                tracing::warn!(
+                    target: "tui.home",
+                    profile = %profile,
+                    count = items.len(),
+                    "bulk_apply_user_action: no storage registered for profile; in-memory mutations will not persist"
+                );
+                continue;
+            };
+            let added: HashSet<String> =
+                self.pending_added.get(profile).cloned().unwrap_or_default();
+            let res = storage.update(|insts, _groups| {
+                let mut missing: Vec<String> = Vec::new();
+                for (id, pre, post) in items {
+                    if let Some(disk) = insts.iter_mut().find(|i| i.id == *id) {
+                        disk.merge_user_action_diff(pre, post);
+                    } else if !added.contains(id) {
+                        missing.push(id.clone());
+                    }
+                }
+                Ok(missing)
+            });
+            match res {
+                Ok(missing) => peer_deleted.extend(missing),
+                Err(e) => {
+                    for (id, pre, _post) in items {
+                        if let Some(slot) = self.instances.iter_mut().find(|i| i.id == *id) {
+                            *slot = pre.clone();
+                        }
+                        self.instance_map.insert(id.clone(), pre.clone());
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        if !peer_deleted.is_empty() {
+            self.drop_peer_deleted_rows(&peer_deleted);
+        }
+        Ok(())
     }
 
     /// Like `mutate_instance`, but for fallible operations. Clones the entry,

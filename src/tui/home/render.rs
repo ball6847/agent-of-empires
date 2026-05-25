@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use rattles::presets::prelude as spinners;
 
 use super::{
-    get_indent, HomeView, TerminalMode, ViewMode, ICON_COLLAPSED, ICON_DELETING, ICON_ERROR,
-    ICON_EXPANDED, ICON_IDLE, ICON_STOPPED, ICON_UNKNOWN,
+    get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_COLLAPSED, ICON_DELETING,
+    ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_STOPPED, ICON_UNKNOWN,
 };
 use crate::session::config::{GroupByMode, SortOrder};
 use crate::session::{Item, Status};
@@ -60,6 +60,35 @@ fn compose_list_title(
 /// reserve to decide when the captured window can no longer cover the
 /// requested scroll.
 const CAPTURE_BUFFER: u16 = 20;
+
+/// Trim `text` to fit within `max_width` display cells, appending '…'
+/// if anything was dropped. Used by the live-send banners so a long
+/// session title never pushes the exit-chord hint off-screen on a
+/// narrow terminal. Returns "" when max_width is 0 (the title gets
+/// sacrificed entirely so the fixed chord text wins).
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    // Reserve one cell for the ellipsis.
+    let budget = max_width.saturating_sub(1);
+    let mut out = String::new();
+    let mut w = 0;
+    for c in text.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > budget {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('\u{2026}');
+    out
+}
 
 /// Number of pane lines to capture for the preview, accounting for the user's
 /// scrollback offset. A small buffer is added so moderate scrolls don't force a
@@ -1137,7 +1166,40 @@ impl HomeView {
 
     /// Refresh preview cache if needed (session changed, dimensions changed, or timer expired)
     fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
-        const PREVIEW_REFRESH_MS: u128 = 250; // Refresh preview 4x/second max
+        // 250ms (4 Hz) is the steady-state cadence, enough to surface
+        // status changes without forking tmux on every loop tick. While
+        // the user is in live-send mode they're watching the preview
+        // for feedback on each keystroke, so drop to 16ms (~60 Hz,
+        // matching the app loop's redraw ceiling) so typed input
+        // appears in the preview as close to instantly as the
+        // fork-per-capture model allows. Cost: ~60 `tmux capture-pane`
+        // forks/sec while live, typically <5% of one core on a modern
+        // laptop. See #1485 for the longer-term fix (one long-lived
+        // tmux control-mode socket instead of per-refresh forks).
+        const PREVIEW_REFRESH_MS_IDLE: u128 = 250;
+        const PREVIEW_REFRESH_MS_LIVE: u128 = 16;
+        let in_live = self.live_send.is_some();
+        let refresh_ms = if in_live {
+            PREVIEW_REFRESH_MS_LIVE
+        } else {
+            PREVIEW_REFRESH_MS_IDLE
+        };
+
+        // While in live-send mode, keep the tmux pane geometry in sync
+        // with the preview's actual cell dimensions so the agent
+        // renders directly into the visible area (no wrap, no cropped
+        // UI). Deduped against live_send_last_resize so we only fire
+        // when the user first enters live mode or the preview pane is
+        // resized (terminal resize, divider drag, layout flip).
+        if in_live && width > 0 && height > 0 {
+            let next = (width, height);
+            if self.live_send_last_resize != Some(next) {
+                if let Some(worker) = &self.live_send_worker {
+                    worker.resize(width, height);
+                }
+                self.live_send_last_resize = Some(next);
+            }
+        }
 
         let scroll_offset = self.preview_scroll_offset;
         let session_changed = match &self.selected_session {
@@ -1145,8 +1207,7 @@ impl HomeView {
             None => false,
         };
         let dims_changed = self.preview_cache.dimensions != (width, height);
-        let timer_expired =
-            self.preview_cache.last_refresh.elapsed().as_millis() > PREVIEW_REFRESH_MS;
+        let timer_expired = self.preview_cache.last_refresh.elapsed().as_millis() > refresh_ms;
         // Only re-capture for scroll when the cached window can no longer
         // cover the requested offset. Wheel ticks inside the BUFFER headroom
         // re-render from the existing content without forking tmux.
@@ -1320,6 +1381,20 @@ impl HomeView {
             ViewMode::Terminal | ViewMode::Tool(_) => {
                 (theme.terminal_border, theme.terminal_border)
             }
+        };
+        // Live-send mode swaps the preview border and title to `accent`
+        // so the pane visually matches the M-compose modal's border
+        // color. Without this affordance the only on-screen tell that
+        // keystrokes are being routed to the agent is the status
+        // banner; users have reported losing track when the banner
+        // scrolls off in compact layouts. Title is overridden too so
+        // the border and title color stay consistent when live mode is
+        // entered from Terminal/Tool views (where the underlying
+        // `title_color` is `terminal_border`, not `title`).
+        let (border_color, title_color) = if self.live_send.is_some() {
+            (theme.accent, theme.accent)
+        } else {
+            (border_color, title_color)
         };
 
         let mut block = Block::default()
@@ -1674,6 +1749,82 @@ impl HomeView {
     }
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        // Live-send banner takes over the status bar so the user has an
+        // always-visible reminder that keystrokes are being relayed to
+        // the pane (and how to get out). Distinct color + bold so it
+        // can't be confused with the regular footer. The scroll
+        // indicator (only present when the user has scrolled back from
+        // the live edge) sits between the title and the exit chord
+        // hint so it gets noticed when there's something to notice.
+        if let Some(state) = &self.live_send {
+            let raw_title = if state.title.is_empty() {
+                "session"
+            } else {
+                state.title.as_str()
+            };
+            let chip = " \u{25CF} LIVE \u{2192} ";
+            // The chord display is built from the user's configured
+            // exit-chord list so the hint always shows what actually
+            // exits live mode for this user. Empty list (impossible
+            // under normal config — parse_chord_list falls back to
+            // the default set) renders as "?" so the user notices
+            // something's wrong rather than thinking the mode is
+            // unescapable.
+            let chord = if state.exit_chords.is_empty() {
+                "?".to_string()
+            } else {
+                live_send::display_chord_list(&state.exit_chords)
+            };
+            let suffix = " to exit ";
+            // Match the preview pane's visible_height calculation
+            // (`area.height - 2` for borders, then `- 1` for the
+            // compact branch in render_output_cached) so the indicator
+            // count stays consistent as the user scrolls.
+            let visible_height = (self.preview_cache.dimensions.1 as usize).saturating_sub(3);
+            let scroll = format_scroll_indicator(
+                self.preview_cache.captured_lines,
+                visible_height,
+                self.preview_scroll_offset,
+            )
+            .unwrap_or_default();
+            // Spaces between chip→title and title→chord. Title gets the
+            // budget after the fixed pieces; reserved last so the exit
+            // chord never falls off on narrow terminals.
+            let fixed_width = unicode_width::UnicodeWidthStr::width(chip)
+                + 1 // single space after the chip
+                + 2 // double space before the chord
+                + unicode_width::UnicodeWidthStr::width(chord.as_str())
+                + unicode_width::UnicodeWidthStr::width(suffix)
+                + unicode_width::UnicodeWidthStr::width(scroll.as_str());
+            let title_budget = (area.width as usize).saturating_sub(fixed_width);
+            let title = truncate_to_width(raw_title, title_budget);
+            let mut spans: Vec<Span<'static>> = vec![
+                Span::styled(
+                    chip,
+                    Style::default()
+                        .fg(theme.background)
+                        .bg(theme.running)
+                        .bold(),
+                ),
+                Span::raw(" "),
+                Span::styled(title, Style::default().fg(theme.text).bold()),
+            ];
+            if !scroll.is_empty() {
+                spans.push(Span::styled(
+                    scroll,
+                    Style::default().fg(theme.dimmed).italic(),
+                ));
+            }
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                chord,
+                Style::default().fg(theme.accent).bold(),
+            ));
+            spans.push(Span::styled(suffix, Style::default().fg(theme.dimmed)));
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
+            return;
+        }
+
         let key_style = Style::default().fg(theme.accent).bold();
         let desc_style = Style::default().fg(theme.dimmed);
         let sep_style = Style::default().fg(theme.border);
@@ -1879,6 +2030,33 @@ impl HomeView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_to_width_passthrough_when_fits() {
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+        assert_eq!(truncate_to_width("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_to_width_appends_ellipsis_when_overflow() {
+        // 5-char budget, 7-char input → 4 chars + ellipsis.
+        assert_eq!(truncate_to_width("abcdefg", 5), "abcd\u{2026}");
+    }
+
+    #[test]
+    fn truncate_to_width_zero_returns_empty() {
+        // Zero budget: title is sacrificed entirely so the fixed exit-
+        // chord text has space to render on very narrow terminals.
+        assert_eq!(truncate_to_width("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_to_width_respects_wide_chars() {
+        // East Asian wide char is 2 cells. Budget 3 should fit one wide
+        // char + ellipsis (2 + 1 = 3) — but we reserve 1 for ellipsis
+        // so budget for content is 2, fitting exactly one wide char.
+        assert_eq!(truncate_to_width("你好世界", 3), "你\u{2026}");
+    }
 
     #[test]
     fn compose_list_title_omits_profile_and_suffix_at_defaults() {

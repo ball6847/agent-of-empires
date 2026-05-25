@@ -5,7 +5,7 @@ use ratatui::prelude::Position;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
-use super::{DragKind, HomeView, TerminalMode, ViewMode};
+use super::{live_send, DragKind, HomeView, TerminalMode, ViewMode};
 use crate::session::config::{load_config, save_config, GroupByMode, SortOrder};
 use crate::session::{list_profiles, repo_config, resolve_config_or_warn, Item, Status};
 use crate::tui::app::Action;
@@ -299,6 +299,15 @@ impl HomeView {
         key: KeyEvent,
         update_info: Option<&crate::update::UpdateInfo>,
     ) -> Option<Action> {
+        // Live-send capture wins over every other key handler. While
+        // `live_send` is `Some` the home view is acting as a thin relay
+        // to the target pane; dialog hotkeys, search, and list navigation
+        // all suspend until the user exits with Ctrl+q.
+        if self.live_send.is_some() {
+            self.handle_live_send_key(key);
+            return None;
+        }
+
         // Handle unsaved changes confirmation for settings (shown over settings view)
         if self.settings_close_confirm {
             if let Some(dialog) = &mut self.confirm_dialog {
@@ -1856,6 +1865,18 @@ impl HomeView {
             KeyCode::Char('M') if self.strict_hotkeys => {
                 self.open_send_message_dialog();
             }
+            // Tab enters live-send mode on the selected running session.
+            // Free at the home-view top level (settings/cockpit/dialogs
+            // own their own Tab handlers), and the entry-vs-send
+            // distinction is unambiguous: this branch only fires when
+            // `live_send` is None, because the live-send capture at the
+            // top of `handle_key` short-circuits otherwise. While in
+            // live mode Tab is sent verbatim to the agent.
+            KeyCode::Tab => {
+                if let Some(action) = self.start_live_send() {
+                    return Some(action);
+                }
+            }
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.apply_sort_order(self.sort_order.cycle_reverse());
             }
@@ -2128,6 +2149,7 @@ impl HomeView {
                 self.tool_preview_cache = super::PreviewCache::default();
                 None
             }
+            PaletteAction::EnterLiveSend => self.start_live_send(),
         }
     }
 
@@ -2378,15 +2400,26 @@ impl HomeView {
             diff.scroll_up(STEP);
             return true;
         }
-        if self.has_dialog() {
-            return false;
-        }
-        if self.hit_list(col, row) {
-            self.move_cursor(-1);
-            return true;
-        }
-        if !self.hit_preview(col, row) {
-            return false;
+        // Live-send mode lets the user scroll the preview to read
+        // agent history without exiting, but list scroll is suppressed
+        // (changing the selection mid-live-send would silently aim the
+        // next keystroke at a different pane than the one the user is
+        // looking at). All other modals swallow scroll entirely.
+        if self.live_send.is_some() {
+            if !self.hit_preview(col, row) {
+                return false;
+            }
+        } else {
+            if self.has_dialog() {
+                return false;
+            }
+            if self.hit_list(col, row) {
+                self.move_cursor(-1);
+                return true;
+            }
+            if !self.hit_preview(col, row) {
+                return false;
+            }
         }
         if self.selected_session.is_none() {
             return false;
@@ -2584,15 +2617,22 @@ impl HomeView {
             diff.scroll_down(STEP);
             return true;
         }
-        if self.has_dialog() {
-            return false;
-        }
-        if self.hit_list(col, row) {
-            self.move_cursor(1);
-            return true;
-        }
-        if !self.hit_preview(col, row) {
-            return false;
+        // See handle_scroll_up for the live-send / has_dialog reasoning.
+        if self.live_send.is_some() {
+            if !self.hit_preview(col, row) {
+                return false;
+            }
+        } else {
+            if self.has_dialog() {
+                return false;
+            }
+            if self.hit_list(col, row) {
+                self.move_cursor(1);
+                return true;
+            }
+            if !self.hit_preview(col, row) {
+                return false;
+            }
         }
         if self.selected_session.is_none() {
             return false;
@@ -2606,12 +2646,26 @@ impl HomeView {
 
     /// Route a bracketed paste event to the active text input dialog.
     ///
-    /// Active text-input dialogs (rename / send_message / new) win first so
-    /// multi-line voice/dictation lands in the dialog the user is actively
-    /// typing into. The settings view is checked last; its paste handler
-    /// strips newlines (settings/input.rs handle_paste sanitizes), which
-    /// would destroy multi-line dictation if we checked it first.
+    /// Live-send mode wins above every dialog: a paste while the user is
+    /// "attached" should stream straight to the agent's pane, not buffer
+    /// in a dialog the user isn't even looking at. Text-input dialogs
+    /// (rename / send_message / new) come next so multi-line dictation
+    /// lands in whichever dialog the user is actively typing into. The
+    /// settings view is checked last; its paste handler strips newlines,
+    /// which would destroy multi-line dictation if we checked it first.
     pub fn handle_paste(&mut self, text: &str) {
+        if let Some(state) = self.live_send.clone() {
+            if let Some(worker) = &self.live_send_worker {
+                // One Literal carries the whole pasted chunk so the worker
+                // dispatches it in a single tmux call. Routing through the
+                // worker (rather than calling tmux inline) keeps the paste
+                // ordered correctly against any in-flight keystrokes
+                // queued from the same event loop tick.
+                worker.send(live_send::TmuxKey::Literal(text.to_string()));
+            }
+            self.stamp_last_accessed(&state.session_id);
+            return;
+        }
         if let Some(ref mut dialog) = self.rename_dialog {
             dialog.handle_paste(text);
             return;
@@ -2690,6 +2744,147 @@ impl HomeView {
             profiles,
             tools,
         ));
+    }
+
+    /// Attempt to enter live-send mode against the currently-selected
+    /// session. Unlike `resolve_paste_target`, this does NOT require
+    /// the tmux pane to already exist: `enter_live_send` calls
+    /// `ensure_pane_ready` which revives stopped sessions (Docker
+    /// start, splash wait, resume cascade). Without this relaxation
+    /// Tab would silently no-op on dead-but-recoverable rows and the
+    /// "Reviving..." toast plumbing would never fire.
+    ///
+    /// Still no-ops on group headers, empty lists, and Creating rows
+    /// (no instance yet, nothing to revive).
+    pub(super) fn start_live_send(&mut self) -> Option<Action> {
+        let id = self.selected_session.clone()?;
+        let inst = self.get_instance(&id)?;
+        if matches!(inst.status, Status::Creating | Status::Deleting) {
+            return None;
+        }
+        // Cockpit-mode sessions are not tmux-backed (HomeView's attach
+        // path special-cases them away from tmux). Live-send has no
+        // target in that mode, so silently no-op rather than enqueue
+        // an Action::EnterLiveSend that would fail downstream.
+        if inst.is_cockpit_mode() {
+            return None;
+        }
+        Some(Action::EnterLiveSend(id))
+    }
+
+    /// Translate one key event in live-send mode and hand the result to
+    /// the background worker. The worker owns the tmux Session and runs
+    /// `send-keys` off the UI thread so a slow fork+exec never blocks
+    /// the redraw loop; literal-key runs coalesce into a single tmux
+    /// call so fast typing isn't N forks. Ctrl+q clears `live_send`
+    /// and drops the worker (which closes its channel, exiting the
+    /// thread cleanly on the next iteration).
+    ///
+    /// Before dispatching we re-verify that the target session still
+    /// exists at the same tmux name as it had at entry time. If a peer
+    /// process deleted the session or a rename diverged the name from
+    /// what the worker is targeting, the user would otherwise type
+    /// into the void with only a `tracing::warn!` for company. Auto-
+    /// exit + info dialog instead.
+    fn handle_live_send_key(&mut self, key: KeyEvent) {
+        let Some(state) = self.live_send.clone() else {
+            return;
+        };
+
+        // Shift+PageUp / Shift+PageDown scroll the preview pane
+        // without forwarding to the agent. Matches the terminal-
+        // emulator convention (xterm, gnome-terminal, iTerm, etc.)
+        // where shift+page operates on the outer scrollback, not the
+        // inner program. Bare PageUp/PageDown still goes to the agent
+        // so agents that page their own UI keep working.
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if shift && !ctrl && !alt {
+            const PAGE_STEP: u16 = 10;
+            match key.code {
+                KeyCode::PageUp => {
+                    self.preview_scroll_offset =
+                        self.preview_scroll_offset.saturating_add(PAGE_STEP);
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.preview_scroll_offset =
+                        self.preview_scroll_offset.saturating_sub(PAGE_STEP);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Exit-chord check runs before the drift check: exiting is
+        // always safe, and the user pressing the chord to escape a
+        // drifted/stuck live mode shouldn't hit a "session ended"
+        // dialog on the way out.
+        if live_send::chord_list_matches(&state.exit_chords, key) {
+            self.exit_live_send_and_restore_sizing(&state);
+            return;
+        }
+        if let Some(reason) = self.live_send_drift_reason(&state) {
+            self.exit_live_send_and_restore_sizing(&state);
+            self.info_dialog = Some(InfoDialog::new("Live send ended", reason));
+            return;
+        }
+        match live_send::translate(key) {
+            live_send::LiveDispatch::Ignore => {}
+            live_send::LiveDispatch::Send(tmux_key) => {
+                if let Some(worker) = &self.live_send_worker {
+                    worker.send(tmux_key);
+                }
+                self.stamp_last_accessed(&state.session_id);
+            }
+        }
+    }
+
+    /// Tear down live-send state and restore the tmux window's
+    /// automatic sizing policy. live-send's per-keystroke resize loop
+    /// forces tmux into manual sizing; if we leave it that way, the
+    /// next tmux attach from a full-size terminal stays cramped at
+    /// the preview-pane dimensions live-send left behind. Re-setting
+    /// `window-size latest` is best-effort: failures are swallowed so
+    /// a stuck pane never blocks the user's exit.
+    fn exit_live_send_and_restore_sizing(&mut self, state: &live_send::LiveSendState) {
+        let session = crate::tmux::Session::from_name(&state.tmux_name);
+        session.reset_size_to_latest_client();
+        self.live_send = None;
+        self.live_send_worker = None;
+        self.live_send_last_resize = None;
+    }
+
+    /// Returns `Some(reason)` if the live-send target has drifted out
+    /// from under us between entry and now. Three drift modes:
+    /// - Instance row deleted (peer / web cockpit / another aoe killed
+    ///   it).
+    /// - Title renamed (which regenerates the tmux session name; the
+    ///   worker is now targeting a stale name).
+    /// - tmux session itself is gone (`tmux kill-session`, server
+    ///   restart) even though our instance row says otherwise. We use
+    ///   the existing `session_exists_from_cache` lookup so this costs
+    ///   a hashmap probe per keystroke (the status poller refreshes
+    ///   the cache every 500ms anyway). If the cache has no entry
+    ///   (`None`, e.g. before first refresh) we don't claim drift; the
+    ///   instance + name checks above are still the load-bearing
+    ///   safety net.
+    ///
+    /// The caller uses the message verbatim in the info dialog, so
+    /// phrase it as a user-facing sentence.
+    fn live_send_drift_reason(&self, state: &live_send::LiveSendState) -> Option<&'static str> {
+        let Some(inst) = self.get_instance(&state.session_id) else {
+            return Some("Session was deleted while live mode was active.");
+        };
+        let current_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        if current_name != state.tmux_name {
+            return Some("Session was renamed while live mode was active.");
+        }
+        if crate::tmux::session_exists_from_cache(&state.tmux_name) == Some(false) {
+            return Some("tmux pane went away while live mode was active.");
+        }
+        None
     }
 
     /// Open the send-message dialog for the currently-selected running session.
@@ -2921,7 +3116,7 @@ impl HomeView {
     /// `CreationPoller` when hooks are present, when the session is sandboxed,
     /// or when a worktree branch is requested (to avoid freezing the TUI on
     /// slow git hooks like `post-checkout`).
-    fn create_session_with_hooks(
+    pub(super) fn create_session_with_hooks(
         &mut self,
         data: NewSessionData,
         hooks: Option<crate::session::HooksConfig>,
@@ -2939,7 +3134,7 @@ impl HomeView {
         match self.create_session(data) {
             Ok(session_id) => {
                 self.new_dialog = None;
-                Some(Action::AttachSession(session_id))
+                Some(Action::AttachAfterCreate(session_id))
             }
             Err(e) => {
                 tracing::error!(target: "tui.input", "Failed to create session: {}", e);

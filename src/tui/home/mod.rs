@@ -1,11 +1,16 @@
 //! Home view - main session list and navigation
 
 mod input;
+mod live_send;
 mod operations;
 mod render;
 
 #[cfg(test)]
 mod tests;
+
+// LiveSendState is intentionally NOT re-exported: it's an internal
+// detail of the home module. Tests that need to install it directly
+// go through the `super::live_send::LiveSendState` path.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -230,6 +235,23 @@ pub struct HomeView {
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
     /// Session to receive the message from the send dialog
     pub(super) pending_send_session: Option<String>,
+    /// Live-send mode: when `Some`, every key event in the home view is
+    /// translated to a tmux send-keys call against this session's pane
+    /// until the user presses the exit chord (Ctrl+q). Set by `Tab` (in
+    /// both modes) and by the palette entry; cleared by the exit chord
+    /// inside the live handler.
+    pub(super) live_send: Option<live_send::LiveSendState>,
+    /// Background dispatcher created alongside `live_send`. Owns the
+    /// tmux Session and a worker thread that drains a channel of
+    /// translated keystrokes, coalescing runs of literals into single
+    /// `tmux send-keys` calls so the UI thread never blocks on fork
+    /// latency. Dropping (set to None when live mode exits) closes the
+    /// channel and the worker thread exits cleanly on its own.
+    pub(super) live_send_worker: Option<live_send::LiveSendWorker>,
+    /// Last (cols, rows) we asked the worker to resize the pane to in
+    /// the current live-send session. Used to dedup the resize messages
+    /// fired from the preview refresh path; cleared on live-send exit.
+    pub(super) live_send_last_resize: Option<(u16, u16)>,
     /// Pasted text captured at the home view that we couldn't immediately
     /// route (no session selected, cursor on a group header, etc.). Drained
     /// into the next compose dialog the user opens, so voice/dictation never
@@ -513,6 +535,9 @@ impl HomeView {
             update_confirm_dialog: None,
             send_message_dialog: None,
             pending_send_session: None,
+            live_send: None,
+            live_send_worker: None,
+            live_send_last_resize: None,
             pending_paste: None,
             pending_attach_after_warning: None,
             pending_stop_session: None,
@@ -1595,6 +1620,14 @@ impl HomeView {
                 if let Err(e) = self.reload() {
                     tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
                 }
+                // reload()'s restore-previous-selection fallback lands
+                // the cursor on whichever flat_items index is closest
+                // to the now-removed stub, which in project-grouped
+                // layouts is often the new session's group folder.
+                // Pin selection onto the new session directly so the
+                // preview pane and dispatch in app.rs see the right
+                // row.
+                self.select_and_reveal_session(&session_id);
                 self.new_dialog = None;
 
                 if !warnings.is_empty() {
@@ -1789,7 +1822,8 @@ impl HomeView {
         #[cfg(not(feature = "serve"))]
         let serve_open = false;
 
-        self.show_help
+        self.live_send.is_some()
+            || self.show_help
             || self.search_active
             || self.new_dialog.is_some()
             || self.confirm_dialog.is_some()
@@ -1835,7 +1869,12 @@ impl HomeView {
         if !self.has_dialog() {
             return true;
         }
-        self.rename_dialog.is_some()
+        // Live-send mode is also paste-aware: handle_paste forwards the
+        // chunk straight to the pane via send_literal_no_enter, which is
+        // strictly faster and safer than letting the chars fan out as
+        // individual KeyEvents and stream per-char tmux calls.
+        self.live_send.is_some()
+            || self.rename_dialog.is_some()
             || self.send_message_dialog.is_some()
             || self.new_dialog.is_some()
             || self.settings_view.is_some()
@@ -2145,6 +2184,91 @@ impl HomeView {
             self.selected_session = None;
         }
         stale_sid
+    }
+
+    /// Stage live-send mode against `session_id`. Mirrors
+    /// `execute_send_message`'s revive cascade so a cold-start (Docker
+    /// pull, agent splash) is handled before the user starts typing,
+    /// then installs `live_send` state so subsequent keystrokes are
+    /// captured by `handle_live_send_key`.
+    ///
+    /// Returns `Ok(Some(stale_sid))` when the resume-fallback cascade
+    /// fired during respawn, `Ok(None)` on a clean ready, and `Err(())`
+    /// if the pane could not be readied (`info_dialog` is set with the
+    /// underlying error so the caller only has to clear its toast).
+    pub fn enter_live_send(&mut self, session_id: &str) -> Result<Option<String>, ()> {
+        let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
+            inst.ensure_pane_ready().map_err(Into::into)
+        });
+        let stale_sid = match outcome {
+            Ok(Some(EnsureReadyOutcome::Respawned {
+                stale_sid: Some(sid),
+            }))
+            | Ok(Some(EnsureReadyOutcome::Started {
+                stale_sid: Some(sid),
+            })) => Some(sid),
+            Ok(_) => None,
+            Err(err) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Live send failed",
+                    &format!("Cannot prepare session: {}", err),
+                ));
+                return Err(());
+            }
+        };
+        let inst = match self.get_instance(session_id) {
+            Some(inst) => inst.clone(),
+            None => {
+                // Defensive: ensure_pane_ready succeeded but the
+                // instance is gone (deleted by a peer process between
+                // those two calls). Without a dialog the user would
+                // press Tab and see nothing happen, with no clue why.
+                self.info_dialog = Some(InfoDialog::new(
+                    "Live send failed",
+                    "Session disappeared before live mode could start.",
+                ));
+                return Err(());
+            }
+        };
+        // Resolve the tmux session name up front so the worker thread
+        // can reconstruct a Session without re-touching HomeView. If we
+        // can't even build the Session here, surface the error before
+        // installing live state.
+        let tmux_session = match crate::tmux::Session::new(&inst.id, &inst.title) {
+            Ok(s) => s,
+            Err(e) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Live send failed",
+                    &format!("Cannot resolve tmux session: {}", e),
+                ));
+                return Err(());
+            }
+        };
+        let tmux_name = tmux_session.name().to_string();
+        // Parse the configured exit-chord list now so the per-keystroke
+        // dispatch path doesn't re-parse on every event. Config edits
+        // during live mode aren't possible (settings_view participates
+        // in has_dialog and lives in its own takeover), so a snapshot
+        // at entry time is sufficient.
+        let exit_chord_spec = resolve_config_or_warn(&self.config_profile())
+            .session
+            .live_send_exit_chord;
+        let exit_chords = live_send::parse_chord_list(&exit_chord_spec);
+        self.live_send = Some(live_send::LiveSendState {
+            session_id: inst.id.clone(),
+            title: inst.title.clone(),
+            tmux_name: tmux_name.clone(),
+            exit_chords,
+        });
+        self.live_send_worker = Some(live_send::LiveSendWorker::spawn(tmux_name));
+        // Force the preview-refresh path to issue a resize on the
+        // first draw inside live mode (it dedups against
+        // live_send_last_resize), so the agent's render matches the
+        // preview pane's actual dimensions instead of whatever the
+        // session was last sized to.
+        self.live_send_last_resize = None;
+        self.stamp_last_accessed(session_id);
+        Ok(stale_sid)
     }
 
     pub fn save(&mut self) -> anyhow::Result<()> {
@@ -2679,6 +2803,85 @@ impl HomeView {
         self.active_profile
             .clone()
             .unwrap_or_else(crate::session::config::resolve_default_profile)
+    }
+
+    /// Resolve `new_session_attach_mode` for a freshly-created session.
+    /// Reads the instance's `source_profile` so the picked mode matches
+    /// whatever profile the session was filed under (the home view's
+    /// active profile may already have moved on). Returns `None` for
+    /// cockpit-mode sessions because neither attach option applies to
+    /// them; callers should fall through to the cockpit-aware path.
+    pub fn new_session_attach_mode(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::session::NewSessionAttachMode> {
+        let inst = self.get_instance(session_id)?;
+        if inst.is_cockpit_mode() {
+            return None;
+        }
+        let profile = if inst.source_profile.is_empty() {
+            self.config_profile()
+        } else {
+            inst.source_profile.clone()
+        };
+        Some(
+            crate::session::resolve_config_or_warn(&profile)
+                .session
+                .new_session_attach_mode,
+        )
+    }
+
+    /// Pin selection to `session_id` and place the cursor on its row.
+    /// If the containing group is collapsed (manual grouping or
+    /// project grouping), it's force-expanded and `flat_items` is
+    /// rebuilt so the row is actually present before the cursor
+    /// search. No-op when the session can't be resolved at all
+    /// (deleted between caller and us): leaves the prior selection
+    /// untouched so the user doesn't see the cursor leap to nowhere.
+    ///
+    /// Used by `apply_creation_results` so a freshly-created session
+    /// becomes the visible cursor row; also a natural fit for any
+    /// future "jump to session" path (command palette deep link,
+    /// API-driven focus change) that wants the same reveal behavior.
+    pub fn select_and_reveal_session(&mut self, session_id: &str) {
+        let Some(inst) = self.get_instance(session_id) else {
+            return;
+        };
+        let group_path = match self.group_by {
+            GroupByMode::Project => Some(project_group_name(inst)),
+            GroupByMode::Manual => {
+                let p = inst.group_path.clone();
+                if p.is_empty() {
+                    None
+                } else {
+                    Some(p)
+                }
+            }
+        };
+        let target_profile = inst.source_profile.clone();
+        self.selected_session = Some(session_id.to_string());
+        self.selected_group = None;
+        self.selected_group_profile = None;
+        if let Some(gpath) = group_path {
+            match self.group_by {
+                GroupByMode::Project => {
+                    self.project_group_collapsed.insert(gpath, false);
+                }
+                GroupByMode::Manual => {
+                    if let Some(tree) = self.group_trees.get_mut(&target_profile) {
+                        tree.set_collapsed(&gpath, false);
+                    }
+                }
+            }
+            self.flat_items = self.build_flat_items();
+        }
+        if let Some(pos) = self
+            .flat_items
+            .iter()
+            .position(|item| matches!(item, Item::Session { id, .. } if id == session_id))
+        {
+            self.cursor = pos;
+        }
     }
 
     /// Refresh all config-dependent state from the current profile's config.

@@ -4686,6 +4686,68 @@ mod scroll_pane_isolation {
         assert!(handled);
         assert_eq!(env.view.cursor, 0, "wheel over list should retreat cursor");
     }
+
+    /// Live-send mode is meant to feel like an attach — users still need
+    /// to scroll the preview to read agent history without exiting. The
+    /// has_dialog() gate would otherwise swallow these events because
+    /// live_send.is_some() participates in that predicate.
+    #[test]
+    #[serial]
+    fn wheel_over_preview_in_live_mode_scrolls_preview() {
+        use crate::tui::home::live_send::LiveSendState;
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_cache.captured_lines = 200;
+        env.view.preview_scroll_offset = 10;
+        // Install live state directly so we don't have to stand up a
+        // tmux session; the scroll handler only cares about
+        // live_send.is_some().
+        env.view.live_send = Some(LiveSendState {
+            session_id: "fake".to_string(),
+            title: "fake".to_string(),
+            tmux_name: "fake".to_string(),
+            exit_chords: crate::tui::home::live_send::parse_chord_list(
+                crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
+            ),
+        });
+
+        let up_handled = env.view.handle_scroll_up(50, 10);
+        assert!(up_handled, "preview scroll should work while in live mode");
+        assert!(
+            env.view.preview_scroll_offset > 10,
+            "preview should scroll back into history"
+        );
+        // And we should still be in live mode (scroll doesn't exit).
+        assert!(env.view.live_send.is_some());
+    }
+
+    /// List-pane wheel scroll stays suppressed in live mode: changing
+    /// the selection mid-session would silently aim the next keystroke
+    /// at a different pane than the preview is showing.
+    #[test]
+    #[serial]
+    fn wheel_over_list_in_live_mode_does_not_change_selection() {
+        use crate::tui::home::live_send::LiveSendState;
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        env.view.live_send = Some(LiveSendState {
+            session_id: "fake".to_string(),
+            title: "fake".to_string(),
+            tmux_name: "fake".to_string(),
+            exit_chords: crate::tui::home::live_send::parse_chord_list(
+                crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
+            ),
+        });
+
+        let handled = env.view.handle_scroll_down(5, 10);
+        assert!(!handled, "list scroll must be a no-op in live mode");
+        assert_eq!(env.view.cursor, 1, "selection must not change in live mode");
+    }
 }
 
 mod click_to_select {
@@ -5223,6 +5285,460 @@ mod preview_click {
         let changed = env.view.handle_preview_click();
         assert!(!changed);
         assert!(env.view.send_message_dialog.is_none());
+    }
+}
+
+mod live_send_mode {
+    //! Live-send wiring at the home view level. Translation correctness
+    //! is covered by unit tests in src/tui/home/live_send.rs. Here we
+    //! verify the integration points: keys are captured while live mode
+    //! is active, Ctrl+q clears the state, the per-keystroke liveness
+    //! check auto-exits on drift, and the predicate plumbing treats
+    //! live mode like a modal capture so the rest of the TUI suspends
+    //! underneath it.
+
+    use super::super::live_send::LiveSendState;
+    use super::*;
+
+    /// Seed live-send state pointing at the first instance in the test
+    /// env, with a matching tmux_name so the drift check passes. Tests
+    /// that want to trigger drift either install pointing at a missing
+    /// id or mutate the instance's title after installing.
+    fn install_live_for_first_session(env: &mut TestEnv) -> String {
+        let id = env
+            .view
+            .flat_items
+            .iter()
+            .find_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("test env has no sessions; use install_live_orphan instead");
+        let inst = env.view.get_instance(&id).unwrap().clone();
+        let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        // CI runs the e2e suite in the same `cargo test` invocation,
+        // which populates the global tmux session cache. The drift
+        // check then sees our fake test session name as "not in tmux"
+        // (Some(false)) and clears live_send mid-test. Pre-inject the
+        // name so the cache reports Some(true) for it; orphan tests
+        // (install_live_orphan) deliberately skip this and let the
+        // instance-missing branch fire instead.
+        crate::tmux::test_inject_session_into_cache(&tmux_name);
+        env.view.live_send = Some(LiveSendState {
+            session_id: inst.id.clone(),
+            title: inst.title,
+            tmux_name,
+            exit_chords: crate::tui::home::live_send::parse_chord_list(
+                crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
+            ),
+        });
+        id
+    }
+
+    /// Install live-send state pointing at a session id the env does
+    /// NOT contain — used to verify the drift check fires (auto-exit
+    /// + info dialog) when the underlying instance has vanished.
+    fn install_live_orphan(env: &mut TestEnv) {
+        env.view.live_send = Some(LiveSendState {
+            session_id: "missing-id".to_string(),
+            title: "missing-title".to_string(),
+            tmux_name: "missing-tmux".to_string(),
+            exit_chords: crate::tui::home::live_send::parse_chord_list(
+                crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
+            ),
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn ctrl_q_exits_live_mode() {
+        let mut env = create_test_env_with_sessions(1);
+        install_live_for_first_session(&mut env);
+        assert!(env.view.live_send.is_some());
+
+        env.view.handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            None,
+        );
+
+        assert!(env.view.live_send.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn ctrl_q_exits_even_when_session_has_drifted() {
+        // Ctrl+q is the safety chord: it must always exit cleanly,
+        // even if the underlying session went away (so the user can
+        // recover from a stuck live mode without an extra dialog).
+        let mut env = create_test_env_empty();
+        install_live_orphan(&mut env);
+        env.view.handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            None,
+        );
+        assert!(env.view.live_send.is_none());
+        assert!(env.view.info_dialog.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn arbitrary_key_in_live_mode_does_not_emit_action() {
+        // Live-send swallows the key (forwards it to tmux). The tmux
+        // call will quietly fail because the test env doesn't have a
+        // real tmux pane, but the home view must NOT bubble an
+        // Action::* out (otherwise the action would race with the
+        // live state). Use bare `x` so the test doesn't collide with
+        // the Ctrl+q exit chord.
+        let mut env = create_test_env_with_sessions(1);
+        install_live_for_first_session(&mut env);
+        let action = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
+        assert!(action.is_none());
+        // Still in live mode; only Ctrl+q exits.
+        assert!(env.view.live_send.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn drift_check_auto_exits_when_instance_missing() {
+        // If the session is deleted while live mode is active, the
+        // very next keystroke should auto-exit and surface an info
+        // dialog explaining why (so the user isn't typing into the
+        // void with no feedback).
+        let mut env = create_test_env_empty();
+        install_live_orphan(&mut env);
+        env.view
+            .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
+        assert!(env.view.live_send.is_none());
+        assert!(env.view.info_dialog.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn shift_page_up_scrolls_preview_instead_of_sending_to_agent() {
+        // Terminal-emulator convention: Shift+PageUp scrolls the outer
+        // scrollback, not the inner program. Live mode honors that so
+        // users can read agent history without exiting.
+        let mut env = create_test_env_with_sessions(1);
+        install_live_for_first_session(&mut env);
+        env.view.preview_scroll_offset = 0;
+
+        env.view
+            .handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT), None);
+
+        assert!(
+            env.view.preview_scroll_offset > 0,
+            "Shift+PageUp should scroll the preview back into history"
+        );
+        // Still in live mode — the intercept doesn't exit.
+        assert!(env.view.live_send.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn shift_page_down_scrolls_preview_forward() {
+        let mut env = create_test_env_with_sessions(1);
+        install_live_for_first_session(&mut env);
+        env.view.preview_scroll_offset = 50;
+
+        env.view
+            .handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::SHIFT), None);
+
+        assert!(
+            env.view.preview_scroll_offset < 50,
+            "Shift+PageDown should reduce the offset (scroll toward live)"
+        );
+        assert!(env.view.live_send.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn bare_page_up_still_passes_through_to_agent() {
+        // Regression guard: only the Shift-modified Page chord is
+        // intercepted. Bare PageUp must keep flowing to the agent so
+        // agents that page their own UI (claude-code transcript, etc.)
+        // keep responding.
+        let mut env = create_test_env_with_sessions(1);
+        install_live_for_first_session(&mut env);
+        env.view.preview_scroll_offset = 25;
+
+        env.view
+            .handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE), None);
+
+        assert_eq!(
+            env.view.preview_scroll_offset, 25,
+            "bare PageUp must NOT change preview scroll offset"
+        );
+        assert!(env.view.live_send.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn drift_check_auto_exits_when_session_renamed() {
+        // Title changes the generated tmux name. After a rename the
+        // worker is targeting a stale name, so the next keystroke
+        // should auto-exit. Simulate the rename by mutating the
+        // instance title after installing live state.
+        let mut env = create_test_env_with_sessions(1);
+        let id = install_live_for_first_session(&mut env);
+        env.view.mutate_instance(&id, |inst| {
+            inst.title = "renamed-after-entry".to_string();
+        });
+        env.view
+            .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
+        assert!(env.view.live_send.is_none());
+        assert!(env.view.info_dialog.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn live_mode_makes_has_dialog_true() {
+        // Every dialog-gating predicate that already inspects has_dialog()
+        // (mouse swallow, list nav suspend, palette skip) inherits live
+        // mode for free via this single addition.
+        let mut env = create_test_env_empty();
+        assert!(!env.view.has_dialog());
+        install_live_orphan(&mut env);
+        assert!(env.view.has_dialog());
+    }
+
+    #[test]
+    #[serial]
+    fn live_mode_enables_paste_burst() {
+        // wants_paste_burst is what tells the runtime to batch a stream
+        // of Char events into a single Paste event when bracketed-paste
+        // markers are missing (mosh, some SSH wrappers). Live mode wants
+        // batching so a paste streams as one tmux call.
+        let mut env = create_test_env_empty();
+        install_live_orphan(&mut env);
+        assert!(env.view.wants_paste_burst());
+    }
+
+    #[test]
+    #[serial]
+    fn tab_does_not_start_live_send_without_selection() {
+        // No session selected (empty list, cursor on a group, etc.) →
+        // Tab must silently no-op rather than emitting a deferred
+        // action targeting nothing.
+        let mut env = create_test_env_empty();
+        let action = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
+        assert!(action.is_none());
+        assert!(env.view.live_send.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn tab_emits_enter_live_send_for_stopped_session() {
+        // start_live_send is intentionally permissive: it accepts any
+        // non-Creating instance and defers ensure_pane_ready to
+        // enter_live_send. Without this, Tab would silently no-op on
+        // stopped/dead-but-recoverable rows because the tmux session
+        // doesn't exist yet.
+        let mut env = create_test_env_with_sessions(1);
+        env.view.cursor = 0;
+        env.view.update_selected();
+        // Pin the status explicitly so this regression guard doesn't
+        // rely on the implicit Instance::new default surviving future
+        // refactors. A real stopped session is what we're modeling.
+        let id = env
+            .view
+            .flat_items
+            .iter()
+            .find_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("test env has one session");
+        env.view.mutate_instance(&id, |inst| {
+            inst.status = crate::session::Status::Stopped;
+        });
+        let action = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
+        assert!(
+            matches!(action, Some(Action::EnterLiveSend(_))),
+            "Tab on a stopped session should emit Action::EnterLiveSend, got {:?}",
+            action
+        );
+    }
+
+    /// Cockpit-mode is a `serve` feature; the `cockpit_mode` field on
+    /// Instance only exists when that feature is compiled in. Without
+    /// it, `is_cockpit_mode()` is hard-coded to false and the gate is
+    /// a no-op, so there's nothing meaningful to verify in the default
+    /// build.
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn tab_does_not_start_live_send_for_cockpit_session() {
+        // Cockpit sessions are not tmux-backed, so live-send has no
+        // valid target. Tab must silently no-op rather than enqueue
+        // an Action::EnterLiveSend that would fail downstream.
+        let mut env = create_test_env_with_sessions(1);
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let id = env
+            .view
+            .flat_items
+            .iter()
+            .find_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("test env has one session");
+        env.view.mutate_instance(&id, |inst| {
+            inst.status = crate::session::Status::Stopped;
+            inst.cockpit_mode = true;
+        });
+        let action = env
+            .view
+            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), None);
+        assert!(action.is_none(), "expected no action, got {:?}", action);
+        assert!(env.view.live_send.is_none());
+    }
+}
+
+/// Tests for the `new_session_attach_mode` setting that drives whether
+/// a freshly-created session enters tmux or live-send mode. The unit
+/// under test is `HomeView::new_session_attach_mode`, plus the
+/// invariant that the sync create path emits the routed action variant
+/// (so it doesn't bypass the setting the way `Action::AttachSession`
+/// would).
+mod new_session_attach_mode {
+    use super::*;
+    use crate::session::config::{save_config, Config, NewSessionAttachMode};
+
+    /// Add a session to the home view, return its id. The instance's
+    /// `source_profile` is set to "test" so the resolver reads the
+    /// test profile's config.
+    fn add_session(view: &mut HomeView, title: &str) -> String {
+        let mut inst = Instance::new(title, "/tmp/test");
+        inst.source_profile = "test".to_string();
+        let id = inst.id.clone();
+        view.add_instance(inst);
+        id
+    }
+
+    /// Write a global config.toml with the given attach mode so the
+    /// resolver under test reads the user-configured value. Other
+    /// fields stay at default.
+    fn write_global_attach_mode(mode: NewSessionAttachMode) {
+        let mut config = Config::default();
+        config.session.new_session_attach_mode = mode;
+        save_config(&config).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn defaults_to_tmux_when_no_config_present() {
+        // Fresh install: no config.toml exists, no profile override.
+        // The setting must resolve to Tmux (historical behavior); a
+        // None or LiveSend default would silently change every existing
+        // user's UX on upgrade.
+        let mut env = create_test_env_empty();
+        let id = add_session(&mut env.view, "session-one");
+        let mode = env.view.new_session_attach_mode(&id);
+        assert_eq!(
+            mode,
+            Some(NewSessionAttachMode::Tmux),
+            "default must be Tmux to preserve existing UX"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn returns_live_send_when_globally_configured() {
+        // User saved `new_session_attach_mode = "live_send"` in their
+        // global config. The resolver must pick it up so the dispatch
+        // path in app.rs routes to live mode instead of tmux attach.
+        let mut env = create_test_env_empty();
+        write_global_attach_mode(NewSessionAttachMode::LiveSend);
+        let id = add_session(&mut env.view, "session-one");
+        let mode = env.view.new_session_attach_mode(&id);
+        assert_eq!(mode, Some(NewSessionAttachMode::LiveSend));
+    }
+
+    #[test]
+    #[serial]
+    fn returns_none_for_missing_instance() {
+        // Race: the apply_creation_results return reaches the dispatch
+        // and the instance has been deleted in the meantime. `None`
+        // signals the caller to fall back to the cockpit-aware
+        // attach_session path rather than try to attach to a ghost.
+        let env = create_test_env_empty();
+        let mode = env.view.new_session_attach_mode("nonexistent-id");
+        assert!(mode.is_none());
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn returns_none_for_cockpit_session() {
+        // Cockpit sessions aren't tmux-backed; live mode has no target
+        // and tmux attach is a no-op. The resolver returns None so the
+        // dispatch picks the (no-op) fallback explicitly, regardless of
+        // what the user configured globally.
+        let mut env = create_test_env_empty();
+        write_global_attach_mode(NewSessionAttachMode::LiveSend);
+        let id = add_session(&mut env.view, "cockpit-one");
+        env.view.mutate_instance(&id, |inst| {
+            inst.cockpit_mode = true;
+        });
+        let mode = env.view.new_session_attach_mode(&id);
+        assert!(mode.is_none(), "cockpit sessions must return None");
+    }
+
+    /// Build a minimal `NewSessionData` for the sync create path: no
+    /// sandbox, no hooks (caller passes `None`), no worktree. This is
+    /// the combination that bypasses `creation_poller` and runs
+    /// `create_session` inline, which is the path that originally
+    /// emitted `Action::AttachSession` and bypassed the attach-mode
+    /// setting.
+    fn sync_path_session_data(project: &str) -> crate::tui::dialogs::NewSessionData {
+        crate::tui::dialogs::NewSessionData {
+            profile: "test".to_string(),
+            title: "sync-path-test".to_string(),
+            path: project.to_string(),
+            group: String::new(),
+            tool: "claude".to_string(),
+            worktree_enabled: false,
+            worktree_branch: None,
+            create_new_branch: false,
+            base_branch: None,
+            extra_repo_paths: Vec::new(),
+            sandbox: false,
+            sandbox_image: String::new(),
+            yolo_mode: false,
+            extra_env: Vec::new(),
+            extra_args: String::new(),
+            command_override: String::new(),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn sync_create_path_emits_attach_after_create_not_attach_session() {
+        // Regression guard for the original bug. `Action::AttachSession`
+        // would skip the `new_session_attach_mode` dispatch; only
+        // `Action::AttachAfterCreate` routes through it. If a future
+        // refactor flips this back, the live-mode setting silently
+        // stops working on no-sandbox/no-hooks/no-worktree creates and
+        // the bug returns. e2e covers the live-mode end of the
+        // dispatch; this unit test covers the action plumbing without
+        // needing tmux.
+        let mut env = create_test_env_empty();
+        let project_dir = env._temp.path().join("sync-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let data = sync_path_session_data(project_dir.to_str().unwrap());
+        let action = env.view.create_session_with_hooks(data, None);
+        assert!(
+            matches!(action, Some(Action::AttachAfterCreate(_))),
+            "sync create path must emit AttachAfterCreate (route through attach-mode setting), got {:?}",
+            action
+        );
     }
 }
 

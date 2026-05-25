@@ -59,6 +59,11 @@ pub enum PaletteAction {
     JumpToCursor(usize),
     /// Open a tool session by name (lazygit, yazi, etc.)
     ToolSession(String),
+    /// Enter live-send mode on the selected session. A dedicated variant
+    /// (rather than synthesizing the keypress) so the palette routes
+    /// correctly in strict mode, where the `m` binding is intentionally
+    /// defanged for the typing-guard.
+    EnterLiveSend,
 }
 
 /// One entry in the palette. `payload` is what gets returned when the user picks it.
@@ -129,6 +134,28 @@ pub fn builtin_commands(serve_enabled: bool, strict_hotkeys: bool) -> Vec<Palett
             keywords: vec!["prompt", "tell", "say"],
             hotkey: hotkey_label("m", "M", strict_hotkeys),
             payload: PaletteAction::Key(key('m')),
+        },
+        PaletteCommand {
+            id: "live-send",
+            title: "Live send: pass keys straight to the agent".to_string(),
+            group: PaletteGroup::Actions,
+            keywords: vec![
+                "live",
+                "passthrough",
+                "attach",
+                "keys",
+                "escape",
+                "arrow",
+                "tab",
+                "interrupt",
+            ],
+            // Tab is the direct binding in both modes (settings / cockpit
+            // / dialogs own their own Tab handlers, the home view's top
+            // level was free). Palette routing uses the dedicated
+            // variant so synthesizing a Tab keypress never accidentally
+            // re-fires this entry from inside a sub-handler.
+            hotkey: "Tab",
+            payload: PaletteAction::EnterLiveSend,
         },
         PaletteCommand {
             id: "stop",
@@ -598,6 +625,25 @@ mod tests {
             top.title.to_lowercase().contains("rename"),
             "got: {}",
             top.title
+        );
+    }
+
+    #[test]
+    fn live_send_entry_is_bound_to_tab_with_dedicated_payload() {
+        // Regression guard: the live-send palette entry must keep its
+        // hotkey label and dedicated payload variant. A future rebinding
+        // (e.g., moving Tab elsewhere) or accidentally regressing the
+        // payload to `Key(Tab)` would break strict-mode users who reach
+        // live-send only through the palette.
+        let cmds = builtin_commands(false, false);
+        let entry = cmds
+            .iter()
+            .find(|c| c.id == "live-send")
+            .expect("builtin commands must include 'live-send'");
+        assert_eq!(entry.hotkey, "Tab");
+        assert!(
+            matches!(&entry.payload, PaletteAction::EnterLiveSend),
+            "live-send entry must dispatch PaletteAction::EnterLiveSend"
         );
     }
 

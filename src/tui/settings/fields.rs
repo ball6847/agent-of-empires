@@ -101,6 +101,8 @@ pub enum FieldKey {
     AgentDetectAs,
     HostEnvironment,
     SessionIdPollerMaxThreads,
+    LiveSendExitChord,
+    NewSessionAttachMode,
     // Sound
     SoundEnabled,
     SoundMode,
@@ -377,6 +379,27 @@ fn index_to_row_tag(idx: usize) -> crate::session::config::RowTagMode {
         3 => Sandbox,
         4 => Branch,
         _ => None,
+    }
+}
+
+/// Display labels for `NewSessionAttachMode`. Order must match
+/// `new_session_attach_mode_to_index` / `index_to_new_session_attach_mode`.
+/// `Tmux` is first so it is the default selection.
+const NEW_SESSION_ATTACH_MODE_OPTIONS: &[&str] = &["Tmux", "Live mode"];
+
+fn new_session_attach_mode_to_index(mode: crate::session::NewSessionAttachMode) -> usize {
+    use crate::session::NewSessionAttachMode::*;
+    match mode {
+        Tmux => 0,
+        LiveSend => 1,
+    }
+}
+
+fn index_to_new_session_attach_mode(idx: usize) -> crate::session::NewSessionAttachMode {
+    use crate::session::NewSessionAttachMode::*;
+    match idx {
+        1 => LiveSend,
+        _ => Tmux,
     }
 }
 
@@ -1515,6 +1538,18 @@ fn build_session_fields(
         session.and_then(|s| s.restart_wake_message.clone()),
     );
 
+    let (live_send_exit_chord, live_send_exit_chord_override) = resolve_value(
+        scope,
+        global.session.live_send_exit_chord.clone(),
+        session.and_then(|s| s.live_send_exit_chord.clone()),
+    );
+
+    let (new_session_attach_mode, new_session_attach_mode_override) = resolve_value(
+        scope,
+        global.session.new_session_attach_mode,
+        session.and_then(|s| s.new_session_attach_mode),
+    );
+
     let (row_tag, row_tag_override) = resolve_value(
         scope,
         global.session.row_tag,
@@ -1703,6 +1738,52 @@ fn build_session_fields(
             inherited_display: inherited_if(
                 restart_wake_message_override,
                 FieldValue::Text(global.session.restart_wake_message.clone()),
+            ),
+        },
+        SettingField {
+            key: FieldKey::LiveSendExitChord,
+            label: "Live-Send Exit Chord",
+            description:
+                "Comma-separated chord specs that exit live-send mode. \
+                 Tmux-style: C-q, M-x, F12. Default `C-q` works in \
+                 every terminal we ship to; add entries for additional \
+                 exits if you need to send C-q through to the agent.",
+            value: FieldValue::Text(live_send_exit_chord),
+            category: SettingsCategory::Session,
+            has_override: live_send_exit_chord_override,
+            inherited_display: inherited_if(
+                live_send_exit_chord_override,
+                FieldValue::Text(global.session.live_send_exit_chord.clone()),
+            ),
+        },
+        SettingField {
+            key: FieldKey::NewSessionAttachMode,
+            label: "New Session Attach Mode",
+            description:
+                "What to do after creating a new session: drop into tmux \
+                 (default, historical behavior) or enter live-send mode so \
+                 you never have to be inside tmux. Cockpit sessions ignore \
+                 this setting.",
+            value: FieldValue::Select {
+                selected: new_session_attach_mode_to_index(new_session_attach_mode),
+                options: NEW_SESSION_ATTACH_MODE_OPTIONS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            },
+            category: SettingsCategory::Session,
+            has_override: new_session_attach_mode_override,
+            inherited_display: inherited_if(
+                new_session_attach_mode_override,
+                FieldValue::Select {
+                    selected: new_session_attach_mode_to_index(
+                        global.session.new_session_attach_mode,
+                    ),
+                    options: NEW_SESSION_ATTACH_MODE_OPTIONS
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                },
             ),
         },
         SettingField {
@@ -2293,6 +2374,12 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         (FieldKey::RestartWakeMessage, FieldValue::Text(v)) => {
             config.session.restart_wake_message = v.clone();
         }
+        (FieldKey::LiveSendExitChord, FieldValue::Text(v)) => {
+            config.session.live_send_exit_chord = v.clone();
+        }
+        (FieldKey::NewSessionAttachMode, FieldValue::Select { selected, .. }) => {
+            config.session.new_session_attach_mode = index_to_new_session_attach_mode(*selected);
+        }
         (FieldKey::RowTag, FieldValue::Select { selected, .. }) => {
             config.session.row_tag = index_to_row_tag(*selected);
         }
@@ -2762,6 +2849,18 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
             set_profile_override(v.clone(), &mut config.session, |s, val| {
                 s.restart_wake_message = val
             });
+        }
+        (FieldKey::LiveSendExitChord, FieldValue::Text(v)) => {
+            set_profile_override(v.clone(), &mut config.session, |s, val| {
+                s.live_send_exit_chord = val
+            });
+        }
+        (FieldKey::NewSessionAttachMode, FieldValue::Select { selected, .. }) => {
+            set_profile_override(
+                index_to_new_session_attach_mode(*selected),
+                &mut config.session,
+                |s, val| s.new_session_attach_mode = val,
+            );
         }
         (FieldKey::RowTag, FieldValue::Select { selected, .. }) => {
             set_profile_override(

@@ -289,7 +289,7 @@ impl App {
         )?;
         let draw_result = (|| -> Result<()> {
             crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Hide)?;
-            terminal.draw(|f| self.render(f)).map(|_| ())?;
+            terminal.draw(|f| self.render(f))?;
             Ok(())
         })();
         let end_result = crossterm::execute!(
@@ -474,8 +474,34 @@ impl App {
             (hup.ok(), term.ok())
         };
 
-        let mut refresh_interval = tokio::time::interval(Duration::from_millis(50));
+        // 33ms ticker (~30fps) is the steady-state refresh in live-send.
+        // 16ms (60fps) was tried but produced visible tearing on
+        // terminals that don't support synchronized-update escapes
+        // (notably macOS Terminal.app); back-to-back ticker + post-key
+        // wakes within ~1ms also doubled-up frame writes. 33ms gives
+        // each frame's writes enough time to land before the next
+        // frame starts, while remaining responsive enough that
+        // animation looks fluid. The post-key wake below covers the
+        // typing-echo case where 33ms would feel laggy.
+        let mut refresh_interval = tokio::time::interval(Duration::from_millis(33));
         refresh_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // After any keystroke routed to live-send, schedule one extra
+        // refresh ~15ms later (roughly the `tmux send-keys` fork plus
+        // agent-echo time) so the resulting capture catches the echo
+        // deterministically instead of waiting up to one full ticker
+        // interval. Cleared when the wake fires; re-armed by each
+        // subsequent key.
+        let mut last_live_key_at: Option<std::time::Instant> = None;
+        const POST_KEY_WAKE_DELAY: Duration = Duration::from_millis(15);
+        // Track when the last refresh fired so the ticker arm can
+        // back off if a post-key wake just ran. Without this, a key
+        // pressed ~10ms before a ticker tick produces two refreshes
+        // back-to-back (post-key wake at +15ms, ticker at +16ms),
+        // which on a non-sync-update terminal looks like tearing:
+        // the first frame's per-cell writes are still landing when
+        // the second frame starts overwriting them.
+        let mut last_refresh_at: Option<std::time::Instant> = None;
+        const REFRESH_COOLDOWN: Duration = Duration::from_millis(15);
         let mut last_status_refresh = std::time::Instant::now();
         let mut last_disk_refresh = std::time::Instant::now();
         let mut last_spinner_redraw = std::time::Instant::now();
@@ -503,6 +529,12 @@ impl App {
                 terminal.clear()?;
                 self.needs_redraw = false;
             }
+
+            // Compute the post-key wake deadline once per iteration so
+            // the select! arm doesn't have to dance with the Option.
+            // `None` here becomes `pending` inside the arm.
+            let post_key_deadline = last_live_key_at.map(|t| t + POST_KEY_WAKE_DELAY);
+            let mut woke_via_post_key = false;
 
             // All event sources are polled cooperatively via tokio::select!.
             // This ensures signal futures actually get scheduled (fixing #608
@@ -621,11 +653,39 @@ impl App {
                             self.handle_key(key, terminal).await?;
                             self.sync_mouse_capture(terminal)?;
 
-                            // Skip the draw when returning from tmux attach.
-                            // needs_redraw triggers a clear + stale event drain
-                            // on the next iteration; drawing before that drain
-                            // wastes a frame and can flicker.
-                            if !self.needs_redraw {
+                            // Arm the post-key wake when the key was
+                            // routed into live-send. We don't have an
+                            // explicit signal from handle_key for that
+                            // (it returns ()), but `live_send.is_some()`
+                            // after the call is a good proxy: a key
+                            // that EXITS live-send won't arm a wake,
+                            // and keys outside live-send leave it None
+                            // anyway since we never set it.
+                            let live_after = self.home.live_send.is_some();
+                            if live_after {
+                                last_live_key_at = Some(std::time::Instant::now());
+                            }
+
+                            // Skip the immediate draw when:
+                            //   - We're returning from tmux attach
+                            //     (`needs_redraw` triggers a clear +
+                            //     stale event drain on the next
+                            //     iteration; drawing before the drain
+                            //     wastes a frame and can flicker), OR
+                            //   - We're inside live-send. The key was
+                            //     queued to the worker but has NOT been
+                            //     dispatched to tmux yet, so the home
+                            //     view's preview cache is still stale.
+                            //     Drawing now produces a frame
+                            //     identical to the previous one
+                            //     (ratatui's diff is empty) and then
+                            //     the post-key wake fires ~15ms later
+                            //     with fresh post-echo content.
+                            //     Skipping the immediate draw avoids a
+                            //     no-op paint that on non-sync-update
+                            //     terminals can still emit cursor-move
+                            //     bytes mid-frame.
+                            if !self.needs_redraw && !live_after {
                                 self.draw(terminal)?;
                             }
 
@@ -650,18 +710,23 @@ impl App {
                             //
                             // Priority order for `Down(Left)`:
                             //   1. modal dialog click (e.g. delete Yes/No)
-                            //   2. divider drag-start (between list/preview)
-                            //   3. preview-pane click (open Send Message)
-                            //   4. list row click (existing select/activate)
-                            // Earlier branches short-circuit so a click on
-                            // the divider never opens a dialog, and a
-                            // click on the preview never selects a row.
+                            //   2. drag-start (divider, or preview text
+                            //      selection)
+                            //   3. list row click (existing select/activate)
+                            // A bare press on the preview seeds a 1x1
+                            // PreviewSelect; `handle_drag_end` collapses it
+                            // back to no selection on release if the cursor
+                            // never moved.
                             let click_action = if matches!(
                                 mouse.kind,
                                 MouseEventKind::Down(MouseButton::Left)
                             ) {
                                 if self.home.handle_dialog_click(mouse.column, mouse.row)
                                 {
+                                    // A modal swallowed the click — drop any
+                                    // leftover preview highlight so it doesn't
+                                    // linger behind / through the dialog.
+                                    let _ = self.home.clear_preview_selection();
                                     self.sync_mouse_capture(terminal)?;
                                     self.draw(terminal)?;
                                     None
@@ -669,20 +734,23 @@ impl App {
                                     .home
                                     .handle_drag_start(mouse.column, mouse.row)
                                 {
-                                    None
-                                } else if hit_preview {
-                                    if self.home.handle_preview_click() {
-                                        self.sync_mouse_capture(terminal)?;
-                                        self.draw(terminal)?;
+                                    // handle_drag_start already overwrote the
+                                    // selection if it started a PreviewSelect;
+                                    // a fresh ListDivider drag is unrelated to
+                                    // the highlight and should drop it.
+                                    if !self.home.is_preview_select_dragging() {
+                                        let _ = self.home.clear_preview_selection();
                                     }
                                     None
                                 } else if hit_list {
+                                    let _ = self.home.clear_preview_selection();
                                     let action = self
                                         .home
                                         .handle_click(mouse.column, mouse.row);
                                     self.draw(terminal)?;
                                     action
                                 } else {
+                                    let _ = self.home.clear_preview_selection();
                                     None
                                 }
                             } else {
@@ -699,9 +767,16 @@ impl App {
                                 // is a no-op inside the handler; we don't
                                 // need a separate guard here.
                                 MouseEventKind::Drag(MouseButton::Left) => {
-                                    self.home.handle_drag_move(mouse.column)
+                                    self.home.handle_drag_move(mouse.column, mouse.row)
                                 }
                                 MouseEventKind::Up(MouseButton::Left) => {
+                                    // Finalize the drag here, but defer the
+                                    // clipboard write until after the next
+                                    // draw: the renderer captures cell text
+                                    // while the buffer is still populated
+                                    // (ratatui resets the back buffer on
+                                    // every frame, so reading post-draw
+                                    // sees empty cells).
                                     self.home.handle_drag_end()
                                 }
                                 // Moved events are dispatched unconditionally
@@ -716,6 +791,13 @@ impl App {
                             };
                             if handled {
                                 self.draw(terminal)?;
+                            }
+                            // After the draw that paints a freshly-finalized
+                            // preview selection, the renderer has captured
+                            // the cell text into `preview_copy_text`. Drain
+                            // it and write to the user's clipboard.
+                            if let Some(text) = self.home.take_preview_copy_text() {
+                                crate::tui::clipboard::copy_to_clipboard(&text);
                             }
                             if let Some(action) = click_action {
                                 self.execute_action(action, terminal)?;
@@ -772,6 +854,17 @@ impl App {
                 }
                 _ = refresh_interval.tick() => {}
                 _ = async {
+                    match post_key_deadline {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    // Targeted refresh ~15ms after a live-send key,
+                    // catching the agent's echo before the next ticker.
+                    woke_via_post_key = true;
+                    last_live_key_at = None;
+                }
+                _ = async {
                     #[cfg(unix)]
                     match sighup {
                         Some(ref mut s) => { s.recv().await; }
@@ -799,18 +892,35 @@ impl App {
                 }
             }
 
-            // Check for update result (non-blocking)
+            // Periodic refreshes (only when no input pending).
+            //
+            // `needs_full_refresh` separately tracks whether anything
+            // other than the live-send ticker/post-key wake wants a
+            // refresh; on those flags the cool-down at the bottom of
+            // the loop is bypassed so deterministic signals (status
+            // updates, dialog ticks) get painted right away.
+            let mut refresh_needed = false;
+            let mut needs_full_refresh = false;
+
+            // Update-check / install-status polls can flip the
+            // bottom-of-screen update bar (banner or transient toast)
+            // on or off, which shifts the home view's layout. If a
+            // live-send wake fires on the same iteration, the
+            // preview-only fast path would paint a stale snapshot
+            // whose preview rect no longer lines up with the new
+            // layout. Treat any banner state change as full-refresh
+            // work so the slow path rebuilds the layout AND the
+            // snapshot.
             if self.poll_update_check() {
                 self.needs_redraw = true;
+                refresh_needed = true;
+                needs_full_refresh = true;
             }
-
-            // Check for in-progress update completion
             if self.poll_update_status() {
                 self.needs_redraw = true;
+                refresh_needed = true;
+                needs_full_refresh = true;
             }
-
-            // Periodic refreshes (only when no input pending)
-            let mut refresh_needed = false;
 
             if last_status_refresh.elapsed() >= STATUS_REFRESH_INTERVAL {
                 self.home.request_status_refresh();
@@ -819,33 +929,51 @@ impl App {
 
             if self.home.apply_status_updates() {
                 refresh_needed = true;
+                needs_full_refresh = true;
             }
 
             if self.home.apply_deletion_results() {
                 refresh_needed = true;
+                needs_full_refresh = true;
             }
 
             if self.home.apply_session_id_updates() {
                 refresh_needed = true;
+                needs_full_refresh = true;
             }
 
             if self.home.apply_recovery_updates() {
                 refresh_needed = true;
+                needs_full_refresh = true;
             }
 
             if let Some(session_id) = self.home.apply_creation_results() {
                 self.dispatch_new_session_attach(&session_id, terminal)?;
                 refresh_needed = true;
+                needs_full_refresh = true;
             }
 
             if self.home.tick_dialog() {
                 refresh_needed = true;
+                needs_full_refresh = true;
             }
 
-            if last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL {
+            // Defer the 5s disk reload while the user is in live-send.
+            // The reload is on the UI thread and rebuilds the sidebar
+            // tree from disk, which causes a visible hitch in the
+            // preview. The user can't change session config from inside
+            // live mode anyway. Leaving `last_disk_refresh` un-advanced
+            // when we skip means the first tick outside live-send
+            // re-checks the interval and reloads immediately if it's
+            // been ≥5s since the last successful reload (so a change
+            // on disk during a long live-send session is picked up on
+            // exit instead of sitting stale for another 5s window).
+            if last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL && self.home.live_send.is_none()
+            {
                 self.home.reload()?;
                 last_disk_refresh = std::time::Instant::now();
                 refresh_needed = true;
+                needs_full_refresh = true;
             }
 
             if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
@@ -872,17 +1000,73 @@ impl App {
                 }
             }
 
-            // Animated spinners (rattles) need periodic redraws, but only at
-            // the spinner frame rate to avoid unnecessary widget tree rebuilds
+            // Animated spinners (rattles) need periodic redraws, but only
+            // at the spinner frame rate to avoid unnecessary widget tree
+            // rebuilds. Skip in live-send: the spinner lives in the
+            // sidebar (which the user isn't looking at) and forcing a
+            // full HomeView render every 120ms inside live mode wakes
+            // the loop eight times a second to repaint a region the
+            // user can't see, which only adds load on top of the
+            // already-busy preview refresh.
             if last_spinner_redraw.elapsed() >= SPINNER_REDRAW_INTERVAL
                 && self.home.has_animated_sessions()
+                && self.home.live_send.is_none()
             {
                 last_spinner_redraw = std::time::Instant::now();
                 refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            // In live-send, the 33ms ticker is the steady-state
+            // refresh source; treat every tick as a refresh. The
+            // post-key wake (`woke_via_post_key`) is the same signal
+            // but on a deterministic ~15ms delay after each keystroke
+            // so typing-echo latency doesn't have to wait for ticker
+            // phase. Outside live-send, only the periodic checks
+            // above trigger refresh.
+            if self.home.live_send.is_some() || woke_via_post_key {
+                refresh_needed = true;
+            }
+
+            // Cool-down guard against double-painting in live-send.
+            // The post-key wake and the ticker can fire within 1ms of
+            // each other (key pressed 14ms before a ticker tick: post-
+            // key wake fires at +15ms, ticker tick fires at +16ms),
+            // which doubles up frame writes and produces visible
+            // tearing on terminals without synchronized-update
+            // support. Skip ticker-driven refreshes inside the
+            // cool-down window unless this refresh was specifically
+            // requested by something else (status update, post-key
+            // wake, etc).
+            if refresh_needed
+                && self.home.live_send.is_some()
+                && !woke_via_post_key
+                && !needs_full_refresh
+                && last_refresh_at
+                    .map(|t| t.elapsed() < REFRESH_COOLDOWN)
+                    .unwrap_or(false)
+            {
+                refresh_needed = false;
             }
 
             if refresh_needed {
+                // Always do a full draw in live-send. The
+                // `draw_preview_only` snapshot-painting fast path was
+                // landed in #1495 to cheapen `%output` wakes, but
+                // (a) `%output` wakes no longer exist (control-mode
+                // is gone), and (b) on terminals that don't support
+                // synchronized-update escapes (Apple Terminal.app,
+                // Mosh-with-prediction), the snapshot-then-overlay
+                // pattern produced visible "drag" (the previous
+                // frame's preview cells stayed on screen for a beat
+                // while ratatui's diff caught up). Always-full-draw is
+                // ~2-3ms more CPU per frame (rebuilding the sidebar
+                // widget tree) but is uniformly clean across
+                // terminals. Outside live-send the same path runs
+                // when `refresh_needed`, so this is just collapsing
+                // the conditional branch.
                 self.draw(terminal)?;
+                last_refresh_at = Some(std::time::Instant::now());
             }
 
             if self.should_quit {
@@ -1446,21 +1630,27 @@ impl App {
                     .set_instance_status(&id, crate::session::Status::Starting);
                 self.update_status = Some(UpdateStatus::transient("Reviving session...".into()));
                 self.draw(terminal)?;
-                let outcome = self.home.enter_live_send(&id);
-                match outcome {
-                    Ok(Some(sid)) => {
-                        self.update_status = Some(UpdateStatus::transient(format!(
-                            "Resume failed for sid {sid}; live-send sent to a fresh pane (history not loaded)"
-                        )));
-                    }
-                    Ok(None) => {
-                        self.update_status = None;
-                    }
-                    Err(()) => {
-                        // enter_live_send already surfaced the failure via
-                        // info_dialog; just clear the transient toast.
-                        self.update_status = None;
-                    }
+                let outcome = self.home.prepare_live_send(&id);
+                // Settle the toast to its final state BEFORE the sync resize
+                // and redraw, so HomeView's cached `preview_pane_area`
+                // matches the geometry the user will see for the next
+                // several frames. Otherwise the toast row that was on screen
+                // during `prepare_live_send` would make the preview pane one
+                // row shorter than post-toast, the sync resize would target
+                // the smaller pane, and the first capture would render
+                // shifted up.
+                self.update_status = match &outcome {
+                    Ok(Some(sid)) => Some(UpdateStatus::transient(format!(
+                        "Resume failed for sid {sid}; live-send sent to a fresh pane (history not loaded)"
+                    ))),
+                    // On clean ready, drop the toast entirely. On Err the
+                    // info_dialog already carries the failure detail, so the
+                    // transient toast just gets in the way.
+                    Ok(None) | Err(()) => None,
+                };
+                if outcome.is_ok() {
+                    self.draw(terminal)?;
+                    self.home.finalize_live_send_resize();
                 }
             }
             Action::AttachToolSession(id, tool_name) => {

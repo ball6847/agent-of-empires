@@ -21,10 +21,15 @@
 //! - No echo, no inline editing, no review step. The preview pane is the
 //!   only feedback channel; users who need multi-line composition or want
 //!   to proofread voice/dictation should use the compose dialog on `M`.
-//! - One tmux process per keystroke. Acceptable on local machines; visibly
-//!   laggy over Docker / mosh on slow links. Bracketed paste shortcuts the
-//!   per-char cost by routing the whole chunk through `send_literal_no_enter`
-//!   in a single call.
+//! - Each coalesced keystroke run becomes one `tmux send-keys`
+//!   subprocess. A long-lived `tmux -C` control-mode connection was
+//!   tried (#1485) to avoid that fork cost on mobile, but the
+//!   connection turned out to be unreliable on macOS tmux 3.x: it
+//!   EOF'd within milliseconds of spawn, leaving us paying the spawn
+//!   cost while never benefiting from the connection. Forking per
+//!   batch is the simpler, more portable model; the per-batch fork
+//!   cost is bounded by user typing speed (held keys / pastes
+//!   coalesce into one fork) and is invisible on a laptop.
 //!
 //! Reserved (non-forwarded) chords:
 //! - The configured exit chord list — exits live mode (see above).
@@ -269,24 +274,27 @@ pub(in crate::tui) struct LiveSendState {
 }
 
 /// One coalesced unit of work the worker hands to tmux. `Literal` runs
-/// fold together; named keys and resizes break the run because their
-/// order vs. surrounding text matters (an Up arrow between "ab" and
-/// "cd" must arrive between, not after; a resize that lands before
-/// keystrokes makes the agent render those keystrokes at the new
-/// geometry).
+/// fold together; named keys, hex-byte runs, and resizes break the run
+/// because their order vs. surrounding text matters (an Up arrow between
+/// "ab" and "cd" must arrive between, not after; a resize that lands
+/// before keystrokes makes the agent render those keystrokes at the new
+/// geometry). Consecutive `HexBytes` payloads do merge with each other
+/// so a multi-blank-line paste collapses into one `send-keys -H` call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TmuxAction {
     Literal(String),
     Named(String),
+    HexBytes(Vec<u8>),
     Resize { cols: u16, rows: u16 },
 }
 
 /// Fold a batch of `WorkerMsg`s into the smallest sequence of
 /// `TmuxAction`s that preserves the original ordering. Consecutive
-/// `Send(Literal)` values merge into one payload (single
-/// `tmux send-keys` call); a `Send(Named)` or `Resize` flushes the
-/// current literal run and goes out on its own. Pure function so tests
-/// can verify ordering without spawning a worker thread.
+/// `Send(Literal)` values merge into one `send-keys -l` payload, and
+/// consecutive `Send(HexBytes)` values merge into one `send-keys -H`
+/// argument list; a `Send(Named)`, `Send(HexBytes)`, or `Resize`
+/// flushes the current literal run. Pure function so tests can verify
+/// ordering without spawning a worker thread.
 pub(super) fn coalesce(batch: Vec<WorkerMsg>) -> Vec<TmuxAction> {
     let mut out: Vec<TmuxAction> = Vec::new();
     let mut run = String::new();
@@ -301,6 +309,13 @@ pub(super) fn coalesce(batch: Vec<WorkerMsg>) -> Vec<TmuxAction> {
             WorkerMsg::Send(TmuxKey::Named(name)) => {
                 flush(&mut out, &mut run);
                 out.push(TmuxAction::Named(name));
+            }
+            WorkerMsg::Send(TmuxKey::HexBytes(bytes)) => {
+                flush(&mut out, &mut run);
+                match out.last_mut() {
+                    Some(TmuxAction::HexBytes(prev)) => prev.extend_from_slice(&bytes),
+                    _ => out.push(TmuxAction::HexBytes(bytes)),
+                }
             }
             WorkerMsg::Resize { cols, rows } => {
                 flush(&mut out, &mut run);
@@ -322,43 +337,54 @@ pub(super) enum WorkerMsg {
     Resize { cols: u16, rows: u16 },
 }
 
-/// Background dispatcher: owns a tmux `Session` and drains a channel of
-/// `WorkerMsg`s, calling `coalesce_batch` to compress runs of literal
-/// keys into single `send-keys` invocations. Spawned on
-/// `enter_live_send` and dropped when the user exits live mode;
-/// dropping closes the channel, which makes the worker thread's `recv`
-/// return `Err` and exit on the next iteration. We deliberately do not
-/// `join` because the worker is idempotent and harmless if it survives
-/// a brief moment past the UI thread that owned it (e.g., the user
-/// toggles live mode rapidly).
+/// Background dispatcher: drains a channel of `WorkerMsg`s and runs
+/// each via a one-shot `tmux send-keys` / `resize-window` subprocess
+/// after coalescing with `coalesce`. Spawned by `prepare_live_send` and
+/// dropped when the user exits live mode; dropping closes the channel,
+/// which makes the worker thread's `recv` return `Err` and exit on the
+/// next iteration. We deliberately do not `join` because the worker is
+/// idempotent and harmless if it survives a brief moment past the UI
+/// thread that owned it (e.g., the user toggles live mode rapidly).
+///
+/// Previously (#1485) this dispatched through a long-lived
+/// `tmux -C attach-session` connection to avoid one fork per
+/// keystroke. The connection turned out to be unstable on at least
+/// some macOS tmux 3.x builds (it would EOF within milliseconds of
+/// spawn), and the resulting fork-fallback path was hit ~100% of the
+/// time on those setups while still paying the spawn cost upfront.
+/// Ripping out control-mode entirely keeps the dispatch path simple
+/// (one fork per coalesced batch) and consistent across setups; the
+/// per-keystroke fork cost is bounded by user typing speed and is
+/// invisible on a laptop. Mobile/mosh users pay a few extra ms per
+/// keypress, which we accept as the cost of reliability.
 pub(in crate::tui) struct LiveSendWorker {
     tx: Sender<WorkerMsg>,
 }
 
 impl LiveSendWorker {
-    pub(super) fn spawn(session_name: String) -> Self {
+    pub(super) fn spawn(tmux_name: String) -> Self {
         let (tx, rx) = channel::<WorkerMsg>();
         std::thread::spawn(move || {
-            let session = crate::tmux::Session::from_name(&session_name);
             // Block until the first message, then drain anything else
-            // that piled up during the previous flush. This is enough
-            // to coalesce paste-bursts and held-key autorepeat without
-            // adding any extra sleep that would inflate single-key
-            // latency.
+            // that piled up during the previous flush. The drain plus
+            // `coalesce` collapses paste-bursts and held-key autorepeat
+            // into one fork per literal run, so typing a long sentence
+            // costs one `tmux send-keys -l` invocation, not one per
+            // character.
             while let Ok(first) = rx.recv() {
                 let mut batch = vec![first];
                 while let Ok(msg) = rx.try_recv() {
                     batch.push(msg);
                 }
-                dispatch_batch(&session, batch);
+                dispatch_batch(&tmux_name, batch);
             }
         });
         Self { tx }
     }
 
     /// Enqueue a translated key for dispatch. Returns immediately; the
-    /// fork+exec for `tmux send-keys` happens on the worker thread, so
-    /// the UI never blocks on tmux latency.
+    /// `tmux send-keys` fork happens on the worker thread, so the UI
+    /// never blocks on tmux latency.
     pub(super) fn send(&self, key: TmuxKey) {
         // Channel send only fails if the worker thread panicked. Drop
         // silently rather than spam logs: the user's next exit attempt
@@ -376,21 +402,71 @@ impl LiveSendWorker {
     }
 }
 
-/// Walk one drained batch and execute it against `session`. Uses
-/// `coalesce` so literal-key runs collapse into a single `send-keys`
-/// call; named keys and resizes dispatch individually. Tests verify
-/// the ordering via `coalesce` directly without needing a real session.
-fn dispatch_batch(session: &crate::tmux::Session, batch: Vec<WorkerMsg>) {
+/// Walk one drained batch and execute it as one-shot `tmux` subprocesses.
+/// `coalesce` merges literal-key runs into a single `send-keys -l` call;
+/// named keys and resizes dispatch individually. Tests verify the
+/// coalescing ordering via `coalesce` directly without needing a real
+/// session.
+fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) {
     for action in coalesce(batch) {
-        let result = match action {
-            TmuxAction::Literal(s) => session.send_literal_no_enter(&s),
-            TmuxAction::Named(name) => session.send_named_key(&name),
-            TmuxAction::Resize { cols, rows } => session.resize(cols, rows),
-        };
-        if let Err(e) = result {
-            tracing::warn!("live-send worker: tmux op failed: {}", e);
+        if let Err(err) = dispatch_via_fork(tmux_name, &action) {
+            tracing::warn!(
+                target: "tui.live_send",
+                error = %err,
+                action = ?action,
+                "live-send fork dispatch failed; keystroke dropped",
+            );
         }
     }
+}
+
+/// Execute one `TmuxAction` as a one-shot `tmux` subprocess. Module-
+/// level fn (rather than a method on the worker) so it stays callable
+/// from the spawned thread without holding a worker reference.
+fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()> {
+    use std::process::{Command, Stdio};
+    let target = format!("{}:^.0", tmux_name);
+    let mut cmd = Command::new("tmux");
+    cmd.stderr(Stdio::null());
+    match action {
+        TmuxAction::Literal(s) => {
+            // `-l --` mirrors `send_literal_no_enter`: literal-mode
+            // send, followed by the end-of-options marker so a payload
+            // starting with `-` isn't reparsed as a flag.
+            cmd.args(["send-keys", "-t", &target, "-l", "--", s.as_str()]);
+        }
+        TmuxAction::Named(name) => {
+            cmd.args(["send-keys", "-t", &target, name.as_str()]);
+        }
+        TmuxAction::HexBytes(bytes) => {
+            // `-H` sends each subsequent arg as the hex byte value of an
+            // ASCII character. We use this for control bytes (CR, TAB,
+            // ESC) and the bracketed-paste markers, none of which can
+            // ride a `-l` payload safely.
+            cmd.args(["send-keys", "-t", &target, "-H"]);
+            for b in bytes {
+                cmd.arg(format!("{:02x}", b));
+            }
+        }
+        TmuxAction::Resize { cols, rows } => {
+            cmd.args([
+                "resize-window",
+                "-t",
+                tmux_name,
+                "-x",
+                &cols.to_string(),
+                "-y",
+                &rows.to_string(),
+            ]);
+        }
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!("spawn live-send tmux subprocess: {}", e))?;
+    if !status.success() {
+        anyhow::bail!("live-send tmux subprocess exited non-zero for {:?}", action);
+    }
+    Ok(())
 }
 
 /// What the translator says to do with one incoming key event.
@@ -408,11 +484,15 @@ pub(super) enum LiveDispatch {
 }
 
 /// How the translator wants the keystroke delivered. `Literal` payloads
-/// go through `tmux send-keys -l --`, named keys through `tmux send-keys`.
+/// go through `tmux send-keys -l --`, named keys through `tmux send-keys`,
+/// and `HexBytes` through `tmux send-keys -H <byte> <byte> ...` for raw
+/// bytes that can't ride a literal payload (control bytes like ESC, CR,
+/// TAB, and the bracketed-paste markers).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TmuxKey {
     Literal(String),
     Named(String),
+    HexBytes(Vec<u8>),
 }
 
 /// Map one crossterm `KeyEvent` onto a `LiveDispatch`.
@@ -811,6 +891,9 @@ mod tests {
     fn snd_named(s: &str) -> WorkerMsg {
         WorkerMsg::Send(TmuxKey::Named(s.into()))
     }
+    fn snd_hex(bytes: &[u8]) -> WorkerMsg {
+        WorkerMsg::Send(TmuxKey::HexBytes(bytes.to_vec()))
+    }
 
     #[test]
     fn coalesce_empty_batch_is_empty() {
@@ -893,6 +976,60 @@ mod tests {
             vec![
                 TmuxAction::Named("Tab".into()),
                 TmuxAction::Literal("xy".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn coalesce_hex_bytes_breaks_literal_run() {
+        // A HexBytes payload (bracketed-paste marker, raw CR, etc.)
+        // must dispatch in order, not after surrounding literals.
+        let out = coalesce(vec![snd_lit("a"), snd_hex(&[0x0d]), snd_lit("b")]);
+        assert_eq!(
+            out,
+            vec![
+                TmuxAction::Literal("a".into()),
+                TmuxAction::HexBytes(vec![0x0d]),
+                TmuxAction::Literal("b".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn coalesce_back_to_back_hex_bytes_merge() {
+        // Consecutive HexBytes payloads (e.g. a paste with a blank line
+        // produces two raw-CR sends in a row) collapse into one
+        // `send-keys -H` invocation. Named keys can't merge because
+        // each is a separate key argument; raw bytes have no such
+        // constraint.
+        let out = coalesce(vec![snd_hex(&[0x0d]), snd_hex(&[0x0d])]);
+        assert_eq!(out, vec![TmuxAction::HexBytes(vec![0x0d, 0x0d])]);
+    }
+
+    #[test]
+    fn coalesce_preserves_order_when_hex_bytes_and_literals_interleave() {
+        // A future caller could send `HexBytes` and `Literal` payloads
+        // back to back (e.g. a typed-then-pasted burst the worker
+        // drained in one tick). Coalesce must keep wire ordering
+        // intact: each `Literal` flushes the run, and only adjacent
+        // `HexBytes` pairs merge.
+        let start = vec![0x1b, b'[', b'2', b'0', b'0', b'~'];
+        let end = vec![0x1b, b'[', b'2', b'0', b'1', b'~'];
+        let out = coalesce(vec![
+            snd_hex(&start),
+            snd_lit("a"),
+            snd_hex(&[0x0d]),
+            snd_lit("b"),
+            snd_hex(&end),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                TmuxAction::HexBytes(start),
+                TmuxAction::Literal("a".into()),
+                TmuxAction::HexBytes(vec![0x0d]),
+                TmuxAction::Literal("b".into()),
+                TmuxAction::HexBytes(end),
             ]
         );
     }

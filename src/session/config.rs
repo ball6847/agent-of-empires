@@ -509,6 +509,15 @@ pub struct AppStateConfig {
     /// Restored on subsequent opens so users don't re-navigate every time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_browse_dir: Option<PathBuf>,
+
+    /// Collapsed state for the synthetic "Archived" sidebar section.
+    /// Defaults to collapsed when absent. Archived sessions are pulled out
+    /// of the natural sort and grouped under this section at the bottom
+    /// across every sort mode, so they stop interleaving with active rows
+    /// without users in non-Attention modes losing the ability to find a
+    /// shelved session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_section_collapsed: Option<bool>,
 }
 
 /// Session-related configuration defaults
@@ -614,6 +623,41 @@ pub struct SessionConfig {
     /// neither tmux nor live-send applies to them.
     #[serde(default)]
     pub new_session_attach_mode: NewSessionAttachMode,
+
+    /// What `Enter` (and double-click) does on an existing session
+    /// row in the Agent view. `Tmux` (default) attaches to the tmux
+    /// pane, the historical behavior. `LiveSend` enters live-send
+    /// mode instead so the TUI keeps the home list visible and pipes
+    /// keystrokes through to the agent. Terminal/Tool views and
+    /// cockpit-mode sessions ignore this setting; they keep their
+    /// existing activation paths (terminal attach, cockpit open).
+    #[serde(default)]
+    pub default_attach_mode: NewSessionAttachMode,
+
+    /// What a single mouse click on a session row does in the Agent
+    /// view. `LiveSend` (default) enters live-send mode for that row,
+    /// the historical behavior. `SelectOnly` just moves the cursor
+    /// to the row so the user can read the preview without ever
+    /// entering live-send. Double-click still activates via
+    /// `default_attach_mode` regardless of this setting.
+    #[serde(default)]
+    pub click_action: ClickAction,
+}
+
+/// What a single mouse click on a session row does in the Agent view.
+/// See `SessionConfig::click_action`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClickAction {
+    /// Single-click enters live-send mode for the clicked session
+    /// (the historical behavior on `main` before this setting landed).
+    #[default]
+    LiveSend,
+    /// Single-click only moves the cursor to the clicked row, so the
+    /// user can browse session previews without entering live-send.
+    /// Double-click still activates the session via the configured
+    /// `default_attach_mode`.
+    SelectOnly,
 }
 
 /// What the TUI does after a new session is created. See
@@ -675,6 +719,8 @@ impl Default for SessionConfig {
             session_id_poller_max_threads: default_session_id_poller_max_threads(),
             live_send_exit_chord: default_live_send_exit_chord(),
             new_session_attach_mode: NewSessionAttachMode::default(),
+            default_attach_mode: NewSessionAttachMode::default(),
+            click_action: ClickAction::default(),
         }
     }
 }
@@ -1136,7 +1182,7 @@ impl Default for SandboxConfig {
 }
 
 fn default_sandbox_image() -> String {
-    "ghcr.io/njbrake/aoe-sandbox:latest".to_string()
+    "ghcr.io/agent-of-empires/aoe-sandbox:latest".to_string()
 }
 
 fn default_sandbox_environment() -> Vec<String> {

@@ -128,6 +128,7 @@ export async function waitForCockpitReady(
         `which means the supervisor.spawn task is wedged.\n` +
         `Original: ${err instanceof Error ? err.message : String(err)}\n` +
         `--- debug.log tail ---\n${log}\n--- end debug.log ---`,
+      { cause: err },
     );
   }
   // Phase 2: wait for the supervisor to reach "running". On failure
@@ -184,8 +185,51 @@ export async function waitForCockpitReady(
       `waitForCockpitReady phase 2 failed: ${err instanceof Error ? err.message : String(err)}\n` +
         `Diagnostic snapshot:\n${summary}\n` +
         `--- debug.log tail ---\n${log}\n--- end debug.log ---`,
+      { cause: err },
     );
   }
+}
+
+/**
+ * Poll `/cockpit/replay?since=0` until the serialized frame list
+ * contains every needle in `needles` (default: `any` matches if at
+ * least one needle is present; pass `mode: "all"` to require all).
+ *
+ * Replaces the `for (let attempt = 0; attempt < 30; attempt++) ... setTimeout(200)`
+ * pattern that was duplicated across the cockpit live specs. Hand-rolled
+ * 30×200ms loops cap at a hard 6s deadline that races supervisor
+ * handshakes under CI load; this helper uses `expect.poll` with
+ * backoff intervals (100, 200, 500, 1000ms) and a 15s default timeout,
+ * which both shortens the happy path and gives long-tail latencies
+ * room to land. On timeout, expect.poll surfaces the last polled value
+ * (the boolean) so failures stay readable.
+ */
+export async function waitForReplayContains(
+  baseUrl: string,
+  sessionId: string,
+  needles: string | string[],
+  options: { timeoutMs?: number; mode?: "any" | "all" } = {},
+): Promise<void> {
+  const list = Array.isArray(needles) ? needles : [needles];
+  const mode = options.mode ?? "any";
+  const timeout = options.timeoutMs ?? 15_000;
+  await expect
+    .poll(
+      async () => {
+        const replay = await fetch(
+          `${baseUrl}/api/sessions/${sessionId}/cockpit/replay?since=0`,
+        ).then((r) => r.json());
+        const frames: unknown[] = Array.isArray(replay)
+          ? replay
+          : (replay?.frames ?? []);
+        const json = JSON.stringify(frames);
+        return mode === "all"
+          ? list.every((n) => json.includes(n))
+          : list.some((n) => json.includes(n));
+      },
+      { timeout, intervals: [100, 200, 500, 1000] },
+    )
+    .toBe(true);
 }
 
 /**

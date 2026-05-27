@@ -13,6 +13,7 @@ use super::{
 };
 use crate::session::config::{GroupByMode, SortOrder};
 use crate::session::{Item, Status};
+use crate::tui::components::preview::{self, CachedPreview};
 use crate::tui::components::{
     format_scroll_indicator, set_prefixed_input_cursor_position, HelpOverlay, Preview,
 };
@@ -190,8 +191,24 @@ pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
 /// The mapping is per-name and deterministic, so two profiles that collapse to
 /// the same code render identically; the full name still shows in a filtered
 /// view's list title and in the New/Restart dialogs.
-/// Compute the per-row tag string for a given instance + mode, or `None`
-/// when the row should not render a tag in this context.
+/// Per-row tag content plus the mode's max content width. The renderer
+/// right-pads `content` to `max_width` so the bracket span is fixed-width
+/// across rows (`[fb  ]` vs `[def ]`), keeping the activity column from
+/// reflowing as tag widths vary. `compute_row_tag` truncates each variant
+/// to the same cap it carries here, so `rendered()` never truncates.
+pub(crate) struct RowTag {
+    pub content: String,
+    pub max_width: usize,
+}
+
+impl RowTag {
+    pub fn rendered(&self) -> String {
+        format!("[{:<width$}]", self.content, width = self.max_width)
+    }
+}
+
+/// Compute the per-row tag for a given instance + mode, or `None` when the
+/// row should not render a tag in this context.
 ///
 /// `Auto` only renders in all-profiles view (no `active_profile`). Other
 /// modes always render when their content is available (e.g. `Branch`
@@ -200,7 +217,7 @@ pub(crate) fn compute_row_tag(
     inst: &crate::session::Instance,
     mode: crate::session::config::RowTagMode,
     in_all_profiles_view: bool,
-) -> Option<String> {
+) -> Option<RowTag> {
     use crate::session::config::RowTagMode;
     match mode {
         RowTagMode::None => None,
@@ -212,7 +229,10 @@ pub(crate) fn compute_row_tag(
             if code.is_empty() {
                 None
             } else {
-                Some(code)
+                Some(RowTag {
+                    content: code,
+                    max_width: 4,
+                })
             }
         }
         RowTagMode::Profile => {
@@ -220,12 +240,18 @@ pub(crate) fn compute_row_tag(
             if code.is_empty() {
                 None
             } else {
-                Some(code)
+                Some(RowTag {
+                    content: code,
+                    max_width: 4,
+                })
             }
         }
         RowTagMode::Sandbox => {
             if inst.is_sandboxed() {
-                Some("sb".to_string())
+                Some(RowTag {
+                    content: "sb".to_string(),
+                    max_width: 2,
+                })
             } else {
                 None
             }
@@ -243,7 +269,7 @@ pub(crate) fn compute_row_tag(
             // path and have no `worktree_info`, so they fall through to
             // `None` here naturally.
             if w.branch != inst.title {
-                return Option::<String>::None;
+                return None;
             }
             // Show the last `/`-segment of the branch (most informative
             // for `feature/foo` style names), truncated to 8 chars so the
@@ -251,9 +277,12 @@ pub(crate) fn compute_row_tag(
             let last = w.branch.rsplit('/').next().unwrap_or("");
             let trimmed: String = last.chars().take(8).collect();
             if trimmed.is_empty() {
-                Option::<String>::None
+                None
             } else {
-                Some(trimmed)
+                Some(RowTag {
+                    content: trimmed,
+                    max_width: 8,
+                })
             }
         }),
     }
@@ -399,6 +428,8 @@ impl HomeView {
         // Diff view takes over the whole screen
         if self.diff_view.is_some() {
             self.preview_area = Rect::default();
+            self.preview_pane_area = Rect::default();
+            self.preview_outer_area = Rect::default();
             self.diff_area = self.active_diff_area(area);
         }
         if let Some(ref mut diff) = self.diff_view {
@@ -544,6 +575,8 @@ impl HomeView {
             info_dialog,
             snooze_duration_dialog,
             profile_picker_dialog,
+            group_picker_dialog,
+            sort_picker_dialog,
             projects_dialog,
             command_palette,
             tool_picker_dialog,
@@ -768,6 +801,8 @@ impl HomeView {
             || self.changelog_dialog.is_some()
             || self.info_dialog.is_some()
             || self.profile_picker_dialog.is_some()
+            || self.group_picker_dialog.is_some()
+            || self.sort_picker_dialog.is_some()
             || self.projects_dialog.is_some()
             || self.command_palette.is_some()
             || self.send_message_dialog.is_some()
@@ -785,10 +820,20 @@ impl HomeView {
     ) -> Line<'static> {
         let indent = get_indent(item.depth());
 
+        // Attention-mode-gated visuals. Favorite, snooze (decoration), and
+        // urgent only render when the user is in Attention sort, so the
+        // sidebar stays clean for users who don't run a high-volume
+        // triage workflow. Archive stays universal because it's a
+        // lifecycle action (the pane is killed), and its rows live in
+        // the dedicated bottom-pinned "Archived" section regardless of
+        // sort mode.
+        let in_attention = self.sort_order == SortOrder::Attention;
+
         use std::borrow::Cow;
 
         let (icon, text, style): (&str, Cow<str>, Style) = match item {
             Item::Group {
+                path,
                 name,
                 collapsed,
                 session_count,
@@ -802,9 +847,23 @@ impl HomeView {
                 };
                 let text = Cow::Owned(format!("{} ({})", name, session_count));
                 let mut style = Style::default().fg(theme.group).bold();
-                if archived_at.is_some() {
-                    // Archived groups: italic + dim, still visible at the
-                    // bottom of the Attention sort.
+                if crate::session::is_within_archived_section(path) {
+                    // Synthetic Archived section header (and any
+                    // project sub-folder rendered under it in Project
+                    // mode): muted + italic + dim so it reads as a
+                    // divider rather than a user-created group. The
+                    // contained rows aren't decorated individually;
+                    // the section header is the sole visual signal
+                    // that those sessions are shelved. Matches the
+                    // modifier set used for archived user groups so
+                    // terminals with weak dimmed-fg rendering still
+                    // surface the parked affordance.
+                    style = Style::default()
+                        .fg(theme.dimmed)
+                        .add_modifier(ratatui::style::Modifier::ITALIC)
+                        .add_modifier(ratatui::style::Modifier::DIM);
+                } else if archived_at.is_some() {
+                    // Archived user groups: italic + dim, still visible.
                     style = style
                         .add_modifier(ratatui::style::Modifier::ITALIC)
                         .add_modifier(ratatui::style::Modifier::DIM);
@@ -859,65 +918,58 @@ impl HomeView {
                                 Status::Creating => theme.accent,
                             };
                             let mut style = Style::default().fg(color);
-                            if inst.is_archived() || inst.is_snoozed() {
-                                // Archived AND snoozed rows render with one
-                                // uniform muted glyph regardless of underlying
-                                // status. Without this override an archived
-                                // session whose sidecar still says `running`
-                                // would keep animating its spinner (just
-                                // dimmed), visually identical to an active
-                                // session and a recurring source of "why is
-                                // this archived row spinning" confusion. The
-                                // semantic state still lives in the persisted
-                                // `inst.status`; we just stop painting it
-                                // here because archive/snooze are by
-                                // definition "not actively asking for
-                                // attention." Delegates to `agent_row_icon`
-                                // so the override is in one place and the
-                                // unit test covers what render shows.
+                            if inst.is_archived() {
+                                // Archived rows render with one uniform
+                                // muted glyph regardless of underlying
+                                // status. The pane is dead, so painting
+                                // the persisted Running/Waiting status
+                                // would be misleading. The Archived
+                                // section header is the sole textual
+                                // cue, so no italic/dim modifier is
+                                // applied here; just a dim color.
+                                icon = agent_row_icon(inst);
+                                style = Style::default().fg(theme.dimmed);
+                            } else if in_attention && inst.is_snoozed() {
+                                // Snooze decoration is Attention-only.
+                                // Outside Attention the row paints its
+                                // real status (the timer keeps running;
+                                // the visual treatment just doesn't
+                                // surface).
                                 icon = agent_row_icon(inst);
                                 style = Style::default()
                                     .fg(theme.dimmed)
                                     .add_modifier(ratatui::style::Modifier::ITALIC)
                                     .add_modifier(ratatui::style::Modifier::DIM);
-                            } else if inst.is_urgent() {
-                                // Agent flagged this row urgent via the
-                                // `attention-urgent` script. Override fg with
-                                // the error color (red) and add BOLD +
-                                // RAPID_BLINK so the row screams across the
-                                // pane. Urgent wins over favorite styling
-                                // since urgent is a cross-tier promoter and
-                                // the visual must match: a row that sorts to
-                                // top must look the part. Archive/snooze
-                                // still wins over urgent because is_urgent()
-                                // returns false for sunk rows.
+                            } else if in_attention && inst.is_urgent() {
+                                // Urgent decoration is Attention-only.
+                                // The flag still persists in non-
+                                // Attention modes, but the cross-tier
+                                // promoter visual only makes sense when
+                                // tier ordering is in effect.
                                 style = Style::default()
                                     .fg(theme.error)
                                     .add_modifier(ratatui::style::Modifier::BOLD)
                                     .add_modifier(ratatui::style::Modifier::RAPID_BLINK);
-                            } else if inst.is_favorited() {
-                                // Favorited, non-archived: bold + underlined
-                                // + "* " prefix. ASCII-only glyph (previously
-                                // ⭐ but emoji wide-width accounting mis-
-                                // aligned row truncation on iOS Blink /
-                                // Termius, causing stray combining-sequence
-                                // chars to bleed into the title). Archive
-                                // wins over favorite if both are set.
+                            } else if in_attention && inst.is_favorited() {
+                                // Favorite decoration is Attention-only,
+                                // since favorites are within-tier pins.
                                 style = style
                                     .add_modifier(ratatui::style::Modifier::BOLD)
                                     .add_modifier(ratatui::style::Modifier::UNDERLINED);
                             }
-                            // Prefix priority: archive (no prefix) wins over
-                            // snooze (`z `) wins over urgent (`! `) wins over
-                            // favorite (`* `). Matches the sort-tier priority:
-                            // archive > snooze > urgent > favorite.
+                            // Prefix priority: archive (no prefix) wins
+                            // over snooze (`z `) wins over urgent (`! `)
+                            // wins over favorite (`* `). All three
+                            // prefixes are Attention-mode-only so users
+                            // in Newest / AZ / etc. don't see decoration
+                            // for state they didn't opt into managing.
                             let title_text = if inst.is_archived() {
                                 Cow::Owned(inst.title.clone())
-                            } else if inst.is_snoozed() {
+                            } else if in_attention && inst.is_snoozed() {
                                 Cow::Owned(format!("z {}", inst.title))
-                            } else if inst.is_urgent() {
+                            } else if in_attention && inst.is_urgent() {
                                 Cow::Owned(format!("! {}", inst.title))
-                            } else if inst.is_favorited() {
+                            } else if in_attention && inst.is_favorited() {
                                 Cow::Owned(format!("* {}", inst.title))
                             } else {
                                 Cow::Owned(inst.title.clone())
@@ -947,46 +999,36 @@ impl HomeView {
                                 (ICON_IDLE, theme.dimmed)
                             };
                             let mut style = Style::default().fg(color);
-                            if inst.is_archived() || inst.is_snoozed() {
-                                // Mirrors the Agent-view path: archived AND
-                                // snoozed rows render with one uniform muted
-                                // glyph regardless of underlying state. Kills
-                                // the running-spinner-on-archived-row visual
-                                // bug where a stale terminal session would
-                                // animate even after the user parked the row.
+                            if inst.is_archived() {
+                                // Archive lifecycle override mirrors the
+                                // Agent-view path: dim color, stopped
+                                // icon, no italic/dim modifier; the
+                                // Archived section header is the cue.
+                                icon = ICON_STOPPED;
+                                style = Style::default().fg(theme.dimmed);
+                            } else if in_attention && inst.is_snoozed() {
                                 icon = ICON_STOPPED;
                                 style = Style::default()
                                     .fg(theme.dimmed)
                                     .add_modifier(ratatui::style::Modifier::ITALIC)
                                     .add_modifier(ratatui::style::Modifier::DIM);
-                            } else if inst.is_urgent() {
-                                // Mirrors the Agent-view path: agent flagged
-                                // urgent gets red + BOLD + RAPID_BLINK across
-                                // both view modes so the visual is consistent
-                                // when the user toggles agent/terminal view.
+                            } else if in_attention && inst.is_urgent() {
                                 style = Style::default()
                                     .fg(theme.error)
                                     .add_modifier(ratatui::style::Modifier::BOLD)
                                     .add_modifier(ratatui::style::Modifier::RAPID_BLINK);
-                            } else if inst.is_favorited() {
-                                // Favorited, non-archived: bold + underlined
-                                // + "* " prefix. ASCII-only glyph (previously
-                                // ⭐ but emoji wide-width accounting mis-
-                                // aligned row truncation on iOS Blink /
-                                // Termius, causing stray combining-sequence
-                                // chars to bleed into the title). Archive
-                                // wins over favorite if both are set.
+                            } else if in_attention && inst.is_favorited() {
                                 style = style
                                     .add_modifier(ratatui::style::Modifier::BOLD)
                                     .add_modifier(ratatui::style::Modifier::UNDERLINED);
                             }
                             let title_text = if inst.is_archived() {
                                 Cow::Owned(inst.title.clone())
-                            } else if inst.is_snoozed() {
+                            } else if in_attention && inst.is_snoozed() {
                                 Cow::Owned(format!("z {}", inst.title))
-                            } else if inst.is_urgent() {
+                            } else if in_attention && inst.is_urgent() {
                                 Cow::Owned(format!("! {}", inst.title))
-                            } else if inst.is_favorited() {
+                            } else if in_attention && inst.is_favorited() {
                                 Cow::Owned(format!("* {}", inst.title))
                             } else {
                                 Cow::Owned(inst.title.clone())
@@ -1076,7 +1118,7 @@ impl HomeView {
                     compute_row_tag(inst, self.row_tag_mode, self.active_profile.is_none())
                 {
                     line_spans.push(Span::styled(
-                        format!("  [{}]", tag),
+                        format!("  {}", tag.rendered()),
                         Style::default().fg(theme.dimmed),
                     ));
                 }
@@ -1131,12 +1173,21 @@ impl HomeView {
                     if pad_len > 0 {
                         line_spans.push(Span::raw(" ".repeat(pad_len)));
                     }
-                    // Snoozed rows show remaining sleep time ("23m" / "1h").
+                    // In Attention mode, snoozed rows show remaining sleep
+                    // time ("23m" / "1h"). Outside Attention mode, snooze
+                    // is invisible (the timer still ticks; we just don't
+                    // surface it) so the column falls through to the
+                    // normal age path.
                     // Idle rows show time-since-stop (`idle_entered_at`)
                     // since `last_accessed_at` would lie after attach/send.
                     // Fall back to `last_accessed_at` when `idle_entered_at`
                     // is missing.
-                    let age = if let Some(remaining) = inst.snooze_remaining() {
+                    let snooze_remaining = if in_attention {
+                        inst.snooze_remaining()
+                    } else {
+                        None
+                    };
+                    let age = if let Some(remaining) = snooze_remaining {
                         format_snooze_remaining(remaining)
                     } else {
                         let age_ts = if inst.status == Status::Idle {
@@ -1165,25 +1216,23 @@ impl HomeView {
     }
 
     /// Refresh preview cache if needed (session changed, dimensions changed, or timer expired)
-    fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
-        // 250ms (4 Hz) is the steady-state cadence, enough to surface
-        // status changes without forking tmux on every loop tick. While
-        // the user is in live-send mode they're watching the preview
-        // for feedback on each keystroke, so drop to 16ms (~60 Hz,
-        // matching the app loop's redraw ceiling) so typed input
-        // appears in the preview as close to instantly as the
-        // fork-per-capture model allows. Cost: ~60 `tmux capture-pane`
-        // forks/sec while live, typically <5% of one core on a modern
-        // laptop. See #1485 for the longer-term fix (one long-lived
-        // tmux control-mode socket instead of per-refresh forks).
+    // pub(super) so unit tests in `super::tests` can exercise the
+    // cache-preservation behavior added with the kill-switch fix
+    // without standing up a full render pipeline.
+    pub(super) fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
+        // Outside live-send, captures fork a fresh `tmux capture-pane`
+        // so we throttle to 250ms (4 Hz). Inside live-send, captures
+        // ride the long-lived `tmux -C` control-mode socket and cost
+        // a single round-trip (~1-2ms), so there's no upside to
+        // throttling: every render refreshes the preview, the agent's
+        // output appears as soon as the main loop wakes (key event,
+        // tokio ticker, or the %output wake-up the reader thread
+        // pushes when tmux notifies us of new pane bytes). The result
+        // is roughly attach-quality latency in the common case; the
+        // residual gap is the cost of capture-pane + ratatui re-render
+        // vs. tmux writing bytes straight into your terminal.
         const PREVIEW_REFRESH_MS_IDLE: u128 = 250;
-        const PREVIEW_REFRESH_MS_LIVE: u128 = 16;
         let in_live = self.live_send.is_some();
-        let refresh_ms = if in_live {
-            PREVIEW_REFRESH_MS_LIVE
-        } else {
-            PREVIEW_REFRESH_MS_IDLE
-        };
 
         // While in live-send mode, keep the tmux pane geometry in sync
         // with the preview's actual cell dimensions so the agent
@@ -1207,7 +1256,10 @@ impl HomeView {
             None => false,
         };
         let dims_changed = self.preview_cache.dimensions != (width, height);
-        let timer_expired = self.preview_cache.last_refresh.elapsed().as_millis() > refresh_ms;
+        // Live-send: no throttle. Idle: 250ms throttle to keep the
+        // fork rate sane. See the constant comment above for why.
+        let timer_expired = in_live
+            || self.preview_cache.last_refresh.elapsed().as_millis() > PREVIEW_REFRESH_MS_IDLE;
         // Only re-capture for scroll when the cached window can no longer
         // cover the requested offset. Wheel ticks inside the BUFFER headroom
         // re-render from the existing content without forking tmux.
@@ -1218,15 +1270,71 @@ impl HomeView {
             && (session_changed || dims_changed || timer_expired || scroll_exceeds);
 
         if needs_refresh {
-            if let Some(id) = &self.selected_session {
-                if let Some(inst) = self.get_instance(id) {
-                    let capture_lines = capture_lines_for(height, scroll_offset);
-                    let content = inst
-                        .capture_output_with_size(capture_lines, width, height)
-                        .unwrap_or_default();
+            if let Some(id) = self.selected_session.clone() {
+                let capture_lines = capture_lines_for(height, scroll_offset);
+                // Captures always go through the fork-based path
+                // (`Session::capture_pane_with_size` via the instance
+                // helper). The long-lived `tmux -C` connection is
+                // reserved for `send-keys` from the worker thread; on
+                // some tmux builds (macOS 3.x observed) the control-
+                // mode connection EOFs mid-session, and routing
+                // captures through it as well meant a dropped
+                // connection froze the preview until the user exited
+                // live mode. Forking per capture costs ~5-10 ms on a
+                // local mac and is invisible against the 250 ms idle
+                // throttle / `%output`-wake cadence; we trade that
+                // overhead for "preview never gets stuck".
+                //
+                // Live vs. non-live failure semantics differ. In live
+                // mode an empty capture (which is what
+                // `Session::capture_pane_with_size` returns when the
+                // session is gone OR tmux had a transient hiccup)
+                // preserves the last-known-good capture so the preview
+                // doesn't flash blank (the kill-switch behavior
+                // introduced in #1501). Outside live mode the empty
+                // content surfaces as "No output available", which is
+                // the intended signal that the underlying session is
+                // gone.
+                let in_live = self.live_send.is_some();
+                // Only treat an empty fork capture as "preserve the
+                // existing cache" when the cache is FOR THIS SAME
+                // SESSION. If the user just switched live-send from
+                // session A to session B and B's first capture comes
+                // back empty, holding the kill-switch would leave A's
+                // content on screen under B's header. Cross-session
+                // we always overwrite, falling back to an empty body
+                // (the same "session looks gone" signal the non-live
+                // path uses).
+                let same_session = self.preview_cache.session_id.as_ref() == Some(&id);
+                let fork_capture = self.get_instance(&id).and_then(|inst| {
+                    inst.capture_output_with_size(capture_lines, width, height)
+                        .ok()
+                });
+                let captured: Option<String> = if in_live {
+                    match fork_capture {
+                        Some(content) if !content.is_empty() => Some(content),
+                        _ if same_session => None,
+                        _ => Some(String::new()),
+                    }
+                } else {
+                    Some(fork_capture.unwrap_or_default())
+                };
+                // Only mutate cache when we actually got bytes. On a
+                // live-mode transient failure (`None`) we leave every
+                // cache field alone — including `session_id` and
+                // `dimensions`, which document "what's in `content`"
+                // and would lie if updated past a stale snapshot. The
+                // retry cadence is already bounded by the loop's tick
+                // / wake / key sources, so we don't need to write a
+                // `last_refresh` here to throttle (in live mode
+                // `in_live` forces `timer_expired` regardless).
+                if let Some(content) = captured {
                     self.preview_cache.captured_lines = content.lines().count();
                     self.preview_cache.content = content;
-                    self.preview_cache.session_id = Some(id.clone());
+                    // Invalidate the cached parse; the next render that
+                    // needs `ensure_parsed` will re-run `ansi-to-tui`.
+                    self.preview_cache.parsed_text = None;
+                    self.preview_cache.session_id = Some(id);
                     self.preview_cache.dimensions = (width, height);
                     self.preview_cache.last_refresh = Instant::now();
                     self.preview_scroll_offset = clamp_scroll_to_capture(
@@ -1273,6 +1381,7 @@ impl HomeView {
                         .unwrap_or_default();
                     self.terminal_preview_cache.captured_lines = content.lines().count();
                     self.terminal_preview_cache.content = content;
+                    self.terminal_preview_cache.parsed_text = None;
                     self.terminal_preview_cache.session_id = Some(id.clone());
                     self.terminal_preview_cache.dimensions = (width, height);
                     self.terminal_preview_cache.last_refresh = Instant::now();
@@ -1320,6 +1429,7 @@ impl HomeView {
                         .unwrap_or_default();
                     self.container_terminal_preview_cache.captured_lines = content.lines().count();
                     self.container_terminal_preview_cache.content = content;
+                    self.container_terminal_preview_cache.parsed_text = None;
                     self.container_terminal_preview_cache.session_id = Some(id.clone());
                     self.container_terminal_preview_cache.dimensions = (width, height);
                     self.container_terminal_preview_cache.last_refresh = Instant::now();
@@ -1361,6 +1471,7 @@ impl HomeView {
                     let content = tool_session.capture_pane(capture_lines).unwrap_or_default();
                     self.tool_preview_cache.captured_lines = content.lines().count();
                     self.tool_preview_cache.content = content;
+                    self.tool_preview_cache.parsed_text = None;
                     self.tool_preview_cache.session_id = Some(id.clone());
                     self.tool_preview_cache.dimensions = (width, height);
                     self.tool_preview_cache.last_refresh = Instant::now();
@@ -1497,7 +1608,20 @@ impl HomeView {
 
         let inner = block.inner(area);
         self.preview_area = inner;
+        // `area` is the OUTER preview rect (the block + borders + content).
+        // Stash it so `App::draw_preview_only` can call back into
+        // `render_preview` with the right rect on `%output` wakes; passing
+        // the inner there draws a nested block.
+        self.preview_outer_area = area;
         self.diff_area = Rect::default();
+        // The agent-pane sub-rect of `inner`: full inner when the info
+        // header is hidden or the layout is compact, otherwise inner
+        // shifted down past the info section. `Preview::render_with_cache`
+        // splits the same way internally, so this mirrors what the user
+        // actually sees and is what we size the tmux pane to in live mode.
+        // Default to `inner`; the Agent branch below refines it if it can
+        // resolve the selected instance.
+        self.preview_pane_area = inner;
         frame.render_widget(block, area);
 
         match self.view_mode {
@@ -1512,8 +1636,39 @@ impl HomeView {
                 if is_creating {
                     self.render_creating_preview(frame, inner, theme);
                 } else {
-                    // Refresh cache before borrowing from instance_map to avoid borrow conflicts
-                    self.refresh_preview_cache_if_needed(inner.width, inner.height);
+                    // Mirror the info-vs-output split in
+                    // `Preview::render_with_cache` so the cache + tmux pane
+                    // match the visible output area. Sizing to the full
+                    // `inner` while the user has the info header expanded
+                    // leaves the top `info_height` rows of the agent's
+                    // pane outside the displayed window, where they get
+                    // tail-clipped on every frame.
+                    let pane_area = if compact || !self.show_preview_info {
+                        inner
+                    } else {
+                        self.selected_session
+                            .as_ref()
+                            .and_then(|id| self.get_instance(id))
+                            .map(|inst| {
+                                let info_h = preview::agent_info_height(inst).min(inner.height);
+                                Rect {
+                                    x: inner.x,
+                                    y: inner.y + info_h,
+                                    width: inner.width,
+                                    height: inner.height - info_h,
+                                }
+                            })
+                            .unwrap_or(inner)
+                    };
+                    self.preview_pane_area = pane_area;
+                    // Refresh the raw `content` cache, then ensure the
+                    // parsed `Text<'static>` cache reflects it. Doing
+                    // the parse here (under `&mut self.preview_cache`)
+                    // means subsequent shared borrows on
+                    // `parsed_text` and on `self.get_instance` can
+                    // coexist in the actual render call.
+                    self.refresh_preview_cache_if_needed(pane_area.width, pane_area.height);
+                    self.preview_cache.ensure_parsed();
 
                     if let Some(id) = &self.selected_session {
                         if let Some(inst) = self.get_instance(id) {
@@ -1521,7 +1676,7 @@ impl HomeView {
                                 frame,
                                 inner,
                                 inst,
-                                &self.preview_cache.content,
+                                CachedPreview::from_text(self.preview_cache.parsed_text.as_ref()),
                                 self.preview_scroll_offset,
                                 theme,
                                 self.idle_decay_window,
@@ -1553,38 +1708,46 @@ impl HomeView {
                         TerminalMode::Host
                     };
 
-                    // Refresh the appropriate cache before borrowing instance
+                    // Refresh the appropriate cache, then warm the
+                    // matching `parsed_text` so the render call below
+                    // can read it via a shared borrow alongside
+                    // `get_instance`.
                     match terminal_mode {
                         TerminalMode::Container => {
                             self.refresh_container_terminal_preview_cache_if_needed(
                                 inner.width,
                                 inner.height,
                             );
+                            self.container_terminal_preview_cache.ensure_parsed();
                         }
                         TerminalMode::Host => {
                             self.refresh_terminal_preview_cache_if_needed(
                                 inner.width,
                                 inner.height,
                             );
+                            self.terminal_preview_cache.ensure_parsed();
                         }
                     }
 
                     // Now borrow instance for rendering
                     if let Some(inst) = self.get_instance(&id) {
-                        let (terminal_running, preview_content) = match terminal_mode {
+                        let (terminal_running, preview_text) = match terminal_mode {
                             TerminalMode::Container => {
                                 let running = inst
                                     .container_terminal_tmux_session()
                                     .map(|s| s.exists())
                                     .unwrap_or(false);
-                                (running, &self.container_terminal_preview_cache.content)
+                                (
+                                    running,
+                                    self.container_terminal_preview_cache.parsed_text.as_ref(),
+                                )
                             }
                             TerminalMode::Host => {
                                 let running = inst
                                     .terminal_tmux_session()
                                     .map(|s| s.exists())
                                     .unwrap_or(false);
-                                (running, &self.terminal_preview_cache.content)
+                                (running, self.terminal_preview_cache.parsed_text.as_ref())
                             }
                         };
 
@@ -1593,7 +1756,7 @@ impl HomeView {
                             inner,
                             inst,
                             terminal_running,
-                            preview_content,
+                            CachedPreview::from_text(preview_text),
                             self.preview_scroll_offset,
                             theme,
                             compact,
@@ -1616,6 +1779,7 @@ impl HomeView {
                         inner.height,
                         &tool_name,
                     );
+                    self.tool_preview_cache.ensure_parsed();
 
                     if let Some(inst) = self.get_instance(&id) {
                         let tool_session =
@@ -1627,7 +1791,7 @@ impl HomeView {
                             inner,
                             inst,
                             tool_running,
-                            &self.tool_preview_cache.content,
+                            CachedPreview::from_text(self.tool_preview_cache.parsed_text.as_ref()),
                             self.preview_scroll_offset,
                             theme,
                             compact,
@@ -1640,6 +1804,78 @@ impl HomeView {
                     frame.render_widget(hint, inner);
                 }
             }
+        }
+
+        // Selection highlight goes last so it sits on top of whatever
+        // the active ViewMode painted into the inner area. Only live
+        // mode populates `preview_selection`, so this branch is a
+        // no-op everywhere else.
+        self.paint_preview_selection(frame, inner, theme);
+    }
+
+    /// Apply the drag-select highlight to cells inside the preview
+    /// pane. Style is reversed (bg/fg swap) for AA-friendly contrast
+    /// against arbitrary agent output, mirroring how most terminal
+    /// emulators render their own native selections.
+    ///
+    /// Walks the frame buffer rather than re-rendering, so the
+    /// underlying preview pane keeps its existing styles (colored
+    /// diff text, syntax highlighting from the agent) — only the
+    /// bg/fg pair swaps. Cells outside the buffer area are skipped
+    /// rather than treated as an error: a terminal resize during a
+    /// drag can leave a stale extent off-screen for one frame.
+    fn paint_preview_selection(&mut self, frame: &mut Frame, inner: Rect, theme: &Theme) {
+        let Some(sel) = self.preview_selection else {
+            return;
+        };
+        let segments = sel.flow_rects(inner);
+        if segments.is_empty() {
+            return;
+        }
+        // Capture cells only on the first render that follows a
+        // finalized drag; subsequent renders just keep painting the
+        // highlight. Reading from the buffer here (rather than from
+        // `App` after `terminal.draw` returns) is load-bearing:
+        // ratatui swaps front/back buffers on every frame, so
+        // `terminal.current_buffer_mut()` post-draw points at the
+        // empty next-frame buffer, not the cells we just drew.
+        let capture = self.preview_copy_pending;
+        if capture {
+            self.preview_copy_pending = false;
+        }
+        let buf = frame.buffer_mut();
+        let buf_area = buf.area;
+        // After release the highlight darkens slightly so the user
+        // can tell "selection finalized + copied" apart from "still
+        // dragging". A non-finalized in-progress drag uses the
+        // brighter selection-style swatch.
+        let bg = if sel.finalized {
+            theme.selection
+        } else {
+            theme.session_selection
+        };
+        for segment in segments {
+            let clipped = segment.intersection(inner);
+            if clipped.width == 0 || clipped.height == 0 {
+                continue;
+            }
+            for row in clipped.y..clipped.bottom() {
+                for col in clipped.x..clipped.right() {
+                    if !buf_area.contains(Position::from((col, row))) {
+                        continue;
+                    }
+                    let cell = &mut buf[(col, row)];
+                    cell.set_bg(bg);
+                    // Force the foreground to a high-contrast color so
+                    // ANSI-painted bright/dim agent output stays
+                    // readable on top of the new background.
+                    cell.set_fg(theme.text);
+                }
+            }
+        }
+        if capture {
+            let text = self.extract_preview_selection_text(&*frame.buffer_mut());
+            self.preview_copy_text = text;
         }
     }
 
@@ -1776,11 +2012,13 @@ impl HomeView {
                 live_send::display_chord_list(&state.exit_chords)
             };
             let suffix = " to exit ";
-            // Match the preview pane's visible_height calculation
-            // (`area.height - 2` for borders, then `- 1` for the
-            // compact branch in render_output_cached) so the indicator
-            // count stays consistent as the user scrolls.
-            let visible_height = (self.preview_cache.dimensions.1 as usize).saturating_sub(3);
+            // `preview_cache.dimensions` is the output pane area passed to
+            // `refresh_preview_cache_if_needed`, and `render_output_cached`
+            // uses `area.height - 1` as its visible height (one row of
+            // headroom for the inner " Output " banner / compact-branch
+            // padding). Match that here so the live `[offset/max]`
+            // indicator agrees with the actual scroll math.
+            let visible_height = (self.preview_cache.dimensions.1 as usize).saturating_sub(1);
             let scroll = format_scroll_indicator(
                 self.preview_cache.captured_lines,
                 visible_height,
@@ -2328,6 +2566,34 @@ mod tests {
         // unconditional render path.
         // prefix(20) + slot(6) + badge(12) + margin(1) = 39 > 35.
         assert_eq!(activity_column_padding(20, 35, 12), None);
+    }
+
+    #[test]
+    fn row_tag_content_fits_within_max_width() {
+        // RowTag.rendered() right-pads to max_width via `{:<width$}` —
+        // if content ever exceeds max_width the format width is ignored
+        // and the bracket span jitters. profile_short_code's documented
+        // cap of 4 is the tightest case to spot-check.
+        assert!(profile_short_code("forit-backup-extra").len() <= 4);
+    }
+
+    #[test]
+    fn row_tag_rendered_pads_to_max_width() {
+        let short = RowTag {
+            content: "fb".to_string(),
+            max_width: 4,
+        };
+        assert_eq!(short.rendered(), "[fb  ]");
+        let exact = RowTag {
+            content: "forb".to_string(),
+            max_width: 4,
+        };
+        assert_eq!(exact.rendered(), "[forb]");
+        let sb = RowTag {
+            content: "sb".to_string(),
+            max_width: 2,
+        };
+        assert_eq!(sb.rendered(), "[sb]");
     }
 
     #[test]

@@ -260,6 +260,12 @@ pub struct SessionConfigOverride {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_session_attach_mode: Option<super::config::NewSessionAttachMode>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_attach_mode: Option<super::config::NewSessionAttachMode>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub click_action: Option<super::config::ClickAction>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -495,6 +501,12 @@ pub fn apply_session_overrides(
     }
     if let Some(new_session_attach_mode) = source.new_session_attach_mode {
         target.new_session_attach_mode = new_session_attach_mode;
+    }
+    if let Some(default_attach_mode) = source.default_attach_mode {
+        target.default_attach_mode = default_attach_mode;
+    }
+    if let Some(click_action) = source.click_action {
+        target.click_action = click_action;
     }
 }
 

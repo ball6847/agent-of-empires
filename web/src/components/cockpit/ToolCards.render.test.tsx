@@ -29,9 +29,14 @@ vi.mock("../../hooks/useShikiTheme", () => ({
   useShikiTheme: () => ({ theme: "dark-plus", appearance: "dark" }),
 }));
 
-import { ToolCard } from "./ToolCards";
+import { ToolCard, TodoGroupCard } from "./ToolCards";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
-import { fixtures, makeCompletion, makeError } from "./__fixtures__/toolCalls";
+import {
+  fixtures,
+  makeCompletion,
+  makeError,
+  makeToolCall,
+} from "./__fixtures__/toolCalls";
 
 function Wrap({
   toolKey,
@@ -188,6 +193,80 @@ describe("ToolCards profile-gated dispatch (claude)", () => {
   });
 });
 
+describe("TodoGroupCard fold (#1468)", () => {
+  function snapshot(id: string, content: string, status: string) {
+    return {
+      tool: makeToolCall({
+        id,
+        name: "TodoWrite",
+        kind: "other",
+        args_preview: JSON.stringify({ todos: [{ content, status }] }),
+      }),
+      result: makeCompletion({ id: `done-${id}`, toolCallId: id }),
+    };
+  }
+
+  const items = [
+    snapshot("td1", "Step Alpha", "in_progress"),
+    snapshot("td2", "Step Bravo", "in_progress"),
+    snapshot("td3", "Step Charlie", "in_progress"),
+  ];
+
+  it("shows the latest snapshot collapsed without expanding", () => {
+    const { container } = render(
+      <Wrap toolKey="claude">
+        <TodoGroupCard items={items} />
+      </Wrap>,
+    );
+    expect(container.textContent).toContain("todos");
+    expect(container.textContent).toContain("updated 3 times");
+    // Collapsed view shows the latest list only.
+    expect(container.textContent).toContain("Step Charlie");
+    expect(container.textContent).not.toContain("Step Alpha");
+    expect(container.textContent).not.toContain("Step Bravo");
+  });
+
+  it("reveals every snapshot in order on expand", () => {
+    const { container, getByRole } = render(
+      <Wrap toolKey="claude">
+        <TodoGroupCard items={items} />
+      </Wrap>,
+    );
+    // Collapsed: only the group header carries a toggle.
+    fireEvent.click(getByRole("button"));
+    const text = container.textContent ?? "";
+    expect(text).toContain("Step Alpha");
+    expect(text).toContain("Step Bravo");
+    expect(text).toContain("Step Charlie");
+    // History renders each call in original order.
+    expect(text.indexOf("Step Alpha")).toBeLessThan(text.indexOf("Step Bravo"));
+  });
+
+  it("falls back to the last successful snapshot when the latest failed", () => {
+    const failedTail = {
+      tool: makeToolCall({
+        id: "td4",
+        name: "TodoWrite",
+        kind: "other",
+        args_preview: JSON.stringify({
+          todos: [{ content: "Broken plan", status: "in_progress" }],
+        }),
+      }),
+      result: makeError({ id: "done-td4", toolCallId: "td4" }),
+    };
+    const { container } = render(
+      <Wrap toolKey="claude">
+        <TodoGroupCard items={[...items, failedTail]} />
+      </Wrap>,
+    );
+    // Collapsed preview shows the last good snapshot, not the failed one.
+    expect(container.textContent).toContain("Step Charlie");
+    expect(container.textContent).not.toContain("Broken plan");
+    // The header surfaces the failed latest attempt rather than looking clean.
+    expect(container.textContent).toContain("failed");
+  });
+});
+
 describe("ToolCards memory_recall (claude-agent-acp v0.37.0)", () => {
   it("renders recall mode with the loaded memory paths after expansion", () => {
     const { container, getByRole, getByTestId } = render(
@@ -232,5 +311,150 @@ describe("ToolCards MCP", () => {
     expect(container.textContent?.toLowerCase()).toContain("mcp");
     expect(container.textContent?.toLowerCase()).toContain("slack");
     expect(container.textContent?.toLowerCase()).toContain("send message");
+  });
+});
+
+// #1467: failed tool cards auto-open on failure but must stay foldable.
+// Before the fix the card was hard-wired `expanded={open || status ===
+// "err"}`, so the chevron rotated but never collapsed the body.
+describe("ToolCards failed-card folding (#1467)", () => {
+  it("renders the error body on first paint for a failed card", () => {
+    const { container } = render(
+      <Wrap>
+        <ToolCard
+          tool={fixtures.bash}
+          result={makeError({ text: "boom: command failed" })}
+        />
+      </Wrap>,
+    );
+    expect(container.textContent).toContain("tool failed");
+    expect(container.textContent).toContain("boom: command failed");
+  });
+
+  it("folds the error body when the chevron is clicked", () => {
+    const { container, getByRole } = render(
+      <Wrap>
+        <ToolCard
+          tool={fixtures.bash}
+          result={makeError({ text: "boom: command failed" })}
+        />
+      </Wrap>,
+    );
+    expect(container.textContent).toContain("tool failed");
+    fireEvent.click(getByRole("button"));
+    expect(container.textContent).not.toContain("tool failed");
+    expect(container.textContent).not.toContain("boom: command failed");
+    // Clicking again re-expands.
+    fireEvent.click(getByRole("button"));
+    expect(container.textContent).toContain("tool failed");
+  });
+
+  it("keeps a successful card collapsed by default", () => {
+    const { container } = render(
+      <Wrap>
+        <ToolCard
+          tool={fixtures.bash}
+          result={makeCompletion({ text: "hello world\n" })}
+        />
+      </Wrap>,
+    );
+    // Header is present, body output is hidden until the user expands.
+    expect(container.textContent).toContain("bash");
+    expect(container.textContent).not.toContain("hello world");
+  });
+
+  it("auto-opens a card that fails mid-stream (running -> err)", () => {
+    const { container, rerender } = render(
+      <Wrap>
+        <ToolCard tool={fixtures.bash} result={undefined} />
+      </Wrap>,
+    );
+    // Running: no error body yet.
+    expect(container.textContent).not.toContain("tool failed");
+    rerender(
+      <Wrap>
+        <ToolCard
+          tool={fixtures.bash}
+          result={makeError({ text: "boom: command failed" })}
+        />
+      </Wrap>,
+    );
+    // The error row arrives and the card opens with no user click.
+    expect(container.textContent).toContain("tool failed");
+    expect(container.textContent).toContain("boom: command failed");
+  });
+
+  it("respects the user's fold once set, even if the card re-enters err", () => {
+    const { container, getByRole, rerender } = render(
+      <Wrap>
+        <ToolCard
+          tool={fixtures.bash}
+          result={makeError({ text: "boom: command failed" })}
+        />
+      </Wrap>,
+    );
+    // User folds the failed card.
+    fireEvent.click(getByRole("button"));
+    expect(container.textContent).not.toContain("tool failed");
+    // A later render still reports err: the card stays folded.
+    rerender(
+      <Wrap>
+        <ToolCard
+          tool={fixtures.bash}
+          result={makeError({ text: "boom again" })}
+        />
+      </Wrap>,
+    );
+    expect(container.textContent).not.toContain("tool failed");
+  });
+
+  // The MemoryRecall and Schedule cards previously gated their toggle on
+  // `hasBody` alone, so a failed card with no normal body had an
+  // unclickable header. They now include `status === "err"` in the
+  // predicate; exercise each failed-and-foldable so that branch (and the
+  // shared hook call site) stays covered.
+  const errToggleKinds: Array<[string, () => unknown]> = [
+    ["memoryRecall", () => fixtures.memoryRecallList],
+    ["scheduleWakeup", () => fixtures.scheduleWakeup],
+  ];
+
+  it.each(errToggleKinds)(
+    "auto-opens and folds a failed %s card",
+    (_label, getTool) => {
+      const { container, getAllByRole } = render(
+        <Wrap toolKey="claude">
+          <ToolCard
+            tool={getTool() as never}
+            result={makeError({ text: "kind-specific boom" })}
+          />
+        </Wrap>,
+      );
+      // Auto-open on failure: the rose error block is visible with no click.
+      expect(container.textContent).toContain("tool failed");
+      // The header is the card's first button; clicking it folds the body.
+      fireEvent.click(getAllByRole("button")[0]);
+      expect(container.textContent).not.toContain("tool failed");
+    },
+  );
+
+  it("auto-opens and folds a failed memory-file card", () => {
+    // A Read on a path under Claude's per-project memory dir dispatches
+    // to the dedicated MemoryCard, which shares the same hook.
+    const tool = makeToolCall({
+      id: "mem-1",
+      name: "Read",
+      kind: "read",
+      args_preview: JSON.stringify({
+        file_path: "/Users/test/.claude/projects/foo/memory/feedback_testing.md",
+      }),
+    });
+    const { container, getAllByRole } = render(
+      <Wrap toolKey="claude">
+        <ToolCard tool={tool} result={makeError({ text: "memory read boom" })} />
+      </Wrap>,
+    );
+    expect(container.textContent).toContain("tool failed");
+    fireEvent.click(getAllByRole("button")[0]);
+    expect(container.textContent).not.toContain("tool failed");
   });
 });

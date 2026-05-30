@@ -42,6 +42,11 @@ pub struct InstanceParams {
     pub command_override: String,
     /// Additional repository paths for multi-repo workspace mode
     pub extra_repo_paths: Vec<String>,
+    /// Scratch session: ignore `path`, provision a fresh directory under
+    /// `<app_dir>/scratch/<id>/`, and persist `instance.scratch = true` so
+    /// the deletion path removes the directory. Mutually exclusive with
+    /// worktree/workspace and with non-empty `extra_repo_paths`.
+    pub scratch: bool,
 }
 
 /// Result of building an instance, tracking what was created for cleanup purposes.
@@ -300,6 +305,15 @@ pub fn build_instance(
         bail!("{} does not support worktree mode.", params.tool);
     }
 
+    if params.scratch {
+        if params.worktree_enabled {
+            bail!("Cannot combine --scratch with worktree mode");
+        }
+        if !params.extra_repo_paths.is_empty() {
+            bail!("Cannot combine --scratch with extra repository paths");
+        }
+    }
+
     if params.sandbox {
         let runtime = containers::get_container_runtime();
         if !runtime.is_available() {
@@ -310,19 +324,32 @@ pub fn build_instance(
         }
     }
 
-    let config = super::repo_config::resolve_config_with_repo(
-        profile,
-        std::path::Path::new(&params.path),
-    )
-    .unwrap_or_else(|e| {
-        tracing::warn!(target: "session.create", "Failed to load config, using defaults: {}", e);
-        Config::default()
-    });
+    // Scratch sessions have no project repo, so config resolution falls
+    // back to global+profile defaults (`Path::new("")` makes
+    // `resolve_config_with_repo` skip the repo-config layer cleanly).
+    let config_path = if params.scratch {
+        std::path::PathBuf::new()
+    } else {
+        std::path::PathBuf::from(&params.path)
+    };
+    let config =
+        super::repo_config::resolve_config_with_repo(profile, &config_path).unwrap_or_else(|e| {
+            tracing::warn!(target: "session.create", "Failed to load config, using defaults: {}", e);
+            Config::default()
+        });
 
-    let mut final_path = PathBuf::from(&params.path)
-        .canonicalize()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| params.path.clone());
+    let mut final_path = if params.scratch {
+        // Provisioning happens after `Instance::new` so we can key the
+        // directory on the generated instance id. Leave `final_path` empty
+        // for now; the worktree/workspace and path-existence blocks below
+        // are gated on the same flag.
+        String::new()
+    } else {
+        PathBuf::from(&params.path)
+            .canonicalize()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| params.path.clone())
+    };
 
     let mut worktree_info = None;
     let mut created_worktree = None;
@@ -470,18 +497,27 @@ pub fn build_instance(
         }
     }
 
-    // Validate that the final path exists and is a directory.
-    // This catches cases where the user typed a non-existent path in the TUI;
-    // without this check tmux silently falls back to the home directory.
-    let final_path_buf = PathBuf::from(&final_path);
-    if !final_path_buf.exists() {
-        bail!("Project path does not exist: {}", final_path);
-    }
-    if !final_path_buf.is_dir() {
-        bail!("Project path is not a directory: {}", final_path);
+    // For scratch sessions, `final_path` is intentionally empty here; the
+    // scratch directory is provisioned below after `Instance::new` runs (we
+    // need the instance id to name the directory). For all other sessions,
+    // catch the typed-a-bad-path case before tmux silently falls back to
+    // the home directory.
+    if !params.scratch {
+        let final_path_buf = PathBuf::from(&final_path);
+        if !final_path_buf.exists() {
+            bail!("Project path does not exist: {}", final_path);
+        }
+        if !final_path_buf.is_dir() {
+            bail!("Project path is not a directory: {}", final_path);
+        }
     }
 
     let mut instance = Instance::new(&final_title, &final_path);
+    if params.scratch {
+        let dir = super::scratch::provision_scratch_dir(&instance.id)?;
+        instance.project_path = dir.to_string_lossy().to_string();
+        instance.scratch = true;
+    }
     instance.group_path = params.group;
     instance.tool = params.tool.clone();
     instance.detect_as = config
@@ -567,6 +603,25 @@ pub fn cleanup_instance(
     created_worktree: Option<&CreatedWorktree>,
     created_workspace_worktrees: &[CreatedWorktree],
 ) {
+    // Scratch dirs are provisioned eagerly inside `build_instance`
+    // (well before this helper's other cleanup targets exist), so an
+    // abort between provisioning and the caller finishing the session
+    // would otherwise leak the directory on disk. Guard the removal
+    // through `is_scratch_path` so a tampered `project_path` cannot
+    // wipe unrelated app data.
+    if instance.scratch {
+        let scratch_path = PathBuf::from(&instance.project_path);
+        if super::scratch::is_scratch_path(&scratch_path) {
+            if let Err(e) = std::fs::remove_dir_all(&scratch_path) {
+                tracing::warn!(
+                    target: "session.create",
+                    "Failed to clean up scratch dir: {}",
+                    e
+                );
+            }
+        }
+    }
+
     if let Some(wt) = created_worktree {
         if let Ok(git_wt) = GitWorktree::new(wt.main_repo_path.clone()) {
             if let Err(e) = git_wt.remove_worktree(&wt.path, false) {
@@ -1093,6 +1148,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            scratch: false,
         }
     }
 
@@ -1218,6 +1274,61 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("No launch command resolved for custom agent 'whitespace-agent'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_scratch_provisions_app_dir() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("config.toml"), "").unwrap();
+
+        let mut params = custom_agent_params(std::path::Path::new(""), "claude");
+        params.tool = "claude".to_string();
+        params.path = String::new();
+        params.scratch = true;
+        params.sandbox = false;
+
+        let result = build_instance(params, &[], &[], "default")
+            .expect("scratch build must succeed without a project path");
+
+        assert!(
+            result.instance.scratch,
+            "scratch flag must be persisted on the instance"
+        );
+        let provisioned = std::path::PathBuf::from(&result.instance.project_path);
+        assert!(provisioned.exists());
+        assert!(super::super::scratch::is_scratch_path(&provisioned));
+
+        let _ = std::fs::remove_dir_all(&provisioned);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_rejects_scratch_with_worktree() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("config.toml"), "").unwrap();
+
+        let mut params = custom_agent_params(std::path::Path::new(""), "claude");
+        params.tool = "claude".to_string();
+        params.scratch = true;
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("feat".to_string());
+
+        let err = match build_instance(params, &[], &[], "default") {
+            Ok(_) => panic!("scratch + worktree must error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("Cannot combine --scratch with worktree mode"),
             "unexpected error: {err}"
         );
     }

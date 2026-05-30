@@ -47,19 +47,22 @@ const twarn = (...args: unknown[]) => {
   console.warn("[terminal.ws]", ...args);
 };
 
-// Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s, 30s (cap). Seven attempts
-// cover typical tunnel restarts and transient WiFi drops without flooding
-// the server or burning the user's battery on a truly dead backend.
-const MAX_RETRIES = 7;
-const RETRY_BASE_MS = 1000;
-const RETRY_CAP_MS = 30000;
+// Fast-start retry schedule: 200ms, 400ms, 800ms, 1.5s, 3s, 6s, 10s. Total
+// to exhaustion ~22s vs the old exponential ladder's ~91s. The old 1s/30s
+// curve magnified first-session-open pain when tmux warm-up briefly bounced
+// the upgrade: by the time the server was ready, the client was asleep on
+// a 30s timer. See #1455.
+const RETRY_DELAYS_MS = [200, 400, 800, 1500, 3000, 6000, 10000] as const;
+const MAX_RETRIES = RETRY_DELAYS_MS.length;
 /** Server-side close code that signals "PTY relay permanently broken,
  *  stop retrying immediately." Mirrors `CLOSE_CODE_PTY_DEAD` in
  *  `src/server/ws.rs`. Picked from the application-reserved 4000-4999
  *  range. See #1107. */
 const CLOSE_CODE_PTY_DEAD = 4001;
-export const retryDelayMs = (attempt: number) =>
-  Math.min(RETRY_CAP_MS, RETRY_BASE_MS * 2 ** (attempt - 1));
+export const retryDelayMs = (attempt: number) => {
+  const idx = Math.max(1, Math.min(RETRY_DELAYS_MS.length, attempt)) - 1;
+  return RETRY_DELAYS_MS[idx]!;
+};
 const MIN_FONT_SIZE = 6;
 const MAX_FONT_SIZE = 28;
 const DEFAULT_FONT_SIZE = 14;
@@ -258,6 +261,58 @@ export function useTerminal(
     term.loadAddon(new WebLinksAddon());
 
     term.open(termEl);
+
+    // Mobile soft-keyboard Backspace autorepeat arrives as a stream of
+    // `beforeinput` events (inputType "deleteContentBackward", with keydown
+    // surfacing as "Unidentified" / keyCode 229). xterm decodes only the
+    // first into a single onData, so holding Backspace deletes one character
+    // instead of repeat-deleting; the PTY sees one DEL rather than one per
+    // tick. Intercept on xterm's hidden textarea and emit one DEL per tick
+    // ourselves. preventDefault blocks the textarea mutation so xterm's
+    // input-diff decoder never fires its own onData for the same tick (no
+    // double-delete). Gated to coarse-pointer-without-fine-pointer: a
+    // hardware Backspace fires a recognized keydown that xterm preventDefaults,
+    // which per the UI Events spec suppresses the follow-on beforeinput, so
+    // this path only runs for soft keyboards. Mirrors the mobile-Enter
+    // interception in Composer.tsx. See #1450.
+    const xtermTextarea = termEl.querySelector("textarea");
+    const onBeforeInput = (e: InputEvent) => {
+      if (e.inputType !== "deleteContentBackward" || e.isComposing) return;
+      const coarse = window.matchMedia?.("(pointer: coarse)").matches;
+      const anyFine = window.matchMedia?.("(any-pointer: fine)").matches;
+      if (!coarse || anyFine) return;
+      const ws = wsRef.current;
+      if (ws?.readyState !== WebSocket.OPEN) return;
+      e.preventDefault();
+      ws.send(new TextEncoder().encode("\x7f"));
+    };
+    xtermTextarea?.addEventListener("beforeinput", onBeforeInput, {
+      capture: true,
+    });
+
+    // Shift+Enter → bracketed paste containing a newline. Agents like
+    // Claude Code treat pasted newlines as literal text (inserted, not
+    // submitted). Bracketed paste passes cleanly through tmux without
+    // requiring extended-keys negotiation. Gated on bare Shift+Enter so
+    // Ctrl/Alt/Cmd+Shift+Enter still reach the app as distinct combos.
+    term.attachCustomKeyEventHandler((ev) => {
+      if (
+        ev.key === "Enter" &&
+        ev.shiftKey &&
+        !ev.ctrlKey &&
+        !ev.metaKey &&
+        !ev.altKey
+      ) {
+        if (ev.type === "keydown") {
+          const ws = wsRef.current;
+          if (ws?.readyState === WebSocket.OPEN) {
+            ws.send(new TextEncoder().encode("\x1b[200~\n\x1b[201~"));
+          }
+        }
+        return false;
+      }
+      return true;
+    });
 
     // GPU renderer. Loaded after .open() per the addon's contract. Falls
     // back to the DOM renderer silently on machines where the context is
@@ -1243,10 +1298,26 @@ export function useTerminal(
       viewport.removeEventListener("touchcancel", onTouchEnd, touchOpts);
       viewport.removeEventListener("click", onClickCapture, true);
       viewport.removeEventListener("wheel", onWheelCapture, true);
+      xtermTextarea?.removeEventListener("beforeinput", onBeforeInput, {
+        capture: true,
+      });
       if (wheelPersistTimer) clearTimeout(wheelPersistTimer);
       if (resizeDebounceTimer) clearTimeout(resizeDebounceTimer);
       if (fontSizeRaf !== null) cancelAnimationFrame(fontSizeRaf);
-      wsRef.current?.close();
+      // Detach handlers BEFORE closing so the soon-to-fire onclose closure
+      // can't schedule a retry that races the next session's connect path.
+      // Without this, the old onclose runs after cleanup, calls setTimeout
+      // -> connect() in the captured (now stale) sessionId scope, and
+      // overwrites wsRef.current with a ghost socket for the previous
+      // session. See #1455.
+      const owned = wsRef.current;
+      if (owned) {
+        owned.onopen = null;
+        owned.onmessage = null;
+        owned.onclose = null;
+        owned.onerror = null;
+        owned.close();
+      }
       term.dispose();
       if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
       if (countdownRef.current) clearInterval(countdownRef.current);

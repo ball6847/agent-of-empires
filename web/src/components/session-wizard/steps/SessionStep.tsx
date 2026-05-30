@@ -13,6 +13,7 @@ interface WizardData {
   baseBranch: string;
   group: string;
   tool: string;
+  scratch: boolean;
   [key: string]: unknown;
 }
 
@@ -60,23 +61,49 @@ export function SessionStep({ data, onChange }: Props) {
         <p className="text-xs text-text-dim mt-1">Shown in the dashboard. Renaming it later does not rename the git branch.</p>
       </div>
 
-      <label
-        className="flex items-center justify-between gap-3 p-3 bg-surface-900 border border-surface-700 rounded-lg cursor-pointer mb-3"
-        onClick={() => onChange("useWorktree", !data.useWorktree)}
-      >
-        <div className="flex-1">
-          <div className="text-sm font-medium text-text-primary">Create a worktree</div>
-          <div className="text-xs text-text-dim mt-0.5 leading-snug">
-            Run the agent in a new git worktree branched off the current HEAD. Off = run directly in the repo folder.
+      {/* Worktree controls are meaningless for scratch sessions: the
+          working directory is a fresh scratch dir, not a git repo. The
+          reducer also forces useWorktree to false when scratch flips
+          on; this hide is purely a UX confirmation that the worktree
+          path is not available in scratch mode. */}
+      {data.scratch ? (
+        <p
+          className="text-xs text-text-dim mb-3"
+          aria-label="Worktree disabled: scratch session"
+        >
+          Scratch sessions do not use git worktrees.
+        </p>
+      ) : (
+        <label
+          className="flex items-center justify-between gap-3 p-3 bg-surface-900 border border-surface-700 rounded-lg cursor-pointer mb-3"
+          onClick={(e) => {
+            // Clicks that land on the Toggle button already drive
+            // `onChange("useWorktree", v)`. Letting the label's own
+            // handler also fire would flip the value a second time
+            // and land back on the original. Skip the label handler
+            // for clicks originating inside the Toggle.
+            if (
+              (e.target as HTMLElement).closest('button[role="switch"]')
+            ) {
+              return;
+            }
+            onChange("useWorktree", !data.useWorktree);
+          }}
+        >
+          <div className="flex-1">
+            <div className="text-sm font-medium text-text-primary">Create a worktree</div>
+            <div className="text-xs text-text-dim mt-0.5 leading-snug">
+              Run the agent in a new git worktree branched off the current HEAD. Off = run directly in the repo folder.
+            </div>
           </div>
-        </div>
-        <Toggle
-          checked={data.useWorktree}
-          onChange={(v) => onChange("useWorktree", v)}
-        />
-      </label>
+          <Toggle
+            checked={data.useWorktree}
+            onChange={(v) => onChange("useWorktree", v)}
+          />
+        </label>
+      )}
 
-      {data.useWorktree && (
+      {!data.scratch && data.useWorktree && (
         <div className="mb-5">
           <label className="block text-sm text-text-dim mb-1.5">Branch / worktree name</label>
           <input

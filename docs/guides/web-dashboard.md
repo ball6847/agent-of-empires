@@ -177,6 +177,7 @@ The upstream proxy must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads
 - **Rate limiting:** 5 failed login attempts from an IP trigger a 15-minute lockout. Uses `Cf-Connecting-IP` / `X-Forwarded-For` from loopback peers (covers `--remote` tunnel mode and `--behind-proxy` reverse-proxy mode) to prevent IP spoofing.
 - **Token rotation:** In `--remote` mode, the token rotates every 4 hours with a 5-minute grace period for active sessions.
 - **Device tracking:** Connected devices (IP, browser, last seen) are visible in Settings > Security.
+- **Step-up elevation:** A "Confirm passphrase" prompt appears on writes whose payload can plant code for the next session spawn: the `sandbox` and `worktree` sections, and dangerous `session` fields (`agent_command_override`, `agent_extra_args`, `extra_env`, `custom_agents`, `agent_detect_as`). Confirmation lasts 15 minutes. User-preference writes (theme, sound, updates, notification toggles, logging filter, profile description, and safe session fields like `yolo_mode_default`) save without the prompt; saving a theme should not feel like signing in again.
 
 ### Security headers
 
@@ -230,6 +231,12 @@ aoe serve --daemon
 - **Connected Devices** view in Settings > Security
 - **Push notifications** on Waiting / Idle / Error transitions, with per-session overrides ([guide](push-notifications.md))
 
+### Mobile layout
+
+On phones (below the `md` breakpoint) the dashboard shows a single full-viewport pane rather than the desktop side-by-side split. The right-panel button in the top bar opens a picker that swaps the main pane between three views: the **Agent terminal**, the **Diff** (changed files and review), and the **Paired terminal** (host or container shell). A back chip in the top-left of the diff and paired views returns you to the agent terminal.
+
+This replaces the earlier slide-in overlay, which left the paired terminal almost no room once the soft keyboard opened. Because each view now owns the whole viewport, the paired terminal handles the keyboard the same way the agent terminal does. The agent terminal and the paired shell stay alive in the background when you switch away, so their scrollback and focus are preserved. The desktop side-by-side split is unchanged.
+
 ### Sidebar sort
 
 By default the sidebar shows your manually-ordered list. Drag a row with a press-and-hold gesture to move it; the new order persists across browsers and devices via `workspace-ordering.json`.
@@ -237,6 +244,20 @@ By default the sidebar shows your manually-ordered list. Drag a row with a press
 A sort toggle next to the filter button in the sidebar header switches to **Recent activity** mode, which orders workspaces by the most recent of `last_accessed_at`, `idle_entered_at`, and `created_at` across each workspace's sessions, descending. Drag-to-reorder is disabled while Recent activity is selected, because the order is computed; the press-and-hold gesture does nothing in that mode.
 
 The toggle's state is per-browser (localStorage), not synced across devices and not tied to your profile. Toggling back to manual restores the stored manual order and re-enables drag. The multi-repo group stays pinned at the bottom in both modes.
+
+### Triage: pin, archive, snooze
+
+The sidebar exposes three triage primitives via the right-click (long-press on touch) context menu on any session row:
+
+- **Pin** floats the workspace to the top of the sidebar in every sort mode (manual and Recent activity). Pin is web-only and intentionally distinct from the TUI's favorite mark, which is a within-tier signal for the Attention sort. The web pin renders as a pushpin glyph next to the row title; the TUI favorite keeps its `*` star marker.
+- **Archive** kills the session's tmux pane (or shuts down the cockpit worker for ACP-cockpit sessions) and sinks the row into the collapsible "Snoozed & archived" footer of its repo group. Sending a message to the row from the dashboard wakes it back into the live list automatically. Daemon restarts and the cockpit worker reconciler both skip archived sessions, so a row stays parked until you explicitly unarchive it.
+- **Snooze** sinks the row into the same footer for a chosen duration. The menu offers the same eight presets as the TUI snooze dialog: 1h, 2h, 3h, 4h, 5h, 6h, 1d, 1w. The row wakes automatically when the timer expires; sending a message wakes it early.
+
+Snooze and archive are mutually exclusive with pin: pinning a sunk row surfaces it, and archiving or snoozing a pinned row removes the pin. The three primitives can be mixed freely across concurrent surfaces (TUI, CLI, web), and the data layer enforces the mutual-exclusion rules in one place so peer writes cannot leave a row in a contradictory state.
+
+The "Snoozed & archived" section sits at the very bottom of the sidebar and aggregates every sunk workspace across all repo groups. It is collapsed by default; clicking the header expands the list and remembers the choice in localStorage. Drag-to-reorder is disabled on pinned and sunk rows since their placement is computed.
+
+In read-only mode (`aoe serve --read-only`) the three menu entries are hidden, matching the existing read-only gate on Delete.
 
 ## Architecture
 
@@ -249,6 +270,22 @@ The server embeds an axum web server that serves a React frontend and provides:
 - Security headers (X-Frame-Options, Referrer-Policy)
 
 Each terminal connection spawns `tmux attach-session` inside a PTY and relays the raw byte stream bidirectionally over WebSocket. This gives the browser a real terminal experience identical to SSH.
+
+### Terminal WebSocket close codes
+
+When the browser fails to reach a working terminal, the disconnect banner shows the close code returned by the server. Decoder ring:
+
+| Code | Reason string             | Meaning                                                                                                                                              | Client behavior              |
+| ---- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------- |
+| 1001 | `server shutdown`         | Daemon is shutting down (SIGINT/SIGTERM).                                                                                                            | Retry with normal backoff.   |
+| 1011 | `openpty_failed`          | Server could not allocate a PTY.                                                                                                                     | Retry with normal backoff.   |
+| 1011 | `attach_spawn_failed`     | Server could not spawn the `tmux attach-session` child process.                                                                                      | Retry with normal backoff.   |
+| 1011 | `pty_reader_failed`       | Server could not clone the PTY reader handle.                                                                                                        | Retry with normal backoff.   |
+| 1011 | `pty_writer_failed`       | Server could not take the PTY writer handle.                                                                                                         | Retry with normal backoff.   |
+| 1013 | `tmux_not_ready`          | Server polled `tmux has-session` / `list-panes` for up to 2s and the pane did not become attachable. Usually a benign warm-up on first session open. | Retry with normal backoff.   |
+| 4001 | `pty_dead`                | PTY relay was running but the pane permanently exited. Continuing to retry would just hammer a dead session.                                         | Show "Click retry" banner.   |
+
+The browser uses a fast-start retry ladder (200ms, 400ms, 800ms, 1.5s, 3s, 6s, 10s) so transient warm-up failures recover in well under 5 seconds end-to-end. Permanently dead panes short-circuit on 4001 and surface a manual reconnect button.
 
 ## Frontend development
 

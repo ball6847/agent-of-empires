@@ -32,6 +32,16 @@ import type { CockpitState } from "../../lib/cockpitTypes";
 import { getDraft, setDraft } from "../../lib/cockpitDrafts";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useAgentProfile } from "../../lib/agentProfileContext";
+import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
+import { useDictationBurstGuard } from "./useDictationBurstGuard";
+
+export {
+  DICTATION_BURST_TIMEOUT_MS,
+  decideDictationAction,
+  type DictationBurstState,
+  type DictationDecision,
+  type DictationEvent,
+} from "./useDictationBurstGuard";
 
 /** Decision returned by {@link decideEnterAction} for an Enter
  *  keystroke on the cockpit composer textarea.
@@ -295,6 +305,17 @@ export function Composer({
 
   const composerRuntime = useComposerRuntime();
 
+  // iOS Safari native dictation (#1431): WebKit fires `beforeinput` /
+  // `input` with `inputType: "insertReplacementText"` per partial
+  // recognition and tracks a private range pointer into the textarea
+  // that is invalidated by any controlled-value re-render. The guard
+  // suspends assistant-ui's `setText` flush for the burst, buffers the
+  // textarea value, and drains it back into the runtime once the burst
+  // ends (1200 ms timeout, blur, or non-replacement input).
+  const dictationGuard = useDictationBurstGuard((text) => {
+    composerRuntime.setText(text);
+  });
+
   // Context-primer prefill: when the parent passes a `primerPrefill`
   // payload (after the user clicked "Resume with prior context" on the
   // banner), replace the composer text with the primer + focus the
@@ -421,6 +442,13 @@ export function Composer({
     };
   }, [isMobile]);
 
+  // Explicit focus from sidebar session selection (#1454). Lands focus on
+  // the composer even when it is already mounted (re-selecting the active
+  // session, where the keyed remount above never fires); the latch inside
+  // the hook covers the first-open race. App only dispatches "composer" on
+  // desktop, so no coarse-pointer gate is needed here.
+  useFocusTerminalTarget("composer", taRef);
+
   const wrapperLayout = composerWrapperLayout({ keyboardOpen });
   return (
     <div className={wrapperLayout.className} style={wrapperLayout.style}>
@@ -505,15 +533,39 @@ export function Composer({
                 // let the keydown matrix handle the platforms that do
                 // fire a real Enter keydown. See #1174.
                 const ne = e.nativeEvent as InputEvent;
-                const action = decideBeforeInputAction(
+                const newlineAction = decideBeforeInputAction(
                   ne.inputType,
                   ne.isComposing,
                   { isMobile },
                 );
-                if (action === "default") return;
-                e.preventDefault();
-                e.stopPropagation();
-                insertNewlineAtCaret(taRef);
+                if (newlineAction === "newline") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  insertNewlineAtCaret(taRef);
+                  return;
+                }
+                // iOS native dictation burst detection (#1431). Driven
+                // from `beforeinput` rather than `input` so the burst
+                // flag is set before assistant-ui's onChange (composed
+                // by radix) gets a chance to run and call `setText`.
+                dictationGuard.observeInputType(ne.inputType, Date.now());
+              }}
+              onChange={(e) => {
+                // Suppress assistant-ui's controlled-input flush while
+                // an iOS dictation burst is active (#1431). Radix's
+                // `composeEventHandlers` (used by ComposerPrimitive.Input)
+                // skips the downstream handler when `defaultPrevented`
+                // is set on the SyntheticEvent.
+                if (dictationGuard.shouldSuppressUpstream(e.currentTarget.value)) {
+                  e.preventDefault();
+                }
+              }}
+              onBlur={() => {
+                // Tapping Send (or anywhere outside the textarea) blurs
+                // the iOS soft-keyboard-owned field; flush the dictation
+                // buffer first so the pending text lands in
+                // assistant-ui state before the Send click reads it.
+                dictationGuard.flushOnBlur();
               }}
               onKeyDown={(e) => {
                 // Three-way Enter dispatch. See decideEnterAction for
@@ -655,17 +707,19 @@ function PopoverItems({ trigger }: { trigger: string }) {
 /** Insert the picked slash command into the composer text. The Action
  *  popover already stripped the user's `/<typed>` from the input via
  *  `removeOnExecute`, so we set the canonical `/<name>` form and add
- *  a trailing space when the agent advertised that the command takes
- *  free-form arguments. The user is then free to type args and hit
- *  Enter to send, or hit Enter immediately for a no-arg command. */
-function insertSlashCommand(
+ *  a trailing space. The trailing space halts assistant-ui's
+ *  `detectTrigger` backward scan (which keys off whitespace as the
+ *  trigger boundary) so the popover does not immediately re-open on
+ *  the inserted `/<name>` and consume the next Enter as a re-pick;
+ *  it also positions the cursor for free-form arg typing when the
+ *  agent advertised the command as `acceptsInput=true`. See #1512. */
+export function insertSlashCommand(
   runtime: ReturnType<typeof useComposerRuntime>,
   item: Unstable_TriggerItem,
 ) {
   if (!runtime) return;
-  const accepts = (item as { acceptsInput?: boolean }).acceptsInput === true;
   const current = runtime.getState().text;
-  const suffix = accepts ? " " : "";
+  const suffix = " ";
   // Preserve any text that was already in the buffer (e.g. user typed
   // a long prompt then ran `/foo` mid-message). We just append the
   // command at the end; the typed `/typed` token has already been

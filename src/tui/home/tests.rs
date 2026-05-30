@@ -150,6 +150,121 @@ fn test_initial_cursor_position() {
 
 #[test]
 #[serial]
+fn preview_info_follows_flag_and_never_auto_shows_in_live() {
+    // Info-header visibility is purely the persisted `show_preview_info` toggle
+    // (driven by `i` in the TUI). Live mode must NOT change it: if the user
+    // hid the header, it stays hidden when they go live, and a shown header
+    // stays shown. Nothing magically re-shows it.
+    use super::live_send::{LiveSendState, LiveSendTarget};
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    env.view.select_session_by_id(&id);
+    env.view.view_mode = ViewMode::Agent;
+    let theme = load_theme("empire");
+
+    let render_to_string = |view: &mut HomeView| {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                view.render(f, area, &theme, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    };
+
+    let live_state = || LiveSendState {
+        session_id: id.clone(),
+        title: "session0".to_string(),
+        tmux_name: "aoe_test_live".to_string(),
+        target: LiveSendTarget::Agent,
+        exit_chords: Vec::new(),
+    };
+
+    // Hidden via the toggle: gone outside live...
+    env.view.show_preview_info = false;
+    let hidden_not_live = render_to_string(&mut env.view);
+    assert!(
+        !hidden_not_live.contains("Profile:"),
+        "header must be hidden when the flag is off.\n{hidden_not_live}"
+    );
+    // ...and STILL gone after going live (the regression the user reported:
+    // it must never magically re-show).
+    env.view.live_send = Some(live_state());
+    let hidden_live = render_to_string(&mut env.view);
+    assert!(
+        !hidden_live.contains("Profile:"),
+        "a hidden header must not re-appear in live mode.\n{hidden_live}"
+    );
+
+    // Shown via the toggle: present both outside and inside live mode.
+    env.view.live_send = None;
+    env.view.show_preview_info = true;
+    let shown_not_live = render_to_string(&mut env.view);
+    assert!(
+        shown_not_live.contains("Profile:"),
+        "header must render when the flag is on.\n{shown_not_live}"
+    );
+    env.view.live_send = Some(live_state());
+    let shown_live = render_to_string(&mut env.view);
+    assert!(
+        shown_live.contains("Profile:"),
+        "a shown header stays shown in live mode (flag, not mode, governs it).\n{shown_live}"
+    );
+}
+
+#[test]
+#[serial]
+fn preview_visible_rows_equal_output_area_with_info_shown() {
+    // With the info header shown, the Agent branch sizes the pane to
+    // `PreviewLayout::compute(..).output` (header + banner removed once) and the
+    // renderer paints into the same rect. `preview_visible_rows` must equal
+    // `preview_pane_area.height`; the historical bugs all came from a second,
+    // drifting derivation of this number, now consolidated into one layout.
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    env.view.select_session_by_id(&id);
+    env.view.view_mode = ViewMode::Agent;
+    env.view.show_preview_info = true;
+
+    let backend = TestBackend::new(120, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let theme = load_theme("empire");
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view.render(f, area, &theme, None, None);
+        })
+        .unwrap();
+
+    assert!(
+        env.view.preview_pane_area.height > 0,
+        "expected a non-empty output sub-rect at 120x40 (non-compact)"
+    );
+    assert_eq!(
+        env.view.preview_visible_rows, env.view.preview_pane_area.height as usize,
+        "visible rows must match the output area height, not be a row short"
+    );
+}
+
+#[test]
+#[serial]
 fn test_q_returns_quit_action() {
     let mut env = create_test_env_empty();
     let action = env.view.handle_key(key(KeyCode::Char('q')), None);
@@ -233,6 +348,70 @@ fn test_has_dialog_returns_true_for_new_dialog() {
         vec!["default".to_string()],
     ));
     assert!(env.view.has_dialog());
+}
+
+#[test]
+#[serial]
+fn test_b_opens_project_session_picker_when_projects_exist() {
+    use crate::session::projects::{self, Project, ProjectScope};
+    let mut env = create_test_env_empty();
+    let repo = env._temp.path().join("repoA");
+    std::fs::create_dir_all(&repo).unwrap();
+    projects::add(
+        "test",
+        ProjectScope::Profile,
+        Project::new("repoA", repo.to_string_lossy(), ProjectScope::Profile),
+        false,
+    )
+    .unwrap();
+
+    assert!(env.view.project_session_picker_dialog.is_none());
+    env.view.handle_key(key(KeyCode::Char('b')), None);
+    assert!(env.view.project_session_picker_dialog.is_some());
+    assert!(env.view.info_dialog.is_none());
+    // The picker captures filter chars, so it must register as a modal: an
+    // unregistered picker lets the global `q` shortcut quit the app and the
+    // paste-burst detector fire mid-filter (text gets stranded in handle_paste).
+    assert!(env.view.has_dialog());
+    assert!(!env.view.wants_paste_burst());
+}
+
+#[test]
+#[serial]
+fn test_b_shows_info_dialog_when_no_projects() {
+    let mut env = create_test_env_empty();
+    assert!(env.view.info_dialog.is_none());
+    env.view.handle_key(key(KeyCode::Char('b')), None);
+    assert!(env.view.info_dialog.is_some());
+    assert!(env.view.project_session_picker_dialog.is_none());
+}
+
+#[test]
+#[serial]
+fn test_b_submit_opens_new_dialog_with_prefilled_path() {
+    use crate::session::projects::{self, Project, ProjectScope};
+    let mut env = create_test_env_empty();
+    let repo = env._temp.path().join("repoB");
+    std::fs::create_dir_all(&repo).unwrap();
+    projects::add(
+        "test",
+        ProjectScope::Profile,
+        Project::new("repoB", repo.to_string_lossy(), ProjectScope::Profile),
+        false,
+    )
+    .unwrap();
+    let expected = projects::load_merged("test").unwrap()[0].path.clone();
+
+    env.view.handle_key(key(KeyCode::Char('b')), None);
+    assert!(env.view.project_session_picker_dialog.is_some());
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(env.view.project_session_picker_dialog.is_none());
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("new session dialog should open after picking a project");
+    assert_eq!(dialog.path_value(), expected);
 }
 
 #[test]
@@ -1907,6 +2086,84 @@ fn test_non_strict_h_snoozes_only_in_attention_sort() {
     }
 }
 
+/// Build a flat list of one Running and one Waiting session in the given mode.
+/// Returns the env plus the flat index of each so callers can park the cursor.
+/// Statuses are seeded in storage before construction so both `instances` and
+/// the `instance_map` that `get_instance`/`jump_to_next_waiting` read agree.
+fn attention_env_running_then_waiting() -> (TestEnv, usize, usize) {
+    use crate::session::config::{GroupByMode, SortOrder};
+    use crate::session::Status;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let storage = Storage::new("test").unwrap();
+
+    let mut running = Instance::new("running", "/tmp/running");
+    running.status = Status::Running;
+    let mut waiting = Instance::new("waiting", "/tmp/waiting");
+    waiting.status = Status::Waiting;
+    let instances = vec![running, waiting];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    view.strict_hotkeys = false;
+    view.group_by = GroupByMode::Manual;
+    view.sort_order = SortOrder::Attention;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+    let env = TestEnv { _temp: temp, view };
+
+    let status_at = |env: &TestEnv, idx: usize| match env.view.flat_items.get(idx) {
+        Some(Item::Session { id, .. }) => env.view.get_instance(id).map(|i| i.status),
+        _ => None,
+    };
+    let running = (0..env.view.flat_items.len())
+        .find(|&i| status_at(&env, i) == Some(Status::Running))
+        .expect("a Running session row");
+    let waiting = (0..env.view.flat_items.len())
+        .find(|&i| status_at(&env, i) == Some(Status::Waiting))
+        .expect("a Waiting session row");
+    (env, running, waiting)
+}
+
+#[test]
+#[serial]
+fn test_non_strict_w_jumps_to_next_waiting_in_attention_sort() {
+    // Regression for #1524: in non-strict Attention sort, `w` must jump to the
+    // next waiting/idle session (the #796 behavior) instead of snoozing the
+    // cursor's session. Snooze lives on `h`/`H`; `w` is navigation. Previously
+    // the snooze arm shadowed the jump arm in exactly the sort users triage in,
+    // so `w` never felt like a navigation key.
+    use crate::session::Status;
+
+    let (mut env, running, _waiting) = attention_env_running_then_waiting();
+    env.view.cursor = running;
+    env.view.update_selected();
+
+    env.view.handle_key(key(KeyCode::Char('w')), None);
+
+    assert!(
+        env.view.snooze_duration_dialog.is_none(),
+        "`w` in Attention sort must jump, not open the snooze dialog"
+    );
+    let landed = match env.view.flat_items.get(env.view.cursor) {
+        Some(Item::Session { id, .. }) => env.view.get_instance(id).map(|i| i.status),
+        _ => None,
+    };
+    assert_eq!(
+        landed,
+        Some(Status::Waiting),
+        "`w` should land the cursor on the Waiting session"
+    );
+}
+
 #[test]
 #[serial]
 fn test_strict_mode_ctrl_g_opens_group_picker() {
@@ -2716,6 +2973,7 @@ fn test_create_session_in_all_mode_is_findable() {
         extra_env: Vec::new(),
         extra_args: String::new(),
         command_override: String::new(),
+        scratch: false,
     };
 
     let session_id = view.create_session(data).unwrap();
@@ -3472,6 +3730,7 @@ fn test_apply_creation_results_returns_session_id() {
         extra_env: Vec::new(),
         extra_args: String::new(),
         command_override: String::new(),
+        scratch: false,
     };
 
     // Use the async CreationPoller path (pass None hooks, non-sandbox,
@@ -3529,6 +3788,18 @@ fn test_project_group_name_handles_trailing_slash() {
 
     let inst = Instance::new("test", "/home/user/my-project/");
     assert_eq!(project_group_name(&inst), "my-project");
+}
+
+#[test]
+fn test_project_group_name_groups_scratch_under_scratch() {
+    use super::project_group_name;
+
+    let mut inst = Instance::new(
+        "test",
+        "/home/user/.config/agent-of-empires/scratch/a4535853054b4096",
+    );
+    inst.scratch = true;
+    assert_eq!(project_group_name(&inst), "scratch");
 }
 
 #[test]
@@ -3956,7 +4227,7 @@ fn set_instance_status_runs_status_hook_on_transition() {
 /// Earlier behavior fell through to the first-running fallback whenever
 /// `selected_session` was None — silently misrouting voice/dictation
 /// across groups. With cursor on a group, `selected_session` is None and
-/// `resolve_paste_target` must return None unconditionally.
+/// `resolve_send_target` must return None unconditionally.
 #[test]
 #[serial]
 fn paste_on_group_header_stashes_instead_of_misrouting() {
@@ -4654,6 +4925,216 @@ fn manual_grouping_attention_sort_stays_flat() {
     );
 }
 
+/// `prune_empty_group` is the post-move cleanup that drops the source
+/// profile's now-empty copy of a group after a session moves to a
+/// different profile. Without it, both profiles end up with the same
+/// group name in unified view, the source one empty and the target one
+/// populated, which reads as a duplicate group header.
+#[test]
+#[serial]
+fn prune_empty_group_drops_source_when_no_session_remains() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _ = Storage::new("alpha").unwrap();
+    let _ = Storage::new("beta").unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools).unwrap();
+
+    // Pre-state: alpha has one session in group "work", beta is empty.
+    let mut moved = Instance::new("moved", "/tmp/moved");
+    moved.source_profile = "alpha".to_string();
+    moved.group_path = "work".to_string();
+    view.instances = vec![moved];
+    view.group_trees.clear();
+    view.group_trees.insert(
+        "alpha".to_string(),
+        GroupTree::new_with_groups(&view.instances, &[]),
+    );
+    view.group_trees
+        .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
+    assert!(view.group_trees["alpha"].group_exists("work"));
+
+    // Simulate the move: re-tag source_profile, then prune the now-empty
+    // source group.
+    view.instances[0].source_profile = "beta".to_string();
+    view.prune_empty_group("alpha", "work");
+
+    assert!(
+        !view.group_trees["alpha"].group_exists("work"),
+        "alpha should no longer own the now-empty 'work' group after the move"
+    );
+}
+
+/// Prune must NOT drop the source group when the source profile still
+/// has other sessions sitting at the same path (or nested under it).
+/// Two sessions, only one moved → source profile keeps the group.
+#[test]
+#[serial]
+fn prune_empty_group_keeps_source_when_sibling_session_remains() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _ = Storage::new("alpha").unwrap();
+    let _ = Storage::new("beta").unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools).unwrap();
+
+    let mut moved = Instance::new("moved", "/tmp/moved");
+    moved.source_profile = "alpha".to_string();
+    moved.group_path = "work".to_string();
+    let mut sibling = Instance::new("sibling", "/tmp/sibling");
+    sibling.source_profile = "alpha".to_string();
+    sibling.group_path = "work".to_string();
+    view.instances = vec![moved, sibling];
+    view.group_trees.clear();
+    view.group_trees.insert(
+        "alpha".to_string(),
+        GroupTree::new_with_groups(&view.instances, &[]),
+    );
+    view.group_trees
+        .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
+
+    view.instances[0].source_profile = "beta".to_string();
+    view.prune_empty_group("alpha", "work");
+
+    assert!(
+        view.group_trees["alpha"].group_exists("work"),
+        "alpha must keep 'work' because the sibling session still lives there"
+    );
+}
+
+/// Prune must also keep the source group when a session sits in a
+/// *descendant* path. Only the leaf moved out; the parent still has
+/// rows under it.
+#[test]
+#[serial]
+fn prune_empty_group_keeps_source_when_descendant_session_remains() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _ = Storage::new("alpha").unwrap();
+    let _ = Storage::new("beta").unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools).unwrap();
+
+    let mut moved = Instance::new("moved", "/tmp/moved");
+    moved.source_profile = "alpha".to_string();
+    moved.group_path = "work".to_string();
+    let mut nested = Instance::new("nested", "/tmp/nested");
+    nested.source_profile = "alpha".to_string();
+    nested.group_path = "work/frontend".to_string();
+    view.instances = vec![moved, nested];
+    view.group_trees.clear();
+    view.group_trees.insert(
+        "alpha".to_string(),
+        GroupTree::new_with_groups(&view.instances, &[]),
+    );
+    view.group_trees
+        .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
+
+    view.instances[0].source_profile = "beta".to_string();
+    view.prune_empty_group("alpha", "work");
+
+    assert!(
+        view.group_trees["alpha"].group_exists("work"),
+        "alpha must keep 'work' because the nested session still lives under it"
+    );
+}
+
+/// Prune must keep the source group when the profile's tree carries a
+/// descendant *group* (even with no session under it). Lets users keep
+/// hand-built structure like `work/anchor` that survives moves of every
+/// session out of the parent. Without this guard, `delete_group`'s
+/// `starts_with(prefix)` cascade nukes the anchor sub-group too.
+#[test]
+#[serial]
+fn prune_empty_group_keeps_source_when_descendant_group_remains() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _ = Storage::new("alpha").unwrap();
+    let _ = Storage::new("beta").unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools).unwrap();
+
+    let mut moved = Instance::new("moved", "/tmp/moved");
+    moved.source_profile = "alpha".to_string();
+    moved.group_path = "work".to_string();
+    view.instances = vec![moved];
+    view.group_trees.clear();
+    let mut alpha_tree = GroupTree::new_with_groups(&view.instances, &[]);
+    alpha_tree.create_group("work/anchor");
+    view.group_trees.insert("alpha".to_string(), alpha_tree);
+    view.group_trees
+        .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
+    assert!(view.group_trees["alpha"].group_exists("work/anchor"));
+
+    view.instances[0].source_profile = "beta".to_string();
+    view.prune_empty_group("alpha", "work");
+
+    assert!(
+        view.group_trees["alpha"].group_exists("work"),
+        "alpha must keep 'work' because of the user-anchored 'work/anchor' sub-group"
+    );
+    assert!(
+        view.group_trees["alpha"].group_exists("work/anchor"),
+        "anchor sub-group must survive the no-op prune"
+    );
+}
+
+/// The prune must persist through save+reload. Without tombstoning in
+/// `pending_group_deletions`, the in-memory delete is reverted on next
+/// startup because `HomeView::new` reloads `existing_groups` from disk
+/// and reseeds the tree with the supposedly-pruned group. Mirrors the
+/// restart_selected_session sequence: seed + persist, then move + prune
+/// + persist.
+#[test]
+#[serial]
+fn prune_empty_group_survives_save_and_reload() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _ = Storage::new("alpha").unwrap();
+    let _ = Storage::new("beta").unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+
+    {
+        let mut view = HomeView::new(None, tools.clone()).unwrap();
+        let moved = {
+            let mut inst = Instance::new("moved", "/tmp/moved");
+            inst.source_profile = "alpha".to_string();
+            inst.group_path = "work".to_string();
+            inst
+        };
+        view.instance_map.insert("moved".to_string(), moved.clone());
+        view.instances.push(moved);
+        view.pending_added
+            .entry("alpha".to_string())
+            .or_default()
+            .insert("moved".to_string());
+        view.group_trees.insert(
+            "alpha".to_string(),
+            GroupTree::new_with_groups(&view.instances, &[]),
+        );
+        view.save().unwrap();
+
+        view.group_trees
+            .entry("beta".to_string())
+            .or_insert_with(|| GroupTree::new_with_groups(&[], &[]));
+        let old_path = view.instance_map["moved"].group_path.clone();
+        view.move_to_profile("moved", "beta", old_path.clone())
+            .unwrap();
+        view.prune_empty_group("alpha", &old_path);
+        view.save().unwrap();
+    }
+
+    let reloaded = HomeView::new(None, tools).unwrap();
+    assert!(
+        reloaded.group_trees.contains_key("alpha"),
+        "alpha tree must still load after the move"
+    );
+    assert!(
+        !reloaded.group_trees["alpha"].group_exists("work"),
+        "pruned 'work' must stay gone after save+reload, not get re-seeded from disk"
+    );
+}
+
 /// Favorite, snooze, and urgent decorations only render in Attention sort.
 /// In Newest (or any other sort), the row paints with its plain title and
 /// status-driven color even when the flags are set, so users who don't
@@ -5289,6 +5770,7 @@ mod scroll_pane_isolation {
             session_id: "fake".to_string(),
             title: "fake".to_string(),
             tmux_name: "fake".to_string(),
+            target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: crate::tui::home::live_send::parse_chord_list(
                 crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
             ),
@@ -5319,6 +5801,7 @@ mod scroll_pane_isolation {
             session_id: "fake".to_string(),
             title: "fake".to_string(),
             tmux_name: "fake".to_string(),
+            target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: crate::tui::home::live_send::parse_chord_list(
                 crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
             ),
@@ -5752,6 +6235,7 @@ mod click_to_select {
             session_id: id_a.clone(),
             title: "session1".to_string(),
             tmux_name: format!("aoe_test_{}", id_a),
+            target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
         });
 
@@ -5786,6 +6270,7 @@ mod click_to_select {
             session_id: id_a.clone(),
             title: "session2".to_string(),
             tmux_name: format!("aoe_test_{}", id_a),
+            target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
         });
 
@@ -6164,6 +6649,7 @@ mod preview_drag_select {
             session_id: "test-session".to_string(),
             title: "test".to_string(),
             tmux_name: "aoe_test_drag_select".to_string(),
+            target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
         });
     }
@@ -6526,6 +7012,7 @@ mod preview_drag_select {
             session_id: "fake-id".to_string(),
             title: "fake".to_string(),
             tmux_name: "aoe_test_full_pipeline".to_string(),
+            target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
         });
 
@@ -6648,6 +7135,7 @@ mod live_send_mode {
             session_id: inst.id.clone(),
             title: inst.title,
             tmux_name,
+            target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: crate::tui::home::live_send::parse_chord_list(
                 crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
             ),
@@ -6663,6 +7151,7 @@ mod live_send_mode {
             session_id: "missing-id".to_string(),
             title: "missing-title".to_string(),
             tmux_name: "missing-tmux".to_string(),
+            target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: crate::tui::home::live_send::parse_chord_list(
                 crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
             ),
@@ -7265,6 +7754,7 @@ mod new_session_attach_mode {
             extra_env: Vec::new(),
             extra_args: String::new(),
             command_override: String::new(),
+            scratch: false,
         }
     }
 
@@ -7356,11 +7846,15 @@ mod default_attach_mode {
 
     #[test]
     #[serial]
-    fn terminal_view_ignores_default_attach_mode() {
-        // Terminal view has its own activation path (Container/Host
-        // tmux attach). The setting only applies to Agent view, so
-        // Terminal must keep its existing behavior even when
-        // default_attach_mode = LiveSend.
+    fn terminal_view_honors_default_attach_mode_live_send() {
+        // The `default_attach_mode = LiveSend` setting applies to
+        // Terminal view too: pressing Enter on a terminal-view row
+        // dispatches `Action::EnterLiveSend` against the paired
+        // terminal pane (the live-send target resolution happens in
+        // `start_live_send` based on view_mode). Without this, the
+        // user's "Enter = live mode" preference would silently flip
+        // back to a full tmux attach whenever they were previewing a
+        // terminal.
         let mut env = create_test_env_empty();
         write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
         let id = add_session(&mut env.view, "session-one");
@@ -7369,10 +7863,192 @@ mod default_attach_mode {
         env.view.update_selected();
         env.view.view_mode = crate::tui::home::ViewMode::Terminal;
         let action = env.view.activate_selected_session();
+        assert_eq!(action, Some(Action::EnterLiveSend(id)));
+    }
+
+    #[test]
+    #[serial]
+    fn terminal_view_falls_back_to_attach_when_default_is_tmux() {
+        // Inverse of the LiveSend case: with the historical Tmux
+        // default, Enter on a terminal-view row keeps the historical
+        // `Action::AttachTerminal` so users who haven't opted into
+        // live mode see no change.
+        let mut env = create_test_env_empty();
+        let id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        env.view.view_mode = crate::tui::home::ViewMode::Terminal;
+        let action = env.view.activate_selected_session();
         assert!(
             matches!(&action, Some(Action::AttachTerminal(returned_id, _)) if returned_id == &id),
-            "Terminal view must emit AttachTerminal regardless of default_attach_mode, got {:?}",
+            "default Tmux mode must keep Terminal view on AttachTerminal, got {:?}",
             action
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn tab_swaps_to_attach_session_when_default_is_live_send() {
+        // When `default_attach_mode = LiveSend`, Enter takes over the
+        // live-send slot, so Tab swaps to a full tmux attach (the
+        // escape hatch). Without this, the user would have no
+        // single-key path to the underlying tmux session.
+        let mut env = create_test_env_empty();
+        write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
+        let id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let action = env.view.handle_key(key(KeyCode::Tab), None);
+        assert_eq!(action, Some(Action::AttachSession(id)));
+    }
+
+    #[test]
+    #[serial]
+    fn tab_still_enters_live_send_when_default_is_tmux() {
+        // With the historical Tmux default, Enter still attaches and
+        // Tab keeps its historical live-send role.
+        let mut env = create_test_env_empty();
+        let id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        let action = env.view.handle_key(key(KeyCode::Tab), None);
+        assert_eq!(action, Some(Action::EnterLiveSend(id)));
+    }
+
+    #[test]
+    #[serial]
+    fn tab_in_terminal_view_swaps_to_attach_terminal_when_default_is_live_send() {
+        // Terminal-view counterpart of the swap: with Enter pinned to
+        // live-send, Tab in Terminal view attaches the paired terminal
+        // pane rather than the agent pane.
+        let mut env = create_test_env_empty();
+        write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
+        let id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        env.view.view_mode = crate::tui::home::ViewMode::Terminal;
+        let action = env.view.handle_key(key(KeyCode::Tab), None);
+        assert!(
+            matches!(&action, Some(Action::AttachTerminal(returned_id, _)) if returned_id == &id),
+            "Tab in Terminal view with LiveSend default must AttachTerminal, got {:?}",
+            action
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn m_in_terminal_view_targets_terminal_pane() {
+        // The 'm' bug from #1554: pressing 'm' from Terminal view used
+        // to open a compose dialog that targeted the agent pane,
+        // sending commands meant for the shell into the agent's input
+        // box. The fix: `pending_send_target` reflects view_mode at
+        // dialog open time so `execute_send_message` routes to the
+        // paired terminal pane.
+        let mut env = create_test_env_empty();
+        let _id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        env.view.view_mode = crate::tui::home::ViewMode::Terminal;
+        let _ = env.view.handle_key(key(KeyCode::Char('m')), None);
+        assert!(
+            env.view.send_message_dialog.is_some(),
+            "Terminal view 'm' must open the compose dialog even when \
+             the paired tmux pane hasn't spawned yet"
+        );
+        assert_eq!(
+            env.view.pending_send_target,
+            crate::tui::home::live_send::LiveSendTarget::Terminal,
+            "compose dialog opened from Terminal view must target the terminal pane"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn start_live_send_in_terminal_view_targets_terminal_pane() {
+        // Direct check on the live-send target resolution: in Terminal
+        // view, `start_live_send` stages the host terminal as the
+        // pending target so `prepare_live_send` will dispatch
+        // keystrokes to the paired terminal tmux pane.
+        let mut env = create_test_env_empty();
+        let _id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        env.view.view_mode = crate::tui::home::ViewMode::Terminal;
+        let _ = env.view.start_live_send();
+        assert_eq!(
+            env.view.pending_live_send_target,
+            crate::tui::home::live_send::LiveSendTarget::Terminal
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn help_live_on_enter_returns_none_when_no_session_selected() {
+        // Cursor parked off any session row: the help overlay shouldn't
+        // claim a session-attach behavior, so `help_live_on_enter`
+        // signals "no row" with None and the render path falls back to
+        // the cached profile default.
+        let env = create_test_env_empty();
+        assert!(
+            env.view.selected_session.is_none(),
+            "fresh empty view should have no session selected"
+        );
+        assert_eq!(env.view.help_live_on_enter(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn help_live_on_enter_returns_some_for_selected_session() {
+        // With the historical Tmux default, a selected session row maps
+        // to Some(false): Enter goes to tmux attach, Tab to live mode.
+        let mut env = create_test_env_empty();
+        let _id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        assert_eq!(env.view.help_live_on_enter(), Some(false));
+    }
+
+    #[test]
+    #[serial]
+    fn help_live_on_enter_reflects_live_send_setting() {
+        // Flipping the user's default to LiveSend must propagate to
+        // help_live_on_enter so the help overlay relabels Enter as
+        // live mode and Tab as tmux attach.
+        let mut env = create_test_env_empty();
+        write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
+        let _id = add_session(&mut env.view, "session-one");
+        env.view.flat_items = env.view.build_flat_items();
+        env.view.cursor = 0;
+        env.view.update_selected();
+        assert_eq!(env.view.help_live_on_enter(), Some(true));
+    }
+
+    #[test]
+    #[serial]
+    fn profile_default_attach_mode_cache_refreshes_with_config() {
+        // The render path falls back to `profile_default_attach_mode`
+        // when no session is selected, so it has to track the saved
+        // config without re-reading from disk per paint. Saving a new
+        // mode + calling `refresh_from_config` must update the cache.
+        let mut env = create_test_env_empty();
+        assert_eq!(
+            env.view.profile_default_attach_mode,
+            NewSessionAttachMode::Tmux,
+            "cache should initialize to the historical Tmux default"
+        );
+        write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
+        env.view.refresh_from_config();
+        assert_eq!(
+            env.view.profile_default_attach_mode,
+            NewSessionAttachMode::LiveSend,
+            "refresh_from_config must pick up the saved LiveSend default"
         );
     }
 
@@ -7611,7 +8287,13 @@ mod save_field_merge {
 
     #[test]
     #[serial]
-    fn test_apply_user_action_preserves_peer_user_action_field() {
+    fn test_apply_user_action_archive_clears_peer_snooze() {
+        // The web/TUI/CLI contract treats pinned / archived / snoozed
+        // as mutually exclusive (see Instance::archive and the sidebar
+        // tier comparator in #1581). When a peer snoozes a row that
+        // the TUI then archives, archive wins because it is the
+        // indefinite sink; leaving both flags persisted would surface
+        // contradictory triage state on the next render.
         let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
 
         let peer_storage = Storage::new("test").unwrap();
@@ -7624,8 +8306,6 @@ mod save_field_merge {
             })
             .unwrap();
 
-        // archive() touches archived_at + favorited_at only; the peer-set
-        // snoozed_until must NOT be clobbered by the diff-splice.
         view.apply_user_action(&id, |inst| inst.archive())
             .expect("archive must persist");
 
@@ -7633,8 +8313,40 @@ mod save_field_merge {
         let row = reloaded.iter().find(|i| i.id == id).expect("row present");
         assert!(row.archived_at.is_some(), "TUI archive landed");
         assert!(
-            row.snoozed_until.is_some(),
-            "peer-written snoozed_until must survive a TUI archive that does not touch the field"
+            row.snoozed_until.is_none(),
+            "archive() invariant must clear a concurrent peer snooze",
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_apply_user_action_preserves_peer_user_action_field() {
+        // Field-level merge regression: a TUI snooze must not clobber
+        // an unrelated peer write (group_path here). Uses snooze
+        // instead of archive so the snoozed_until field IS touched on
+        // both sides and the test isolates the peer-field-survival
+        // invariant from the archive XOR rules tested above.
+        let (_temp, mut view, id) = boot_view_with_one_session("session", "/tmp/race");
+
+        let peer_storage = Storage::new("test").unwrap();
+        peer_storage
+            .update(|insts, _| {
+                if let Some(inst) = insts.iter_mut().find(|i| i.id == id) {
+                    inst.group_path = "peer/group".to_string();
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        view.apply_user_action(&id, |inst| inst.snooze(30))
+            .expect("snooze must persist");
+
+        let reloaded = Storage::new("test").unwrap().load().unwrap();
+        let row = reloaded.iter().find(|i| i.id == id).expect("row present");
+        assert!(row.snoozed_until.is_some(), "TUI snooze landed");
+        assert_eq!(
+            row.group_path, "peer/group",
+            "peer-written group_path must survive a TUI snooze that does not touch the field",
         );
     }
 
@@ -7898,6 +8610,365 @@ mod save_field_merge {
         assert!(
             disk_row.snoozed_until.is_none(),
             "stamp_last_accessed must persist the auto-unsnooze (merge_from_tui drops snoozed_until)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod right_click_context_menu {
+    //! Right-click on a sidebar row opens a small popup menu (Rename /
+    //! Delete) anchored to the click. Picking Rename routes through the
+    //! same helper as the `r` key, Delete through the same helper as
+    //! `d`. Click-outside dismisses the menu.
+
+    use super::*;
+    use crate::session::Item;
+    use crate::tui::dialogs::ContextMenuAction;
+    use ratatui::layout::Rect;
+
+    fn setup_inner(env: &mut TestEnv) {
+        env.view.list_inner_area = Rect::new(1, 1, 28, 10);
+        env.view.list_area = Rect::new(0, 0, 30, 12);
+    }
+
+    #[test]
+    #[serial]
+    fn right_click_on_session_opens_session_menu_and_moves_cursor() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+
+        // Click the third visible row (inner.y + 2 == 3) -> flat_items[2].
+        assert!(env.view.handle_right_click(5, 3));
+        assert_eq!(env.view.cursor, 2, "cursor should move to clicked row");
+        let menu = env
+            .view
+            .context_menu
+            .as_ref()
+            .expect("context_menu should be open");
+        assert_eq!(menu.selected_action(), ContextMenuAction::Rename);
+        // The selected item is a session, not a group.
+        assert!(matches!(
+            env.view.flat_items[env.view.cursor],
+            Item::Session { .. }
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn right_click_off_list_is_noop() {
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        // Row 50 is well past list_inner_area.bottom.
+        assert!(!env.view.handle_right_click(5, 50));
+        assert!(env.view.context_menu.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn right_click_on_group_uses_group_menu() {
+        let mut env = create_test_env_with_groups();
+        setup_inner(&mut env);
+        // Find a group row index in flat_items.
+        let group_idx = env
+            .view
+            .flat_items
+            .iter()
+            .position(|item| matches!(item, Item::Group { .. }))
+            .expect("manual-mode test env should have a group row");
+        let click_row = env.view.list_inner_area.y + group_idx as u16;
+
+        assert!(env.view.handle_right_click(5, click_row));
+        assert_eq!(env.view.cursor, group_idx);
+        assert!(env.view.context_menu.is_some());
+        assert!(matches!(
+            env.view.flat_items[env.view.cursor],
+            Item::Group { .. }
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn enter_rename_in_menu_opens_rename_dialog() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.handle_right_click(5, 1);
+        assert!(env.view.context_menu.is_some());
+        // First item is Rename; Enter submits it.
+        env.view.handle_key(key(KeyCode::Enter), None);
+        assert!(
+            env.view.context_menu.is_none(),
+            "menu should close on submit"
+        );
+        assert!(
+            env.view.rename_dialog.is_some(),
+            "Rename should route to rename_dialog like the 'r' key"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn down_then_enter_in_menu_opens_delete_dialog() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.handle_right_click(5, 1);
+        env.view.handle_key(key(KeyCode::Down), None);
+        env.view.handle_key(key(KeyCode::Enter), None);
+        assert!(env.view.context_menu.is_none());
+        assert!(
+            env.view.unified_delete_dialog.is_some(),
+            "Delete should route to unified_delete_dialog like the 'd' key"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn esc_in_menu_cancels_without_dialog() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.handle_right_click(5, 1);
+        env.view.handle_key(key(KeyCode::Esc), None);
+        assert!(env.view.context_menu.is_none());
+        assert!(env.view.rename_dialog.is_none());
+        assert!(env.view.unified_delete_dialog.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn right_click_is_gated_when_other_dialog_is_open() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.show_help = true;
+        assert!(env.view.has_dialog());
+        // resolve_row_to_index short-circuits on any non-live-send overlay,
+        // so the right-click handler should bail without opening the menu.
+        assert!(!env.view.handle_right_click(5, 1));
+        assert!(env.view.context_menu.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn context_menu_counts_as_dialog() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        assert!(!env.view.has_dialog());
+        env.view.handle_right_click(5, 1);
+        assert!(env.view.has_dialog());
+    }
+
+    #[test]
+    #[serial]
+    fn left_click_outside_menu_dismisses_it() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.handle_right_click(5, 1);
+        assert!(env.view.context_menu.is_some());
+        // Before a render captures the menu's last_area, every click
+        // reads as "outside", which is exactly the dismissal contract
+        // we want here. (Item-row hit testing has its own unit coverage
+        // in `dialogs::context_menu`.)
+        let consumed = env.view.handle_context_menu_click(99, 99);
+        assert!(consumed, "router should mark the click consumed");
+        assert!(
+            env.view.context_menu.is_none(),
+            "outside click should dismiss the menu"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn handle_context_menu_click_returns_false_when_no_menu() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        assert!(env.view.context_menu.is_none());
+        assert!(!env.view.handle_context_menu_click(5, 5));
+    }
+
+    #[test]
+    #[serial]
+    fn left_click_on_empty_sidebar_outside_live_mode_is_noop() {
+        // Left-click on empty sidebar space is intentionally low-stakes:
+        // it does NOT open the new-session dialog anymore (right-click
+        // owns that entry point) and it doesn't move selection. The
+        // user can keep clicking the empty area to dismiss preview
+        // selections without summoning modals.
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        // Sessions occupy inner rows 0 and 1 (y=1, y=2). Row 5 is well
+        // past the last item but still inside list_inner_area.
+        assert!(!env.view.handle_empty_list_click(5, 5));
+        assert!(env.view.new_dialog.is_none());
+        assert!(env.view.context_menu.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn left_click_on_empty_sidebar_in_live_mode_exits_live_mode() {
+        // Quick-exit gesture: when live-send is active, a click on the
+        // empty sidebar drops the user out of live mode. Mirrors the
+        // Ctrl+Q chord but with the mouse, so a user who came in via
+        // a left-click can also leave that way.
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        use crate::tui::home::live_send;
+        env.view.live_send = Some(live_send::LiveSendState {
+            session_id: "fake".to_string(),
+            title: "fake".to_string(),
+            tmux_name: "aoe_test_empty_click_exit_live".to_string(),
+            target: live_send::LiveSendTarget::Agent,
+            exit_chords: live_send::parse_chord_list(live_send::DEFAULT_EXIT_CHORD),
+        });
+        assert!(env.view.live_send.is_some());
+        assert!(env.view.handle_empty_list_click(5, 5));
+        assert!(
+            env.view.live_send.is_none(),
+            "click on empty sidebar should exit live mode"
+        );
+        assert!(env.view.new_dialog.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn click_on_a_real_row_does_not_change_empty_click_state() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        // Row 1 resolves to flat_items[0], a real session row. The
+        // empty-list click handler must defer to the regular click
+        // path; it shouldn't open new-session or exit live mode here.
+        assert!(!env.view.handle_empty_list_click(5, 1));
+        assert!(env.view.new_dialog.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn empty_sidebar_click_is_gated_when_overlay_is_open() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.show_help = true;
+        assert!(!env.view.handle_empty_list_click(5, 5));
+        assert!(env.view.new_dialog.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn right_click_on_empty_sidebar_opens_empty_menu() {
+        // Right-clicking the empty area of the sidebar (below the last
+        // session) opens the dedicated 3-item menu so the mouse can
+        // reach New / Sort / Grouping the same way `n`/`o`/`g` would
+        // from the keyboard.
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        assert!(env.view.handle_right_click(5, 5));
+        let menu = env.view.context_menu.as_ref().expect("menu opened");
+        let labels: Vec<String> = menu
+            .items_for_test()
+            .iter()
+            .map(|(_, label)| (*label).to_string())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["New Session", "Change Sort", "Change Grouping"]
+        );
+    }
+
+    /// Helper: hit a key through the home view's handle_key path so
+    /// the dispatch tests run the same wiring real input does. Both
+    /// click and keyboard funnel through `dispatch_context_menu_action`,
+    /// so this covers the dispatcher without having to mock the menu's
+    /// `last_area` for hit-testing.
+    fn send_key(env: &mut crate::tui::home::tests::TestEnv, code: crossterm::event::KeyCode) {
+        env.view.handle_key(
+            crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+            None,
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn empty_sidebar_menu_new_session_dispatches() {
+        // First item (New Session) submits through the shared
+        // dispatcher and opens the new-session dialog.
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.handle_right_click(5, 5);
+        send_key(&mut env, crossterm::event::KeyCode::Enter);
+        assert!(env.view.context_menu.is_none());
+        assert!(env.view.new_dialog.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn empty_sidebar_menu_sort_dispatches() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.handle_right_click(5, 5);
+        send_key(&mut env, crossterm::event::KeyCode::Down); // highlight "Change Sort"
+        send_key(&mut env, crossterm::event::KeyCode::Enter);
+        assert!(env.view.context_menu.is_none());
+        assert!(env.view.sort_picker_dialog.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn empty_sidebar_menu_grouping_dispatches() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.handle_right_click(5, 5);
+        send_key(&mut env, crossterm::event::KeyCode::Down);
+        send_key(&mut env, crossterm::event::KeyCode::Down); // highlight "Change Grouping"
+        send_key(&mut env, crossterm::event::KeyCode::Enter);
+        assert!(env.view.context_menu.is_none());
+        assert!(env.view.group_picker_dialog.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn empty_sidebar_menu_n_hotkey_opens_new_session() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.handle_right_click(5, 5);
+        send_key(&mut env, crossterm::event::KeyCode::Char('n'));
+        assert!(env.view.context_menu.is_none());
+        assert!(env.view.new_dialog.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn empty_sidebar_menu_o_hotkey_opens_sort_picker() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.handle_right_click(5, 5);
+        send_key(&mut env, crossterm::event::KeyCode::Char('o'));
+        assert!(env.view.context_menu.is_none());
+        assert!(env.view.sort_picker_dialog.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn empty_sidebar_menu_g_hotkey_opens_group_picker() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.handle_right_click(5, 5);
+        send_key(&mut env, crossterm::event::KeyCode::Char('g'));
+        assert!(env.view.context_menu.is_none());
+        assert!(env.view.group_picker_dialog.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn session_menu_n_hotkey_is_inert() {
+        // Sanity: the session-row menu only has Rename/Delete actions,
+        // so 'n' must NOT submit NewSession when the wrong menu is open.
+        // This proves the hotkey gate (action must be in items) holds.
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+        env.view.handle_right_click(5, 1); // row 1 = first session
+        send_key(&mut env, crossterm::event::KeyCode::Char('n'));
+        assert!(env.view.context_menu.is_some(), "menu should stay open");
+        assert!(
+            env.view.new_dialog.is_none(),
+            "n on session menu must not open new-session"
         );
     }
 }

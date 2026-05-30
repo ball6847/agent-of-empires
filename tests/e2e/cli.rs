@@ -1067,3 +1067,154 @@ fn test_cli_add_attaches_to_existing_worktree() {
         Some("feat/existing"),
     );
 }
+
+#[test]
+#[serial]
+fn test_cli_add_scratch_provisions_dir() {
+    let h = TuiTestHarness::new("cli_add_scratch");
+
+    let add_output = h.run_cli(&["add", "--scratch", "-t", "QuickScratch"]);
+    assert!(
+        add_output.status.success(),
+        "aoe add --scratch failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&add_output.stdout),
+        String::from_utf8_lossy(&add_output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&add_output.stdout);
+    assert!(
+        stdout.contains("Scratch:") && stdout.contains("yes"),
+        "expected scratch yes summary line; got:\n{}",
+        stdout
+    );
+
+    let json = read_sessions_json(&h);
+    let sessions = json.as_array().expect("sessions array");
+    let session = sessions
+        .iter()
+        .find(|s| s["title"].as_str() == Some("QuickScratch"))
+        .expect("QuickScratch must exist");
+    assert_eq!(session["scratch"].as_bool(), Some(true));
+    let project_path = session["project_path"]
+        .as_str()
+        .expect("project_path must be a string");
+    let path = Path::new(project_path);
+    assert!(path.exists(), "scratch dir must exist: {}", project_path);
+    // Lives under <app_dir>/scratch/<id>/. The harness isolates app_dir
+    // under its own temp tree, so we assert the structural shape rather than
+    // a hard-coded location.
+    assert!(
+        path.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("scratch"),
+        "scratch dir must sit under a `scratch/` parent: {}",
+        project_path
+    );
+
+    // Capture path before rm so we can assert cleanup.
+    let captured = path.to_path_buf();
+
+    let rm_output = h.run_cli(&["rm", "QuickScratch"]);
+    assert!(
+        rm_output.status.success(),
+        "aoe rm failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rm_output.stdout),
+        String::from_utf8_lossy(&rm_output.stderr),
+    );
+    assert!(
+        !captured.exists(),
+        "scratch dir must be removed after aoe rm: {}",
+        captured.display(),
+    );
+}
+
+#[test]
+#[serial]
+fn test_cli_add_scratch_rejects_explicit_path() {
+    let h = TuiTestHarness::new("cli_add_scratch_path");
+    let project = h.project_path();
+
+    let output = h.run_cli(&["add", project.to_str().unwrap(), "--scratch"]);
+    assert!(
+        !output.status.success(),
+        "aoe add <path> --scratch must error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Cannot specify a project path with --scratch"),
+        "unexpected error output:\n{}",
+        stderr,
+    );
+}
+
+#[test]
+#[serial]
+fn test_cli_rm_keep_scratch_leaves_dir_on_disk() {
+    let h = TuiTestHarness::new("cli_rm_keep_scratch");
+
+    let add_output = h.run_cli(&["add", "--scratch", "-t", "KeepMe"]);
+    assert!(add_output.status.success(), "aoe add --scratch failed");
+
+    let json = read_sessions_json(&h);
+    let session = json
+        .as_array()
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|s| s["title"].as_str() == Some("KeepMe"))
+        })
+        .expect("KeepMe session must exist");
+    let project_path = session["project_path"].as_str().expect("project_path");
+    let path = Path::new(project_path).to_path_buf();
+    assert!(path.exists(), "scratch dir must exist before rm");
+
+    let rm_output = h.run_cli(&["rm", "KeepMe", "--keep-scratch"]);
+    assert!(
+        rm_output.status.success(),
+        "aoe rm --keep-scratch failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&rm_output.stdout),
+        String::from_utf8_lossy(&rm_output.stderr),
+    );
+    assert!(
+        path.exists(),
+        "scratch dir must survive when --keep-scratch is passed: {}",
+        path.display(),
+    );
+
+    // The session record itself is gone.
+    let json_after = read_sessions_json(&h);
+    let still_there = json_after.as_array().and_then(|sessions| {
+        sessions
+            .iter()
+            .find(|s| s["title"].as_str() == Some("KeepMe"))
+    });
+    assert!(
+        still_there.is_none(),
+        "session record must be removed even with --keep-scratch"
+    );
+
+    // Clean up the leftover dir so re-runs of this test don't accumulate
+    // entries under the user's scratch root.
+    let _ = std::fs::remove_dir_all(&path);
+}
+
+#[test]
+#[serial]
+fn test_cli_add_scratch_conflicts_with_worktree_flag() {
+    let h = TuiTestHarness::new("cli_add_scratch_worktree");
+
+    let output = h.run_cli(&["add", "--scratch", "-w", "feat/x"]);
+    assert!(
+        !output.status.success(),
+        "aoe add --scratch -w must error at clap layer"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // clap's mutex error wording mentions one of the two flag names.
+    assert!(
+        stderr.contains("--scratch")
+            || stderr.contains("--worktree")
+            || stderr.contains("cannot be used"),
+        "unexpected error output:\n{}",
+        stderr,
+    );
+}

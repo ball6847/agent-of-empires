@@ -11,9 +11,9 @@ use crate::session::{civilizations, GroupTree, Instance, SandboxInfo, Storage};
 
 #[derive(Args)]
 pub struct AddArgs {
-    /// Project directory (defaults to current directory)
-    #[arg(default_value = ".")]
-    path: PathBuf,
+    /// Project directory (defaults to current directory). Omit when
+    /// using `--scratch`.
+    path: Option<PathBuf>,
 
     /// Session title (defaults to folder name)
     #[arg(short = 't', long)]
@@ -117,22 +117,55 @@ pub struct AddArgs {
     #[cfg(feature = "serve")]
     #[arg(long = "model")]
     model: Option<String>,
+
+    /// Create the session in a fresh scratch directory under
+    /// `<app_dir>/scratch/<id>/` instead of a project path. The directory is
+    /// removed when the session is deleted (unless `aoe rm` is given
+    /// `--keep-scratch`). Mutually exclusive with worktree-related flags.
+    #[arg(
+        long = "scratch",
+        conflicts_with_all = [
+            "worktree_branch",
+            "create_branch",
+            "base_branch",
+            "extra_repos",
+            "projects",
+            "no_submodules",
+        ]
+    )]
+    scratch: bool,
 }
 
 #[tracing::instrument(target = "cli.add", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
-    let mut path = if args.path.as_os_str() == "." {
-        std::env::current_dir()?
+    // Scratch sessions have no project path; the scratch directory is
+    // provisioned below once we know the instance id. Reject an
+    // explicitly-passed path loudly so `aoe add /some/repo --scratch` does
+    // not silently drop the path arg.
+    if args.scratch && args.path.is_some() {
+        bail!(
+            "Cannot specify a project path with --scratch\nTip: drop the path argument, the session runs in a fresh scratch directory"
+        );
+    }
+
+    let mut path = if args.scratch {
+        // Placeholder; the real path is set after `Instance::new` runs and
+        // `scratch::provision_scratch_dir` returns a fresh scratch dir.
+        PathBuf::new()
     } else {
-        if !args.path.exists() {
-            bail!("Path does not exist: {}", args.path.display());
+        let raw = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
+        if raw.as_os_str() == "." {
+            std::env::current_dir()?
+        } else {
+            if !raw.exists() {
+                bail!("Path does not exist: {}", raw.display());
+            }
+            raw.canonicalize()
+                .with_context(|| format!("Failed to resolve path: {}", raw.display()))?
         }
-        args.path
-            .canonicalize()
-            .with_context(|| format!("Failed to resolve path: {}", args.path.display()))?
     };
 
-    if !path.is_dir() {
+    if !args.scratch && !path.is_dir() {
         bail!("Path is not a directory: {}", path.display());
     }
 
@@ -153,7 +186,17 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     all_extra_repos.extend(args.extra_repos.iter().cloned());
     all_extra_repos.extend(resolved_project_paths);
 
-    let config = repo_config::resolve_config_with_repo_or_warn(profile, &path);
+    // Scratch sessions have no project repo, so repo-scoped config
+    // overrides have nothing to anchor on. Resolving the repo-aware
+    // variant against the launch directory would silently pick up
+    // `.agent-of-empires/config.toml` from whatever folder the user
+    // happened to run `aoe add --scratch` in, which breaks the
+    // project-less contract. Fall back to the profile-only resolver.
+    let config = if args.scratch {
+        crate::session::profile_config::resolve_config_or_warn(profile)
+    } else {
+        repo_config::resolve_config_with_repo_or_warn(profile, &path)
+    };
 
     // Preserve the original project path for hook trust checking.
     // `path` gets reassigned to the worktree/workspace directory below,
@@ -316,6 +359,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 worktree_info_opt.as_ref(),
                 workspace_info_opt.as_ref(),
                 args.create_branch,
+                None,
             );
             return Ok(());
         }
@@ -332,6 +376,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 worktree_info_opt.as_ref(),
                 workspace_info_opt.as_ref(),
                 args.create_branch,
+                None,
             );
             return Ok(());
         }
@@ -343,6 +388,16 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     let mut instance = Instance::new(&final_title, path.to_str().unwrap_or(""));
     instance.source_profile = profile.to_string();
+
+    // Scratch sessions: provision a fresh scratch directory keyed on the
+    // freshly-generated instance id. The session layer owns the location
+    // (`<app_dir>/scratch/<id>/`) and the deletion guard.
+    if args.scratch {
+        let dir = crate::session::scratch::provision_scratch_dir(&instance.id)?;
+        path = dir;
+        instance.project_path = path.to_string_lossy().to_string();
+        instance.scratch = true;
+    }
 
     if let Some(group) = &group_path {
         instance.group_path = group.trim().to_string();
@@ -555,7 +610,14 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // Use the original project path for trust checking (not the worktree/workspace
     // path, which won't contain `.agent-of-empires/config.toml`).
     let hook_result: Result<()> = (|| {
-        let resolved_hooks: Option<crate::session::HooksConfig> =
+        let resolved_hooks: Option<crate::session::HooksConfig> = if args.scratch {
+            // Scratch sessions never have a `.agent-of-empires/config.toml`
+            // anchored on `original_project_path` (the path is either
+            // empty or the scratch dir itself). Skip the repo hook
+            // trust prompt entirely and fall back to profile-level
+            // hooks so the project-less contract stays intact.
+            repo_config::resolve_global_profile_hooks(profile)
+        } else {
             match repo_config::check_hook_trust(&original_project_path) {
                 Ok(repo_config::HookTrustStatus::NeedsTrust { hooks, hooks_hash }) => {
                     let should_trust = if args.trust_hooks {
@@ -601,7 +663,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     tracing::warn!(target: "cli.add", "Failed to check repo hooks: {}", e);
                     repo_config::resolve_global_profile_hooks(profile)
                 }
-            };
+            }
+        };
 
         if let Some(hooks) = resolved_hooks {
             if !hooks.on_create.is_empty() {
@@ -620,6 +683,11 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             instance.worktree_info.as_ref(),
             instance.workspace_info.as_ref(),
             args.create_branch,
+            if instance.scratch {
+                Some(std::path::Path::new(&instance.project_path))
+            } else {
+                None
+            },
         );
         return Err(e);
     }
@@ -652,6 +720,11 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 instance.worktree_info.as_ref(),
                 instance.workspace_info.as_ref(),
                 args.create_branch,
+                if instance.scratch {
+                    Some(std::path::Path::new(&instance.project_path))
+                } else {
+                    None
+                },
             );
             return Ok(());
         }
@@ -661,6 +734,11 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 instance.worktree_info.as_ref(),
                 instance.workspace_info.as_ref(),
                 args.create_branch,
+                if instance.scratch {
+                    Some(std::path::Path::new(&instance.project_path))
+                } else {
+                    None
+                },
             );
             return Err(e);
         }
@@ -679,6 +757,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
     if instance.sandbox_info.is_some() {
         println!("  Sandbox: enabled");
+    }
+    if instance.scratch {
+        println!("  Scratch:  yes");
     }
     if instance.yolo_mode {
         println!("  YOLO:    enabled");
@@ -778,6 +859,7 @@ fn cleanup_partial_session(
     worktree_info: Option<&crate::session::WorktreeInfo>,
     workspace_info: Option<&crate::session::WorkspaceInfo>,
     created_branch: bool,
+    scratch_dir: Option<&std::path::Path>,
 ) {
     if let Some(wt) = worktree_info {
         if wt.managed_by_aoe {
@@ -801,6 +883,14 @@ fn cleanup_partial_session(
             }
         }
         let _ = std::fs::remove_dir_all(&ws.workspace_dir);
+    }
+    // Remove the scratch directory provisioned earlier in this run.
+    // Guarded by `is_scratch_path` (same check the deletion path uses),
+    // so a tampered or unexpected `project_path` is a no-op.
+    if let Some(scratch) = scratch_dir {
+        if crate::session::scratch::is_scratch_path(scratch) {
+            let _ = std::fs::remove_dir_all(scratch);
+        }
     }
 }
 

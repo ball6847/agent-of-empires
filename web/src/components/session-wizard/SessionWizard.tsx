@@ -61,6 +61,11 @@ export interface WizardPrefill {
   skipToReview?: boolean;
   /** Which tab to show initially on the project step */
   initialTab?: "recent" | "browse" | "clone";
+  /** Open the wizard pre-configured for a scratch session: the
+   *  `scratch` flag is on, no path is required, worktree controls are
+   *  hidden. Pairs with `skipToReview` for the Cmd+Shift+N then
+   *  Cmd+Enter fast-create flow. */
+  scratch?: boolean;
 }
 
 interface Props {
@@ -78,17 +83,33 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
   const prefillData: WizardData = prefill
     ? {
         ...baseInitial,
-        path: prefill.path || "",
+        path: prefill.scratch ? "" : (prefill.path || ""),
         tool: prefill.tool || baseInitial.tool,
         yoloMode: prefill.yoloMode ?? false,
         sandboxEnabled: prefill.sandboxEnabled ?? false,
         profile: prefill.profile || "",
         group: prefill.group || "",
+        scratch: prefill.scratch ?? false,
+        // Scratch mode clears worktree/extra-repos so the submit
+        // payload mirrors what the reducer's SET_FIELD arm would emit
+        // for a user-triggered scratch toggle. See wizardReducer.ts.
+        useWorktree: prefill.scratch ? false : baseInitial.useWorktree,
+        extraRepoPaths: prefill.scratch ? [] : baseInitial.extraRepoPaths,
       }
     : baseInitial;
 
   const [state, dispatch] = useReducer(reducer, {
-    currentStep: prefill?.skipToReview ? 3 : (prefill?.path ? 1 : 0),
+    // Only `skipToReview` jumps directly to Review. The fast-create
+    // shortcut sets both `scratch: true` and `skipToReview: true`, so
+    // pairing them is still a single keystroke flow; gating on the
+    // scratch flag alone conflicted with WizardPrefill's documented
+    // contract (a wizard opened with `scratch: true` for "open at
+    // ProjectStep with scratch pre-enabled" would have skipped past
+    // the project step entirely).
+    currentStep:
+      prefill?.skipToReview
+        ? 3
+        : (prefill?.path ? 1 : 0),
     data: prefillData, isSubmitting: false, error: null,
     agents: [], groups: [], profiles: [], dockerAvailable: false,
   });
@@ -169,20 +190,29 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
   const handleSubmit = async () => {
     dispatch({ type: "SUBMIT_START" });
     const d = state.data;
+    // Scratch sessions: server provisions the working directory and
+    // ignores `path`. Force-omit every worktree-related field so a
+    // stale reducer state cannot make the server return 400 on the
+    // `scratch + worktree_branch` mutex.
     const body: CreateSessionRequest = {
-      path: d.path, tool: d.tool,
+      path: d.scratch ? "" : d.path,
+      tool: d.tool,
       title: d.title || undefined, group: d.group || undefined,
       yolo_mode: d.yoloMode,
-      worktree_branch: d.useWorktree ? getSubmittedBranch(d.title, d.worktreeBranch) : undefined,
-      create_new_branch: d.useWorktree && !d.attachExisting,
+      worktree_branch:
+        !d.scratch && d.useWorktree
+          ? getSubmittedBranch(d.title, d.worktreeBranch)
+          : undefined,
+      create_new_branch: !d.scratch && d.useWorktree && !d.attachExisting,
       base_branch:
-        d.useWorktree && !d.attachExisting && d.baseBranch.trim()
+        !d.scratch && d.useWorktree && !d.attachExisting && d.baseBranch.trim()
           ? d.baseBranch.trim()
           : undefined,
       sandbox: d.sandboxEnabled,
       sandbox_image: d.sandboxEnabled ? d.sandboxImage : undefined,
       extra_env: d.sandboxEnabled && d.extraEnv.length > 0 ? d.extraEnv.filter(Boolean) : undefined,
-      extra_repo_paths: d.extraRepoPaths.length > 0 ? d.extraRepoPaths : undefined,
+      extra_repo_paths:
+        !d.scratch && d.extraRepoPaths.length > 0 ? d.extraRepoPaths : undefined,
       extra_args: d.extraArgs || undefined,
       command_override: d.commandOverride || undefined,
       custom_instruction: d.customInstruction || undefined,
@@ -193,6 +223,7 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
       // switch (see src/server/api/sessions.rs), so a tampered
       // client request can't escalate cockpit on.
       cockpit_mode: cockpitMasterEnabled && ACP_CAPABLE_TOOLS.has(d.tool),
+      scratch: d.scratch || undefined,
     };
     const result = await createSession(body);
     if (result.ok) {
@@ -235,7 +266,13 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
     }
   };
 
-  const nextDisabled = currentStepDef?.id === "project" && !state.data.path;
+  // Scratch selection satisfies the project-step "need a project" gate
+  // without a path: the server provisions the working directory on
+  // submit. Otherwise require a path as before.
+  const nextDisabled =
+    currentStepDef?.id === "project" &&
+    !state.data.scratch &&
+    !state.data.path;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">

@@ -3,7 +3,7 @@
 use anyhow::Result;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures_util::StreamExt;
 use ratatui::prelude::*;
@@ -209,7 +209,7 @@ impl App {
             // changelog so the warning is what the user sees first, and avoid
             // overwriting a malformed config.toml with defaults via save_config.
         } else if !config.app_state.has_seen_welcome {
-            home.show_welcome();
+            home.show_intro(theme_name);
             config.app_state.has_seen_welcome = true;
             config.app_state.last_seen_version = Some(current_version);
             save_config(&config)?;
@@ -403,8 +403,8 @@ impl App {
         // wrap estimation under-counts when Paragraph word-wraps mid-line.
         let height = ((visual_lines as u16).saturating_add(7)).clamp(9, 35);
         // Warnings preempt onboarding dialogs so the user sees the problem
-        // before the welcome screen.
-        self.home.welcome_dialog = None;
+        // before the intro walkthrough.
+        self.home.intro_dialog = None;
         self.home.changelog_dialog = None;
         tracing::info!(target: "tui.dialog", dialog = "warning", "opening warning dialog");
         self.home.info_dialog =
@@ -437,6 +437,11 @@ impl App {
     ) -> Result<()> {
         // Initial render
         terminal.clear()?;
+        // Sync mouse capture before the first paint so any onboarding
+        // surface that wants native drag-to-select (intro Welcome page,
+        // changelog, info dialog) gets capture turned off on frame 1.
+        // Otherwise the user would have to press a key first.
+        self.sync_mouse_capture(terminal)?;
         self.draw(terminal)?;
 
         // Refresh tmux session cache
@@ -506,6 +511,7 @@ impl App {
         let mut last_disk_refresh = std::time::Instant::now();
         let mut last_spinner_redraw = std::time::Instant::now();
         let mut last_heartbeat = std::time::Instant::now();
+        let mut last_presence_refresh = std::time::Instant::now();
         // Throttle for how often the periodic block re-reads settings;
         // without this, the inner guards would re-fire on every loop
         // iteration once any time has passed, hitting the config file at
@@ -516,10 +522,21 @@ impl App {
         // Fastest spinner (breathe) changes every 180ms; 120ms ensures smooth animation
         const SPINNER_REDRAW_INTERVAL: Duration = Duration::from_millis(120);
         const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+        // How often to recount live TUIs for the footer indicator. Cheap dir
+        // listing (a handful of entries), so a tight-ish cadence keeps the
+        // "another instance appeared/left" signal responsive without disk I/O
+        // on the hot render path.
+        const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+        // A presence file counts as live while its mtime is within this window.
+        // Larger than HEARTBEAT_INTERVAL so a couple of missed beats (busy loop,
+        // brief stall) don't drop an instance; matches the push consumer.
+        const PRESENCE_FRESH_WINDOW: Duration = Duration::from_secs(30);
 
         // Signal that the TUI is active so the web push consumer can
-        // suppress notifications while the user is watching the dashboard.
+        // suppress notifications while the user is watching the dashboard, and
+        // so other TUIs can count this instance.
         crate::session::write_tui_heartbeat();
+        self.home.active_tui_count = crate::session::count_active_tuis(PRESENCE_FRESH_WINDOW);
 
         loop {
             // Force full redraw if needed (e.g., after returning from tmux).
@@ -543,6 +560,17 @@ impl App {
                 event = self.event_stream.as_mut().expect("event_stream missing").next() => {
                     match event {
                         Some(Ok(Event::Key(key))) => {
+                            // Only act on key-down / auto-repeat. Terminals that
+                            // report release events (Windows console always does;
+                            // kitty-protocol terminals do when enhancement flags are
+                            // on) would otherwise deliver a Release for every press
+                            // and double-fire every handler, so a toggle like `i`
+                            // (hide the info header) nets to zero and "won't hide".
+                            // The cockpit and remote-home loops already filter this;
+                            // the home loop has to as well.
+                            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                                continue;
+                            }
                             // Paste-burst detector for VoiceInk + Mosh ergonomics.
                             // Mosh strips bracketed-paste markers, so pasted
                             // dictation arrives as a stream of individual KeyEvents
@@ -575,6 +603,15 @@ impl App {
                                         self.event_stream.as_mut().expect("event_stream missing").next(),
                                     ).await;
                                     match next {
+                                        // Ignore key-release / non-press events mid-burst, same
+                                        // gate as the arm entry. On terminals that report releases
+                                        // they would otherwise be taken as burst chars (doubling the
+                                        // pasted text) or stashed as the deferred key.
+                                        Ok(Some(Ok(Event::Key(k))))
+                                            if !matches!(
+                                                k.kind,
+                                                KeyEventKind::Press | KeyEventKind::Repeat
+                                            ) => {}
                                         Ok(Some(Ok(Event::Key(k)))) if Self::is_burst_candidate(&k) => {
                                             if let Some(c) = Self::burst_char_for(&k) {
                                                 burst_str.push(c);
@@ -626,7 +663,19 @@ impl App {
                                                     // draining keystrokes). A user double-clicking
                                                     // during dictation can click again after the burst
                                                     // ends.
-                                                    MouseEventKind::Down(MouseButton::Left) if hit_list => { let _ = self.home.handle_click(mouse.column, mouse.row); }
+                                                    MouseEventKind::Down(MouseButton::Left) => {
+                                                        if self.home.handle_context_menu_click(mouse.column, mouse.row) {
+                                                            // Click consumed by the context menu
+                                                            // (item dispatched, kept open, or
+                                                            // dismissed on outside-click).
+                                                        } else if hit_list {
+                                                            let action = self.home.handle_click(mouse.column, mouse.row);
+                                                            if action.is_none() {
+                                                                let _ = self.home.handle_empty_list_click(mouse.column, mouse.row);
+                                                            }
+                                                        }
+                                                    }
+                                                    MouseEventKind::Down(MouseButton::Right) if hit_list => { self.home.handle_right_click(mouse.column, mouse.row); }
                                                     MouseEventKind::Moved => { self.home.handle_hover(mouse.column, mouse.row); }
                                                     _ => {}
                                                 }
@@ -709,10 +758,11 @@ impl App {
                             // before dispatching the action.
                             //
                             // Priority order for `Down(Left)`:
-                            //   1. modal dialog click (e.g. delete Yes/No)
-                            //   2. drag-start (divider, or preview text
+                            //   1. context menu outside-click (close it)
+                            //   2. modal dialog click (e.g. delete Yes/No)
+                            //   3. drag-start (divider, or preview text
                             //      selection)
-                            //   3. list row click (existing select/activate)
+                            //   4. list row click (existing select/activate)
                             // A bare press on the preview seeds a 1x1
                             // PreviewSelect; `handle_drag_end` collapses it
                             // back to no selection on release if the cursor
@@ -721,12 +771,29 @@ impl App {
                                 mouse.kind,
                                 MouseEventKind::Down(MouseButton::Left)
                             ) {
-                                if self.home.handle_dialog_click(mouse.column, mouse.row)
+                                if self
+                                    .home
+                                    .handle_context_menu_click(mouse.column, mouse.row)
+                                {
+                                    // Click consumed by the context menu:
+                                    // either dispatched an item (Rename /
+                                    // Delete), kept the menu open (border
+                                    // hit), or dismissed it (click outside).
+                                    self.draw(terminal)?;
+                                    None
+                                } else if self.home.handle_dialog_click(mouse.column, mouse.row)
                                 {
                                     // A modal swallowed the click — drop any
                                     // leftover preview highlight so it doesn't
                                     // linger behind / through the dialog.
                                     let _ = self.home.clear_preview_selection();
+                                    // Intro dialog can queue a live theme
+                                    // preview or a final pick on click; apply
+                                    // it before redrawing so the next frame
+                                    // already reflects the choice.
+                                    if let Some(name) = self.home.take_pending_intro_theme() {
+                                        self.set_theme(&name);
+                                    }
                                     self.sync_mouse_capture(terminal)?;
                                     self.draw(terminal)?;
                                     None
@@ -747,8 +814,26 @@ impl App {
                                     let action = self
                                         .home
                                         .handle_click(mouse.column, mouse.row);
+                                    // A click inside the list area that
+                                    // didn't resolve to a row (empty space
+                                    // below the last session) opens the
+                                    // new-session dialog, mirroring `n`.
+                                    if action.is_none() {
+                                        let _ = self
+                                            .home
+                                            .handle_empty_list_click(mouse.column, mouse.row);
+                                    }
                                     self.draw(terminal)?;
                                     action
+                                } else if hit_diff {
+                                    // The diff view file-list panel
+                                    // accepts clicks to select files,
+                                    // matching j/k navigation. Other
+                                    // diff regions are no-op.
+                                    let _ = self.home.clear_preview_selection();
+                                    self.home.handle_diff_click(mouse.column, mouse.row);
+                                    self.draw(terminal)?;
+                                    None
                                 } else {
                                     let _ = self.home.clear_preview_selection();
                                     None
@@ -779,13 +864,33 @@ impl App {
                                     // sees empty cells).
                                     self.home.handle_drag_end()
                                 }
+                                // Right-click opens the sidebar context menu
+                                // (Rename / Delete) for the clicked row.
+                                // hit_list is the only place it makes sense
+                                // today; other surfaces fall through.
+                                MouseEventKind::Down(MouseButton::Right) if hit_list => {
+                                    self.home.handle_right_click(mouse.column, mouse.row)
+                                }
                                 // Moved events are dispatched unconditionally
                                 // (no `hit_list` guard) so the handler can
                                 // clear the hover state the moment the
                                 // cursor leaves the list, even when the new
                                 // position lands on the preview or border.
                                 MouseEventKind::Moved => {
-                                    self.home.handle_hover(mouse.column, mouse.row)
+                                    // Route hover to the diff view's
+                                    // file list when one is open AND
+                                    // the mouse is over it; that's an
+                                    // OR with the home view's own hover
+                                    // (which already covers list +
+                                    // overlay dialogs).
+                                    let mut changed =
+                                        self.home.handle_hover(mouse.column, mouse.row);
+                                    if hit_diff {
+                                        changed |= self
+                                            .home
+                                            .handle_diff_hover(mouse.column, mouse.row);
+                                    }
+                                    changed
                                 }
                                 _ => false,
                             };
@@ -812,6 +917,14 @@ impl App {
                                 if let Some(session_id) = self.pending_cockpit_open.take() {
                                     self.run_cockpit_view(&session_id, terminal).await?;
                                 }
+                            }
+                            // Drain any Action stashed by a modal-dialog
+                            // click (e.g. clicking `[Yes]` on a stop or
+                            // quit confirm). The keyboard path returns
+                            // these through handle_key; the click path
+                            // can't, so it stashes them here.
+                            if let Some(action) = self.home.pending_dialog_click_action.take() {
+                                self.execute_action(action, terminal)?;
                             }
                             continue;
                         }
@@ -979,6 +1092,15 @@ impl App {
             if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
                 crate::session::write_tui_heartbeat();
                 last_heartbeat = std::time::Instant::now();
+            }
+
+            if last_presence_refresh.elapsed() >= PRESENCE_REFRESH_INTERVAL {
+                last_presence_refresh = std::time::Instant::now();
+                let count = crate::session::count_active_tuis(PRESENCE_FRESH_WINDOW);
+                if count != self.home.active_tui_count {
+                    self.home.active_tui_count = count;
+                    refresh_needed = true;
+                }
             }
 
             // Periodic update re-check (#1471). The startup spawn only fires
@@ -1831,6 +1953,14 @@ impl App {
             Some(inst) => inst.tmux_session()?,
             None => return Ok(()),
         };
+        // The non-live preview may have left the window pinned to manual
+        // sizing at the (smaller) preview dimensions. Restore `window-size
+        // latest` so the attaching client resizes it to the full terminal,
+        // and drop the preview-resize dedup so the next render re-asserts the
+        // preview geometry against the now-grown window instead of leaving the
+        // top clipped.
+        tmux_session.reset_size_to_latest_client();
+        self.home.clear_preview_pane_sync();
         let (attach_result, attached_status_updates) =
             self.with_attached_status_hooks(terminal, || tmux_session.attach())?;
 

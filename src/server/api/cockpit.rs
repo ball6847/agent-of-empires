@@ -444,6 +444,77 @@ pub async fn cockpit_prompt(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
+    // Touch the instance before forwarding so an archived or
+    // currently-snoozed session auto-wakes the same way the tmux send
+    // path does (`/api/sessions/{id}/send`). `touch_last_accessed`
+    // clears `archived_at` and `snoozed_until` so the cockpit
+    // reconciler stops skipping the session on its next ~2s tick and
+    // respawns the worker; the frontend's queue drains as soon as the
+    // fresh `AcpSessionAssigned` lands. See #1581.
+    //
+    // The in-memory mutation and the disk persistence are both held
+    // under `state.instance_lock(&id)` so they serialize against
+    // other session-mutating endpoints (archive / snooze / pin /
+    // rename) on the same id. Without this guard, a concurrent
+    // archive PATCH could interleave with the touch and produce a
+    // lost write (archive sets archived_at = Some, touch clears it,
+    // archive's persist lands first, touch's persist lands second
+    // and overwrites the archive).
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+    let triage_changed = {
+        let mut instances = state.instances.write().await;
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            let was_sunk = inst.is_archived() || inst.is_snoozed();
+            if was_sunk {
+                inst.touch_last_accessed();
+            }
+            was_sunk
+        } else {
+            false
+        }
+    };
+    if triage_changed {
+        let profile = {
+            let instances = state.instances.read().await;
+            instances
+                .iter()
+                .find(|i| i.id == id)
+                .map(|i| i.source_profile.clone())
+                .unwrap_or_default()
+        };
+        if let Ok(storage) = crate::session::Storage::new(&profile) {
+            let id_clone = id.clone();
+            let session_id_for_log = id.clone();
+            match tokio::task::spawn_blocking(move || {
+                storage.update(|instances, _groups| {
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                        inst.touch_last_accessed();
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    target: "http.api.cockpit",
+                    session = %session_id_for_log,
+                    "failed to save after triage auto-wake: {e}"
+                ),
+                Err(join_err) => tracing::warn!(
+                    target: "http.api.cockpit",
+                    session = %session_id_for_log,
+                    "spawn_blocking join error during triage auto-wake save: {join_err}"
+                ),
+            }
+        }
+    }
+    // Drop the per-session lock before reaching out to the
+    // supervisor. publish_user_prompt and send_prompt take their own
+    // locks downstream; holding ours across the agent forward would
+    // serialize prompts unnecessarily and stall siblings.
+    drop(_guard);
     // Publish the user's prompt into the event stream BEFORE forwarding
     // to the agent so the replay buffer / on-disk store captures it
     // even if the agent forward fails. The frontend treats UserPromptSent
@@ -535,6 +606,138 @@ pub async fn cockpit_files(
         )
             .into_response(),
     }
+}
+
+const WORKER_LOG_DEFAULT_TAIL: usize = 200;
+const WORKER_LOG_MAX_TAIL: usize = 2000;
+/// Cap the read size so a runaway log file can't pin the daemon. A 4 MiB
+/// window comfortably covers `WORKER_LOG_MAX_TAIL` lines worth of stderr
+/// while keeping memory predictable.
+const WORKER_LOG_MAX_READ_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+pub struct WorkerLogQuery {
+    /// Number of trailing lines to return. Clamped to
+    /// [1, `WORKER_LOG_MAX_TAIL`]; defaults to `WORKER_LOG_DEFAULT_TAIL`.
+    pub tail: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkerLogResponse {
+    pub path: String,
+    pub exists: bool,
+    pub tail: String,
+    pub lines_returned: usize,
+    /// `true` when the file was larger than the read window and the
+    /// returned tail starts mid-stream rather than at the beginning of
+    /// the file.
+    pub truncated: bool,
+}
+
+/// Tail of the per-session cockpit runner log file. Surfaces the same
+/// stream `aoe cockpit logs --session <id>` reads, so a dashboard user
+/// (Funnel / no host terminal) can see the verbatim adapter error when
+/// the cockpit startup banner is otherwise opaque. Read-only; allowed
+/// in `--read-only` mode.
+pub async fn cockpit_worker_log(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<WorkerLogQuery>,
+) -> impl IntoResponse {
+    let instances = state.instances.read().await;
+    let session_known = instances.iter().any(|i| i.id == id);
+    drop(instances);
+    if !session_known {
+        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    }
+
+    let log_path = match crate::cockpit::worker_registry::log_path_for(&id) {
+        Ok(p) => p,
+        Err(e) => {
+            return (StatusCode::BAD_REQUEST, format!("invalid session id: {e}")).into_response();
+        }
+    };
+
+    let tail = q
+        .tail
+        .unwrap_or(WORKER_LOG_DEFAULT_TAIL)
+        .clamp(1, WORKER_LOG_MAX_TAIL);
+
+    let log_path_display = log_path.display().to_string();
+    let read_result = tokio::task::spawn_blocking(move || read_log_tail(&log_path, tail)).await;
+    match read_result {
+        Ok(Ok((lines, truncated, exists))) => {
+            let lines_returned = lines.len();
+            let body = lines.join("\n");
+            Json(WorkerLogResponse {
+                path: log_path_display,
+                exists,
+                tail: body,
+                lines_returned,
+                truncated,
+            })
+            .into_response()
+        }
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("worker log read failed: {e}"),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("blocking task failed: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+pub(crate) fn read_log_tail(
+    path: &std::path::Path,
+    tail: usize,
+) -> std::io::Result<(Vec<String>, bool, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), false, false));
+        }
+        Err(e) => return Err(e),
+    };
+    let len = file.metadata()?.len();
+    let read_from = len.saturating_sub(WORKER_LOG_MAX_READ_BYTES);
+    let truncated = len > WORKER_LOG_MAX_READ_BYTES;
+
+    // If the read window starts inside a line, the first line we parse
+    // is a partial line. If the previous byte is '\n' the first line is
+    // whole and we keep it. Probing one byte before `read_from` is the
+    // cheap way to tell them apart without re-reading the prefix.
+    let mut prev_byte = [0u8; 1];
+    let prev_is_newline = if truncated && read_from > 0 {
+        file.seek(SeekFrom::Start(read_from - 1))?;
+        file.read_exact(&mut prev_byte)?;
+        prev_byte[0] == b'\n'
+    } else {
+        false
+    };
+
+    file.seek(SeekFrom::Start(read_from))?;
+    let window_len = len - read_from;
+    let mut raw = Vec::with_capacity(window_len as usize);
+    // Bound the read with `take` so a concurrent append between
+    // `metadata()` and now cannot grow `raw` beyond the precomputed
+    // window. Keeps the 4 MiB cap a hard ceiling, not a target.
+    (&mut file).take(window_len).read_to_end(&mut raw)?;
+    // Lossy decode so a partial UTF-8 boundary at the window edge cannot
+    // 500 the endpoint; the tail is for human eyeballs, exact bytes are
+    // not required.
+    let buf = String::from_utf8_lossy(&raw);
+    let mut lines: Vec<String> = buf.lines().map(|l| l.to_string()).collect();
+    if truncated && !prev_is_newline && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let total = lines.len();
+    let start = total.saturating_sub(tail);
+    Ok((lines[start..].to_vec(), truncated, true))
 }
 
 fn list_files(root: &std::path::Path, cap: usize) -> std::io::Result<(Vec<String>, bool)> {
@@ -1147,5 +1350,80 @@ pub async fn set_cockpit_master(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn read_log_tail_missing_file_returns_empty_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.log");
+        let (lines, truncated, exists) = read_log_tail(&path, 100).unwrap();
+        assert!(lines.is_empty());
+        assert!(!truncated);
+        assert!(!exists);
+    }
+
+    #[test]
+    fn read_log_tail_returns_last_n_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.log");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 0..10 {
+            writeln!(f, "line {i}").unwrap();
+        }
+        drop(f);
+        let (lines, truncated, exists) = read_log_tail(&path, 3).unwrap();
+        assert_eq!(lines, vec!["line 7", "line 8", "line 9"]);
+        assert!(!truncated);
+        assert!(exists);
+    }
+
+    #[test]
+    fn read_log_tail_tail_larger_than_file_returns_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.log");
+        std::fs::write(&path, "only\nthree\nlines\n").unwrap();
+        let (lines, _, exists) = read_log_tail(&path, 999).unwrap();
+        assert_eq!(lines, vec!["only", "three", "lines"]);
+        assert!(exists);
+    }
+
+    #[test]
+    fn read_log_tail_keeps_first_line_when_window_starts_on_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aligned.log");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let big_line = "x".repeat((WORKER_LOG_MAX_READ_BYTES as usize) - 1);
+        writeln!(f, "{big_line}").unwrap();
+        writeln!(f, "first whole line").unwrap();
+        writeln!(f, "second whole line").unwrap();
+        drop(f);
+        let (lines, truncated, exists) = read_log_tail(&path, 10).unwrap();
+        assert!(truncated);
+        assert!(exists);
+        assert_eq!(lines.first().map(String::as_str), Some("first whole line"));
+        assert_eq!(lines.last().map(String::as_str), Some("second whole line"));
+    }
+
+    #[test]
+    fn read_log_tail_drops_partial_first_line_when_window_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.log");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let big_line = "x".repeat((WORKER_LOG_MAX_READ_BYTES as usize) + 64);
+        writeln!(f, "{big_line}").unwrap();
+        writeln!(f, "real first").unwrap();
+        writeln!(f, "real second").unwrap();
+        drop(f);
+        let (lines, truncated, exists) = read_log_tail(&path, 10).unwrap();
+        assert!(truncated);
+        assert!(exists);
+        assert_eq!(lines.last().map(String::as_str), Some("real second"));
+        assert!(!lines.iter().any(|l| l == &big_line));
     }
 }

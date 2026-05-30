@@ -8,11 +8,13 @@
 // header and put output in a syntax-highlighted body.
 
 import {
+  useCallback,
   useEffect,
   useMemo,
   useState,
   type CSSProperties,
   type ReactNode,
+  type SetStateAction,
 } from "react";
 import {
   Brain,
@@ -237,6 +239,30 @@ function statusFor(result?: ActivityRow): Status {
   return result.kind === "tool_error" ? "err" : "ok";
 }
 
+// Per-card expand state for tool cards. Failed cards auto-open so the
+// user sees the error immediately, but the chevron must still fold them
+// once read. We model the user's choice as a nullable override: while
+// it is null we derive openness from the current props
+// (`status === "err" || defaultOpen`), so both a replayed already-failed
+// card (mounts as err) and a live card that fails mid-stream
+// (running -> err) open during render with no effect and no one-frame
+// collapse flash. The first user toggle pins `userOpen` and is respected
+// from then on, even if the card later re-enters err. See #1467.
+function useToolCardExpansion(status: Status, defaultOpen = false) {
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
+  const open = userOpen ?? (status === "err" || defaultOpen);
+  const setOpen = useCallback(
+    (action: SetStateAction<boolean>) => {
+      setUserOpen((prev) => {
+        const current = prev ?? (status === "err" || defaultOpen);
+        return typeof action === "function" ? action(current) : action;
+      });
+    },
+    [status, defaultOpen],
+  );
+  return [open, setOpen] as const;
+}
+
 function StatusDot({ status, neutral }: { status: Status; neutral?: boolean }) {
   // Group cards opt into a neutral dot once every child has settled
   // because a single child error doesn't make the whole group "failed"
@@ -278,6 +304,11 @@ interface CardChromeProps {
   expanded: boolean;
   onToggle?: () => void;
   body?: React.ReactNode;
+  /** Region rendered unconditionally below the header, regardless of
+   *  `expanded`. Used by `TodoGroupCard` to keep the latest todo list
+   *  visible while the per-snapshot history stays behind the expand
+   *  toggle (#1468). */
+  subBody?: React.ReactNode;
   /** When true and the card has settled (`status !== "running"`),
    *  render a neutral dot and omit the status badge. Used by
    *  `ToolGroupCard` so a single child error doesn't roll up to a
@@ -326,6 +357,7 @@ function CardChrome({
   expanded,
   onToggle,
   body,
+  subBody,
   startedAt,
   endedAt,
   neutralOnDone,
@@ -366,6 +398,7 @@ function CardChrome({
           />
         )}
       </Header>
+      {subBody}
       {expanded && body}
     </div>
   );
@@ -594,7 +627,7 @@ function ExecuteToolCard({ tool, result }: Props) {
   const command = pickFirst(argCommand, title, tool.name) ?? "(no command)";
   const description = pickStr(args, "description");
   const output = result?.text ?? "";
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useToolCardExpansion(status);
 
   const meta =
     output && status !== "running" ? (
@@ -655,7 +688,7 @@ function ReadToolCard({ tool, result }: Props) {
   const range = formatRange(args);
   const ext = argPath?.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase();
   const content = result?.text ?? "";
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useToolCardExpansion(status);
 
   const meta = content && (
     <span className="hidden md:inline text-[11px] text-text-dim">
@@ -677,7 +710,7 @@ function ReadToolCard({ tool, result }: Props) {
           {meta}
         </>
       }
-      expanded={open || status === "err"}
+      expanded={open}
       onToggle={
         status === "err" || content ? () => setOpen((v) => !v) : undefined
       }
@@ -713,7 +746,7 @@ function EditToolCard({ tool, result }: Props) {
   const oldText = pickStr(args, "old_string", "oldString", "old_str") ?? "";
   const newText =
     pickStr(args, "new_string", "newString", "new_str", "content") ?? "";
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useToolCardExpansion(status);
   const hasDiff = oldText !== "" || newText !== "";
   const verb = oldText ? "edit" : "write";
 
@@ -741,7 +774,7 @@ function EditToolCard({ tool, result }: Props) {
       label={verb}
       primary={path}
       meta={errorChip ? undefined : meta}
-      expanded={open || status === "err"}
+      expanded={open}
       onToggle={
         status === "err" || hasDiff ? () => setOpen((v) => !v) : undefined
       }
@@ -770,7 +803,7 @@ function DeleteToolCard({ tool, result }: Props) {
   const argPath = pickStr(args, "path", "file_path", "filePath", "filename");
   const title = pickStr(args, "_aoe_title");
   const path = pickFirst(argPath, title, tool.name) ?? "(unknown file)";
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useToolCardExpansion(status);
   return (
     <CardChrome
       status={status}
@@ -779,7 +812,7 @@ function DeleteToolCard({ tool, result }: Props) {
       icon={<Trash2 className="h-3.5 w-3.5 text-rose-400" />}
       label="delete"
       primary={path}
-      expanded={open || status === "err"}
+      expanded={open}
       onToggle={status === "err" ? () => setOpen((v) => !v) : undefined}
       body={
         status === "err" ? (
@@ -812,7 +845,7 @@ function SearchToolCard({ tool, result, provenance }: SearchProps) {
   const path = pickStr(args, "path", "directory", "scope");
   const output = result?.text ?? "";
   const lines = output ? output.split("\n").filter(Boolean) : [];
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useToolCardExpansion(status);
 
   return (
     <CardChrome
@@ -836,7 +869,7 @@ function SearchToolCard({ tool, result, provenance }: SearchProps) {
           )}
         </>
       }
-      expanded={open || status === "err"}
+      expanded={open}
       onToggle={
         status === "err" || lines.length > 0 ? () => setOpen((v) => !v) : undefined
       }
@@ -880,7 +913,7 @@ function FetchToolCard({ tool, result }: Props) {
   const title = pickStr(args, "_aoe_title");
   const url = pickFirst(argUrl, title, tool.name) ?? "(no url)";
   const output = result?.text ?? "";
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useToolCardExpansion(status);
 
   return (
     <CardChrome
@@ -890,7 +923,7 @@ function FetchToolCard({ tool, result }: Props) {
       icon={<Globe className="h-3.5 w-3.5" />}
       label="fetch"
       primary={url}
-      expanded={open || status === "err"}
+      expanded={open}
       onToggle={
         status === "err" || output ? () => setOpen((v) => !v) : undefined
       }
@@ -989,21 +1022,55 @@ const TODO_CLASS: Record<TodoStatus, string> = {
   cancelled: "text-text-dim line-through",
 };
 
-function TodoUpdateCard({ tool, result, todos }: TodoCardProps) {
-  const status = statusFor(result);
-  const counts = useMemo(() => {
-    const c = { pending: 0, in_progress: 0, completed: 0, cancelled: 0 };
-    for (const t of todos) c[t.status] += 1;
-    return c;
-  }, [todos]);
-  const [open, setOpen] = useState(todos.length <= 5);
+function todoCounts(todos: TodoItem[]): Record<TodoStatus, number> {
+  const c: Record<TodoStatus, number> = {
+    pending: 0,
+    in_progress: 0,
+    completed: 0,
+    cancelled: 0,
+  };
+  for (const t of todos) c[t.status] += 1;
+  return c;
+}
 
+function todoBreakdown(counts: Record<TodoStatus, number>): string[] {
   const breakdown: string[] = [];
   if (counts.in_progress > 0) breakdown.push(`${counts.in_progress} active`);
   if (counts.pending > 0) breakdown.push(`${counts.pending} pending`);
   if (counts.completed > 0) breakdown.push(`${counts.completed} done`);
-  if (counts.cancelled > 0)
-    breakdown.push(`${counts.cancelled} cancelled`);
+  if (counts.cancelled > 0) breakdown.push(`${counts.cancelled} cancelled`);
+  return breakdown;
+}
+
+/** The todo checklist itself, shared by the per-call `TodoUpdateCard`
+ *  body and the folded `TodoGroupCard`'s always-visible latest list. */
+function TodoList({ todos }: { todos: TodoItem[] }) {
+  return (
+    <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
+      <ul className="flex flex-col gap-1 font-mono text-xs">
+        {todos.map((t, i) => (
+          <li
+            key={`${i}-${t.content}`}
+            className={`flex items-start gap-2 ${TODO_CLASS[t.status]}`}
+          >
+            <span className="select-none w-4 shrink-0 text-center">
+              {TODO_GLYPH[t.status]}
+            </span>
+            <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">
+              {t.content}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function TodoUpdateCard({ tool, result, todos }: TodoCardProps) {
+  const status = statusFor(result);
+  const counts = useMemo(() => todoCounts(todos), [todos]);
+  const [open, setOpen] = useToolCardExpansion(status, todos.length <= 5);
+  const breakdown = todoBreakdown(counts);
 
   return (
     <CardChrome
@@ -1018,30 +1085,114 @@ function TodoUpdateCard({ tool, result, todos }: TodoCardProps) {
           )}
         </>
       }
-      expanded={open || status === "err"}
+      expanded={open}
       onToggle={() => setOpen((v) => !v)}
       startedAt={tool.started_at}
       endedAt={result?.at}
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
-          <div className="border-t border-surface-800 bg-surface-950 px-3 py-2">
-            <ul className="flex flex-col gap-1 font-mono text-xs">
-              {todos.map((t, i) => (
-                <li
-                  key={`${i}-${t.content}`}
-                  className={`flex items-start gap-2 ${TODO_CLASS[t.status]}`}
-                >
-                  <span className="select-none w-4 shrink-0 text-center">
-                    {TODO_GLYPH[t.status]}
-                  </span>
-                  <span className="min-w-0 flex-1 whitespace-pre-wrap break-words">
-                    {t.content}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          </div>
+          <TodoList todos={todos} />
         </ToolErrorBody>
+      }
+    />
+  );
+}
+
+interface TodoGroupChild {
+  tool: ToolCall;
+  result?: ActivityRow;
+}
+
+/** Folds a run of consecutive TodoWrite snapshots into one card. The
+ *  collapsed view shows the latest list (the only snapshot whose
+ *  pending/in_progress/completed mix is current); expanding reveals
+ *  each individual update in order so the plan's evolution during the
+ *  turn stays auditable. See #1468. */
+export function TodoGroupCard({ items }: { items: TodoGroupChild[] }) {
+  const profile = useAgentProfile();
+  const [open, setOpen] = useState(false);
+  const snapshots = useMemo(
+    () =>
+      items
+        .map((it) => {
+          const c = classifyTodoWrite(it.tool, profile);
+          return c.isTodoWrite
+            ? { tool: it.tool, result: it.result, todos: c.todos }
+            : null;
+        })
+        .filter(
+          (
+            s,
+          ): s is {
+            tool: ToolCall;
+            result: ActivityRow | undefined;
+            todos: TodoItem[];
+          } => s !== null,
+        ),
+    [items, profile],
+  );
+  if (snapshots.length === 0) return null;
+
+  // The collapsed preview shows the latest *successful* snapshot, since
+  // a TodoWrite that ended in tool_error never became the live state.
+  // The header still reflects the latest attempt so a failed trailing
+  // update surfaces as an error rather than looking clean. See #1468.
+  const latestAttempt = snapshots[snapshots.length - 1]!;
+  const latestSuccessful =
+    [...snapshots].reverse().find((s) => s.result?.kind !== "tool_error") ??
+    null;
+  const previewSnapshot = latestSuccessful ?? latestAttempt;
+  const latestFailed = latestAttempt.result?.kind === "tool_error";
+  const breakdown = todoBreakdown(todoCounts(previewSnapshot.todos));
+  const running = snapshots.some((s) => !s.result);
+  const status: Status = running ? "running" : latestFailed ? "err" : "ok";
+
+  const startedAt = snapshots
+    .map((s) => s.tool.started_at)
+    .sort()
+    .at(0);
+  const allDone = snapshots.every((s) => s.result);
+  const endedAt = allDone
+    ? snapshots
+        .map((s) => s.result!.at)
+        .sort()
+        .at(-1)
+    : undefined;
+
+  return (
+    <CardChrome
+      status={status}
+      neutralOnDone={!latestFailed}
+      icon={<ListChecks className="h-3.5 w-3.5" />}
+      label="todos"
+      primary={
+        <>
+          <span>updated {snapshots.length} times</span>
+          {breakdown.length > 0 && (
+            <span className="ml-2 text-text-dim">· {breakdown.join(" · ")}</span>
+          )}
+        </>
+      }
+      expanded={open}
+      onToggle={() => setOpen((v) => !v)}
+      startedAt={startedAt}
+      endedAt={endedAt}
+      subBody={
+        previewSnapshot.result?.kind === "tool_error" ? undefined : (
+          <TodoList todos={previewSnapshot.todos} />
+        )
+      }
+      body={
+        <div className="border-t border-surface-800 bg-surface-900/30 px-2 py-1">
+          {snapshots.map((s) => (
+            <TodoUpdateCard
+              key={s.tool.id}
+              tool={s.tool}
+              result={s.result}
+              todos={s.todos}
+            />
+          ))}
+        </div>
       }
     />
   );
@@ -1074,7 +1225,7 @@ interface SkillProps extends Props {
 
 function SkillToolCard({ tool, result, skillName }: SkillProps) {
   const status = statusFor(result);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useToolCardExpansion(status);
   // Memo on the raw string so downstream memos see a stable args reference
   // and don't recompute every render.
   const args = useMemo(
@@ -1103,7 +1254,7 @@ function SkillToolCard({ tool, result, skillName }: SkillProps) {
       icon={<Sparkles className="h-3.5 w-3.5" />}
       label="skill"
       primary={skillName}
-      expanded={open || status === "err"}
+      expanded={open}
       onToggle={
         status === "err" || hasBody ? () => setOpen((v) => !v) : undefined
       }
@@ -1363,7 +1514,7 @@ interface McpProps extends Props {
 
 function McpToolCard({ tool, result, server, verb }: McpProps) {
   const status = statusFor(result);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useToolCardExpansion(status);
   // Memo on the raw string so downstream memos see a stable args reference
   // and don't recompute every render.
   const args = useMemo(
@@ -1417,7 +1568,7 @@ function McpToolCard({ tool, result, server, verb }: McpProps) {
           )}
         </>
       }
-      expanded={open || status === "err"}
+      expanded={open}
       onToggle={
         status === "err" || hasBody ? () => setOpen((v) => !v) : undefined
       }
@@ -1456,7 +1607,7 @@ interface MemoryCardProps extends Props {
  *  classifyMemory and render here. See issue #1071. */
 function MemoryCard({ tool, result, hit }: MemoryCardProps) {
   const status = statusFor(result);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useToolCardExpansion(status);
 
   const args = useMemo(
     () => parseJsonObject(tool.args_preview),
@@ -1502,7 +1653,7 @@ function MemoryCard({ tool, result, hit }: MemoryCardProps) {
         </>
       }
       meta={meta}
-      expanded={open || status === "err"}
+      expanded={open}
       onToggle={
         status === "err" || hasBody ? () => setOpen((v) => !v) : undefined
       }
@@ -1569,7 +1720,7 @@ function MemoryCard({ tool, result, hit }: MemoryCardProps) {
 function MemoryRecallCard({ tool, result }: Props) {
   const status = statusFor(result);
   const recall = tool.memory_recall;
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useToolCardExpansion(status);
 
   if (!recall) {
     // Defensive: dispatcher only enters this branch when memory_recall
@@ -1601,8 +1752,10 @@ function MemoryRecallCard({ tool, result }: Props) {
       icon={<Brain className="h-3.5 w-3.5" />}
       label="Memory recall"
       primary={primary}
-      expanded={open || status === "err"}
-      onToggle={hasBody ? () => setOpen((v) => !v) : undefined}
+      expanded={open}
+      onToggle={
+        status === "err" || hasBody ? () => setOpen((v) => !v) : undefined
+      }
       body={
         <ToolErrorBody status={status} errorText={result?.text}>
           {status !== "err" && hasBody ? (
@@ -1707,7 +1860,7 @@ interface ScheduleProps extends Props {
 
 function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
   const status = statusFor(result);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useToolCardExpansion(status);
   const args = useMemo(
     () => parseJsonObject(tool.args_preview),
     [tool.args_preview],
@@ -1812,8 +1965,10 @@ function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
       label={label}
       primary={primary}
       meta={meta}
-      expanded={open || status === "err"}
-      onToggle={hasBody ? () => setOpen((v) => !v) : undefined}
+      expanded={open}
+      onToggle={
+        status === "err" || hasBody ? () => setOpen((v) => !v) : undefined
+      }
       startedAt={tool.started_at}
       endedAt={result?.at}
       body={
@@ -1850,7 +2005,7 @@ function ScheduleToolCard({ tool, result, kind }: ScheduleProps) {
 
 function GenericToolCard({ tool, result }: Props) {
   const status = statusFor(result);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useToolCardExpansion(status);
   const output = result?.text ?? "";
   return (
     <CardChrome
@@ -1860,7 +2015,7 @@ function GenericToolCard({ tool, result }: Props) {
       icon={<Sparkles className="h-3.5 w-3.5" />}
       label={tool.kind || "tool"}
       primary={tool.name}
-      expanded={open || status === "err"}
+      expanded={open}
       onToggle={
         status === "err" || tool.args_preview || output
           ? () => setOpen((v) => !v)

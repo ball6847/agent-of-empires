@@ -150,8 +150,10 @@ function sendResult(id, result) {
   send({ jsonrpc: "2.0", id, result });
 }
 
-function sendError(id, code, message) {
-  send({ jsonrpc: "2.0", id, error: { code, message } });
+function sendError(id, code, message, data) {
+  const error = { code, message };
+  if (data !== undefined) error.data = data;
+  send({ jsonrpc: "2.0", id, error });
 }
 
 function sendNotification(method, params) {
@@ -302,7 +304,7 @@ const INITIALIZE_RESULT = {
   },
   agentInfo: {
     name: "@agentclientprotocol/claude-agent-acp",
-    version: "0.37.0",
+    version: "0.39.0",
   },
   // No authMethods key at all. An empty array is interpreted by some
   // ACP client implementations as "auth methods listed but none
@@ -324,6 +326,26 @@ async function handleRequest(msg) {
       // ignore log errors
     }
   }
+  // Script-controlled failure injection: lets specs simulate "adapter
+  // returns a JSON-RPC error on method X" without needing a hand-rolled
+  // ACP server per failure mode. Shape: script.failOn = { method:
+  // "session/new", code: -32603, message: "Internal error", data: {...} }.
+  // Single-shot by default; set `repeat: true` to keep failing on every
+  // call. See web/tests/live/cockpit-stories/startup-error-banner-native-binary.spec.ts.
+  if (script.failOn && script.failOn.method === method) {
+    const f = script.failOn;
+    sendError(
+      id,
+      typeof f.code === "number" ? f.code : -32603,
+      typeof f.message === "string" ? f.message : "Internal error",
+      f.data,
+    );
+    if (!f.repeat) {
+      script.failOn = null;
+    }
+    return;
+  }
+
   switch (method) {
     case "initialize":
       sendResult(id, INITIALIZE_RESULT);
@@ -332,6 +354,47 @@ async function handleRequest(msg) {
     case "session/new":
     case "session/load": {
       const sessionId = params?.sessionId ?? makeSessionId();
+      // Test hook: when FAKE_ACP_COMMANDS is set, emit an
+      // `available_commands_update` session/update notification right
+      // after the session/new response so the cockpit composer's
+      // slash-command popover is populated for stories that drive the
+      // `/` picker (e.g. composer-slash-pick-no-arg #1512).
+      const commandsJson = process.env.FAKE_ACP_COMMANDS;
+      if (commandsJson) {
+        try {
+          const parsed = JSON.parse(commandsJson);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            // ACP wire shape (per
+            // agent-client-protocol-schema 0.12 client.rs:447-508):
+            // each AvailableCommand has `name`, `description`, and an
+            // optional `input` of `{ hint: "..." }` for unstructured
+            // free-form args. accepts_input=false serializes as input
+            // omitted.
+            const availableCommands = parsed.map((c) => ({
+              name: c.name,
+              description: c.description ?? "",
+              ...(c.accepts_input ? { input: { hint: c.hint ?? "" } } : {}),
+            }));
+            // Defer emission to the next tick so the session/new
+            // response lands first; the cockpit acp_client wires the
+            // session id from the response before it can route follow-up
+            // session/update notifications.
+            setImmediate(() => {
+              sendNotification("session/update", {
+                sessionId,
+                update: {
+                  sessionUpdate: "available_commands_update",
+                  availableCommands,
+                },
+              });
+            });
+          }
+        } catch (err) {
+          process.stderr.write(
+            `[fakeAcpAgent] bad FAKE_ACP_COMMANDS: ${err}\n`,
+          );
+        }
+      }
       // Mirror claude-agent-acp v0.37.0: the initial set of
       // per-session selectors (model + effort + mode) ships in the
       // session/new and session/load *response*, not as a subsequent

@@ -47,6 +47,14 @@ interface Props {
    *  Threaded through to `useCockpit` so the drain effect parks queued
    *  prompts while the reconciler is mid-resume. See #1088. */
   cockpitWorkerState?: "absent" | "resuming" | "running";
+  /** RFC3339 archived-at timestamp, or null. Threaded into `useCockpit`
+   *  so `sendPrompt` can auto-unarchive the session before enqueueing,
+   *  matching the `touch_last_accessed` invariant the server enforces
+   *  for tmux sends. See #1581. */
+  archivedAt?: string | null;
+  /** RFC3339 snoozed-until timestamp, or null. Same auto-wake purpose
+   *  as `archivedAt`. See #1581. */
+  snoozedUntil?: string | null;
   /** When true, every row is rendered including those preceding the
    *  most recent `/clear`. When false (the default), rows before the
    *  latest `session_cleared` divider are folded out of the message
@@ -96,10 +104,12 @@ export interface CockpitContext {
 export function CockpitRuntime({
   sessionId,
   cockpitWorkerState = "running",
+  archivedAt = null,
+  snoozedUntil = null,
   showClearedTurns = false,
   children,
 }: Props) {
-  const cockpit = useCockpit(sessionId, cockpitWorkerState);
+  const cockpit = useCockpit(sessionId, cockpitWorkerState, archivedAt, snoozedUntil);
   // Memoise the activity → ThreadMessageLike conversion. The function
   // walks the entire activity array, allocates a new AssistantBuilder
   // per turn, and produces brand-new message objects. Without
@@ -569,6 +579,46 @@ const TOOL_GROUP_MIN_RUN = 3;
  *  the `_aoe_` prefix so it can't collide with a real ACP tool kind. */
 export const TOOL_GROUP_NAME = "_aoe_tool_group";
 
+/** Synthetic toolName for a run of consecutive TodoWrite snapshots
+ *  folded into one card. Distinct from TOOL_GROUP_NAME so the renderer
+ *  dispatches it to TodoGroupCard (latest list always visible, history
+ *  on expand) rather than the generic actions group. See #1468. */
+export const TODO_GROUP_NAME = "_aoe_todo_group";
+
+type GroupChildPayload = {
+  toolCallId: string;
+  toolName: string;
+  argsText: string;
+  // `endedAt` rides along from DraftPart.result (set in completeToolCall)
+  // and CockpitView's pickEndedAt reads it to compute durations; keep it
+  // on the type so a future rebuild of `result` doesn't drop it.
+  result?: { content: string; endedAt?: string };
+  isError?: boolean;
+};
+
+/** Flatten a run of tool-call parts into the verbatim child payload the
+ *  group renderers reconstruct from. Shared by the generic actions
+ *  group and the TodoWrite group (#1468). */
+function buildGroupChildren(run: DraftPart[]): {
+  childIds: string[];
+  children: GroupChildPayload[];
+} {
+  const childIds: string[] = [];
+  const children: GroupChildPayload[] = [];
+  for (const p of run) {
+    if (p.type !== "tool-call") continue;
+    childIds.push(p.toolCallId);
+    children.push({
+      toolCallId: p.toolCallId,
+      toolName: p.toolName,
+      argsText: p.argsText,
+      result: p.result,
+      isError: p.isError,
+    });
+  }
+  return { childIds, children };
+}
+
 /** Walk an assistant message's parts and collapse runs of consecutive
  *  tool-call parts (regardless of kind) into one synthetic group part
  *  when the run is ≥ TOOL_GROUP_MIN_RUN long. The grouping boundary is
@@ -585,16 +635,29 @@ function collapseToolRuns(parts: DraftPart[]): DraftPart[] {
     if (run.length < TOOL_GROUP_MIN_RUN) {
       for (const p of run) out.push(p);
     } else {
-      // TodoWrite calls aren't silent tool work; they're status
-      // updates the user wants to see one-by-one (#1064). Detect them
-      // via the `_aoe_title` echo we stash in argsText (the adapter
-      // names them "Update TODOs: …") and exempt the group entirely
-      // when any child looks like a TodoWrite. Cheap: argsText is
-      // already parsed JSON, just sniff the prefix.
-      const hasTodoWrite = run.some(
-        (p) => p.type === "tool-call" && isTodoWriteArgsText(p.argsText),
-      );
-      if (hasTodoWrite) {
+      // A run made up entirely of consecutive TodoWrite snapshots is
+      // the spam case (#1468): fold it into one TodoGroupCard that
+      // shows the latest list collapsed and the per-call history on
+      // expand. TodoWrites are detected via the `_aoe_title` echo /
+      // `todos` payload stashed in argsText.
+      const isTodo = (p: DraftPart) =>
+        p.type === "tool-call" && isTodoWriteArgsText(p.argsText);
+      if (run.every(isTodo)) {
+        const { childIds, children } = buildGroupChildren(run);
+        out.push({
+          type: "tool-call",
+          toolCallId: `todogroup-${childIds.join("-")}`,
+          toolName: TODO_GROUP_NAME,
+          argsText: JSON.stringify({ children }),
+        });
+        run = [];
+        return;
+      }
+      // A run that MIXES TodoWrite with real tool work stays inline: a
+      // status update sandwiched between Reads/Edits shouldn't be
+      // hidden inside a generic actions group, and pulling it out
+      // would reorder the timeline. See #1064, #1468.
+      if (run.some(isTodo)) {
         for (const p of run) out.push(p);
         run = [];
         return;
@@ -610,25 +673,7 @@ function collapseToolRuns(parts: DraftPart[]): DraftPart[] {
         run = [];
         return;
       }
-      const childIds: string[] = [];
-      const children: Array<{
-        toolCallId: string;
-        toolName: string;
-        argsText: string;
-        result?: { content: string };
-        isError?: boolean;
-      }> = [];
-      for (const p of run) {
-        if (p.type !== "tool-call") continue;
-        childIds.push(p.toolCallId);
-        children.push({
-          toolCallId: p.toolCallId,
-          toolName: p.toolName,
-          argsText: p.argsText,
-          result: p.result,
-          isError: p.isError,
-        });
-      }
+      const { childIds, children } = buildGroupChildren(run);
       out.push({
         type: "tool-call",
         toolCallId: `group-${childIds.join("-")}`,

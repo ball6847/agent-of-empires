@@ -78,6 +78,7 @@ vi.mock("@xterm/xterm", () => {
     attachCustomWheelEventHandler(fn: (e: WheelEvent) => boolean): void {
       captured.customWheel = fn;
     }
+    attachCustomKeyEventHandler(_fn: (e: KeyboardEvent) => boolean): void {}
     resize(cols: number, rows: number): void {
       this.cols = cols;
       this.rows = rows;
@@ -649,6 +650,141 @@ describe("useTerminal lifecycle", () => {
       // for the next session.
       expect(captured.disposed).toBe(true);
       expect(sockets.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("session change nulls the old socket's handlers before close (no ghost retry)", async () => {
+    // Regression for #1455: a session change must detach the previous
+    // socket's onopen/onmessage/onclose/onerror BEFORE close(), otherwise
+    // the still-bound onclose closure runs after cleanup and schedules a
+    // setTimeout that calls connect() on the OLD sessionId, dialing a
+    // ghost socket and overwriting wsRef.current for the new session.
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    try {
+      const { rerender } = renderHook(
+        (props: { id: string | null }) => {
+          const term = useTerminal(props.id, "ws", false, false);
+          if (term.containerRef && !term.containerRef.current) {
+            (
+              term.containerRef as unknown as {
+                current: HTMLDivElement | null;
+              }
+            ).current = div;
+          }
+          return term;
+        },
+        { initialProps: { id: "s-old" } },
+      );
+      await flushAsync();
+      const oldWs = sockets[0]!;
+      expect(oldWs.url).toContain("/sessions/s-old/ws");
+      expect(oldWs.onclose).not.toBeNull();
+
+      // Switch sessions. Cleanup should detach handlers before close().
+      rerender({ id: "s-new" });
+      await flushAsync();
+
+      // All four lifecycle handlers must be cleared on the orphaned socket.
+      expect(oldWs.onopen).toBeNull();
+      expect(oldWs.onmessage).toBeNull();
+      expect(oldWs.onclose).toBeNull();
+      expect(oldWs.onerror).toBeNull();
+
+      // Even if the browser had a queued close event for the old socket,
+      // with onclose nulled it cannot schedule a setTimeout retry. Advance
+      // past every retry delay and confirm no third (ghost) socket was
+      // dialed for the OLD sessionId.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(12_000);
+      });
+      await flushAsync();
+      const ghostForOldSession = sockets
+        .slice(1)
+        .find((s) => s.url.includes("/sessions/s-old/ws"));
+      expect(ghostForOldSession).toBeUndefined();
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("server close code 1011 falls through to the standard retry path", async () => {
+    // Regression for #1455: the server now sends 1011 <reason> close
+    // frames on openpty/spawn/clone-reader/take-writer failures instead
+    // of opaque 1006. The client must treat 1011 as a regular retryable
+    // failure (not the 4001 short-circuit).
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    try {
+      const { result } = renderHook(() => {
+        const term = useTerminal("s-1011", "ws", false, false);
+        if (term.containerRef && !term.containerRef.current) {
+          (
+            term.containerRef as unknown as { current: HTMLDivElement | null }
+          ).current = div;
+        }
+        return term;
+      });
+      await flushAsync();
+      const ws = sockets[0]!;
+      act(() => {
+        ws.readyState = FakeWebSocket.CLOSED;
+        ws.onclose?.({
+          code: 1011,
+          reason: "openpty_failed",
+          wasClean: false,
+        } as CloseEvent);
+      });
+      await flushAsync();
+      expect(result.current.state.reconnecting).toBe(true);
+      expect(result.current.state.retryCount).toBe(1);
+      expect(result.current.state.retryCount).toBeLessThan(
+        result.current.maxRetries,
+      );
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("server close code 1013 (tmux_not_ready) falls through to the standard retry path", async () => {
+    // Regression for #1455: server's pane-readiness poll closes with
+    // 1013 tmux_not_ready when the bounded wait elapses. Client must
+    // retry on the fast-start ladder, NOT short-circuit to exhausted.
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    try {
+      const { result } = renderHook(() => {
+        const term = useTerminal("s-1013", "ws", false, false);
+        if (term.containerRef && !term.containerRef.current) {
+          (
+            term.containerRef as unknown as { current: HTMLDivElement | null }
+          ).current = div;
+        }
+        return term;
+      });
+      await flushAsync();
+      const ws = sockets[0]!;
+      act(() => {
+        ws.readyState = FakeWebSocket.CLOSED;
+        ws.onclose?.({
+          code: 1013,
+          reason: "tmux_not_ready",
+          wasClean: false,
+        } as CloseEvent);
+      });
+      await flushAsync();
+      expect(result.current.state.reconnecting).toBe(true);
+      expect(result.current.state.retryCount).toBe(1);
+      // The next retry must fire on the fast-start ladder, not on the
+      // old 1s+ exponential delay.
+      const before = sockets.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(250);
+      });
+      await flushAsync();
+      expect(sockets.length).toBeGreaterThan(before);
     } finally {
       div.remove();
     }
@@ -1352,6 +1488,165 @@ describe("useTerminal lifecycle", () => {
       expect(ctrlA).toBeDefined();
       // The ref should also be cleared after consumption.
       expect(result.current.ctrlActiveRef.current).toBe(false);
+    } finally {
+      div.remove();
+    }
+  });
+});
+
+// Mobile soft-keyboard Backspace autorepeat handler (#1450). The hook
+// intercepts `beforeinput` on xterm's hidden textarea and emits one DEL
+// (0x7f) per `deleteContentBackward` tick, gated to coarse-pointer devices
+// without a fine pointer. jsdom lets us drive every branch deterministically:
+// matchMedia controls the gate, the FakeSocket's readyState the open guard.
+describe("useTerminal mobile backspace autorepeat", () => {
+  function stubPointer(coarse: boolean, anyFine: boolean): void {
+    vi.stubGlobal(
+      "matchMedia",
+      (q: string) =>
+        ({
+          matches:
+            q === "(pointer: coarse)"
+              ? coarse
+              : q === "(any-pointer: fine)"
+                ? anyFine
+                : false,
+        }) as MediaQueryList,
+    );
+  }
+
+  // Mount the hook, attach a container, and drive the socket to OPEN so the
+  // beforeinput handler's `ws.readyState === OPEN` guard passes. Returns the
+  // textarea xterm's mock created and the live FakeSocket.
+  async function mountOpen(): Promise<{
+    div: HTMLDivElement;
+    ws: FakeSocket;
+    ta: HTMLTextAreaElement;
+  }> {
+    const div = document.createElement("div");
+    document.body.appendChild(div);
+    renderHook(() => {
+      const term = useTerminal("s-bksp", "ws", false, false);
+      if (term.containerRef && !term.containerRef.current) {
+        (
+          term.containerRef as unknown as { current: HTMLDivElement | null }
+        ).current = div;
+      }
+      return term;
+    });
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.(new Event("open"));
+    });
+    await flushAsync();
+    const ta = div.querySelector("textarea") as HTMLTextAreaElement;
+    return { div, ws, ta };
+  }
+
+  function fireDelete(
+    ta: HTMLTextAreaElement,
+    count: number,
+    opts: { inputType?: string; isComposing?: boolean } = {},
+  ): void {
+    const inputType = opts.inputType ?? "deleteContentBackward";
+    act(() => {
+      for (let i = 0; i < count; i++) {
+        const e = new InputEvent("beforeinput", {
+          inputType,
+          bubbles: true,
+          cancelable: true,
+        });
+        if (opts.isComposing) {
+          Object.defineProperty(e, "isComposing", { get: () => true });
+        }
+        ta.dispatchEvent(e);
+      }
+    });
+  }
+
+  function delBytes(ws: FakeSocket): number {
+    return ws.sent.filter(
+      (m) => typeof m !== "string" && m.length === 1 && m[0] === 0x7f,
+    ).length;
+  }
+
+  it("emits one DEL per tick on a coarse pointer", async () => {
+    stubPointer(true, false);
+    const { div, ws, ta } = await mountOpen();
+    try {
+      fireDelete(ta, 3);
+      expect(delBytes(ws)).toBe(3);
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("emits exactly one DEL for a single tick (no double-delete)", async () => {
+    stubPointer(true, false);
+    const { div, ws, ta } = await mountOpen();
+    try {
+      fireDelete(ta, 1);
+      expect(delBytes(ws)).toBe(1);
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("does nothing on a fine pointer", async () => {
+    stubPointer(false, false);
+    const { div, ws, ta } = await mountOpen();
+    try {
+      fireDelete(ta, 3);
+      expect(delBytes(ws)).toBe(0);
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("does nothing when a fine pointer is also present (iPad + keyboard)", async () => {
+    stubPointer(true, true);
+    const { div, ws, ta } = await mountOpen();
+    try {
+      fireDelete(ta, 3);
+      expect(delBytes(ws)).toBe(0);
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("ignores non-delete input types", async () => {
+    stubPointer(true, false);
+    const { div, ws, ta } = await mountOpen();
+    try {
+      fireDelete(ta, 3, { inputType: "insertText" });
+      expect(delBytes(ws)).toBe(0);
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("leaves composition deletes to xterm", async () => {
+    stubPointer(true, false);
+    const { div, ws, ta } = await mountOpen();
+    try {
+      fireDelete(ta, 3, { isComposing: true });
+      expect(delBytes(ws)).toBe(0);
+    } finally {
+      div.remove();
+    }
+  });
+
+  it("does not send while the socket is not open", async () => {
+    stubPointer(true, false);
+    const { div, ws, ta } = await mountOpen();
+    try {
+      act(() => {
+        ws.readyState = FakeWebSocket.CLOSED;
+      });
+      fireDelete(ta, 3);
+      expect(delBytes(ws)).toBe(0);
     } finally {
       div.remove();
     }

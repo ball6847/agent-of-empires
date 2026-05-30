@@ -130,9 +130,7 @@ Add a new session
 
 ###### **Arguments:**
 
-* `<PATH>` — Project directory (defaults to current directory)
-
-  Default value: `.`
+* `<PATH>` — Project directory (defaults to current directory). Omit when using `--scratch`
 
 ###### **Options:**
 
@@ -158,6 +156,7 @@ Add a new session
 * `--no-cockpit` — Force terminal/PTY mode for this session, overriding the default-for-claude cockpit setting
 * `--agent <AGENT>` — Pick a specific cockpit agent (e.g., aoe-agent, claude-code). Implies --cockpit
 * `--model <MODEL>` — Override the model used by aoe-agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
+* `--scratch` — Create the session in a fresh scratch directory under `<app_dir>/scratch/<id>/` instead of a project path. The directory is removed when the session is deleted (unless `aoe rm` is given `--keep-scratch`). Mutually exclusive with worktree-related flags
 
 
 
@@ -244,6 +243,7 @@ Remove a session
 * `--delete-branch` — Delete git branch after worktree removal (default: per config)
 * `--force` — Force worktree removal even with untracked/modified files
 * `--keep-container` — Keep container instead of deleting it (default: delete per config)
+* `--keep-scratch` — For scratch sessions, keep the scratch directory on disk instead of removing it. The session record is still deleted; the kept path is logged so you can find the files later. No effect on non-scratch sessions
 
 
 

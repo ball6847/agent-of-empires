@@ -1106,6 +1106,15 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/diff-base",
             patch(api::update_session_diff_base),
         )
+        .route("/api/sessions/{id}/pin", patch(api::update_session_pin))
+        .route(
+            "/api/sessions/{id}/archive",
+            patch(api::update_session_archive),
+        )
+        .route(
+            "/api/sessions/{id}/snooze",
+            patch(api::update_session_snooze),
+        )
         .route("/api/sessions/{id}/terminal", post(api::ensure_terminal))
         .route(
             "/api/sessions/{id}/container-terminal",
@@ -1201,6 +1210,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             post(api::cockpit_force_end_turn),
         )
         .route("/api/sessions/{id}/cockpit/files", get(api::cockpit_files))
+        .route(
+            "/api/sessions/{id}/cockpit/worker-log",
+            get(api::cockpit_worker_log),
+        )
         .route(
             "/api/sessions/{id}/cockpit/replay",
             get(api::cockpit_replay),

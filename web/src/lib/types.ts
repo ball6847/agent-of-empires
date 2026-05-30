@@ -29,11 +29,36 @@ export interface SessionResponse {
    *  diff header. See #970. */
   base_branch_override?: string | null;
   is_sandboxed: boolean;
+  /** True when the session was created in scratch mode (`aoe add
+   *  --scratch` or the wizard toggle). The `project_path` points
+   *  at an auto-provisioned directory under `<app_dir>/scratch/<id>/`,
+   *  and the deletion path removes it (unless the user opts in to
+   *  keeping the directory). The wizard's Recent-projects list filters
+   *  scratch sessions out. */
+  scratch: boolean;
   /** True when the session is marked as a user favorite. Mirrors
    *  `Instance::is_favorited()` server-side. The sidebar pins favorited
    *  rows and prepends a `*` marker. Toggled via the TUI `f`/`F` keybind
    *  or `aoe session favorite|unfavorite`. */
   favorited: boolean;
+  /** RFC3339 timestamp at which the session was web-pinned, or null /
+   *  undefined when not pinned. Distinct from `favorited`: favorite is
+   *  the TUI within-tier attention-sort signal; pin is the hard
+   *  top-of-sort surfacing primitive used by the web sidebar. Derive
+   *  `isPinned = pinned_at != null` client-side; no separate boolean is
+   *  exposed (the timestamp itself is the source of truth). See #1581. */
+  pinned_at?: string | null;
+  /** RFC3339 timestamp at which the session was archived, or null /
+   *  undefined when not archived. Archived workspaces sink into the
+   *  collapsible "Snoozed & archived" footer of their repo group and
+   *  their tmux pane is killed by the archive handler. See #1581. */
+  archived_at?: string | null;
+  /** RFC3339 timestamp at which an active snooze expires, or null /
+   *  undefined when not snoozed. The server gates this on
+   *  `Instance::is_snoozed()` so an expired snooze that is still on disk
+   *  comes back as null on the wire; the web therefore only needs to
+   *  treat any non-null value as an active snooze. See #1581. */
+  snoozed_until?: string | null;
   has_managed_worktree: boolean;
   has_terminal: boolean;
   profile: string;
@@ -309,6 +334,11 @@ export interface CreateSessionRequest {
    *  false → tmux passthrough (legacy). Server defaults to true on
    *  web-created sessions; the wizard may override. */
   cockpit_mode?: boolean;
+  /** Scratch mode: server provisions a fresh directory under
+   *  `<app_dir>/scratch/<id>/` and ignores `path` (clients send `""`).
+   *  Mutually exclusive with `worktree_branch` and `extra_repo_paths`;
+   *  the server returns 400 on either combination. */
+  scratch?: boolean;
 }
 
 /** Live cockpit worker lifecycle, mirrored from

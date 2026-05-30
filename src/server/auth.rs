@@ -310,6 +310,46 @@ fn post_token_auth_action(
     }
 }
 
+/// Decision for the entry of `run_passphrase_wall`: a request landed on
+/// the wall because the daemon is running in `--auth=passphrase` mode
+/// (token gate disabled, passphrase login active). The wall normally
+/// requires a session cookie + device binding for `/api/*` and `/ws`,
+/// redirects to `/login` otherwise, and step-up-elevates writes to
+/// persistent-config surfaces. Two conditions bypass that entire
+/// gauntlet: a login-bootstrap path (so the SPA can load assets and
+/// post to `/api/login`) and a loopback caller (so the local TUI can
+/// attach without a passphrase exchange).
+#[derive(Debug, PartialEq, Eq)]
+enum PassphraseWallEntryAction {
+    /// Path is in the login-bootstrap allow-list. Skip the wall so
+    /// `/login`, `/api/login`, static assets, etc. stay reachable
+    /// even without a session.
+    BypassExempt,
+    /// Caller is on loopback. fs-perm boundary on
+    /// `~/.agent-of-empires/serve.*` already protects same-host
+    /// access, so layering the passphrase factor on top adds friction
+    /// without strengthening the trust boundary. Mirrors the token-
+    /// auth path's `is_local_trusted` carve-out from #1168 so the
+    /// local TUI works against an `--auth=passphrase` daemon. See
+    /// #1525.
+    BypassLoopback,
+    /// Run the full session + device-binding + elevation flow.
+    Continue,
+}
+
+/// Resolve the entry decision for `run_passphrase_wall`. Extracted so
+/// the bypass policy is table-testable without standing up the full
+/// axum middleware. See #1525.
+fn passphrase_wall_entry_action(path: &str, client_ip: IpAddr) -> PassphraseWallEntryAction {
+    if is_login_session_exempt(path) {
+        return PassphraseWallEntryAction::BypassExempt;
+    }
+    if is_local_trusted(client_ip) {
+        return PassphraseWallEntryAction::BypassLoopback;
+    }
+    PassphraseWallEntryAction::Continue
+}
+
 /// Whether a request path + method needs an elevated login session
 /// (step-up auth, 15-minute passphrase confirmation window).
 ///
@@ -324,6 +364,18 @@ fn post_token_auth_action(
 /// owner to spawn a session that runs it. The writes must be gated
 /// even though the spawn itself is not, because the spawn runs with
 /// the legitimate owner's elevation, not the attacker's.
+///
+/// `PATCH /api/profiles/{name}/settings` is intentionally exempt at
+/// this layer: the same endpoint accepts both tamper-surface keys
+/// (sandbox, worktree, dangerous session fields) and benign user-
+/// preference keys (theme, sound, updates, web notifications,
+/// logging, description, safe session fields). The handler does a
+/// body-shape elevation check via `body_requires_elevation` and
+/// returns the same `403 elevation_required` payload when a tamper-
+/// surface key is present without elevation. Elevating the whole
+/// endpoint here trained every preference save to re-prompt for the
+/// passphrase, which both broke the theme picker UX and conditioned
+/// users to dismiss the real prompts. See #1510.
 ///
 /// Read-only `GET`/`HEAD` on these resources stay open; this is an
 /// allow-list, not a default-deny, so adding a benign read endpoint
@@ -351,10 +403,17 @@ fn requires_elevation(method: &axum::http::Method, path: &str) -> bool {
     if path == "/api/profiles" && method == Method::POST {
         return true;
     }
-    if path.starts_with("/api/profiles/") {
-        // Per-profile writes: PATCH /api/profiles/{name}/settings,
-        // PATCH .../rename, DELETE /api/profiles/{name}. Read GETs
-        // were filtered out by the GET/HEAD bypass above.
+    if let Some(rest) = path.strip_prefix("/api/profiles/") {
+        // Per-profile writes. `PATCH /api/profiles/{name}/settings`
+        // is body-gated inside the handler so safe preference fields
+        // (theme, sound, etc.) do not pay a passphrase prompt; the
+        // tamper-surface fields still 403 with elevation_required.
+        // Rename + delete stay path-gated. Read GETs were filtered
+        // out by the GET/HEAD bypass above.
+        if method == Method::PATCH && (rest.ends_with("/settings") || rest.ends_with("/settings/"))
+        {
+            return false;
+        }
         return true;
     }
 
@@ -410,10 +469,33 @@ enum TokenSource {
 #[derive(Clone, Copy, Debug)]
 pub struct AuthenticatedTokenHash(pub [u8; 32]);
 
+/// Request extension carrying the login session id used to authenticate
+/// the current request. Inserted by `auth_middleware` whenever a valid
+/// `aoe_session` cookie + device binding pair landed (both the
+/// session+binding steady-state path and the `--auth=passphrase` wall).
+/// Absent under `--auth=none` and on bootstrap token-only paths where
+/// no session cookie exists yet. Handlers that need a body-shape
+/// elevation check (e.g. `update_profile_settings`) read this extension
+/// to call `state.login_manager.is_elevated(...)` from inside the
+/// handler instead of relying on the path-shape gate in
+/// `requires_elevation`. See #1510.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedSession(pub String);
+
 /// Passphrase login wall used when the token gate is disabled
 /// (`--auth=passphrase`). Mirrors the session + device-binding check
 /// inside the token-auth path, but skips every token-cookie
 /// operation since there is no token to refresh.
+///
+/// Loopback callers bypass the wall entirely (see
+/// [`passphrase_wall_entry_action`] / [`is_local_trusted`]). This
+/// mirrors the token-auth path's #1168 carve-out so the local TUI can
+/// attach to a same-host `--auth=passphrase` daemon without going
+/// through a passphrase exchange. The fs-perm boundary on
+/// `~/.agent-of-empires/serve.*` already protects same-host access,
+/// and remote callers proxied through a tunnel come in with the real
+/// remote IP via `resolve_client_ip`, so they still hit the wall as
+/// expected. See #1525.
 ///
 /// Rate-limit lockout is intentionally not consulted here: the only
 /// authentication attempt that can fail in this path is the passphrase
@@ -431,8 +513,18 @@ async fn run_passphrase_wall(
     let path = request.uri().path().to_string();
     let method = request.method().clone();
 
-    if is_login_session_exempt(&path) {
-        return next.run(request).await;
+    match passphrase_wall_entry_action(&path, client_ip) {
+        PassphraseWallEntryAction::BypassExempt => return next.run(request).await,
+        PassphraseWallEntryAction::BypassLoopback => {
+            tracing::info!(
+                target: "auth.passphrase",
+                ip = %client_ip,
+                path = %path,
+                "loopback bypass: skipping passphrase factor in passphrase-only mode"
+            );
+            return next.run(request).await;
+        }
+        PassphraseWallEntryAction::Continue => {}
     }
 
     let session_id = super::login::extract_login_session(&request);
@@ -483,6 +575,11 @@ async fn run_passphrase_wall(
         )
             .into_response();
     }
+
+    let mut request = request;
+    request
+        .extensions_mut()
+        .insert(AuthenticatedSession(session_id.clone()));
 
     let mut response = next.run(request).await;
 
@@ -831,6 +928,10 @@ async fn handle_session_authenticated(
             .into_response();
     }
 
+    request
+        .extensions_mut()
+        .insert(AuthenticatedSession(session_id.clone()));
+
     let mut response = next.run(request).await;
 
     if should_refresh_session_cookie(&path) {
@@ -983,6 +1084,63 @@ mod tests {
         assert_eq!(
             post_token_auth_action(true, false, remote),
             PostTokenAuthAction::RequireLogin
+        );
+    }
+
+    // Per-row coverage of the passphrase-wall entry policy added in
+    // #1525: a loopback caller should bypass the wall outright so the
+    // local TUI can attach to an `--auth=passphrase` daemon without a
+    // session, while remote callers continue to fall through to the
+    // session check. The login-bootstrap allow-list still wins over
+    // both regardless of IP so the SPA can fetch assets and POST to
+    // `/api/login` even when the network would otherwise be remote.
+    #[test]
+    fn passphrase_wall_entry_action_matrix() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let loopback_v6: IpAddr = "::1".parse().unwrap();
+        let remote: IpAddr = "100.64.0.5".parse().unwrap();
+
+        // Non-exempt path + loopback (IPv4 and IPv6): bypass the
+        // wall entirely. This is the #1525 fix: same-host TUI attach
+        // must not require a passphrase exchange.
+        assert_eq!(
+            passphrase_wall_entry_action("/api/sessions", loopback),
+            PassphraseWallEntryAction::BypassLoopback
+        );
+        assert_eq!(
+            passphrase_wall_entry_action("/sessions/abc/cockpit/ws", loopback),
+            PassphraseWallEntryAction::BypassLoopback
+        );
+        assert_eq!(
+            passphrase_wall_entry_action("/api/settings", loopback_v6),
+            PassphraseWallEntryAction::BypassLoopback
+        );
+
+        // Non-exempt path + remote: run the full session check. This
+        // is the case the passphrase wall was built for; the bypass
+        // must not leak through here.
+        assert_eq!(
+            passphrase_wall_entry_action("/api/sessions", remote),
+            PassphraseWallEntryAction::Continue
+        );
+        assert_eq!(
+            passphrase_wall_entry_action("/sessions/abc/cockpit/ws", remote),
+            PassphraseWallEntryAction::Continue
+        );
+
+        // Login-bootstrap allow-list wins regardless of IP, so the
+        // SPA can pull assets and POST to `/api/login` from any peer.
+        assert_eq!(
+            passphrase_wall_entry_action("/login", remote),
+            PassphraseWallEntryAction::BypassExempt
+        );
+        assert_eq!(
+            passphrase_wall_entry_action("/api/login", remote),
+            PassphraseWallEntryAction::BypassExempt
+        );
+        assert_eq!(
+            passphrase_wall_entry_action("/assets/index.css", loopback),
+            PassphraseWallEntryAction::BypassExempt
         );
     }
 
@@ -1280,16 +1438,23 @@ mod tests {
         assert!(requires_elevation(&Method::POST, "/api/profiles"));
         assert!(requires_elevation(
             &Method::PATCH,
-            "/api/profiles/work/settings"
-        ));
-        assert!(requires_elevation(
-            &Method::PATCH,
             "/api/profiles/work/rename"
         ));
         assert!(requires_elevation(&Method::DELETE, "/api/profiles/work"));
         // Trailing slash must not bypass the gate.
         assert!(requires_elevation(&Method::PATCH, "/api/settings/"));
-        assert!(requires_elevation(
+
+        // `PATCH /api/profiles/{name}/settings` is body-gated inside the
+        // handler (`update_profile_settings` calls `body_requires_elevation`
+        // and re-issues the 403 elevation_required payload for tamper-
+        // surface keys). The path-level gate exempts it so safe
+        // preference fields (theme, sound, etc.) do not re-prompt the
+        // passphrase on every save. See #1510.
+        assert!(!requires_elevation(
+            &Method::PATCH,
+            "/api/profiles/work/settings"
+        ));
+        assert!(!requires_elevation(
             &Method::PATCH,
             "/api/profiles/work/settings/"
         ));

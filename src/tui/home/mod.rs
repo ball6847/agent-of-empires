@@ -31,11 +31,11 @@ use super::deletion_poller::DeletionPoller;
 #[cfg(feature = "serve")]
 use super::dialogs::ServeView;
 use super::dialogs::{
-    ChangelogDialog, CommandPaletteDialog, ConfirmDialog, GroupDeleteOptionsDialog,
-    GroupPickerDialog, HookTrustDialog, HooksInstallDialog, InfoDialog, NewSessionData,
-    NewSessionDialog, NoAgentsDialog, ProfilePickerDialog, ProjectsDialog, RenameDialog,
-    RestartDialog, SnoozeDurationDialog, SortPickerDialog, UnifiedDeleteDialog,
-    UpdateConfirmDialog, WelcomeDialog,
+    ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
+    GroupDeleteOptionsDialog, GroupPickerDialog, HookTrustDialog, HooksInstallDialog, InfoDialog,
+    IntroDialog, NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
+    ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RestartDialog, SnoozeDurationDialog,
+    SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog,
 };
 use super::diff::DiffView;
 use super::settings::SettingsView;
@@ -45,6 +45,12 @@ use super::status_poller::{StatusPoller, StatusUpdate};
 /// Uses `worktree_info.main_repo_path` for worktree sessions (so all branches of the
 /// same repo group together), otherwise uses `project_path`. Returns the last path segment.
 fn project_group_name(inst: &Instance) -> String {
+    // Scratch sessions live under `<app_dir>/scratch/<instance-id>/`, so the last
+    // path segment is the opaque instance id. Group them under a readable label.
+    if inst.scratch {
+        return "scratch".to_string();
+    }
+
     let base_path = inst
         .worktree_info
         .as_ref()
@@ -343,6 +349,11 @@ pub struct HomeView {
     /// the render layer reads this rather than re-resolving the config on
     /// every paint.
     pub(super) row_tag_mode: crate::session::config::RowTagMode,
+    /// Active profile's `default_attach_mode`, cached at construction and
+    /// refreshed by `refresh_from_config` / `switch_profile`. The help
+    /// overlay falls back to this when no session row is selected so the
+    /// render path never touches disk for the Enter/Tab labels.
+    pub(super) profile_default_attach_mode: crate::session::NewSessionAttachMode,
     /// Collapsed state for project-mode groups (persists across rebuilds)
     pub(super) project_group_collapsed: HashMap<String, bool>,
 
@@ -355,6 +366,9 @@ pub struct HomeView {
     pub(super) group_delete_options_dialog: Option<GroupDeleteOptionsDialog>,
     pub(super) rename_dialog: Option<RenameDialog>,
     pub(super) restart_dialog: Option<RestartDialog>,
+    /// Right-click popup on the sidebar list. Anchored to a screen
+    /// position when opened; the renderer clamps it into view.
+    pub(super) context_menu: Option<ContextMenuDialog>,
     pub(super) group_rename_context: Option<GroupRenameContext>,
     pub(super) hook_trust_dialog: Option<HookTrustDialog>,
     /// Session data pending hook trust approval
@@ -362,7 +376,12 @@ pub struct HomeView {
     pub(super) hooks_install_dialog: Option<HooksInstallDialog>,
     /// Session data pending agent hooks acknowledgment
     pub(super) pending_hooks_install_data: Option<NewSessionData>,
-    pub(super) welcome_dialog: Option<WelcomeDialog>,
+    pub(super) intro_dialog: Option<IntroDialog>,
+    /// Theme name queued by a click on the intro dialog (live preview or
+    /// final pick). Drained by the `App` mouse handler after
+    /// `handle_dialog_click` so the click path can apply the theme without
+    /// returning an Action.
+    pub(super) pending_intro_theme: Option<String>,
     pub(super) no_agents_dialog: Option<NoAgentsDialog>,
     pub(super) changelog_dialog: Option<ChangelogDialog>,
     pub(super) info_dialog: Option<InfoDialog>,
@@ -373,6 +392,7 @@ pub struct HomeView {
     pub(super) profile_picker_dialog: Option<ProfilePickerDialog>,
     pub(super) group_picker_dialog: Option<GroupPickerDialog>,
     pub(super) sort_picker_dialog: Option<SortPickerDialog>,
+    pub(super) project_session_picker_dialog: Option<ProjectSessionPickerDialog>,
     pub(super) projects_dialog: Option<ProjectsDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     #[cfg(feature = "serve")]
@@ -381,6 +401,19 @@ pub struct HomeView {
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
     /// Session to receive the message from the send dialog
     pub(super) pending_send_session: Option<String>,
+    /// Which pane the pending send-message dialog will target. Set
+    /// alongside `pending_send_session` and read when the dialog
+    /// submits, so 'm' in Terminal view routes to the terminal pane
+    /// instead of the agent. Defaults to Agent for the historical
+    /// path (paste/dictation capture, palette compose).
+    pub(super) pending_send_target: live_send::LiveSendTarget,
+    /// Which pane the next `Action::EnterLiveSend` should target.
+    /// Set by `start_live_send` whenever it returns an action; read
+    /// (and reset to Agent) by `prepare_live_send` so each action
+    /// carries its own target without a stale value leaking into a
+    /// later live-send call. Defaults to Agent for the historical
+    /// path (Tab in Agent view).
+    pub(super) pending_live_send_target: live_send::LiveSendTarget,
     /// Live-send mode: when `Some`, every key event in the home view is
     /// translated to a tmux send-keys call against this session's pane
     /// until the user presses the exit chord (Ctrl+q). Set by `Tab` (in
@@ -398,6 +431,13 @@ pub struct HomeView {
     /// the current live-send session. Used to dedup the resize messages
     /// fired from the preview refresh path; cleared on live-send exit.
     pub(super) live_send_last_resize: Option<(u16, u16)>,
+    /// `(session_id, cols, rows)` of the last NON-live preview resize we sent
+    /// to the selected agent's pane, so the 250ms preview poll doesn't
+    /// SIGWINCH-storm it every tick. Invalidated (set to None) on attach and on
+    /// live-send enter/exit, where the window's real size changes out from
+    /// under us and the next render must re-assert the preview geometry. See
+    /// `refresh_preview_cache_if_needed`.
+    pub(super) preview_pane_synced: Option<(String, u16, u16)>,
     /// Pasted text captured at the home view that we couldn't immediately
     /// route (no session selected, cursor on a group header, etc.). Drained
     /// into the next compose dialog the user opens, so voice/dictation never
@@ -409,6 +449,13 @@ pub struct HomeView {
     pub(super) pending_stop_session: Option<String>,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
+    /// Action emitted by a mouse-click on a modal dialog (e.g. clicking
+    /// `[Yes]` on a stop-session confirm). The keyboard path returns
+    /// these via `handle_key -> Option<Action>`, but the mouse path
+    /// goes through `handle_dialog_click` which has no return slot for
+    /// an Action. Stashed here and drained by `app.rs` after the click
+    /// is consumed so both paths produce the same downstream effect.
+    pub(super) pending_dialog_click_action: Option<crate::tui::app::Action>,
     // Search
     pub(super) search_active: bool,
     pub(super) search_query: Input,
@@ -460,6 +507,15 @@ pub struct HomeView {
     /// see; tail-anchored display clipped those rows off the top, so
     /// every frame in info-expanded mode looked shifted up.
     pub(super) preview_pane_area: Rect,
+    /// Rows of captured output the renderer actually paints into the preview
+    /// body. This is just `PreviewLayout::compute(..).output.height`: the
+    /// single split helper already accounts for the info header and the inner
+    /// ` Output ` / ` Terminal Output ` banner. Set in `render_preview` from the
+    /// same layout the renderer paints with, and shared with
+    /// `clamp_scroll_to_capture` and the live-send `[offset/max]` banner so
+    /// every consumer of "how many rows are visible" agrees with what's on
+    /// screen.
+    pub(super) preview_visible_rows: usize,
     /// Outer rect of the preview pane (block + borders + content), captured
     /// during `render_preview`. The live-send preview-only fast path uses
     /// this to call back into `render_preview` with the correct OUTER area,
@@ -505,6 +561,12 @@ pub struct HomeView {
     // When true, letter-based action hotkeys require SHIFT (guard against
     // dictation / stray keystrokes triggering destructive actions).
     pub(super) strict_hotkeys: bool,
+
+    // Number of live `aoe` TUI processes (including this one), refreshed on a
+    // throttle from the app loop. The footer surfaces it when >1 so the user
+    // knows another instance is attached (the two clash over agent pane sizes
+    // since tmux reflows to the smallest attached client).
+    pub(super) active_tui_count: usize,
 
     // Settings view
     pub(super) settings_view: Option<SettingsView>,
@@ -701,6 +763,7 @@ impl HomeView {
             sort_order,
             group_by,
             row_tag_mode: resolved.session.row_tag,
+            profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: HashMap::new(),
             show_help: false,
             help_scroll: 0,
@@ -710,12 +773,14 @@ impl HomeView {
             group_delete_options_dialog: None,
             rename_dialog: None,
             restart_dialog: None,
+            context_menu: None,
             group_rename_context: None,
             hook_trust_dialog: None,
             pending_hook_trust_data: None,
             hooks_install_dialog: None,
             pending_hooks_install_data: None,
-            welcome_dialog: None,
+            intro_dialog: None,
+            pending_intro_theme: None,
             no_agents_dialog: None,
             changelog_dialog: None,
             info_dialog: None,
@@ -724,6 +789,7 @@ impl HomeView {
             profile_picker_dialog: None,
             group_picker_dialog: None,
             sort_picker_dialog: None,
+            project_session_picker_dialog: None,
             projects_dialog: None,
             command_palette: None,
             #[cfg(feature = "serve")]
@@ -731,13 +797,17 @@ impl HomeView {
             update_confirm_dialog: None,
             send_message_dialog: None,
             pending_send_session: None,
+            pending_send_target: live_send::LiveSendTarget::Agent,
+            pending_live_send_target: live_send::LiveSendTarget::Agent,
             live_send: None,
             live_send_worker: None,
             live_send_last_resize: None,
+            preview_pane_synced: None,
             pending_paste: None,
             pending_attach_after_warning: None,
             pending_stop_session: None,
             pending_force_remove_session: None,
+            pending_dialog_click_action: None,
             search_active: false,
             search_query: Input::default(),
             search_matches: Vec::new(),
@@ -758,6 +828,7 @@ impl HomeView {
             preview_scroll_offset: 0,
             preview_area: Rect::default(),
             preview_pane_area: Rect::default(),
+            preview_visible_rows: 0,
             preview_outer_area: Rect::default(),
             diff_area: Rect::default(),
             list_area: Rect::default(),
@@ -770,6 +841,7 @@ impl HomeView {
             status_hook_config,
             status_hook_configs,
             strict_hotkeys,
+            active_tui_count: 1,
             idle_decay_window,
             settings_view: None,
             settings_close_confirm: false,
@@ -2018,7 +2090,13 @@ impl HomeView {
         #[cfg(not(feature = "serve"))]
         let serve_open = false;
 
-        serve_open || self.info_dialog.is_some() || self.changelog_dialog.is_some()
+        serve_open
+            || self.info_dialog.is_some()
+            || self.changelog_dialog.is_some()
+            || self
+                .intro_dialog
+                .as_ref()
+                .is_some_and(|d| d.wants_text_selection())
     }
 
     /// Same membership as `has_dialog()` minus live-send. Two callers:
@@ -2048,14 +2126,16 @@ impl HomeView {
             || self.group_delete_options_dialog.is_some()
             || self.rename_dialog.is_some()
             || self.restart_dialog.is_some()
+            || self.context_menu.is_some()
             || self.hook_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
-            || self.welcome_dialog.is_some()
+            || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()
             || self.info_dialog.is_some()
             || self.snooze_duration_dialog.is_some()
             || self.profile_picker_dialog.is_some()
+            || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
@@ -2081,14 +2161,16 @@ impl HomeView {
             || self.group_delete_options_dialog.is_some()
             || self.rename_dialog.is_some()
             || self.restart_dialog.is_some()
+            || self.context_menu.is_some()
             || self.hook_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
-            || self.welcome_dialog.is_some()
+            || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()
             || self.info_dialog.is_some()
             || self.snooze_duration_dialog.is_some()
             || self.profile_picker_dialog.is_some()
+            || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
@@ -2160,6 +2242,14 @@ impl HomeView {
         }
     }
 
+    /// Forget the last non-live preview resize so the next render re-asserts the
+    /// preview geometry. Call whenever the agent window's real size changes out
+    /// from under the preview (an attach grows it to the client; entering or
+    /// leaving live mode hands the resize off and back).
+    pub(super) fn clear_preview_pane_sync(&mut self) {
+        self.preview_pane_synced = None;
+    }
+
     pub fn toggle_archived_section(&mut self) {
         self.archived_section_collapsed = !self.archived_section_collapsed;
         if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
@@ -2182,9 +2272,9 @@ impl HomeView {
         self.update_selected();
     }
 
-    pub fn show_welcome(&mut self) {
-        tracing::info!(target: "tui.dialog", dialog = "welcome", "opening");
-        self.welcome_dialog = Some(WelcomeDialog::new());
+    pub fn show_intro(&mut self, current_theme: &str) {
+        tracing::info!(target: "tui.dialog", dialog = "intro", "opening");
+        self.intro_dialog = Some(IntroDialog::new(current_theme));
     }
 
     pub fn show_no_agents(&mut self) {
@@ -2409,6 +2499,21 @@ impl HomeView {
         self.group_picker_dialog = Some(GroupPickerDialog::new(self.group_by));
     }
 
+    /// Open the saved-project picker that starts a new session pre-filled with
+    /// the chosen project's path. Shows an info dialog when no projects exist.
+    pub(super) fn open_project_session_picker(&mut self) {
+        let profile = self.config_profile();
+        let projects = crate::session::projects::load_merged(&profile).unwrap_or_default();
+        if projects.is_empty() {
+            self.info_dialog = Some(InfoDialog::new(
+                "No Projects",
+                "No registered projects available. Add one with `aoe project add <path>`.",
+            ));
+            return;
+        }
+        self.project_session_picker_dialog = Some(ProjectSessionPickerDialog::new(projects));
+    }
+
     /// Show the sort-order picker dialog seeded with the current order.
     pub(super) fn show_sort_picker(&mut self) {
         self.sort_picker_dialog = Some(SortPickerDialog::new(self.sort_order));
@@ -2465,37 +2570,85 @@ impl HomeView {
     /// during the implicit respawn so the caller can toast the user about
     /// the lost history; `None` otherwise.
     pub fn execute_send_message(&mut self, session_id: &str, message: &str) -> Option<String> {
-        let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
-            inst.ensure_pane_ready().map_err(Into::into)
-        });
-        let stale_sid = match outcome {
-            Ok(Some(EnsureReadyOutcome::Respawned {
-                stale_sid: Some(sid),
-            }))
-            | Ok(Some(EnsureReadyOutcome::Started {
-                stale_sid: Some(sid),
-            })) => Some(sid),
-            Ok(_) => None,
-            Err(err) => {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Send Failed",
-                    &format!("Cannot prepare session: {}", err),
-                ));
-                return None;
+        let target = std::mem::replace(
+            &mut self.pending_send_target,
+            live_send::LiveSendTarget::Agent,
+        );
+        let size = crate::terminal::get_size();
+        // Same pane-readiness cascades as live-send: agent runs the
+        // full `ensure_pane_ready` (Docker, splash, resume); terminals
+        // just need their tmux session to exist with a live pane.
+        let stale_sid = match target {
+            live_send::LiveSendTarget::Agent => {
+                let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
+                    inst.ensure_pane_ready().map_err(Into::into)
+                });
+                match outcome {
+                    Ok(Some(EnsureReadyOutcome::Respawned {
+                        stale_sid: Some(sid),
+                    }))
+                    | Ok(Some(EnsureReadyOutcome::Started {
+                        stale_sid: Some(sid),
+                    })) => Some(sid),
+                    Ok(_) => None,
+                    Err(err) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Send Failed",
+                            &format!("Cannot prepare session: {}", err),
+                        ));
+                        return None;
+                    }
+                }
+            }
+            live_send::LiveSendTarget::Terminal => {
+                if let Err(e) = self.ensure_terminal_pane_ready(session_id, size) {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Send Failed",
+                        &format!("Cannot prepare terminal: {}", e),
+                    ));
+                    return None;
+                }
+                None
+            }
+            live_send::LiveSendTarget::ContainerTerminal => {
+                if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, size) {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Send Failed",
+                        &format!("Cannot prepare container terminal: {}", e),
+                    ));
+                    return None;
+                }
+                None
             }
         };
         let inst = self.get_instance(session_id)?;
-        let tmux_session = match crate::tmux::Session::new(&inst.id, &inst.title) {
-            Ok(s) => s,
-            Err(e) => {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Send Failed",
-                    &format!("Failed to resolve session: {}", e),
-                ));
-                return None;
+        let tmux_session = match target {
+            live_send::LiveSendTarget::Agent => {
+                match crate::tmux::Session::new(&inst.id, &inst.title) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Send Failed",
+                            &format!("Failed to resolve session: {}", e),
+                        ));
+                        return None;
+                    }
+                }
             }
+            live_send::LiveSendTarget::Terminal => crate::tmux::Session::from_name(
+                &crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title),
+            ),
+            live_send::LiveSendTarget::ContainerTerminal => crate::tmux::Session::from_name(
+                &crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title),
+            ),
         };
-        let delay = crate::agents::send_keys_enter_delay(&inst.tool);
+        // Agent gets a tool-specific Enter delay so paste-burst-aware
+        // agents (e.g. Codex) don't swallow the final Enter. Shells in
+        // the paired terminal panes don't need the delay.
+        let delay = match target {
+            live_send::LiveSendTarget::Agent => crate::agents::send_keys_enter_delay(&inst.tool),
+            live_send::LiveSendTarget::Terminal | live_send::LiveSendTarget::ContainerTerminal => 0,
+        };
         if let Err(e) = tmux_session.send_keys_with_delay(message, delay) {
             self.info_dialog = Some(InfoDialog::new(
                 "Send Failed",
@@ -2536,23 +2689,55 @@ impl HomeView {
     /// if the pane could not be readied (`info_dialog` is set with the
     /// underlying error so the caller only has to clear its toast).
     pub fn prepare_live_send(&mut self, session_id: &str) -> Result<Option<String>, ()> {
-        let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
-            inst.ensure_pane_ready().map_err(Into::into)
-        });
-        let stale_sid = match outcome {
-            Ok(Some(EnsureReadyOutcome::Respawned {
-                stale_sid: Some(sid),
-            }))
-            | Ok(Some(EnsureReadyOutcome::Started {
-                stale_sid: Some(sid),
-            })) => Some(sid),
-            Ok(_) => None,
-            Err(err) => {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Live send failed",
-                    &format!("Cannot prepare session: {}", err),
-                ));
-                return Err(());
+        let target = self.pending_live_send_target;
+        self.pending_live_send_target = live_send::LiveSendTarget::Agent;
+        let size = crate::terminal::get_size();
+        // Agent targets revive the agent pane via the full
+        // ensure_pane_ready cascade (Docker, splash, resume). Terminal
+        // targets are simpler: the paired terminal is a plain shell,
+        // so we just ensure the tmux session exists and re-spawn it if
+        // the pane has died (matches `attach_terminal`).
+        let stale_sid = match target {
+            live_send::LiveSendTarget::Agent => {
+                let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
+                    inst.ensure_pane_ready().map_err(Into::into)
+                });
+                match outcome {
+                    Ok(Some(EnsureReadyOutcome::Respawned {
+                        stale_sid: Some(sid),
+                    }))
+                    | Ok(Some(EnsureReadyOutcome::Started {
+                        stale_sid: Some(sid),
+                    })) => Some(sid),
+                    Ok(_) => None,
+                    Err(err) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Live send failed",
+                            &format!("Cannot prepare session: {}", err),
+                        ));
+                        return Err(());
+                    }
+                }
+            }
+            live_send::LiveSendTarget::Terminal => {
+                if let Err(e) = self.ensure_terminal_pane_ready(session_id, size) {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Live send failed",
+                        &format!("Cannot prepare terminal: {}", e),
+                    ));
+                    return Err(());
+                }
+                None
+            }
+            live_send::LiveSendTarget::ContainerTerminal => {
+                if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, size) {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Live send failed",
+                        &format!("Cannot prepare container terminal: {}", e),
+                    ));
+                    return Err(());
+                }
+                None
             }
         };
         let inst = match self.get_instance(session_id) {
@@ -2570,20 +2755,27 @@ impl HomeView {
             }
         };
         // Resolve the tmux session name up front so the worker thread
-        // can reconstruct a Session without re-touching HomeView. If we
-        // can't even build the Session here, surface the error before
-        // installing live state.
-        let tmux_session = match crate::tmux::Session::new(&inst.id, &inst.title) {
-            Ok(s) => s,
-            Err(e) => {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Live send failed",
-                    &format!("Cannot resolve tmux session: {}", e),
-                ));
-                return Err(());
+        // can reconstruct a Session without re-touching HomeView.
+        let tmux_name = match target {
+            live_send::LiveSendTarget::Agent => {
+                match crate::tmux::Session::new(&inst.id, &inst.title) {
+                    Ok(s) => s.name().to_string(),
+                    Err(e) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Live send failed",
+                            &format!("Cannot resolve tmux session: {}", e),
+                        ));
+                        return Err(());
+                    }
+                }
+            }
+            live_send::LiveSendTarget::Terminal => {
+                crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+            }
+            live_send::LiveSendTarget::ContainerTerminal => {
+                crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
             }
         };
-        let tmux_name = tmux_session.name().to_string();
         // Switching live mode from session A to session B (click on a
         // different row while already live): we need to drop the old
         // worker BEFORE resetting the old session's window-size,
@@ -2619,6 +2811,7 @@ impl HomeView {
             session_id: inst.id.clone(),
             title: inst.title.clone(),
             tmux_name: tmux_name.clone(),
+            target,
             exit_chords,
         });
         // Spawn the background worker that dispatches translated
@@ -2631,6 +2824,9 @@ impl HomeView {
         // issues its sync resize, even if the cached geometry from a
         // prior session happens to match the current preview_pane_area.
         self.live_send_last_resize = None;
+        // Live mode takes over the pane's size from here; drop the non-live
+        // preview dedup so exiting re-asserts the preview geometry cleanly.
+        self.preview_pane_synced = None;
         self.stamp_last_accessed(session_id);
         Ok(stale_sid)
     }
@@ -2645,12 +2841,15 @@ impl HomeView {
     /// for why the two are split.
     ///
     /// `preview_pane_area` is the cached OUTPUT sub-rect: the full inner
-    /// (after border + padding) minus the Agent-view info header when the
-    /// user has it expanded. Sizing to the full inner instead would leave
-    /// the top `info_height` rows of the agent's output outside the
-    /// visible window; tail-clip semantics in the preview's `Paragraph`
-    /// render then drop those rows on every frame, which the user
-    /// perceives as content shifted up.
+    /// (after border + padding) minus the info header AND minus the
+    /// inner ` Output ` / ` Terminal Output ` banner row when the user
+    /// has the header expanded. Sizing to the full inner instead would
+    /// leave the top `info_height + 1` rows of the agent's output
+    /// outside the visible window; tail-clip semantics in the preview's
+    /// `Paragraph` render then drop those rows on every frame, which
+    /// the user perceives as content shifted up. The math is shared
+    /// with the per-frame resize in `refresh_preview_cache_if_needed`
+    /// and friends; the rect comes from `preview::PreviewLayout::compute`.
     pub fn finalize_live_send_resize(&mut self) {
         let Some(state) = self.live_send.as_ref() else {
             return;
@@ -2815,6 +3014,41 @@ impl HomeView {
                 .collect();
             *tree = GroupTree::new_with_groups(&profile_instances, &existing_groups);
         }
+    }
+
+    /// Drop `group_path` from `profile`'s tree when no remaining session in
+    /// that profile sits at the path or anywhere underneath it AND the path
+    /// carries no user-anchored descendant group. Used after a session moves
+    /// to a different profile: without this, the source profile keeps an
+    /// empty group header that renders alongside the target profile's new
+    /// copy of the same group, reading as a duplicate. Delegates to
+    /// `delete_group_in_profile` so the deletion is tombstoned for `save()`
+    /// and survives the next reload.
+    pub(super) fn prune_empty_group(&mut self, profile: &str, group_path: &str) {
+        if group_path.is_empty() {
+            return;
+        }
+        let prefix = format!("{}/", group_path);
+        let still_used = self.instances.iter().any(|i| {
+            i.source_profile == profile
+                && (i.group_path == group_path || i.group_path.starts_with(&prefix))
+        });
+        if still_used {
+            return;
+        }
+        // Preserve hand-built structure: if the tree carries a descendant
+        // group (e.g. user-anchored `work/anchor`) under this path, leave
+        // the parent alone. The duplicate-header in unified view is the
+        // lesser evil compared to nuking the user's hierarchy.
+        let has_descendant_group = self.group_trees.get(profile).is_some_and(|tree| {
+            tree.get_all_groups()
+                .iter()
+                .any(|g| g.path.starts_with(&prefix))
+        });
+        if has_descendant_group {
+            return;
+        }
+        self.delete_group_in_profile(profile, group_path);
     }
 
     /// Determine which profile the item at the given cursor position belongs to.
@@ -3163,6 +3397,55 @@ impl HomeView {
         Ok(())
     }
 
+    /// Make sure the paired host-terminal tmux pane is alive and
+    /// ready to receive keystrokes. Mirrors `attach_terminal`: if the
+    /// session doesn't exist (or its pane has died), kill the
+    /// tombstone and spawn a fresh one with the requested size. Used
+    /// by `prepare_live_send` when the live target is the terminal.
+    fn ensure_terminal_pane_ready(
+        &mut self,
+        session_id: &str,
+        size: Option<(u16, u16)>,
+    ) -> anyhow::Result<()> {
+        let inst = self
+            .get_instance(session_id)
+            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?
+            .clone();
+        let term = inst.terminal_tmux_session()?;
+        if !term.exists() || term.is_pane_dead() {
+            if term.exists() {
+                let _ = term.kill();
+            }
+            self.start_terminal_for_instance_with_size(session_id, size)?;
+        }
+        Ok(())
+    }
+
+    /// Container-shell counterpart of `ensure_terminal_pane_ready`,
+    /// used when the live-send target is the container terminal
+    /// (sandboxed sessions in container terminal mode).
+    fn ensure_container_terminal_pane_ready(
+        &mut self,
+        session_id: &str,
+        size: Option<(u16, u16)>,
+    ) -> anyhow::Result<()> {
+        let inst = self
+            .get_instance(session_id)
+            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?
+            .clone();
+        if !inst.is_sandboxed() {
+            anyhow::bail!("Cannot prepare container terminal for non-sandboxed session");
+        }
+        let term = inst.container_terminal_tmux_session()?;
+        if !term.exists() || term.is_pane_dead() {
+            if term.exists() {
+                let _ = term.kill();
+            }
+            self.start_container_terminal_for_instance_with_size(session_id, size)?;
+        }
+        Ok(())
+    }
+
     pub fn restart_instance_with_size_opts(
         &mut self,
         id: &str,
@@ -3295,6 +3578,21 @@ impl HomeView {
             .map(|s| s.default_attach_mode)
     }
 
+    /// True when Enter on the *currently selected session row* would
+    /// enter live-send mode (and Tab would swap to a tmux attach).
+    /// Returns `None` when the cursor is not on a session row (group or
+    /// nothing selected) so the help overlay can fall back to a stable
+    /// default rather than mislabel keys that don't apply. Honors per-
+    /// profile overrides via `default_attach_mode(id)`.
+    pub(super) fn help_live_on_enter(&self) -> Option<bool> {
+        let id = self.selected_session.as_deref()?;
+        let mode = self.default_attach_mode(id)?;
+        Some(matches!(
+            mode,
+            crate::session::NewSessionAttachMode::LiveSend
+        ))
+    }
+
     /// Pin selection to `session_id` and place the cursor on its row.
     /// If the containing group is collapsed (manual grouping or
     /// project grouping), it's force-expanded and `flat_items` is
@@ -3362,6 +3660,7 @@ impl HomeView {
         self.refresh_status_hook_config_cache();
         self.strict_hotkeys = config.session.strict_hotkeys;
         self.row_tag_mode = config.session.row_tag;
+        self.profile_default_attach_mode = config.session.default_attach_mode;
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
         self.tool_configs = config.tools;

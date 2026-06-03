@@ -21,6 +21,13 @@ Auto-detection scores every configured remote, not just `origin`. In a fork plus
 | `PgUp` / `PgDn` | Page through diff |
 | `g` / `G` | Jump to top / bottom of diff |
 
+## Split view
+
+Diffs can be shown in a **split** layout (side-by-side: old on the left, new on the right) in addition to the default unified layout. Pure additions and deletions appear on their own side with an aligned placeholder opposite them; context lines show on both sides.
+
+- **TUI**: press `s` to toggle split vs unified. The choice is saved to `[diff].split_view` and restored on the next launch (also editable in the settings TUI under **Diff**). On a narrow diff pane the view falls back to unified automatically.
+- **Web dashboard**: use the **Unified/Split** toggle in the diff header, or **Settings → Diff**. The preference is stored per browser and the view falls back to unified on narrow screens. Inline comments work in either layout.
+
 ## Editing Files
 
 Press `e` or `Enter` to open the selected file in your editor (`$EDITOR`, or vim/nano if not set).
@@ -31,10 +38,21 @@ After saving and exiting, the diff view refreshes automatically to show your cha
 
 | Key | Action |
 |-----|--------|
+| `s` | Toggle split/unified layout |
 | `b` | Change base branch (persists per-session as `base_branch_override`) |
 | `r` | Refresh the diff |
+| `y` | Copy the selected file's relative path to the clipboard |
 | `?` | Show help |
 | `Esc` | Close diff view |
+
+## Copying a file's path
+
+Copy a changed file's repo-relative path to the clipboard:
+
+- **TUI**: press `y` (yank) on the selected file. A `Copied <path>` confirmation shows in the footer.
+- **Web dashboard**: right-click a file in the Changes list (or a folder row in tree view) and choose **Copy relative path**. A `Copied <path>` toast confirms it.
+
+The path is relative to the file's repository root, so it pastes straight into commands or comments.
 
 ## Commenting on the diff (web only, cockpit sessions)
 
@@ -99,6 +117,9 @@ default_branch = "main"
 
 # Lines of context around changes (default: 3)
 context_lines = 3
+
+# Show diffs in a split layout instead of unified (default: false)
+split_view = false
 ```
 
 ## Tips: See Changes While Editing

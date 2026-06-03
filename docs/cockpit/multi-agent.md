@@ -71,6 +71,15 @@ different MCP naming scheme, file an issue or PR adjusting the profile's
   adapter advertises the matching channels (`available_modes`,
   `available_commands_update`, `usage_update`). When the adapter doesn't
   emit them, the UI simply stays empty rather than showing stale state.
+- **Mode picker sources, in order**: a `category:"mode"` config option
+  (OpenCode, and claude-agent-acp v0.37.0+), then the ACP
+  SessionModeState `available_modes` channel (older claude), then, for
+  claude-family agents only, claude's built-in Default / Plan / Accept
+  edits / Yolo taxonomy. A non-claude agent that advertises no modes
+  shows no picker rather than a vocabulary it would reject. OpenCode has
+  no "default" mode: it operates in modes such as `build` and `plan`,
+  so the picker surfaces those real names and switches through the
+  config-option channel.
 
 ## How the Profile Works
 
@@ -90,6 +99,15 @@ hasn't been verified hands-on, the entry is omitted rather than guessed.
 The cockpit then renders the generic tool card, which is the right
 fallback. The user can file a PR adding the alias once they've used the
 agent and confirmed the wire shape.
+
+## Switching Agents on a Live Session
+
+A cockpit session is not pinned to the agent it started with. You can hand it off to any other installed ACP backend at any time, keeping the transcript. The new agent starts fresh (a new ACP session) and is primed with a recap of the recent turns so it can pick up where the last one left off.
+
+- **Web dashboard:** right-click a cockpit session in the sidebar and pick "Switch agent". The rate-limit recovery banner exposes the same picker via "Continue in another agent" when an agent is over its limit.
+- **CLI:** `aoe cockpit switch-agent <session> <target>`, where `<target>` is a registry key from `aoe cockpit agents`. Add `--model <name>` to override the model.
+
+This is what you reach for after a rate-limit hand-off: switch claude to codex when claude is limited, then `aoe cockpit switch-agent <session> claude` (or the sidebar "Switch agent" item) to return once the window resets. The transcript records each switch with its reason (`manual` or `rate_limited`) on a divider.
 
 ## Known Limitations
 

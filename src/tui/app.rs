@@ -103,6 +103,19 @@ pub struct App {
     /// it back on when the surface dismisses. Default true to match the
     /// startup `EnableMouseCapture` in `tui::run`.
     mouse_captured: bool,
+    /// Whether the resolved config permits xterm mouse tracking (the
+    /// `session.mouse_capture` field plus the `AOE_MOUSE_CAPTURE` backstop).
+    /// This is permission, not live state: `mouse_captured` tracks whether
+    /// tracking is actually engaged right now. Refreshed from disk on the
+    /// periodic reload so toggling Settings > Interaction > Mouse Capture takes
+    /// effect without a restart. When false, `sync_mouse_capture` keeps xterm
+    /// tracking off entirely.
+    mouse_capture_allowed: bool,
+    /// True when running under Mosh (`MOSH_CONNECTION` set). Mosh mangles
+    /// xterm mouse-tracking escapes, so `tui::run` skips the startup
+    /// `EnableMouseCapture` and `sync_mouse_capture` must not re-enable
+    /// tracking mid-session either.
+    mosh_active: bool,
     /// Set by `Action::OpenCockpit` so the async main loop can pick it
     /// up and enter the cockpit view (which needs `event_stream` access
     /// the sync `execute_action` can't lend out).
@@ -175,6 +188,7 @@ impl App {
         profile: &str,
         available_tools: AvailableTools,
         suppress_first_run_dialogs: bool,
+        mosh_active: bool,
     ) -> Result<Self> {
         let no_agents = !available_tools.any_available();
         let active_profile = if profile.is_empty() {
@@ -218,6 +232,15 @@ impl App {
             home.show_changelog(config.app_state.last_seen_version.clone());
             config.app_state.last_seen_version = Some(current_version);
             save_config(&config)?;
+        } else if !config.app_state.has_responded_to_telemetry {
+            // Existing users who finished the walkthrough before telemetry
+            // existed get a one-time opt-in popup. Gated behind the changelog
+            // branch above (mutually exclusive in this if/else chain), so it
+            // never co-renders with the changelog; and because it is a modal
+            // dialog, the version update modal (opened only by an explicit
+            // keypress) can't open on top of it while it is up. No save here:
+            // the dialog's response handler persists the answer.
+            home.show_telemetry_consent();
         }
 
         let dismissed_update_version = config.app_state.dismissed_update_version.clone();
@@ -233,9 +256,13 @@ impl App {
             update_status_rx: None,
             dismissed_update_version,
             event_stream: Some(EventStream::new()),
-            // Initial state matches whatever `tui::run` did at startup;
-            // capture is on by default, off only if AOE_MOUSE_CAPTURE=0.
-            mouse_captured: crate::tui::mouse_capture_requested(),
+            // Initial state matches whatever `tui::run` did at startup: capture
+            // is requested by default, but Mosh suppresses the actual escape, so
+            // `mouse_captured` (live state) also factors in `mosh_active`.
+            // `mouse_capture_allowed` is permission only and ignores Mosh.
+            mouse_captured: crate::tui::mouse_capture_requested(&config.session) && !mosh_active,
+            mouse_capture_allowed: crate::tui::mouse_capture_requested(&config.session),
+            mosh_active,
             #[cfg(feature = "serve")]
             pending_cockpit_open: None,
             pending_install_version: None,
@@ -254,14 +281,17 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
-        // Mouse capture is on by default; AOE_MOUSE_CAPTURE=0 opts out so
-        // iOS Mosh + Termius/Blink use the terminal app's native scrollback
-        // for touch-scroll (Mosh doesn't reliably forward mouse-tracking
-        // escapes to mobile clients).
-        if !crate::tui::mouse_capture_requested() {
-            return Ok(());
-        }
-        let desired = !self.home.wants_text_selection();
+        // Mouse capture is on by default; the Mouse Capture setting (or the
+        // AOE_MOUSE_CAPTURE=0 backstop) opts out so iOS Mosh + Termius/Blink
+        // use the terminal app's native scrollback for touch-scroll (Mosh
+        // doesn't reliably forward mouse-tracking escapes to mobile clients).
+        // Folding `mouse_capture_allowed` into `desired` (rather than an early
+        // return) means flipping the setting off mid-session disables tracking
+        // on the next sync instead of leaving it stuck on. `mosh_active` is
+        // folded in too so a mid-session enable never emits the escape under
+        // Mosh, matching the startup gate in `tui::run`.
+        let desired =
+            self.mouse_capture_allowed && !self.mosh_active && !self.home.wants_text_selection();
         if desired == self.mouse_captured {
             return Ok(());
         }
@@ -318,7 +348,7 @@ impl App {
             crossterm::terminal::LeaveAlternateScreen,
             DisableBracketedPaste,
         )?;
-        if crate::tui::mouse_capture_requested() {
+        if self.mouse_captured {
             crossterm::execute!(terminal.backend_mut(), DisableMouseCapture)?;
         }
         crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Show)?;
@@ -345,8 +375,8 @@ impl App {
         )?;
         // Defer mouse-capture restore to sync_mouse_capture so we don't
         // briefly enable it only to disable again when the user returned
-        // to the serve view. sync_mouse_capture itself respects the
-        // AOE_MOUSE_CAPTURE opt-out.
+        // to the serve view. sync_mouse_capture itself respects the Mouse
+        // Capture setting and the AOE_MOUSE_CAPTURE opt-out.
         self.sync_mouse_capture(terminal)?;
         std::io::Write::flush(terminal.backend_mut())?;
 
@@ -406,6 +436,7 @@ impl App {
         // before the intro walkthrough.
         self.home.intro_dialog = None;
         self.home.changelog_dialog = None;
+        self.home.telemetry_consent_dialog = None;
         tracing::info!(target: "tui.dialog", dialog = "warning", "opening warning dialog");
         self.home.info_dialog =
             Some(crate::tui::dialogs::InfoDialog::new("Warning", message).with_size(WIDTH, height));
@@ -512,6 +543,7 @@ impl App {
         let mut last_spinner_redraw = std::time::Instant::now();
         let mut last_heartbeat = std::time::Instant::now();
         let mut last_presence_refresh = std::time::Instant::now();
+        let mut last_session_idle_reap = std::time::Instant::now();
         // Throttle for how often the periodic block re-reads settings;
         // without this, the inner guards would re-fire on every loop
         // iteration once any time has passed, hitting the config file at
@@ -527,6 +559,11 @@ impl App {
         // "another instance appeared/left" signal responsive without disk I/O
         // on the hot render path.
         const PRESENCE_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+        // How often the standalone TUI evaluates plain tmux sessions for idle
+        // auto-stop (`session.auto_stop_idle_secs`, #1690). Matches the serve
+        // daemon's cadence; both reapers claim under the storage lock so they
+        // never double-stop a session when run side by side.
+        const SESSION_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(60);
         // A presence file counts as live while its mtime is within this window.
         // Larger than HEARTBEAT_INTERVAL so a couple of missed beats (busy loop,
         // brief stall) don't drop an instance; matches the push consumer.
@@ -537,6 +574,14 @@ impl App {
         // so other TUIs can count this instance.
         crate::session::write_tui_heartbeat();
         self.home.active_tui_count = crate::session::count_active_tuis(PRESENCE_FRESH_WINDOW);
+
+        // Telemetry (opt-in, no-op otherwise): announce this surface on boot,
+        // send an initial snapshot, then refresh it periodically and once more
+        // on graceful exit. All sends are detached and swallow errors.
+        const TELEMETRY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+        crate::telemetry::spawn_process_start(crate::telemetry::Surface::Tui);
+        self.emit_telemetry_snapshot();
+        let mut last_telemetry_snapshot = std::time::Instant::now();
 
         loop {
             // Force full redraw if needed (e.g., after returning from tmux).
@@ -552,6 +597,12 @@ impl App {
             // `None` here becomes `pending` inside the arm.
             let post_key_deadline = last_live_key_at.map(|t| t + POST_KEY_WAKE_DELAY);
             let mut woke_via_post_key = false;
+            // The capture worker notifies this when it has fresh, changed
+            // pane content; the arm below wakes the loop so the new preview
+            // paints without busy-polling. Cloned per iteration so the
+            // select! arm doesn't borrow `self`.
+            let preview_wake = self.home.preview_wake.clone();
+            let mut woke_via_preview = false;
 
             // All event sources are polled cooperatively via tokio::select!.
             // This ensures signal futures actually get scheduled (fixing #608
@@ -668,6 +719,12 @@ impl App {
                                                             // Click consumed by the context menu
                                                             // (item dispatched, kept open, or
                                                             // dismissed on outside-click).
+                                                        } else if self.home.handle_dialog_click(mouse.column, mouse.row) {
+                                                            // A modal (e.g. the telemetry consent
+                                                            // popup) swallowed the click. Mirrors the
+                                                            // non-burst path so dialog buttons are
+                                                            // clickable even when a mouse event lands
+                                                            // right after a paste/dictation burst.
                                                         } else if hit_list {
                                                             let action = self.home.handle_click(mouse.column, mouse.row);
                                                             if action.is_none() {
@@ -966,6 +1023,12 @@ impl App {
                     }
                 }
                 _ = refresh_interval.tick() => {}
+                _ = preview_wake.notified() => {
+                    // The capture worker produced fresh content. Repaint so
+                    // it shows; an idle pane never fires this, so the home
+                    // view stays as quiet as before when nothing changes.
+                    woke_via_preview = true;
+                }
                 _ = async {
                     match post_key_deadline {
                         Some(at) => tokio::time::sleep_until(at.into()).await,
@@ -1050,6 +1113,19 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            if self.home.apply_stop_results() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if last_session_idle_reap.elapsed() >= SESSION_IDLE_REAP_INTERVAL {
+                last_session_idle_reap = std::time::Instant::now();
+                if self.reap_idle_sessions() {
+                    refresh_needed = true;
+                    needs_full_refresh = true;
+                }
+            }
+
             if self.home.apply_session_id_updates() {
                 refresh_needed = true;
                 needs_full_refresh = true;
@@ -1084,6 +1160,17 @@ impl App {
             if last_disk_refresh.elapsed() >= DISK_REFRESH_INTERVAL && self.home.live_send.is_none()
             {
                 self.home.reload()?;
+                // Pick up a Settings > Interaction > Mouse Capture toggle from
+                // disk and apply it now, so capture turns on/off within the
+                // reload window instead of waiting for a restart.
+                let profile = self.home.active_profile.as_deref().unwrap_or("default");
+                let mouse_capture_allowed = crate::session::resolve_config(profile)
+                    .map(|c| crate::tui::mouse_capture_requested(&c.session))
+                    .unwrap_or(self.mouse_capture_allowed);
+                if mouse_capture_allowed != self.mouse_capture_allowed {
+                    self.mouse_capture_allowed = mouse_capture_allowed;
+                    self.sync_mouse_capture(terminal)?;
+                }
                 last_disk_refresh = std::time::Instant::now();
                 refresh_needed = true;
                 needs_full_refresh = true;
@@ -1092,6 +1179,11 @@ impl App {
             if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
                 crate::session::write_tui_heartbeat();
                 last_heartbeat = std::time::Instant::now();
+            }
+
+            if last_telemetry_snapshot.elapsed() >= TELEMETRY_SNAPSHOT_INTERVAL {
+                last_telemetry_snapshot = std::time::Instant::now();
+                self.emit_telemetry_snapshot();
             }
 
             if last_presence_refresh.elapsed() >= PRESENCE_REFRESH_INTERVAL {
@@ -1145,8 +1237,10 @@ impl App {
             // but on a deterministic ~15ms delay after each keystroke
             // so typing-echo latency doesn't have to wait for ticker
             // phase. Outside live-send, only the periodic checks
-            // above trigger refresh.
-            if self.home.live_send.is_some() || woke_via_post_key {
+            // above and the capture-worker wake (`woke_via_preview`,
+            // fired only when pane content actually changed) trigger a
+            // refresh.
+            if self.home.live_send.is_some() || woke_via_post_key || woke_via_preview {
                 refresh_needed = true;
             }
 
@@ -1159,10 +1253,15 @@ impl App {
             // support. Skip ticker-driven refreshes inside the
             // cool-down window unless this refresh was specifically
             // requested by something else (status update, post-key
-            // wake, etc).
+            // wake, or the capture-worker wake). Preview wakes carry
+            // genuinely new pane content (the worker dedups and only
+            // fires on change), so they're a real frame to paint, not a
+            // redundant repaint, and must bypass the cool-down like the
+            // post-key wake does or live-send echo stalls to the ticker.
             if refresh_needed
                 && self.home.live_send.is_some()
                 && !woke_via_post_key
+                && !woke_via_preview
                 && !needs_full_refresh
                 && last_refresh_at
                     .map(|t| t.elapsed() < REFRESH_COOLDOWN)
@@ -1203,7 +1302,36 @@ impl App {
             tracing::error!(target: "tui.input", "Failed to save on quit: {}", e);
         }
 
+        // Best-effort final snapshot on graceful exit, bounded so a dead
+        // endpoint can't delay quit. Deduped against the boot/periodic snapshot
+        // so a launch-then-quit with unchanged sessions doesn't post the same
+        // counts twice within seconds.
+        if let Some(snapshot) = self.build_telemetry_snapshot() {
+            crate::telemetry::flush_snapshot_if_changed(snapshot).await;
+        }
+
         Ok(())
+    }
+
+    /// Build a `usage_snapshot` from the current session list, or `None` when
+    /// telemetry is not opted in. The TUI never hosts the web dashboard, so
+    /// `web_seen` / `cockpit_seen` are false and the create-trend counter is
+    /// left at 0 (the `aoe serve` daemon is the surface that tracks those).
+    fn build_telemetry_snapshot(&self) -> Option<crate::telemetry::UsageSnapshot> {
+        crate::telemetry::build_usage_snapshot(
+            crate::telemetry::Surface::Tui,
+            self.home.instances(),
+            false,
+            false,
+            0,
+        )
+    }
+
+    /// Build and send a snapshot, detached. No-op when not opted in.
+    fn emit_telemetry_snapshot(&self) {
+        if let Some(snapshot) = self.build_telemetry_snapshot() {
+            crate::telemetry::spawn_snapshot(snapshot);
+        }
     }
 
     fn render(&mut self, frame: &mut Frame) {
@@ -1212,6 +1340,10 @@ impl App {
             self.update_status = None;
         }
         let status_text = self.update_status.as_ref().map(|s| s.text.as_str());
+        // Reset before the render so a frame that skips the preview path
+        // (dialog open, non-home view) reads as zero capture/parse rather
+        // than leaking the previous frame's durations.
+        self.home.preview_timings = Default::default();
         self.home.render(
             frame,
             frame.area(),
@@ -1219,19 +1351,30 @@ impl App {
             self.update_info.as_ref(),
             status_text,
         );
-        // Sampled / slow-frame only: full-frame trace would dominate the
-        // log at `default_level = trace`. Only emit when a frame breaks the
-        // 16ms budget (60fps), which is the diagnostic case worth tracing.
+        // Sampled trace for frame-budget diagnostics. A full-frame trace on
+        // every paint would dominate the log at `default_level = trace`, so
+        // we only emit for (a) frames that break the 16ms / 60fps budget and
+        // (b) live-send frames, where the per-frame `tmux capture-pane` fork
+        // is the latency we're profiling and individual frames usually stay
+        // under 16ms. `capture_us` / `parse_us` break the frame down into the
+        // capture fork vs. the `ansi-to-tui` parse; the remainder (frame_ms
+        // minus those two) is the widget build + ratatui diff.
         let elapsed = start.elapsed();
-        if elapsed.as_millis() > 16
+        let in_live = self.home.live_send.is_some();
+        if (elapsed.as_millis() > 16 || in_live)
             && tracing::enabled!(target: "tui.render", tracing::Level::TRACE)
         {
+            let timings = self.home.preview_timings;
             tracing::trace!(
                 target: "tui.render",
                 frame_ms = elapsed.as_millis() as u64,
+                frame_us = elapsed.as_micros() as u64,
+                capture_us = timings.capture.as_micros() as u64,
+                parse_us = timings.parse.as_micros() as u64,
+                live = in_live,
                 width = frame.area().width,
                 height = frame.area().height,
-                "slow frame",
+                "render frame sample",
             );
         }
     }
@@ -1567,6 +1710,38 @@ fn poll_update_receiver(
     }
 }
 
+/// What a `q` key press at the home screen should do. Factored out of the
+/// key handler so the quit policy is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum QuitIntent {
+    /// Don't quit. Ctrl+Q lands here: it's reserved for exiting live-send
+    /// mode and must never close aoe from the home view (#1569).
+    Ignore,
+    /// A session is mid-creation; confirm before cancelling it.
+    ConfirmDuringCreation,
+    /// Confirm-before-quit is enabled; show the quit confirmation.
+    Confirm,
+    /// Quit immediately.
+    Quit,
+}
+
+fn quit_intent(
+    modifiers: KeyModifiers,
+    creation_pending: bool,
+    confirm_before_quit: bool,
+) -> QuitIntent {
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        return QuitIntent::Ignore;
+    }
+    if creation_pending {
+        return QuitIntent::ConfirmDuringCreation;
+    }
+    if confirm_before_quit {
+        return QuitIntent::Confirm;
+    }
+    QuitIntent::Quit
+}
+
 impl App {
     async fn handle_key(
         &mut self,
@@ -1587,12 +1762,23 @@ impl App {
                 self.should_quit = true;
                 return Ok(());
             }
-            (KeyCode::Char('q'), _) if !self.home.has_dialog() => {
-                if self.home.is_creation_pending() {
-                    self.home.show_quit_during_creation_confirm();
-                    return Ok(());
+            (KeyCode::Char('q'), modifiers) if !self.home.has_dialog() => {
+                match quit_intent(
+                    modifiers,
+                    self.home.is_creation_pending(),
+                    self.home.confirm_before_quit(),
+                ) {
+                    QuitIntent::Ignore => {}
+                    QuitIntent::ConfirmDuringCreation => {
+                        self.home.show_quit_during_creation_confirm();
+                    }
+                    QuitIntent::Confirm => {
+                        self.home.show_quit_confirm();
+                    }
+                    QuitIntent::Quit => {
+                        self.should_quit = true;
+                    }
                 }
-                self.should_quit = true;
                 return Ok(());
             }
             // Ctrl+x dismisses the update bar / status toast. Gated on
@@ -1660,6 +1846,77 @@ impl App {
         Ok(())
     }
 
+    /// Auto-stop plain tmux sessions idle past `session.auto_stop_idle_secs`
+    /// (#1690). Runs on a 60s gate from the main loop. Each candidate is
+    /// claimed under the per-profile storage lock (so a co-running `aoe serve`
+    /// cannot double-stop it), marked `Stopped` in memory, then handed to the
+    /// background `StopPoller`; the result is reconciled by `apply_stop_results`
+    /// like a manual stop. Returns true if any session was reaped.
+    fn reap_idle_sessions(&mut self) -> bool {
+        // Live attach state; on a tmux query failure skip this pass rather
+        // than risk reaping a session the user is attached to.
+        let Ok(attached) = crate::tmux::attached_session_names() else {
+            return false;
+        };
+        let now = chrono::Utc::now();
+        let candidates = crate::session::idle_reap::idle_reap_candidates(
+            self.home.instances(),
+            now,
+            &attached,
+            |profile| {
+                crate::session::profile_config::resolve_config_or_warn(profile)
+                    .session
+                    .auto_stop_idle_secs
+            },
+        );
+        let mut reaped = false;
+        for cand in candidates {
+            match crate::session::idle_reap::claim_idle_stop(
+                &cand.profile,
+                &cand.session_id,
+                now,
+                cand.threshold_secs,
+            ) {
+                Ok(Some(instance)) => {
+                    // Mirror Action::StopSession: the claim already persisted
+                    // `Stopped`; reassert it in memory and run the kill off the
+                    // UI thread so a sandbox `docker stop` cannot freeze the TUI.
+                    self.home
+                        .set_instance_status(&cand.session_id, crate::session::Status::Stopped);
+                    self.home
+                        .stop_poller
+                        .request_stop(crate::tui::stop_poller::StopRequest {
+                            session_id: cand.session_id.clone(),
+                            instance,
+                        });
+                    tracing::info!(
+                        target: "tui.idle_reap",
+                        session = %cand.session_id,
+                        profile = %cand.profile,
+                        threshold_secs = cand.threshold_secs,
+                        "auto-stopped idle tmux session",
+                    );
+                    reaped = true;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tui.idle_reap",
+                        session = %cand.session_id,
+                        error = %e,
+                        "idle auto-stop claim failed",
+                    );
+                }
+            }
+        }
+        if reaped {
+            if let Err(e) = self.home.save() {
+                tracing::error!(target: "tui.idle_reap", "failed to save after idle reap: {e}");
+            }
+        }
+        reaped
+    }
+
     fn execute_action(
         &mut self,
         action: Action,
@@ -1681,28 +1938,21 @@ impl App {
             }
             Action::StopSession(id) => {
                 if let Some(inst) = self.home.get_instance(&id) {
-                    let inst_clone = inst.clone();
-                    // Set Stopped immediately so the status poller won't
-                    // override to Error while stop() blocks (docker stop
-                    // can take up to 10s).
+                    // Run the stop on a background thread: `inst.stop()` calls
+                    // `docker stop` for sandboxed sessions, which can block for
+                    // the container's grace period (~10s) and would otherwise
+                    // freeze the TUI (issue #1496). Set Stopped immediately so
+                    // the status poller won't override to Error while the stop
+                    // is in flight; the result is applied in the main loop via
+                    // `apply_stop_results`.
+                    let request = crate::tui::stop_poller::StopRequest {
+                        session_id: id.clone(),
+                        instance: inst.clone(),
+                    };
                     self.home
                         .set_instance_status(&id, crate::session::Status::Stopped);
-                    match inst_clone.stop() {
-                        Ok(()) => {
-                            crate::tmux::refresh_session_cache();
-                            self.home.reload()?;
-                            self.home
-                                .set_instance_status(&id, crate::session::Status::Stopped);
-                            self.home.save()?;
-                        }
-                        Err(e) => {
-                            tracing::error!(target: "tui.input", "Failed to stop session: {}", e);
-                            self.home.set_instance_error(&id, Some(e.to_string()));
-                            self.home
-                                .set_instance_status(&id, crate::session::Status::Error);
-                            self.home.save()?;
-                        }
-                    }
+                    self.home.save()?;
+                    self.home.stop_poller.request_stop(request);
                 }
             }
             Action::SetTheme(name) => {
@@ -2241,6 +2491,51 @@ pub enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctrl_q_never_quits() {
+        // The whole point of #1569: Ctrl+Q is a live-mode-exit habit and
+        // must not close aoe from the home view, regardless of the other
+        // flags.
+        for creation_pending in [false, true] {
+            for confirm in [false, true] {
+                assert_eq!(
+                    quit_intent(KeyModifiers::CONTROL, creation_pending, confirm),
+                    QuitIntent::Ignore,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plain_q_quits_when_confirm_disabled() {
+        assert_eq!(
+            quit_intent(KeyModifiers::NONE, false, false),
+            QuitIntent::Quit,
+        );
+    }
+
+    #[test]
+    fn plain_q_confirms_when_enabled() {
+        assert_eq!(
+            quit_intent(KeyModifiers::NONE, false, true),
+            QuitIntent::Confirm,
+        );
+    }
+
+    #[test]
+    fn creation_pending_confirms_before_anything_else() {
+        // Creation-in-progress takes precedence over the quit confirm so
+        // the user is warned the hook will be cancelled.
+        assert_eq!(
+            quit_intent(KeyModifiers::NONE, true, true),
+            QuitIntent::ConfirmDuringCreation,
+        );
+        assert_eq!(
+            quit_intent(KeyModifiers::NONE, true, false),
+            QuitIntent::ConfirmDuringCreation,
+        );
+    }
 
     #[test]
     fn test_action_enum() {

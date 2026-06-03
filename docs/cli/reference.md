@@ -60,6 +60,11 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe theme list`↴](#aoe-theme-list)
 * [`aoe theme export`↴](#aoe-theme-export)
 * [`aoe theme dir`↴](#aoe-theme-dir)
+* [`aoe telemetry`↴](#aoe-telemetry)
+* [`aoe telemetry status`↴](#aoe-telemetry-status)
+* [`aoe telemetry enable`↴](#aoe-telemetry-enable)
+* [`aoe telemetry disable`↴](#aoe-telemetry-disable)
+* [`aoe telemetry reset-id`↴](#aoe-telemetry-reset-id)
 * [`aoe serve`↴](#aoe-serve)
 * [`aoe url`↴](#aoe-url)
 * [`aoe cockpit`↴](#aoe-cockpit)
@@ -77,6 +82,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe cockpit cancel`↴](#aoe-cockpit-cancel)
 * [`aoe cockpit tail`↴](#aoe-cockpit-tail)
 * [`aoe cockpit attach`↴](#aoe-cockpit-attach)
+* [`aoe cockpit switch-agent`↴](#aoe-cockpit-switch-agent)
 * [`aoe uninstall`↴](#aoe-uninstall)
 * [`aoe update`↴](#aoe-update)
 * [`aoe completion`↴](#aoe-completion)
@@ -108,6 +114,7 @@ Run without arguments to launch the TUI dashboard.
 * `tmux` — tmux integration utilities
 * `sounds` — Manage sound effects for agent state transitions
 * `theme` — Manage color themes (list, export, customize)
+* `telemetry` — Manage anonymous opt-in usage telemetry
 * `serve` — Start a web dashboard for remote session access
 * `url` — Print the current dashboard URL of a running `aoe serve` daemon
 * `cockpit` — Cockpit (ACP-based native agent rendering) management
@@ -294,7 +301,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `rename` — Rename a session
 * `capture` — Capture tmux pane output
 * `current` — Auto-detect current session
-* `set-session-id` — Set agent session ID for a session
+* `set-session-id` — Set the resume target for a session (pin a conversation or force a one-shot fresh start)
 * `set-base` — Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
 * `snooze` — Snooze a session for a duration (temporary archive, auto wakes)
 * `unsnooze` — Wake a snoozed session immediately
@@ -428,14 +435,14 @@ Auto-detect current session
 
 ## `aoe session set-session-id`
 
-Set agent session ID for a session
+Set the resume target for a session (pin a conversation or force a one-shot fresh start)
 
 **Usage:** `aoe session set-session-id <IDENTIFIER> <SESSION_ID>`
 
 ###### **Arguments:**
 
 * `<IDENTIFIER>` — Session ID or title
-* `<SESSION_ID>` — Agent session ID to set (pass empty string to clear)
+* `<SESSION_ID>` — Resume target: a UUID/sid pins the next launches to that conversation; an empty string forces a one-shot fresh start (after which the system reverts to auto-resume)
 
 
 
@@ -915,6 +922,53 @@ Show the custom themes directory path
 
 
 
+## `aoe telemetry`
+
+Manage anonymous opt-in usage telemetry
+
+**Usage:** `aoe telemetry <COMMAND>`
+
+###### **Subcommands:**
+
+* `status` — Show the current telemetry opt-in state and install id
+* `enable` — Opt in to anonymous usage telemetry
+* `disable` — Opt out of telemetry (deletes the local install id)
+* `reset-id` — Generate a fresh anonymous install id (only while opted in)
+
+
+
+## `aoe telemetry status`
+
+Show the current telemetry opt-in state and install id
+
+**Usage:** `aoe telemetry status`
+
+
+
+## `aoe telemetry enable`
+
+Opt in to anonymous usage telemetry
+
+**Usage:** `aoe telemetry enable`
+
+
+
+## `aoe telemetry disable`
+
+Opt out of telemetry (deletes the local install id)
+
+**Usage:** `aoe telemetry disable`
+
+
+
+## `aoe telemetry reset-id`
+
+Generate a fresh anonymous install id (only while opted in)
+
+**Usage:** `aoe telemetry reset-id`
+
+
+
 ## `aoe serve`
 
 Start a web dashboard for remote session access
@@ -983,6 +1037,7 @@ Cockpit (ACP-based native agent rendering) management
 * `cancel` — Cancel the in-flight prompt for a cockpit session
 * `tail` — Stream the cockpit broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
 * `attach` — Open the TUI cockpit view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) to attach across machines without going through the home session list
+* `switch-agent` — Switch a cockpit session to a different ACP agent, keeping the transcript. The new agent starts fresh; use `aoe cockpit agents` to list valid targets. Handy for returning to claude after a rate-limit handoff to codex
 
 
 
@@ -1180,6 +1235,23 @@ Open the TUI cockpit view directly for a known session id. Combine with `AOE_DAE
 ###### **Arguments:**
 
 * `<SESSION>` — Cockpit session id
+
+
+
+## `aoe cockpit switch-agent`
+
+Switch a cockpit session to a different ACP agent, keeping the transcript. The new agent starts fresh; use `aoe cockpit agents` to list valid targets. Handy for returning to claude after a rate-limit handoff to codex
+
+**Usage:** `aoe cockpit switch-agent [OPTIONS] <SESSION> <TARGET>`
+
+###### **Arguments:**
+
+* `<SESSION>` — Cockpit session id
+* `<TARGET>` — Registry key of the target agent (e.g. `claude`, `codex`)
+
+###### **Options:**
+
+* `--model <MODEL>` — Optional model override forwarded to the new agent
 
 
 

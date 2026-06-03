@@ -62,6 +62,11 @@ wizard with scratch already enabled and jumped to the Review step.
 A follow-up `Cmd+Enter` / `Ctrl+Enter` launches the session, so two
 keystrokes is enough to spin up a fresh scratch session.
 
+**Command palette.** The same flow is reachable from the command
+palette (`Cmd+K` / `Ctrl+K`): search for "New scratch session" and
+run it to open the wizard prefilled for a scratch session. In
+read-only mode the creation commands are hidden from the palette.
+
 **Sidebar grouping.** Every scratch session has its own
 `scratch/<id>/` directory on disk, so the dashboard sidebar would
 otherwise render each one as its own one-session group. Scratch
@@ -115,7 +120,10 @@ logged so you can find it later.
 
 The wizard's **Recent projects** tab filters scratch sessions out
 once they exist, so a deleted scratch directory does not appear as a
-reusable recent project.
+reusable recent project. Multi-repo workspace sessions are filtered out
+of the same list, since the project step cannot rebuild a workspace from
+a single path; picking one would start a plain single-repo session and
+silently drop the other repos.
 
 ## Compatibility
 

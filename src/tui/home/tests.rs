@@ -191,6 +191,7 @@ fn preview_info_follows_flag_and_never_auto_shows_in_live() {
         tmux_name: "aoe_test_live".to_string(),
         target: LiveSendTarget::Agent,
         exit_chords: Vec::new(),
+        leader: None,
     };
 
     // Hidden via the toggle: gone outside live...
@@ -269,6 +270,56 @@ fn test_q_returns_quit_action() {
     let mut env = create_test_env_empty();
     let action = env.view.handle_key(key(KeyCode::Char('q')), None);
     assert_eq!(action, Some(Action::Quit));
+}
+
+#[test]
+#[serial]
+fn test_ctrl_q_does_not_quit_home() {
+    // #1569: Ctrl+Q is a live-mode-exit habit; on the home view it must
+    // not quit aoe. (The app-level handler swallows it; the home view
+    // itself must also never treat it as a quit.)
+    let mut env = create_test_env_empty();
+    let action = env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert_eq!(action, None);
+}
+
+#[test]
+#[serial]
+fn test_quit_confirm_dont_ask_again_persists_opt_out() {
+    let mut env = create_test_env_empty();
+    env.view.confirm_before_quit = true;
+
+    env.view.show_quit_confirm();
+    assert!(env.view.confirm_dialog.is_some());
+
+    // Tick "don't warn me again", then confirm.
+    env.view.handle_key(key(KeyCode::Char(' ')), None);
+    let action = env.view.handle_key(key(KeyCode::Char('y')), None);
+
+    assert_eq!(action, Some(Action::Quit));
+    assert!(!env.view.confirm_before_quit);
+    // The opt-out is persisted so it survives a restart.
+    let saved = crate::session::config::load_config()
+        .unwrap()
+        .expect("config should have been written");
+    assert!(!saved.session.confirm_before_quit);
+}
+
+#[test]
+#[serial]
+fn test_quit_confirm_without_opt_out_keeps_flag() {
+    let mut env = create_test_env_empty();
+    env.view.confirm_before_quit = true;
+
+    env.view.show_quit_confirm();
+    // Confirm without ticking the checkbox.
+    let action = env.view.handle_key(key(KeyCode::Char('y')), None);
+
+    assert_eq!(action, Some(Action::Quit));
+    assert!(env.view.confirm_before_quit);
 }
 
 #[test]
@@ -1156,6 +1207,43 @@ fn test_t_toggles_view_mode() {
 
 #[test]
 #[serial]
+fn switching_view_retargets_capture_worker_pane() {
+    // The preview's off-thread capture worker follows the displayed pane:
+    // switching agent <-> terminal must resolve to different tmux sessions
+    // so `sync_preview_capture_worker` respawns the worker against the new
+    // pane (instead of the old agent-only behavior). Regression guard for
+    // the responsiveness fix that moved every preview's `tmux capture-pane`
+    // off the render thread.
+    let env = create_test_env_with_sessions(1);
+    let mut view = env.view;
+
+    let agent_pane = view.displayed_pane_tmux_name();
+    assert!(
+        agent_pane.is_some(),
+        "a selected session must resolve a pane"
+    );
+
+    view.handle_key(key(KeyCode::Char('t')), None);
+    assert_eq!(view.view_mode, ViewMode::Terminal);
+    let terminal_pane = view.displayed_pane_tmux_name();
+    assert!(terminal_pane.is_some());
+    assert_ne!(
+        agent_pane, terminal_pane,
+        "agent and terminal panes must differ so the worker retargets on switch",
+    );
+
+    // The reconcile tracks the active target and is idempotent: a changed
+    // pane updates it, the same pane leaves it in place.
+    view.sync_preview_capture_worker(terminal_pane.clone());
+    assert_eq!(view.preview_capture_target, terminal_pane);
+    view.sync_preview_capture_worker(terminal_pane.clone());
+    assert_eq!(view.preview_capture_target, terminal_pane);
+    view.sync_preview_capture_worker(agent_pane.clone());
+    assert_eq!(view.preview_capture_target, agent_pane);
+}
+
+#[test]
+#[serial]
 fn test_enter_returns_attach_terminal_in_terminal_view() {
     let env = create_test_env_with_sessions(1);
     let mut view = env.view;
@@ -1923,10 +2011,9 @@ fn test_o_key_opens_sort_picker() {
 #[test]
 #[serial]
 fn test_shift_o_opens_sort_picker_in_strict_mode() {
-    // Regression guard: normalize_strict_key maps Shift+O → bare 'o'. The main
-    // match must handle 'o' without an `if !self.strict_hotkeys` guard,
-    // otherwise the key falls through to capture_letter_to_compose and opens
-    // the message dialog instead of the sort picker.
+    // Regression guard: the SortPicker binding lists Shift+O (Char('O')) for
+    // strict mode, so it must resolve to the sort picker rather than falling
+    // through to the typing-guard (capture_letter_to_compose).
     use crate::session::config::SortOrder;
 
     let mut env = create_test_env_with_mixed_sessions();
@@ -2167,12 +2254,9 @@ fn test_non_strict_w_jumps_to_next_waiting_in_attention_sort() {
 #[test]
 #[serial]
 fn test_strict_mode_ctrl_g_opens_group_picker() {
-    // Regression guard: the help overlay lists "Ctrl+G" for Group by in
-    // strict mode. Previously normalize_strict_key stripped CTRL and routed
-    // the result into the typing-guard catch-all, so the advertised hotkey
-    // was a no-op (the bare 'g' landed in pending_paste). Ctrl+G must now
-    // keep its modifier and open the group picker, while bare 'g' continues
-    // to fall into the typing-guard catch-all.
+    // Regression guard: the GroupBy binding is Ctrl+G in strict mode. It must
+    // open the group picker, while bare 'g' continues to fall into the
+    // typing-guard catch-all (it lands in pending_paste).
     use crate::session::config::GroupByMode;
 
     let mut env = create_test_env_with_sessions(3);
@@ -2210,6 +2294,209 @@ fn test_strict_mode_ctrl_g_opens_group_picker() {
         env.view.pending_paste.as_deref(),
         Some("g"),
         "bare 'g' in strict mode falls through to the typing-guard catch-all"
+    );
+}
+
+#[test]
+#[serial]
+fn test_strict_mode_ctrl_t_and_ctrl_n_reach_secondary_actions() {
+    // Regression guard (2026-05-29): in strict_hotkeys mode, normalize_strict_key
+    // used to fold Ctrl+T -> 'T' and Ctrl+N -> 'N' (modifier stripped), which
+    // collided with the Shift+T / Shift+N primary arms (toggle view, plain new
+    // session) and left the Ctrl+T / Ctrl+N secondary arms (quick-attach
+    // terminal, new-from-selection) as unreachable dead code. Both chords must
+    // keep CTRL so the secondary arms fire.
+    let mut env = create_test_env_with_sessions(1);
+    env.view.strict_hotkeys = true;
+    env.view.cursor = 0;
+    env.view.update_selected();
+
+    // Shift+T toggles the view (primary action), no terminal attach.
+    assert_eq!(env.view.view_mode, ViewMode::Agent);
+    let shift_t = env
+        .view
+        .handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT), None);
+    assert_eq!(env.view.view_mode, ViewMode::Terminal);
+    assert!(
+        !matches!(shift_t, Some(Action::AttachTerminal(_, _))),
+        "Shift+T must toggle view, not attach terminal"
+    );
+    // Reset to Agent view.
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT), None);
+    assert_eq!(env.view.view_mode, ViewMode::Agent);
+
+    // Ctrl+T quick-attaches the paired terminal (secondary action) and must
+    // NOT toggle the view.
+    let ctrl_t = env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(
+        matches!(ctrl_t, Some(Action::AttachTerminal(_, _))),
+        "Ctrl+T in strict mode must quick-attach the paired terminal"
+    );
+    assert_eq!(
+        env.view.view_mode,
+        ViewMode::Agent,
+        "Ctrl+T must not toggle the view"
+    );
+
+    // Shift+N opens the plain new-session dialog (no prefill from selection).
+    assert!(env.view.new_dialog.is_none());
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT), None);
+    assert!(
+        env.view.new_dialog.is_some(),
+        "Shift+N must open the new-session dialog"
+    );
+    env.view.new_dialog = None;
+
+    // Ctrl+N opens the new-from-selection dialog (secondary action). It also
+    // routes through open_new_session_dialog, so assert it reaches the arm by
+    // confirming the dialog opens with CTRL intact rather than being swallowed.
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(
+        env.view.new_dialog.is_some(),
+        "Ctrl+N in strict mode must open the new-from-selection dialog"
+    );
+}
+
+#[test]
+#[serial]
+fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
+    // Regression guard (2026-05-29): normalize_strict_key used to fold
+    // Ctrl+D/Ctrl+R/Ctrl+P to bare 'D'/'R'/'P', which collided with the
+    // Shift+letter primary arms. In strict mode Shift+D=delete, Shift+R=rename,
+    // Shift+P=profiles, so the folds made Ctrl+D fire delete (not diff), Ctrl+R
+    // fire rename (not serve), and orphaned the diff/serve/projects arms. All
+    // three Ctrl chords must keep CTRL so their secondary arms fire.
+    let mut env = create_test_env_with_sessions(1);
+    env.view.strict_hotkeys = true;
+    env.view.cursor = 0;
+    env.view.update_selected();
+
+    // Shift+D opens the delete confirmation (primary uppercase action).
+    assert!(env.view.unified_delete_dialog.is_none());
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT), None);
+    assert!(
+        env.view.unified_delete_dialog.is_some(),
+        "Shift+D must open the delete dialog"
+    );
+    env.view.unified_delete_dialog = None;
+
+    // Ctrl+D routes to the diff arm, NOT delete. The test session's path is not
+    // a real git worktree so the diff view may fail to open (info dialog) or
+    // open empty; either way the regression is that Ctrl+D must never reach
+    // open_delete_for_selected. Clear any takeover the diff arm leaves behind so
+    // it doesn't swallow the next keypress.
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(
+        env.view.unified_delete_dialog.is_none(),
+        "Ctrl+D in strict mode must NOT open the delete dialog (it targets diff)"
+    );
+    env.view.diff_view = None;
+    env.view.info_dialog = None;
+
+    // Shift+R opens the rename dialog (primary uppercase action).
+    assert!(env.view.rename_dialog.is_none());
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT), None);
+    assert!(
+        env.view.rename_dialog.is_some(),
+        "Shift+R must open the rename dialog"
+    );
+    env.view.rename_dialog = None;
+
+    // Ctrl+R routes to the serve arm, NOT rename.
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(
+        env.view.rename_dialog.is_none(),
+        "Ctrl+R in strict mode must NOT open the rename dialog (it targets serve)"
+    );
+    env.view.info_dialog = None;
+    #[cfg(feature = "serve")]
+    {
+        env.view.serve_view = None;
+    }
+
+    // P follows the same relocation rule as D/R/T/N: the bare-`p` (primary)
+    // action -> Shift+P, the Shift+P (secondary) action -> Ctrl+P. So in strict
+    // mode Shift+P opens projects and Ctrl+P opens profiles.
+    assert!(env.view.projects_dialog.is_none());
+    env.view
+        .handle_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT), None);
+    assert!(
+        env.view.projects_dialog.is_some(),
+        "Shift+P in strict mode must open the projects dialog"
+    );
+    assert!(
+        env.view.profile_picker_dialog.is_none(),
+        "Shift+P must not open the profile picker"
+    );
+    env.view.projects_dialog = None;
+
+    // Ctrl+P opens the profile picker, NOT projects.
+    assert!(env.view.profile_picker_dialog.is_none());
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(
+        env.view.profile_picker_dialog.is_some(),
+        "Ctrl+P in strict mode must open the profile picker"
+    );
+    assert!(
+        env.view.projects_dialog.is_none(),
+        "Ctrl+P must not open the projects dialog"
+    );
+}
+
+#[test]
+#[serial]
+fn test_command_palette_diff_invokes_diff_in_strict_mode() {
+    // Regression guard for the palette half of the strict-mode bug: the palette
+    // used to synthesize a keypress, so picking "Open diff view" in strict mode
+    // routed through Shift+D and fired DELETE instead. Palette entries now carry
+    // an ActionId and run the action directly, so the mode can't matter.
+    let mut env = create_test_env_with_sessions(1);
+    env.view.strict_hotkeys = true;
+    env.view.cursor = 0;
+    env.view.update_selected();
+
+    // Open the palette and filter to the diff command.
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert!(
+        env.view.command_palette.is_some(),
+        "Ctrl+K opens the palette"
+    );
+    for ch in "diff view".chars() {
+        env.view.handle_key(key(KeyCode::Char(ch)), None);
+    }
+    env.view.handle_key(key(KeyCode::Enter), None);
+
+    // The diff action ran (opened the diff view, or raised an info dialog if the
+    // temp path isn't a real git repo). Crucially, it did NOT delete.
+    assert!(
+        env.view.unified_delete_dialog.is_none(),
+        "palette 'diff' in strict mode must not open the delete dialog"
+    );
+    assert!(
+        env.view.diff_view.is_some() || env.view.info_dialog.is_some(),
+        "palette 'diff' in strict mode must attempt to open the diff view"
     );
 }
 
@@ -4064,6 +4351,45 @@ fn apply_status_update_skips_terminal_states() {
 
 #[test]
 #[serial]
+fn apply_stop_results_transitions_instance_to_stopped() {
+    use crate::session::Status;
+    use crate::tui::stop_poller::StopRequest;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the fixture to seed a single Session item"),
+    };
+
+    // Pretend the session is live, then dispatch the stop to the background
+    // poller exactly as Action::StopSession does. The fixture instance has no
+    // tmux pane or sandbox, so perform_stop returns success quickly.
+    env.view
+        .mutate_instance(&id, |inst| inst.status = Status::Running);
+    let inst = env.view.get_instance(&id).unwrap().clone();
+    env.view.stop_poller.request_stop(StopRequest {
+        session_id: id.clone(),
+        instance: inst,
+    });
+
+    // Poll the result-application path the main loop runs each frame.
+    let mut applied = false;
+    for _ in 0..50 {
+        if env.view.apply_stop_results() {
+            applied = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(applied, "apply_stop_results never observed the stop result");
+
+    let inst = env.view.get_instance(&id).unwrap();
+    assert_eq!(inst.status, Status::Stopped);
+    assert_eq!(inst.last_error, None);
+}
+
+#[test]
+#[serial]
 fn apply_status_update_runs_status_hook_on_transition() {
     use crate::session::Status;
     use crate::status_hooks::{take_recorded_launches, StatusHookConfig};
@@ -5774,6 +6100,7 @@ mod scroll_pane_isolation {
             exit_chords: crate::tui::home::live_send::parse_chord_list(
                 crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
             ),
+            leader: None,
         });
 
         let up_handled = env.view.handle_scroll_up(50, 10);
@@ -5805,11 +6132,226 @@ mod scroll_pane_isolation {
             exit_chords: crate::tui::home::live_send::parse_chord_list(
                 crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
             ),
+            leader: None,
         });
 
         let handled = env.view.handle_scroll_down(5, 10);
         assert!(!handled, "list scroll must be a no-op in live mode");
         assert_eq!(env.view.cursor, 1, "selection must not change in live mode");
+    }
+
+    /// Build a live-send env with the default Ctrl+B leader armed and the
+    /// cursor on a real session, so leader-menu keys route through
+    /// `handle_live_send_key`.
+    fn live_env_with_leader() -> TestEnv {
+        use crate::tui::home::live_send::LiveSendState;
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        let id = match env.view.flat_items.get(1) {
+            Some(Item::Session { id, .. }) => id.clone(),
+            _ => panic!("fixture should have a session at flat_items[1]"),
+        };
+        env.view.live_send = Some(LiveSendState {
+            session_id: id,
+            title: "session".to_string(),
+            tmux_name: "fake".to_string(),
+            target: crate::tui::home::live_send::LiveSendTarget::Agent,
+            exit_chords: crate::tui::home::live_send::parse_chord_list(
+                crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
+            ),
+            leader: crate::tui::home::live_send::parse_chord(
+                crate::tui::home::live_send::DEFAULT_LEADER,
+            ),
+        });
+        env
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// Pressing the leader arms the menu (swallowed, not forwarded);
+    /// the follow-up `b` toggles the sidebar and disarms.
+    #[test]
+    #[serial]
+    fn live_leader_b_toggles_sidebar() {
+        let mut env = live_env_with_leader();
+        assert!(!env.view.sidebar_collapsed);
+
+        env.view.handle_key(ctrl('b'), None);
+        assert!(
+            env.view.live_send_pending_leader,
+            "leader press should arm the menu"
+        );
+        assert!(
+            !env.view.sidebar_collapsed,
+            "leader alone must not toggle anything yet"
+        );
+
+        env.view.handle_key(key(KeyCode::Char('b')), None);
+        assert!(!env.view.live_send_pending_leader, "menu should disarm");
+        assert!(env.view.sidebar_collapsed, "leader+b hides the sidebar");
+
+        // And again to reveal it.
+        env.view.handle_key(ctrl('b'), None);
+        env.view.handle_key(key(KeyCode::Char('b')), None);
+        assert!(!env.view.sidebar_collapsed, "leader+b again shows it");
+    }
+
+    /// Leader + k opens the command palette over live mode.
+    #[test]
+    #[serial]
+    fn live_leader_k_opens_palette() {
+        let mut env = live_env_with_leader();
+        env.view.handle_key(ctrl('b'), None);
+        env.view.handle_key(key(KeyCode::Char('k')), None);
+        assert!(!env.view.live_send_pending_leader);
+        assert!(
+            env.view.command_palette.is_some(),
+            "leader+k should open the command palette"
+        );
+        // Live mode is still active underneath the palette overlay.
+        assert!(env.view.live_send.is_some());
+    }
+
+    /// Leader + q exits live mode and resets the live-only UI state.
+    #[test]
+    #[serial]
+    fn live_leader_q_exits() {
+        let mut env = live_env_with_leader();
+        env.view.sidebar_collapsed = true;
+        env.view.handle_key(ctrl('b'), None);
+        env.view.handle_key(key(KeyCode::Char('q')), None);
+        assert!(env.view.live_send.is_none(), "leader+q exits live mode");
+        assert!(
+            !env.view.sidebar_collapsed,
+            "exiting must re-reveal the sidebar"
+        );
+        assert!(!env.view.live_send_pending_leader);
+    }
+
+    /// An unbound key after the leader cancels the menu without exiting,
+    /// toggling, or opening anything (it does not fall through to the
+    /// agent either: the leader already swallowed it).
+    #[test]
+    #[serial]
+    fn live_leader_unknown_key_cancels_menu() {
+        let mut env = live_env_with_leader();
+        env.view.handle_key(ctrl('b'), None);
+        env.view.handle_key(key(KeyCode::Char('z')), None);
+        assert!(!env.view.live_send_pending_leader, "menu disarms");
+        assert!(env.view.live_send.is_some(), "still live");
+        assert!(!env.view.sidebar_collapsed);
+        assert!(env.view.command_palette.is_none());
+    }
+
+    /// The fast exit chord (Ctrl+Q) stays a single press, independent of
+    /// the leader: it must not require arming the menu first.
+    #[test]
+    #[serial]
+    fn live_ctrl_q_still_one_press_exit() {
+        let mut env = live_env_with_leader();
+        env.view.handle_key(ctrl('q'), None);
+        assert!(
+            env.view.live_send.is_none(),
+            "Ctrl+Q exits in a single press"
+        );
+        assert!(!env.view.live_send_pending_leader);
+    }
+
+    /// A modified key after the leader (e.g. Ctrl+K) cancels the menu
+    /// rather than firing a command: only the leader-again passthrough
+    /// claims a modified form, so the user can't accidentally trigger the
+    /// palette by holding Ctrl out of muscle memory.
+    #[test]
+    #[serial]
+    fn live_leader_then_modified_key_cancels() {
+        let mut env = live_env_with_leader();
+        env.view.handle_key(ctrl('b'), None);
+        env.view.handle_key(ctrl('k'), None);
+        assert!(!env.view.live_send_pending_leader, "menu disarms");
+        assert!(
+            env.view.command_palette.is_none(),
+            "leader + Ctrl+K must NOT open the palette"
+        );
+        assert!(env.view.live_send.is_some(), "still live");
+    }
+
+    /// Committing a palette command while live (here a jump) exits live
+    /// mode first, so the preview can never show one session while
+    /// keystrokes target another. Cancelling the palette is covered
+    /// separately and must stay live.
+    #[test]
+    #[serial]
+    fn palette_command_while_live_exits_live() {
+        let mut env = live_env_with_leader();
+        // Open the palette from within live mode via the leader.
+        env.view.handle_key(ctrl('b'), None);
+        env.view.handle_key(key(KeyCode::Char('k')), None);
+        assert!(env.view.command_palette.is_some());
+        assert!(env.view.live_send.is_some(), "palette opens over live mode");
+
+        // Filter to a jump entry and commit it.
+        for ch in "jump".chars() {
+            env.view.handle_key(key(KeyCode::Char(ch)), None);
+        }
+        env.view.handle_key(key(KeyCode::Enter), None);
+
+        assert!(
+            env.view.live_send.is_none(),
+            "committing a palette command must drop out of live mode"
+        );
+        assert!(env.view.command_palette.is_none());
+        assert!(!env.view.sidebar_collapsed, "live-only state is reset");
+    }
+
+    /// Collapsing the sidebar in live mode hands the preview the full
+    /// width: the preview sub-rect grows past the normal side-by-side
+    /// width, and rendering the which-key banner doesn't panic.
+    #[test]
+    #[serial]
+    fn collapsed_sidebar_gives_preview_full_width() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut env = live_env_with_leader();
+        let theme = crate::tui::styles::load_theme("empire");
+
+        let render = |env: &mut TestEnv| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|f| {
+                    let area = f.area();
+                    env.view.render(f, area, &theme, None, None);
+                })
+                .unwrap();
+            env.view.preview_pane_area.width
+        };
+
+        let split_width = render(&mut env);
+        env.view.sidebar_collapsed = true;
+        let full_width = render(&mut env);
+        assert!(
+            full_width > split_width,
+            "collapsed sidebar should widen the preview ({full_width} vs {split_width})"
+        );
+        // The list isn't drawn while collapsed, so its hit-test rects must
+        // be cleared or a click in the preview area could resolve to a
+        // hidden list row.
+        assert!(
+            env.view.list_inner_area.width == 0 && env.view.list_inner_area.height == 0,
+            "collapsed sidebar must clear the list hit-test rect"
+        );
+        assert!(
+            env.view.handle_click(2, 2).is_none(),
+            "a click in collapsed live mode must not resolve to a list row"
+        );
+
+        // The which-key banner renders without panicking while armed.
+        env.view.live_send_pending_leader = true;
+        let _ = render(&mut env);
     }
 }
 
@@ -6237,6 +6779,7 @@ mod click_to_select {
             tmux_name: format!("aoe_test_{}", id_a),
             target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
+            leader: None,
         });
 
         // Click session B's row.
@@ -6272,6 +6815,7 @@ mod click_to_select {
             tmux_name: format!("aoe_test_{}", id_a),
             target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
+            leader: None,
         });
 
         let action = env.view.handle_click(5, 3);
@@ -6651,6 +7195,7 @@ mod preview_drag_select {
             tmux_name: "aoe_test_drag_select".to_string(),
             target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
+            leader: None,
         });
     }
 
@@ -7014,6 +7559,7 @@ mod preview_drag_select {
             tmux_name: "aoe_test_full_pipeline".to_string(),
             target: crate::tui::home::live_send::LiveSendTarget::Agent,
             exit_chords: Vec::new(),
+            leader: None,
         });
 
         // Find a row in the preview area that actually has text in
@@ -7139,6 +7685,7 @@ mod live_send_mode {
             exit_chords: crate::tui::home::live_send::parse_chord_list(
                 crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
             ),
+            leader: None,
         });
         id
     }
@@ -7155,6 +7702,7 @@ mod live_send_mode {
             exit_chords: crate::tui::home::live_send::parse_chord_list(
                 crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
             ),
+            leader: None,
         });
     }
 
@@ -7466,6 +8014,43 @@ mod live_send_mode {
             "cache must be preserved when the fork capture fails inside live mode"
         );
         assert_eq!(env.view.preview_cache.captured_lines, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn refresh_terminal_cache_overwrites_on_empty_capture() {
+        // Counterpart to `refresh_preserves_cache_when_live_capture_fails`:
+        // the agent cache and the host-terminal cache now share
+        // `refresh_preview_cache_core`, but only the agent wrapper carries the
+        // live-send kill switch. The terminal path must keep its old semantics
+        // (overwrite to empty so the preview surfaces "session looks gone")
+        // even when the unit fixture's backing tmux session does not exist and
+        // the capture comes back empty. Guards against the kill switch leaking
+        // into the shared core for the non-agent wrappers.
+        let mut env = create_test_env_with_sessions(1);
+        let id = env
+            .view
+            .flat_items
+            .iter()
+            .find_map(|item| match item {
+                crate::session::Item::Session { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .expect("test env has one session");
+        env.view.selected_session = Some(id.clone());
+        env.view.terminal_preview_cache.content = "stale terminal output".to_string();
+        env.view.terminal_preview_cache.captured_lines = 1;
+        env.view.terminal_preview_cache.dimensions = (10, 10);
+        env.view.terminal_preview_cache.session_id = Some(id.clone());
+
+        env.view.refresh_terminal_preview_cache_if_needed(80, 24);
+
+        assert_eq!(
+            env.view.terminal_preview_cache.content, "",
+            "terminal cache must overwrite stale content (no kill switch outside the agent path)"
+        );
+        assert_eq!(env.view.terminal_preview_cache.dimensions, (80, 24));
+        assert_eq!(env.view.terminal_preview_cache.session_id, Some(id));
     }
 
     mod paste_splitting {
@@ -8818,6 +9403,7 @@ mod right_click_context_menu {
             tmux_name: "aoe_test_empty_click_exit_live".to_string(),
             target: live_send::LiveSendTarget::Agent,
             exit_chords: live_send::parse_chord_list(live_send::DEFAULT_EXIT_CHORD),
+            leader: None,
         });
         assert!(env.view.live_send.is_some());
         assert!(env.view.handle_empty_list_click(5, 5));
@@ -8969,6 +9555,302 @@ mod right_click_context_menu {
         assert!(
             env.view.new_dialog.is_none(),
             "n on session menu must not open new-session"
+        );
+    }
+}
+
+mod apply_session_id_updates {
+    //! Post-CAS env publish: env mirrors the disk-confirmed sid
+    //! (Applied) or reloaded peer value (Skipped); filter paths
+    //! republish the memory mirror to clear `on_change`'s pre-CAS write.
+
+    use super::*;
+    use crate::session::poller::SessionPoller;
+    use crate::session::ResumeIntent;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+
+    const NEW_SID: &str = "019342ab-1111-7aaa-8bbb-cccdddeeefff";
+
+    struct TmuxSession(String);
+
+    impl TmuxSession {
+        fn create(id: &str, title: &str) -> Self {
+            let name = crate::tmux::Session::generate_name(id, title);
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &name])
+                .output();
+            let status = Command::new("tmux")
+                .args(["new-session", "-d", "-s", &name])
+                .status()
+                .expect("failed to spawn tmux");
+            assert!(status.success(), "tmux new-session failed for {}", name);
+            crate::tmux::refresh_session_cache();
+            Self(name)
+        }
+        fn name(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl Drop for TmuxSession {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["kill-session", "-t", &self.0])
+                .output();
+            crate::tmux::refresh_session_cache();
+        }
+    }
+
+    fn skip_if_no_tmux() -> bool {
+        if Command::new("tmux").arg("-V").output().is_err() {
+            eprintln!("Skipping: tmux not available");
+            return true;
+        }
+        false
+    }
+
+    fn captured_env(name: &str) -> Option<String> {
+        crate::tmux::env::get_hidden_env(name, crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
+    }
+
+    fn build_view_with_inst(profile: &str, inst: &Instance) -> HomeView {
+        use crate::session::config::GroupByMode;
+        let storage = Storage::new(profile).unwrap();
+        storage
+            .update(|i, g| {
+                *i = vec![inst.clone()];
+                *g = GroupTree::new_with_groups(std::slice::from_ref(inst), &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+        let tools = AvailableTools::with_tools(&["claude"]);
+        let mut view = HomeView::new(Some(profile.to_string()), tools).unwrap();
+        view.group_by = GroupByMode::Manual;
+        view.flat_items = view.build_flat_items();
+        view.update_selected();
+        view
+    }
+
+    fn attach_poller_with_update(view: &mut HomeView, instance_id: &str, sid: &str) {
+        let poller = SessionPoller::new("test-session".to_string());
+        poller.inject_test_update(instance_id, sid);
+        let arc = Arc::new(Mutex::new(poller));
+        for i in &mut view.instances {
+            if i.id == instance_id {
+                i.session_id_poller = Some(arc.clone());
+            }
+        }
+        if let Some(i) = view.instance_map.get_mut(instance_id) {
+            i.session_id_poller = Some(arc);
+        }
+    }
+
+    fn fresh_instance(profile: &str, title: &str) -> Instance {
+        let mut inst = Instance::new(title, "/tmp/x");
+        inst.tool = "claude".to_string();
+        inst.source_profile = profile.to_string();
+        inst.agent_session_id = None;
+        inst.resume_intent = ResumeIntent::Default;
+        inst
+    }
+
+    #[test]
+    #[serial]
+    fn apply_session_id_updates_publishes_after_cas() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+
+        let profile = "apply-publish";
+        let inst = fresh_instance(profile, "apa");
+        let mut view = build_view_with_inst(profile, &inst);
+
+        let tmux = TmuxSession::create(&inst.id, &inst.title);
+
+        attach_poller_with_update(&mut view, &inst.id, NEW_SID);
+
+        let updated = view.apply_session_id_updates();
+        assert!(updated, "Applied CAS must report a touch");
+        assert_eq!(captured_env(tmux.name()).as_deref(), Some(NEW_SID));
+    }
+
+    #[test]
+    #[serial]
+    fn apply_session_id_updates_skips_retroactive_excludes() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+
+        let profile = "apply-excludes";
+        let inst = fresh_instance(profile, "aer");
+        let mut view = build_view_with_inst(profile, &inst);
+        for i in &mut view.instances {
+            if i.id == inst.id {
+                i.retroactive_capture_excludes.insert(NEW_SID.to_string());
+            }
+        }
+        if let Some(i) = view.instance_map.get_mut(&inst.id) {
+            i.retroactive_capture_excludes.insert(NEW_SID.to_string());
+        }
+
+        let tmux = TmuxSession::create(&inst.id, &inst.title);
+        crate::tmux::env::set_hidden_env(
+            tmux.name(),
+            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            "stale-untouched",
+        )
+        .unwrap();
+
+        attach_poller_with_update(&mut view, &inst.id, NEW_SID);
+
+        let updated = view.apply_session_id_updates();
+        assert!(
+            !updated,
+            "filtered sid must not propagate to memory (returned bool tracks memory)"
+        );
+        let mem_sid = view
+            .instances
+            .iter()
+            .find(|i| i.id == inst.id)
+            .and_then(|i| i.agent_session_id.clone());
+        assert!(
+            mem_sid.is_none(),
+            "filtered sid must not enter in-memory mirror"
+        );
+        assert!(
+            captured_env(tmux.name()).is_none(),
+            "filtered sid must not survive in tmux env: env converges on disk (None)"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn apply_session_id_updates_skipped_publishes_disk_value() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+
+        let profile = "apply-skipped";
+        let peer_sid = "019342aa-3333-7eee-8fff-aaaabbbbcccc";
+        let other_peer = "019342bb-4444-7fff-8000-111122223333";
+
+        let mut inst = fresh_instance(profile, "ase");
+        inst.agent_session_id = Some(peer_sid.to_string());
+        let mut view = build_view_with_inst(profile, &inst);
+
+        let storage = Storage::new(profile).unwrap();
+        storage
+            .update(|i, _g| {
+                i[0].agent_session_id = Some(other_peer.to_string());
+                Ok(())
+            })
+            .unwrap();
+
+        let tmux = TmuxSession::create(&inst.id, &inst.title);
+        crate::tmux::env::set_hidden_env(
+            tmux.name(),
+            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            NEW_SID,
+        )
+        .unwrap();
+
+        attach_poller_with_update(&mut view, &inst.id, NEW_SID);
+
+        let updated = view.apply_session_id_updates();
+        assert!(updated, "Skipped path still touches state");
+
+        let mem_sid = view
+            .instances
+            .iter()
+            .find(|i| i.id == inst.id)
+            .and_then(|i| i.agent_session_id.clone());
+        assert_eq!(
+            mem_sid.as_deref(),
+            Some(other_peer),
+            "memory rolls back to disk after CAS skip"
+        );
+        assert_eq!(
+            captured_env(tmux.name()).as_deref(),
+            Some(other_peer),
+            "env converges from poller's pre-published NEW_SID to disk's other_peer"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn apply_session_id_updates_invalid_sid_corrects_env() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+
+        let profile = "apply-invalid";
+        let inst = fresh_instance(profile, "aiv");
+        let mut view = build_view_with_inst(profile, &inst);
+
+        let tmux = TmuxSession::create(&inst.id, &inst.title);
+        crate::tmux::env::set_hidden_env(
+            tmux.name(),
+            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            "bad sid!",
+        )
+        .unwrap();
+
+        attach_poller_with_update(&mut view, &inst.id, "bad sid!");
+
+        let updated = view.apply_session_id_updates();
+        assert!(
+            !updated,
+            "validation-filtered sid must not propagate to memory"
+        );
+        assert!(
+            captured_env(tmux.name()).is_none(),
+            "env converges to disk-backed memory mirror (None) after validation failure"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn apply_session_id_updates_no_tmux_session_skips_publish() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+
+        let profile = "apply-pane-dead";
+        let inst = fresh_instance(profile, "apds");
+        let mut view = build_view_with_inst(profile, &inst);
+
+        attach_poller_with_update(&mut view, &inst.id, NEW_SID);
+
+        let updated = view.apply_session_id_updates();
+        assert!(
+            updated,
+            "CAS still applies even when no tmux session exists"
+        );
+        let mem_sid = view
+            .instances
+            .iter()
+            .find(|i| i.id == inst.id)
+            .and_then(|i| i.agent_session_id.clone());
+        assert_eq!(
+            mem_sid.as_deref(),
+            Some(NEW_SID),
+            "memory still mirrors the CAS-applied sid",
+        );
+        let expected_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        assert!(
+            captured_env(&expected_name).is_none(),
+            "no tmux session means no publish target"
         );
     }
 }

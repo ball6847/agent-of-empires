@@ -4,6 +4,7 @@ import type {
   RichFileDiffResponse,
   AgentInfo,
   ProfileInfo,
+  ProfileSettingsResponse,
   BrowseResponse,
   GroupInfo,
   ProjectInfo,
@@ -210,16 +211,53 @@ export async function setDefaultProfile(name: string): Promise<boolean> {
 
 export function getProfileSettings(
   name: string,
-): Promise<Record<string, unknown> | null> {
-  return fetchJson<Record<string, unknown>>(
+): Promise<ProfileSettingsResponse | null> {
+  return fetchJson<ProfileSettingsResponse>(
     `/api/profiles/${encodeURIComponent(name)}/settings`,
   );
 }
+
+/** Profile-settings sections the dashboard is allowed to PATCH. Mirror of
+ *  the server's `ALLOWED_PROFILE_SETTINGS_SECTIONS` (src/server/api/mod.rs).
+ *  Sections NOT listed here, notably `hooks` plus the agent-command and
+ *  env fields, are remote-code-execution surfaces blocked server-side with
+ *  a pinned regression test (mod.rs tests module). We reject them client
+ *  side too as defense in depth. Keep this in sync with the Rust constant
+ *  by hand: there is no automated cross-language pin. */
+export const PROFILE_WRITABLE_SECTIONS = [
+  "theme",
+  "session",
+  "tmux",
+  "updates",
+  "sound",
+  "sandbox",
+  "worktree",
+  "web",
+  "logging",
+  "cockpit",
+  "description",
+] as const;
+
+const PROFILE_WRITABLE_SECTION_SET: ReadonlySet<string> = new Set(
+  PROFILE_WRITABLE_SECTIONS,
+);
 
 export async function updateProfileSettings(
   name: string,
   updates: Record<string, unknown>,
 ): Promise<boolean> {
+  for (const key of Object.keys(updates)) {
+    if (!PROFILE_WRITABLE_SECTION_SET.has(key)) {
+      // Refuse loudly rather than silently dropping the key. A blocked
+      // section in a profile PATCH (e.g. `hooks`) is a caller bug; the
+      // server would 400 it anyway. Failing here keeps a buggy caller
+      // from reporting a partial save as success.
+      console.error(
+        `updateProfileSettings: refusing to send blocked profile section "${key}"`,
+      );
+      return false;
+    }
+  }
   try {
     const res = await fetch(
       `/api/profiles/${encodeURIComponent(name)}/settings`,
@@ -348,6 +386,45 @@ export function fetchAbout(): Promise<ServerAbout | null> {
   return fetchJson<ServerAbout>("/api/about");
 }
 
+export interface TelemetryStatus {
+  enabled: boolean;
+  responded: boolean;
+  do_not_track: boolean;
+}
+
+export function fetchTelemetryStatus(): Promise<TelemetryStatus | null> {
+  return fetchJson<TelemetryStatus>("/api/telemetry/status");
+}
+
+/// Set the opt-in state. The daemon owns the anonymous install id; the
+/// browser never posts to the telemetry backend itself. Returns the updated
+/// status, or null on failure.
+export async function setTelemetryConsent(
+  enabled: boolean,
+): Promise<TelemetryStatus | null> {
+  try {
+    const res = await fetch("/api/telemetry/consent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/// Tell the daemon the web dashboard or cockpit UI was opened, so its next
+/// opt-in snapshot can carry web_seen / cockpit_seen. Best-effort.
+export function reportTelemetrySeen(surface: "web" | "cockpit"): void {
+  void fetch("/api/telemetry/seen", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ surface }),
+  }).catch(() => {});
+}
+
 /** Runtime helper around `ServerAbout.build_flavor`. See #1055. */
 export function isDebugBuild(about: ServerAbout | null | undefined): boolean {
   if (!about) return false;
@@ -442,14 +519,18 @@ export interface SwitchAgentResponse {
  *  `target` (registry key, e.g. "codex"). Backend stops the old
  *  worker, spawns the new one, persists the agent change, and emits
  *  an AgentSwitched event. On failure (unknown target, spawn error)
- *  the instance is left untouched. See #1282. */
+ *  the instance is left untouched. `reason` is recorded on the event
+ *  and shown in the transcript divider: "rate_limited" for the
+ *  recovery flow, "manual" for an explicit user switch. See #1282. */
 export async function switchCockpitAgent(
   sessionId: string,
   target: string,
   model?: string | null,
+  reason?: string | null,
 ): Promise<SwitchAgentResponse | null> {
-  const body: { target: string; model?: string } = { target };
+  const body: { target: string; model?: string; reason?: string } = { target };
   if (model) body.model = model;
+  if (reason) body.reason = reason;
   return fetchJson<SwitchAgentResponse>(
     `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/switch-agent`,
     {

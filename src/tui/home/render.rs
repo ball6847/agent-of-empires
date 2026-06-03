@@ -491,7 +491,21 @@ impl HomeView {
         // stacking gives the preview the full width.
         let available_width = main_chunks[0].width;
         self.main_area_width = available_width;
-        if available_width < responsive::STACKED_BREAKPOINT {
+        // Collapsed sidebar (live mode only): hand the whole main area to
+        // the preview so the agent pane fills the terminal. The live-send
+        // resize loop then reflows the agent to the wider geometry. Reset
+        // on live-send exit, so the list always returns in the home view.
+        if self.live_send.is_some() && self.sidebar_collapsed {
+            self.divider_col = None;
+            // render_list is skipped, so its hit-test rects would otherwise
+            // keep last frame's values and a click in the now-preview area
+            // could resolve to an invisible list row (and switch the live
+            // target). Zero them so mouse hit-testing can't target the
+            // hidden sidebar.
+            self.list_area = Rect::default();
+            self.list_inner_area = Rect::default();
+            self.render_preview(frame, main_chunks[0], theme);
+        } else if available_width < responsive::STACKED_BREAKPOINT {
             let main_height = main_chunks[0].height;
             let list_height = responsive::stacked_list_height(main_height);
             let chunks = Layout::default()
@@ -587,6 +601,7 @@ impl HomeView {
             intro_dialog,
             no_agents_dialog,
             changelog_dialog,
+            telemetry_consent_dialog,
             info_dialog,
             snooze_duration_dialog,
             profile_picker_dialog,
@@ -819,6 +834,7 @@ impl HomeView {
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()
+            || self.telemetry_consent_dialog.is_some()
             || self.info_dialog.is_some()
             || self.profile_picker_dialog.is_some()
             || self.group_picker_dialog.is_some()
@@ -1269,19 +1285,185 @@ impl HomeView {
         }
     }
 
+    /// Shared core for the four `refresh_*_preview_cache_if_needed` methods.
+    /// They all run the same needs-refresh gate (session id / dimensions /
+    /// scroll-exceeds / 250ms timer) and the same capture, cache-update, and
+    /// scroll-clamp body; they differ only in which cache field they target,
+    /// where the capture comes from, and whether live-send forces a refresh.
+    ///
+    /// `select` is called twice: once for the gate, once to write the result.
+    /// `capture` runs between those two borrows so it can take a shared `&self`
+    /// to reach `get_instance`. It returns `None` to leave the cache untouched:
+    /// the agent uses that for its live-send preserve-last-good kill switch
+    /// (#1501); the terminal/tool wrappers use it when the instance has gone
+    /// away, matching the original "only write inside `if let Some(inst)`".
+    ///
+    /// `force` bypasses the idle throttle; the agent passes `in_live` here so
+    /// every render refreshes the preview in live-send mode (see the throttle
+    /// note in `refresh_preview_cache_if_needed`), the others pass `false`.
+    fn refresh_preview_cache_core(
+        &mut self,
+        width: u16,
+        height: u16,
+        force: bool,
+        select: fn(&mut Self) -> &mut super::PreviewCache,
+        capture: impl FnOnce(&Self, &str, usize) -> Option<String>,
+    ) {
+        const PREVIEW_REFRESH_MS: u128 = 250;
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        let scroll_offset = self.preview_scroll_offset;
+
+        let cache = select(self);
+        let needs_refresh = force
+            || cache.session_id.as_ref() != Some(&id)
+            || cache.dimensions != (width, height)
+            || scroll_exceeds_cache(cache.captured_lines, height, scroll_offset)
+            || cache.last_refresh.elapsed().as_millis() > PREVIEW_REFRESH_MS;
+        if !needs_refresh {
+            return;
+        }
+
+        let capture_lines = capture_lines_for(height, scroll_offset);
+        let Some(content) = capture(self, id.as_str(), capture_lines) else {
+            return;
+        };
+
+        let captured_lines = select(self).store_capture(content, id, (width, height));
+
+        self.preview_scroll_offset = clamp_scroll_to_capture(
+            self.preview_scroll_offset,
+            captured_lines,
+            self.preview_visible_rows,
+        );
+    }
+
+    /// tmux session name backing the pane the preview currently shows, as a
+    /// function of the selected session and view mode (and, for Terminal,
+    /// the host/container sub-mode). `None` when nothing is selected. Drives
+    /// `sync_preview_capture_worker`.
+    pub(super) fn displayed_pane_tmux_name(&self) -> Option<String> {
+        let id = self.selected_session.as_ref()?;
+        let inst = self.get_instance(id)?;
+        let name = match &self.view_mode {
+            ViewMode::Agent => crate::tmux::Session::generate_name(&inst.id, &inst.title),
+            ViewMode::Terminal => {
+                let mode = if inst.is_sandboxed() {
+                    self.get_terminal_mode(id)
+                } else {
+                    TerminalMode::Host
+                };
+                match mode {
+                    TerminalMode::Host => {
+                        crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+                    }
+                    TerminalMode::Container => {
+                        crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+                    }
+                }
+            }
+            ViewMode::Tool(tool) => crate::tmux::ToolSession::new(&inst.id, &inst.title, tool)
+                .session_name()
+                .to_string(),
+        };
+        Some(name)
+    }
+
+    /// Point the off-thread capture worker at `desired` (the displayed
+    /// pane's tmux session), then retune its cadence to live-send vs. idle.
+    /// One long-lived worker is spawned lazily on first use and retargeted
+    /// in place (no per-switch respawn); an empty target idles it. Cheap and
+    /// idempotent when the target is unchanged, so render calls it every
+    /// frame. This is what keeps the worker tracking whatever the user is
+    /// looking at instead of only the agent during live-send.
+    pub(super) fn sync_preview_capture_worker(&mut self, desired: Option<String>) {
+        // Don't spawn the worker until there's actually something to show.
+        if desired.is_none() && self.preview_capture_worker.is_none() {
+            self.preview_capture_target = None;
+            return;
+        }
+        if self.preview_capture_worker.is_none() {
+            self.preview_capture_worker = Some(live_send::LiveCaptureWorker::spawn(
+                self.preview_wake.clone(),
+            ));
+        }
+        if self.preview_capture_target != desired {
+            if let Some(worker) = self.preview_capture_worker.as_ref() {
+                worker.set_target(desired.clone().unwrap_or_default());
+            }
+            self.preview_capture_target = desired;
+        }
+        // Fast cadence only when the displayed pane IS the live-send target.
+        // Viewing the agent while live-send points at a terminal (or vice
+        // versa) leaves this preview a background view, so it stays on the
+        // idle interval instead of forking every 25ms.
+        let live = self
+            .live_send
+            .as_ref()
+            .is_some_and(|s| self.preview_capture_target.as_deref() == Some(s.tmux_name.as_str()));
+        // Terminal / container panes forward empty captures so a cleared
+        // shell drops its stale text; agent / tool panes preserve the
+        // last-good frame (the #1501 kill switch). The policy follows the
+        // displayed pane, not just the live-send target, so a backgrounded
+        // terminal preview clears the same way the live one does.
+        let forward_empty = matches!(self.view_mode, ViewMode::Terminal);
+        if let Some(worker) = self.preview_capture_worker.as_ref() {
+            worker.set_live(live);
+            worker.set_forward_empty(forward_empty);
+        }
+    }
+
+    /// If the capture worker has fresh content, store it into `select`'s
+    /// cache and report `true` so the caller skips the synchronous fork.
+    /// Returns `false` when the worker has nothing new (cold start, or an
+    /// idle/unchanged pane), leaving the caller's `refresh_preview_cache_core`
+    /// to populate the cache once via the fork gate. Steady state across
+    /// every view goes through here, so `tmux capture-pane` stays off the
+    /// render thread.
+    fn apply_worker_capture(
+        &mut self,
+        width: u16,
+        height: u16,
+        select: fn(&mut Self) -> &mut super::PreviewCache,
+    ) -> bool {
+        let Some(id) = self.selected_session.clone() else {
+            return false;
+        };
+        let scroll_offset = self.preview_scroll_offset;
+        let capture_lines = capture_lines_for(height, scroll_offset);
+        let Some(worker) = self.preview_capture_worker.as_ref() else {
+            return false;
+        };
+        worker.set_capture_lines(capture_lines);
+        let Some(content) = worker.take_latest() else {
+            return false;
+        };
+        let captured_lines = select(self).store_capture(content, id, (width, height));
+        // `set_capture_lines` is async, so this frame may carry a capture
+        // produced under a smaller line budget (the user just scrolled back
+        // or the pane grew). If it doesn't cover the requested window, fall
+        // through so `refresh_preview_cache_core` does a one-off synchronous
+        // catch-up instead of clamping the offset against an undersized
+        // capture and snapping the preview toward the live edge.
+        if scroll_exceeds_cache(captured_lines, height, scroll_offset) {
+            return false;
+        }
+        self.preview_scroll_offset =
+            clamp_scroll_to_capture(scroll_offset, captured_lines, self.preview_visible_rows);
+        true
+    }
+
     pub(super) fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
-        // Outside live-send, captures fork a fresh `tmux capture-pane`
-        // so we throttle to 250ms (4 Hz). Inside live-send, captures
-        // ride the long-lived `tmux -C` control-mode socket and cost
-        // a single round-trip (~1-2ms), so there's no upside to
-        // throttling: every render refreshes the preview, the agent's
-        // output appears as soon as the main loop wakes (key event,
-        // tokio ticker, or the %output wake-up the reader thread
-        // pushes when tmux notifies us of new pane bytes). The result
-        // is roughly attach-quality latency in the common case; the
-        // residual gap is the cost of capture-pane + ratatui re-render
-        // vs. tmux writing bytes straight into your terminal.
-        const PREVIEW_REFRESH_MS_IDLE: u128 = 250;
+        // The off-thread `LiveCaptureWorker` (retargeted to this pane by
+        // `sync_preview_capture_worker` in `render_preview`) keeps fresh
+        // content flowing on its own thread; `apply_worker_capture` below
+        // just applies the newest it has produced. The synchronous fork via
+        // `refresh_preview_cache_core` remains only as the cold-start /
+        // worker-empty fallback (its 250ms gate still applies there). This
+        // moves the per-frame capture cost (~8.5ms on macOS, ~90% of a
+        // frame; the `tui.render` `capture_us` trace measures it) off the
+        // render thread for every view, not just agent live-send.
         let in_live = self.live_send.is_some();
         // While in live-send mode, keep the agent's tmux pane sized to the
         // preview's visible output area so it renders directly into view.
@@ -1321,67 +1503,52 @@ impl HomeView {
             }
         }
 
-        let scroll_offset = self.preview_scroll_offset;
-        let session_changed = match &self.selected_session {
-            Some(id) => self.preview_cache.session_id.as_ref() != Some(id),
-            None => false,
-        };
-        let dims_changed = self.preview_cache.dimensions != (width, height);
-        // Live-send: no throttle. Idle: 250ms throttle to keep the
-        // fork rate sane. See the constant comment above for why.
-        let timer_expired = in_live
-            || self.preview_cache.last_refresh.elapsed().as_millis() > PREVIEW_REFRESH_MS_IDLE;
-        // Only re-capture for scroll when the cached window can no longer
-        // cover the requested offset. Wheel ticks inside the BUFFER headroom
-        // re-render from the existing content without forking tmux.
-        let scroll_exceeds =
-            scroll_exceeds_cache(self.preview_cache.captured_lines, height, scroll_offset);
+        // Apply the worker's latest capture if it has fresh content; that's
+        // the steady-state path and never forks. Only a cold start (worker
+        // just retargeted) or an idle/unchanged pane falls through to the
+        // synchronous fork below.
+        if self.apply_worker_capture(width, height, |s| &mut s.preview_cache) {
+            return;
+        }
 
-        let needs_refresh = self.selected_session.is_some()
-            && (session_changed || dims_changed || timer_expired || scroll_exceeds);
-
-        if needs_refresh {
-            if let Some(id) = self.selected_session.clone() {
-                let capture_lines = capture_lines_for(height, scroll_offset);
-                // Captures always go through the fork-based path
-                // (`Session::capture_pane_with_size` via the instance
-                // helper). The long-lived `tmux -C` connection is
-                // reserved for `send-keys` from the worker thread; on
-                // some tmux builds (macOS 3.x observed) the control-
-                // mode connection EOFs mid-session, and routing
-                // captures through it as well meant a dropped
-                // connection froze the preview until the user exited
-                // live mode. Forking per capture costs ~5-10 ms on a
-                // local mac and is invisible against the 250 ms idle
-                // throttle / `%output`-wake cadence; we trade that
-                // overhead for "preview never gets stuck".
-                //
-                // Live vs. non-live failure semantics differ. In live
-                // mode an empty capture (which is what
-                // `Session::capture_pane_with_size` returns when the
-                // session is gone OR tmux had a transient hiccup)
-                // preserves the last-known-good capture so the preview
-                // doesn't flash blank (the kill-switch behavior
-                // introduced in #1501). Outside live mode the empty
-                // content surfaces as "No output available", which is
-                // the intended signal that the underlying session is
-                // gone.
-                let in_live = self.live_send.is_some();
-                // Only treat an empty fork capture as "preserve the
-                // existing cache" when the cache is FOR THIS SAME
-                // SESSION. If the user just switched live-send from
-                // session A to session B and B's first capture comes
-                // back empty, holding the kill-switch would leave A's
-                // content on screen under B's header. Cross-session
-                // we always overwrite, falling back to an empty body
-                // (the same "session looks gone" signal the non-live
-                // path uses).
-                let same_session = self.preview_cache.session_id.as_ref() == Some(&id);
-                let fork_capture = self.get_instance(&id).and_then(|inst| {
+        // Cold-start / fallback capture via the fork-based path
+        // (`Session::capture_pane_with_size` via the instance helper). The
+        // 250ms gate in `refresh_preview_cache_core` keeps this from forking
+        // every frame; in steady state the worker above satisfies the render.
+        //
+        // Live vs. non-live failure semantics differ. In live mode an empty
+        // capture (which is what `Session::capture_pane_with_size` returns when
+        // the session is gone OR tmux had a transient hiccup) preserves the
+        // last-known-good capture so the preview doesn't flash blank (the
+        // kill-switch behavior introduced in #1501). The capture closure
+        // returns `None` for that case so the core leaves every cache field
+        // alone, including `session_id` and `dimensions`, which document
+        // "what's in `content`" and would lie if updated past a stale snapshot.
+        // Outside live mode the empty content surfaces as "No output
+        // available", the intended signal that the underlying session is gone.
+        self.refresh_preview_cache_core(
+            width,
+            height,
+            false,
+            |s| &mut s.preview_cache,
+            |s, id, capture_lines| {
+                let in_live = s
+                    .live_send
+                    .as_ref()
+                    .is_some_and(|st| st.target == live_send::LiveSendTarget::Agent);
+                // Only treat an empty fork capture as "preserve the existing
+                // cache" when the cache is FOR THIS SAME SESSION. If the user
+                // just switched live-send from session A to session B and B's
+                // first capture comes back empty, holding the kill-switch would
+                // leave A's content on screen under B's header. Cross-session we
+                // always overwrite, falling back to an empty body (the same
+                // "session looks gone" signal the non-live path uses).
+                let same_session = s.preview_cache.session_id.as_deref() == Some(id);
+                let fork_capture = s.get_instance(id).and_then(|inst| {
                     inst.capture_output_with_size(capture_lines, width, height)
                         .ok()
                 });
-                let captured: Option<String> = if in_live {
+                if in_live {
                     match fork_capture {
                         Some(content) if !content.is_empty() => Some(content),
                         _ if same_session => None,
@@ -1389,93 +1556,41 @@ impl HomeView {
                     }
                 } else {
                     Some(fork_capture.unwrap_or_default())
-                };
-                // Only mutate cache when we actually got bytes. On a
-                // live-mode transient failure (`None`) we leave every
-                // cache field alone — including `session_id` and
-                // `dimensions`, which document "what's in `content`"
-                // and would lie if updated past a stale snapshot. The
-                // retry cadence is already bounded by the loop's tick
-                // / wake / key sources, so we don't need to write a
-                // `last_refresh` here to throttle (in live mode
-                // `in_live` forces `timer_expired` regardless).
-                if let Some(content) = captured {
-                    self.preview_cache.captured_lines = content.lines().count();
-                    self.preview_cache.content = content;
-                    // Invalidate the cached parse; the next render that
-                    // needs `ensure_parsed` will re-run `ansi-to-tui`.
-                    self.preview_cache.parsed_text = None;
-                    self.preview_cache.session_id = Some(id);
-                    self.preview_cache.dimensions = (width, height);
-                    self.preview_cache.last_refresh = Instant::now();
-                    self.preview_scroll_offset = clamp_scroll_to_capture(
-                        self.preview_scroll_offset,
-                        self.preview_cache.captured_lines,
-                        self.preview_visible_rows,
-                    );
                 }
-            }
-        }
+            },
+        );
     }
 
     /// Refresh terminal preview cache if needed (for host terminals)
-    fn refresh_terminal_preview_cache_if_needed(&mut self, width: u16, height: u16) {
-        const PREVIEW_REFRESH_MS: u128 = 250;
-
+    pub(super) fn refresh_terminal_preview_cache_if_needed(&mut self, width: u16, height: u16) {
         // Symmetric with `refresh_preview_cache_if_needed`: when live-send
         // is pointed at the host-terminal pane, keep its tmux pane sized to
         // the visible output area so a window resize or info-header toggle
         // reflows the shell instead of waiting for a live-mode re-enter.
         self.resize_live_pane_if_target(live_send::LiveSendTarget::Terminal, width, height);
-
-        let scroll_offset = self.preview_scroll_offset;
-        let needs_refresh = match &self.selected_session {
-            Some(id) => {
-                self.terminal_preview_cache.session_id.as_ref() != Some(id)
-                    || self.terminal_preview_cache.dimensions != (width, height)
-                    || scroll_exceeds_cache(
-                        self.terminal_preview_cache.captured_lines,
-                        height,
-                        scroll_offset,
-                    )
-                    || self
-                        .terminal_preview_cache
-                        .last_refresh
-                        .elapsed()
-                        .as_millis()
-                        > PREVIEW_REFRESH_MS
-            }
-            None => false,
-        };
-
-        if needs_refresh {
-            if let Some(id) = &self.selected_session {
-                if let Some(inst) = self.get_instance(id) {
-                    let capture_lines = capture_lines_for(height, scroll_offset);
-                    let content = inst
-                        .terminal_tmux_session()
-                        .and_then(|s| s.capture_pane(capture_lines))
-                        .unwrap_or_default();
-                    self.terminal_preview_cache.captured_lines = content.lines().count();
-                    self.terminal_preview_cache.content = content;
-                    self.terminal_preview_cache.parsed_text = None;
-                    self.terminal_preview_cache.session_id = Some(id.clone());
-                    self.terminal_preview_cache.dimensions = (width, height);
-                    self.terminal_preview_cache.last_refresh = Instant::now();
-                    self.preview_scroll_offset = clamp_scroll_to_capture(
-                        self.preview_scroll_offset,
-                        self.terminal_preview_cache.captured_lines,
-                        self.preview_visible_rows,
-                    );
-                }
-            }
+        // Worker (retargeted to this pane in `render_preview`) drives the
+        // steady-state refresh fork-free; the core below is the cold-start /
+        // empty-worker fallback.
+        if self.apply_worker_capture(width, height, |s| &mut s.terminal_preview_cache) {
+            return;
         }
+        self.refresh_preview_cache_core(
+            width,
+            height,
+            false,
+            |s| &mut s.terminal_preview_cache,
+            |s, id, capture_lines| {
+                s.get_instance(id).map(|inst| {
+                    inst.terminal_tmux_session()
+                        .and_then(|sess| sess.capture_pane(capture_lines))
+                        .unwrap_or_default()
+                })
+            },
+        );
     }
 
     /// Refresh container terminal preview cache if needed
     fn refresh_container_terminal_preview_cache_if_needed(&mut self, width: u16, height: u16) {
-        const PREVIEW_REFRESH_MS: u128 = 250;
-
         // Symmetric with `refresh_preview_cache_if_needed`: when live-send
         // is pointed at the in-container shell, keep its tmux pane sized to
         // the visible output area so a window resize or info-header toggle
@@ -1485,91 +1600,41 @@ impl HomeView {
             width,
             height,
         );
-
-        let scroll_offset = self.preview_scroll_offset;
-        let needs_refresh = match &self.selected_session {
-            Some(id) => {
-                self.container_terminal_preview_cache.session_id.as_ref() != Some(id)
-                    || self.container_terminal_preview_cache.dimensions != (width, height)
-                    || scroll_exceeds_cache(
-                        self.container_terminal_preview_cache.captured_lines,
-                        height,
-                        scroll_offset,
-                    )
-                    || self
-                        .container_terminal_preview_cache
-                        .last_refresh
-                        .elapsed()
-                        .as_millis()
-                        > PREVIEW_REFRESH_MS
-            }
-            None => false,
-        };
-
-        if needs_refresh {
-            if let Some(id) = &self.selected_session {
-                if let Some(inst) = self.get_instance(id) {
-                    let capture_lines = capture_lines_for(height, scroll_offset);
-                    let content = inst
-                        .container_terminal_tmux_session()
-                        .and_then(|s| s.capture_pane(capture_lines))
-                        .unwrap_or_default();
-                    self.container_terminal_preview_cache.captured_lines = content.lines().count();
-                    self.container_terminal_preview_cache.content = content;
-                    self.container_terminal_preview_cache.parsed_text = None;
-                    self.container_terminal_preview_cache.session_id = Some(id.clone());
-                    self.container_terminal_preview_cache.dimensions = (width, height);
-                    self.container_terminal_preview_cache.last_refresh = Instant::now();
-                    self.preview_scroll_offset = clamp_scroll_to_capture(
-                        self.preview_scroll_offset,
-                        self.container_terminal_preview_cache.captured_lines,
-                        self.preview_visible_rows,
-                    );
-                }
-            }
+        if self.apply_worker_capture(width, height, |s| &mut s.container_terminal_preview_cache) {
+            return;
         }
+        self.refresh_preview_cache_core(
+            width,
+            height,
+            false,
+            |s| &mut s.container_terminal_preview_cache,
+            |s, id, capture_lines| {
+                s.get_instance(id).map(|inst| {
+                    inst.container_terminal_tmux_session()
+                        .and_then(|sess| sess.capture_pane(capture_lines))
+                        .unwrap_or_default()
+                })
+            },
+        );
     }
 
     fn refresh_tool_preview_cache_if_needed(&mut self, width: u16, height: u16, tool_name: &str) {
-        const PREVIEW_REFRESH_MS: u128 = 250;
-
-        let scroll_offset = self.preview_scroll_offset;
-        let needs_refresh = match &self.selected_session {
-            Some(id) => {
-                self.tool_preview_cache.session_id.as_ref() != Some(id)
-                    || self.tool_preview_cache.dimensions != (width, height)
-                    || scroll_exceeds_cache(
-                        self.tool_preview_cache.captured_lines,
-                        height,
-                        scroll_offset,
-                    )
-                    || self.tool_preview_cache.last_refresh.elapsed().as_millis()
-                        > PREVIEW_REFRESH_MS
-            }
-            None => false,
-        };
-
-        if needs_refresh {
-            if let Some(id) = &self.selected_session {
-                if let Some(inst) = self.get_instance(id) {
-                    let capture_lines = capture_lines_for(height, scroll_offset);
-                    let tool_session =
-                        crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
-                    let content = tool_session.capture_pane(capture_lines).unwrap_or_default();
-                    self.tool_preview_cache.captured_lines = content.lines().count();
-                    self.tool_preview_cache.content = content;
-                    self.tool_preview_cache.parsed_text = None;
-                    self.tool_preview_cache.session_id = Some(id.clone());
-                    self.tool_preview_cache.dimensions = (width, height);
-                    self.tool_preview_cache.last_refresh = Instant::now();
-                    self.preview_scroll_offset = clamp_scroll_to_capture(
-                        self.preview_scroll_offset,
-                        self.tool_preview_cache.captured_lines,
-                        self.preview_visible_rows,
-                    );
-                }
-            }
+        if self.apply_worker_capture(width, height, |s| &mut s.tool_preview_cache) {
+            return;
         }
+        self.refresh_preview_cache_core(
+            width,
+            height,
+            false,
+            |s| &mut s.tool_preview_cache,
+            |s, id, capture_lines| {
+                s.get_instance(id).map(|inst| {
+                    crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name)
+                        .capture_pane(capture_lines)
+                        .unwrap_or_default()
+                })
+            },
+        );
     }
 
     /// `captured_lines` from whichever preview cache is currently on screen.
@@ -1746,6 +1811,13 @@ impl HomeView {
         self.preview_visible_rows = inner.height as usize;
         frame.render_widget(block, area);
 
+        // Keep the off-thread capture worker pointed at whatever pane this
+        // view shows (and tuned to live-send vs. idle cadence) before any
+        // refresh reads from it. Done once here, not per-branch, so the
+        // creating / no-selection paths also retarget or tear it down.
+        let desired = self.displayed_pane_tmux_name();
+        self.sync_preview_capture_worker(desired);
+
         match self.view_mode {
             ViewMode::Agent => {
                 // Check if selected session is being created (show hook progress)
@@ -1787,8 +1859,12 @@ impl HomeView {
                     // means subsequent shared borrows on
                     // `parsed_text` and on `self.get_instance` can
                     // coexist in the actual render call.
+                    let cap_start = Instant::now();
                     self.refresh_preview_cache_if_needed(pane_area.width, pane_area.height);
+                    self.preview_timings.capture = cap_start.elapsed();
+                    let parse_start = Instant::now();
                     self.preview_cache.ensure_parsed();
+                    self.preview_timings.parse = parse_start.elapsed();
 
                     if let Some(id) = &self.selected_session {
                         if let Some(inst) = self.get_instance(id) {
@@ -2170,6 +2246,37 @@ impl HomeView {
             // dialog's title.
             let raw_title = live_send::format_target_label(base_title, state.target);
             let chip = " \u{25CF} LIVE \u{2192} ";
+            let chip_style = Style::default()
+                .fg(theme.background)
+                .bg(theme.running)
+                .bold();
+
+            // Which-key menu: the leader is armed, so surface the live-send
+            // commands the next key can pick instead of the normal exit
+            // hint. This is the discoverability moment the issue asked for;
+            // pressing the leader shows exactly what it does.
+            if self.live_send_pending_leader {
+                if let Some(leader) = state.leader {
+                    let lead = live_send::display_chord(leader);
+                    let sidebar_cmd = if self.sidebar_collapsed {
+                        "b show sidebar"
+                    } else {
+                        "b hide sidebar"
+                    };
+                    let menu =
+                        format!("  {lead}:  k palette \u{00b7} {sidebar_cmd} \u{00b7} q exit ");
+                    let menu_budget = (area.width as usize)
+                        .saturating_sub(unicode_width::UnicodeWidthStr::width(chip));
+                    let menu = truncate_to_width(&menu, menu_budget);
+                    let spans = vec![
+                        Span::styled(chip, chip_style),
+                        Span::styled(menu, Style::default().fg(theme.accent).bold()),
+                    ];
+                    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+                    return;
+                }
+            }
+
             // The chord display is built from the user's configured
             // exit-chord list so the hint always shows what actually
             // exits live mode for this user. Empty list (impossible
@@ -2183,6 +2290,14 @@ impl HomeView {
                 live_send::display_chord_list(&state.exit_chords)
             };
             let suffix = " to exit ";
+            // Compact reminder that the leader opens the command menu, so
+            // the user can discover the palette / sidebar toggle without
+            // having entered the menu yet. Empty when the leader is
+            // disabled (the user cleared the setting).
+            let leader_hint = state
+                .leader
+                .map(|l| format!(" \u{00b7} {} menu", live_send::display_chord(l)))
+                .unwrap_or_default();
             // `preview_visible_rows` is the output-body height the renderer
             // last painted into (pane height minus the inner banner row only
             // when that banner is shown). Reuse it so the live `[offset/max]`
@@ -2207,17 +2322,12 @@ impl HomeView {
                 + 2 // double space before the chord
                 + unicode_width::UnicodeWidthStr::width(chord.as_str())
                 + unicode_width::UnicodeWidthStr::width(suffix)
+                + unicode_width::UnicodeWidthStr::width(leader_hint.as_str())
                 + unicode_width::UnicodeWidthStr::width(scroll.as_str());
             let title_budget = (area.width as usize).saturating_sub(fixed_width);
             let title = truncate_to_width(&raw_title, title_budget);
             let mut spans: Vec<Span<'static>> = vec![
-                Span::styled(
-                    chip,
-                    Style::default()
-                        .fg(theme.background)
-                        .bg(theme.running)
-                        .bold(),
-                ),
+                Span::styled(chip, chip_style),
                 Span::raw(" "),
                 Span::styled(title, Style::default().fg(theme.text).bold()),
             ];
@@ -2233,6 +2343,12 @@ impl HomeView {
                 Style::default().fg(theme.accent).bold(),
             ));
             spans.push(Span::styled(suffix, Style::default().fg(theme.dimmed)));
+            if !leader_hint.is_empty() {
+                spans.push(Span::styled(
+                    leader_hint,
+                    Style::default().fg(theme.dimmed).italic(),
+                ));
+            }
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
             return;
         }

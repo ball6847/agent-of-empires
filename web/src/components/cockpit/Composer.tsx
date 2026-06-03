@@ -18,20 +18,35 @@ import {
   type Unstable_TriggerAdapter,
   type Unstable_TriggerItem,
 } from "@assistant-ui/core";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AtSign,
   ChevronUp,
+  Paperclip,
   Slash,
   Square,
+  X,
 } from "lucide-react";
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
 import { SessionConfigControls } from "./SessionConfigControls";
-import type { CockpitState } from "../../lib/cockpitTypes";
+import { SwitchAgentModal } from "./SwitchAgentModal";
+import {
+  OPEN_SWITCH_AGENT_EVENT,
+  consumePendingSwitchAgent,
+  type OpenSwitchAgentDetail,
+} from "../../lib/switchAgentTrigger";
+import type {
+  CockpitState,
+  PromptAttachmentInput,
+  PromptAttachmentKind,
+  PromptCapabilities,
+} from "../../lib/cockpitTypes";
 import { getDraft, setDraft } from "../../lib/cockpitDrafts";
+import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useAgentProfile } from "../../lib/agentProfileContext";
+import { resolveModeChannel } from "../../lib/modeChannel";
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
 
@@ -140,8 +155,56 @@ function detectMobileInput(): boolean {
   return coarse && !anyFine;
 }
 
+/** Client-side mirror of the server's per-prompt attachment cap. */
+const MAX_ATTACHMENTS = 8;
+
+/** Map a file's MIME type to the ACP attachment kind. */
+function mimeToKind(mime: string): PromptAttachmentKind {
+  if (mime.startsWith("image/")) return "image";
+  if (mime.startsWith("audio/")) return "audio";
+  return "resource";
+}
+
+/** Whether the current agent accepts the given attachment kind. */
+function kindSupported(
+  kind: PromptAttachmentKind,
+  caps: PromptCapabilities | null,
+): boolean {
+  if (!caps) return false;
+  if (kind === "image") return caps.image;
+  if (kind === "audio") return caps.audio;
+  return caps.embeddedContext;
+}
+
+/** The `accept` attribute for the file picker, narrowed to the kinds
+ *  the agent advertises so the OS dialog only offers usable files. */
+function acceptForCaps(caps: PromptCapabilities | null): string {
+  const parts: string[] = [];
+  if (caps?.image) parts.push("image/*");
+  if (caps?.audio) parts.push("audio/*");
+  if (caps?.embeddedContext) parts.push(".txt,.md,.json,.pdf");
+  return parts.join(",");
+}
+
+/** Read a File into standard base64 (no `data:` prefix). */
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("read failed"));
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      // `data:<mime>;base64,<b64>` → keep only the base64 tail.
+      resolve(result.slice(result.indexOf(",") + 1));
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 interface Props {
   sessionId: string;
+  /** Registry key of the agent the session currently runs. Drives the
+   *  "Switch agent" control's filtered target list and handoff copy. */
+  currentAgent: CockpitState["agent"];
   availableModes: CockpitState["availableModes"];
   currentModeId: CockpitState["currentModeId"];
   /** Legacy enum-based mode used as fallback when the agent does not
@@ -187,7 +250,20 @@ interface Props {
    *  the ComposerPrimitive.Send path (which assistant-ui hard-disables
    *  while `thread.isRunning && !capabilities.queue`). Used by the
    *  mid-turn Send button + the Enter-while-running handler. */
-  enqueuePrompt: (text: string) => void | Promise<void>;
+  enqueuePrompt: (
+    text: string,
+    attachments?: PromptAttachmentInput[],
+  ) => void | Promise<void>;
+  /** Attachment kinds the current agent accepts, gating the paperclip
+   *  / paste / drop affordances. Null until the handshake reports it.
+   *  See #1000 / #965. */
+  promptCapabilities: PromptCapabilities | null;
+  /** Attachments staged for the next send, owned by CockpitRuntime so
+   *  the assistant-ui Enter / Send path can read them on submit. */
+  pendingAttachments: PromptAttachmentInput[];
+  setPendingAttachments: React.Dispatch<
+    React.SetStateAction<PromptAttachmentInput[]>
+  >;
   /** When set, replace the current composer text with `text` and
    *  focus the textarea (cursor at end). Used by the context-primer
    *  banner to prefill a transcript recap before send. The `id` is
@@ -198,6 +274,7 @@ interface Props {
 
 export function Composer({
   sessionId,
+  currentAgent,
   availableModes,
   currentModeId,
   legacyMode,
@@ -210,10 +287,70 @@ export function Composer({
   turnActive,
   queuedCount,
   enqueuePrompt,
+  promptCapabilities,
+  pendingAttachments,
+  setPendingAttachments,
   primerPrefill,
 }: Props) {
   const taRef = useRef<HTMLTextAreaElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const { files } = useFilesIndex(sessionId);
+
+  const attachmentsEnabled =
+    !!promptCapabilities &&
+    (promptCapabilities.image ||
+      promptCapabilities.audio ||
+      promptCapabilities.embeddedContext);
+
+  // Stage files dropped, pasted, or picked. Filters to kinds the agent
+  // accepts and respects the per-prompt count cap; oversize / type
+  // rejection beyond this is enforced authoritatively server-side.
+  const addFiles = useCallback(
+    async (files: FileList | File[]) => {
+      // Only encode up to the remaining slots: base64 work on files the
+      // cap would discard anyway stalls the composer on large drops.
+      const remaining = Math.max(0, MAX_ATTACHMENTS - pendingAttachments.length);
+      if (remaining === 0) return;
+      const list = Array.from(files).slice(0, remaining);
+      const accepted: PromptAttachmentInput[] = [];
+      for (const file of list) {
+        const kind = mimeToKind(file.type || "application/octet-stream");
+        if (!kindSupported(kind, promptCapabilities)) continue;
+        const dataB64 = await fileToBase64(file);
+        if (!dataB64) continue;
+        accepted.push({
+          kind,
+          mimeType: file.type || "application/octet-stream",
+          name: file.name || undefined,
+          dataB64,
+        });
+      }
+      if (accepted.length === 0) return;
+      setPendingAttachments((prev) =>
+        prev.concat(accepted).slice(0, MAX_ATTACHMENTS),
+      );
+    },
+    [pendingAttachments.length, promptCapabilities, setPendingAttachments],
+  );
+
+  // Reconcile already-staged attachments when capabilities change (e.g.
+  // after a manual agent switch): drop files whose kind the new agent no
+  // longer supports so they cannot be submitted. `attachmentsEnabled`
+  // only gates new intake, not files staged under the previous agent.
+  useEffect(() => {
+    if (!promptCapabilities) return;
+    setPendingAttachments((prev) => {
+      const next = prev.filter((att) => kindSupported(att.kind, promptCapabilities));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [promptCapabilities, setPendingAttachments]);
+
+  const removeAttachment = useCallback(
+    (index: number) => {
+      setPendingAttachments((prev) => prev.filter((_, i) => i !== index));
+    },
+    [setPendingAttachments],
+  );
 
   // When the soft keyboard is up the App root's safe-area-inset-bottom
   // padding reserves space for the iOS home indicator that the keyboard
@@ -304,6 +441,47 @@ export function Composer({
   );
 
   const composerRuntime = useComposerRuntime();
+
+  // Unified submit for the custom Send / QueueSend buttons and the
+  // mid-turn Enter path: drains the textarea text + staged attachments
+  // through `enqueuePrompt` (which is the cockpit `sendPrompt`), then
+  // clears both. The idle assistant-ui Enter path submits via the
+  // runtime's `onNew`, which reads the same staged attachments from
+  // CockpitRuntime. See #1000 / #965.
+  const submitComposer = useCallback(() => {
+    void sendFromTextarea(
+      taRef,
+      composerRuntime,
+      enqueuePrompt,
+      pendingAttachments,
+      () => setPendingAttachments([]),
+    );
+  }, [composerRuntime, enqueuePrompt, pendingAttachments, setPendingAttachments]);
+
+  // Manual agent switch dialog. Opened from the sidebar row context menu
+  // (see WorkspaceSidebar's "Switch agent" item) via the cross-component
+  // trigger below. Unlike the rate-limit recovery path (which lives up in
+  // CockpitView), this is available at any time so a user can hand back
+  // to, say, claude after a rate-limit handoff to codex.
+  const [switchAgentOpen, setSwitchAgentOpen] = useState(false);
+  // Open on a switch-agent request targeting this session. The dispatched
+  // event covers the already-open session; the pending latch (consumed on
+  // mount) covers the case where the user picked the menu item on another
+  // session and navigation mounted this Composer a tick later.
+  useEffect(() => {
+    if (consumePendingSwitchAgent(sessionId)) setSwitchAgentOpen(true);
+    const onOpen = (e: Event) => {
+      const detail = (e as CustomEvent<OpenSwitchAgentDetail>).detail;
+      if (detail?.sessionId === sessionId) {
+        // Clear the latch we also set, so a later remount of this
+        // already-open session does not reopen the dialog.
+        consumePendingSwitchAgent(sessionId);
+        setSwitchAgentOpen(true);
+      }
+    };
+    window.addEventListener(OPEN_SWITCH_AGENT_EVENT, onOpen);
+    return () => window.removeEventListener(OPEN_SWITCH_AGENT_EVENT, onOpen);
+  }, [sessionId]);
 
   // iOS Safari native dictation (#1431): WebKit fires `beforeinput` /
   // `input` with `inputType: "insertReplacementText"` per partial
@@ -452,7 +630,22 @@ export function Composer({
   const wrapperLayout = composerWrapperLayout({ keyboardOpen });
   return (
     <div className={wrapperLayout.className} style={wrapperLayout.style}>
-      <div className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl">
+      <div
+        {...tourAnchor(TOUR_ANCHORS.composer)}
+        className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl"
+        onDragOver={(e) => {
+          const hasFiles = Array.from(e.dataTransfer?.types ?? []).includes("Files");
+          if (!hasFiles) return;
+          e.preventDefault();
+        }}
+        onDrop={(e) => {
+          const dropped = e.dataTransfer?.files;
+          if (!dropped || dropped.length === 0) return;
+          e.preventDefault();
+          if (!attachmentsEnabled) return;
+          void addFiles(dropped);
+        }}
+      >
         <ComposerPrimitive.Unstable_TriggerPopoverRoot>
           <ComposerPrimitive.Root
             className={[
@@ -601,7 +794,21 @@ export function Composer({
                 // action === "send"
                 e.preventDefault();
                 e.stopPropagation();
-                void sendFromTextarea(taRef, composerRuntime, enqueuePrompt);
+                submitComposer();
+              }}
+              onPaste={(e) => {
+                // Cmd/Ctrl+V of an image (screenshot) lands here as a
+                // clipboard file item. Capture supported files and stage
+                // them; let text paste fall through untouched. See #965.
+                if (!attachmentsEnabled) return;
+                const items = Array.from(e.clipboardData?.items ?? []);
+                const files = items
+                  .filter((it) => it.kind === "file")
+                  .map((it) => it.getAsFile())
+                  .filter((f): f is File => f != null);
+                if (files.length === 0) return;
+                e.preventDefault();
+                void addFiles(files);
               }}
               autoFocus={!isMobile}
               className={[
@@ -610,6 +817,43 @@ export function Composer({
                 "placeholder:text-text-dim focus:outline-none",
               ].join(" ")}
             />
+
+            {/* Staged attachments — thumbnails for images, labelled
+                chips for audio / resources. Removable before send. */}
+            {pendingAttachments.length > 0 && (
+              <div className="flex flex-wrap gap-2 px-3 pt-1">
+                {pendingAttachments.map((att, i) => (
+                  <div
+                    key={`${att.name ?? att.kind}-${i}`}
+                    className="group/att relative flex items-center gap-2 rounded-md border border-surface-700 bg-surface-800 py-1 pl-1 pr-2 text-[11px] text-text-secondary"
+                  >
+                    {att.kind === "image" ? (
+                      <img
+                        src={`data:${att.mimeType};base64,${att.dataB64}`}
+                        alt={att.name ?? "attachment"}
+                        className="h-8 w-8 rounded object-cover"
+                      />
+                    ) : (
+                      <span className="flex h-8 w-8 items-center justify-center rounded bg-surface-700">
+                        <Paperclip className="h-3.5 w-3.5" />
+                      </span>
+                    )}
+                    <span className="max-w-[120px] truncate">
+                      {att.name ?? att.kind}
+                    </span>
+                    <button
+                      type="button"
+                      aria-label={`Remove ${att.name ?? "attachment"}`}
+                      title="Remove attachment"
+                      onClick={() => removeAttachment(i)}
+                      className="rounded p-0.5 text-text-dim hover:bg-surface-700 hover:text-text-secondary"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
 
             {/* Footer strip — affordances on the left, send/stop on the right */}
             <div className="flex items-center justify-between gap-2 border-t border-surface-800/60 px-2 pb-2 pt-1.5">
@@ -626,12 +870,40 @@ export function Composer({
                   hint="/"
                   onClick={() => insertAtCaret(taRef, "/")}
                 />
+                <ToolbarButton
+                  icon={<Paperclip className="h-3.5 w-3.5" />}
+                  label={
+                    attachmentsEnabled
+                      ? "Attach files (image / audio / resource)"
+                      : promptCapabilities
+                        ? "This agent does not accept attachments"
+                        : "Waiting for agent capabilities…"
+                  }
+                  disabled={!attachmentsEnabled}
+                  onClick={() => fileInputRef.current?.click()}
+                />
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  accept={acceptForCaps(promptCapabilities)}
+                  className="hidden"
+                  onChange={(e) => {
+                    const picked = e.target.files;
+                    if (picked && picked.length > 0) void addFiles(picked);
+                    // Reset so re-picking the same file fires onChange.
+                    e.target.value = "";
+                  }}
+                />
                 <span className="mx-1 h-4 w-px bg-surface-700" aria-hidden />
                 <ModePicker
                   sessionId={sessionId}
                   availableModes={availableModes}
                   currentModeId={currentModeId}
                   legacyMode={legacyMode}
+                  configOptions={configOptions}
+                  pendingConfigOption={pendingConfigOption}
+                  setConfigOption={setConfigOption}
                 />
                 <SessionConfigControls
                   configOptions={configOptions}
@@ -648,17 +920,40 @@ export function Composer({
                     <QueueSendButton
                       connected={connected}
                       queuedCount={queuedCount}
-                      onSend={() => sendFromTextarea(taRef, composerRuntime, enqueuePrompt)}
+                      onSend={submitComposer}
                     />
                   </>
                 ) : (
-                  <SendButton connected={connected} />
+                  <SendButton connected={connected} onSend={submitComposer} />
                 )}
               </div>
             </div>
           </ComposerPrimitive.Root>
         </ComposerPrimitive.Unstable_TriggerPopoverRoot>
       </div>
+      <SwitchAgentModal
+        open={switchAgentOpen}
+        sessionId={sessionId}
+        currentAgent={currentAgent}
+        onClose={() => setSwitchAgentOpen(false)}
+        onPrefill={(text) => {
+          composerRuntime.setText(text);
+          requestAnimationFrame(() => {
+            const el = taRef.current;
+            if (!el) return;
+            el.focus();
+            const len = el.value.length;
+            try {
+              el.setSelectionRange(len, len);
+            } catch {
+              // ignore: non-text inputs can throw here
+            }
+            el.style.height = "auto";
+            el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+          });
+        }}
+        trigger="manual"
+      />
     </div>
   );
 }
@@ -845,23 +1140,30 @@ function ToolbarButton({
 
 /* ── Mode picker ─────────────────────────────────────────────────── */
 
-const LEGACY_MODES: ReadonlyArray<{
-  id: string;
-  legacyId: CockpitState["mode"];
-  name: string;
-  description: string;
-}> = [
-  { id: "default", legacyId: "Default", name: "Default", description: "Approve each tool individually" },
-  { id: "plan", legacyId: "Plan", name: "Plan", description: "Plan first, no edits applied" },
-  { id: "accept_edits", legacyId: "AcceptEdits", name: "Accept edits", description: "Auto-approve safe file edits" },
-  { id: "bypass_permissions", legacyId: "BypassPermissions", name: "Yolo", description: "Skip all approvals (destructive)" },
-];
-
 interface ModePickerProps {
   sessionId: string;
   availableModes: CockpitState["availableModes"];
   currentModeId: string | null;
   legacyMode: CockpitState["mode"];
+  configOptions: CockpitState["configOptions"];
+  pendingConfigOption: CockpitState["pendingConfigOption"];
+  setConfigOption: (configId: string, value: string) => void | Promise<void>;
+}
+
+/** POST the legacy `session/set_mode` path. Used by the SessionModeState
+ *  and claude-fallback channels; the config-option channel switches via
+ *  `setConfigOption` instead. */
+async function postLegacyMode(sessionId: string, id: string): Promise<void> {
+  try {
+    await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/cockpit/mode`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode_id: id }),
+    });
+  } catch {
+    // The agent broadcasts CurrentModeChanged on success; if the request
+    // fails the UI stays on the current mode.
+  }
 }
 
 function ModePicker({
@@ -869,37 +1171,28 @@ function ModePicker({
   availableModes,
   currentModeId,
   legacyMode,
+  configOptions,
+  pendingConfigOption,
+  setConfigOption,
 }: ModePickerProps) {
+  const profile = useAgentProfile();
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement | null>(null);
 
-  // Use real agent-advertised modes when available, otherwise fall
-  // back to the four-mode taxonomy. Even with agent modes, we still
-  // tint by id pattern (default/plan/accept/bypass) because Claude's
-  // adapter happens to use those tokens.
-  const usingAgentModes = availableModes.length > 0;
-  const modes = usingAgentModes
-    ? availableModes.map((m) => ({
-        id: m.id,
-        name: m.name,
-        description: m.description ?? "",
-      }))
-    : LEGACY_MODES.map((m) => ({
-        id: m.id,
-        name: m.name,
-        description: m.description,
-      }));
+  // Resolve which channel drives the picker (config option vs ACP
+  // SessionModeState vs claude fallback) and pair each with its own
+  // write path so the two never drift. See lib/modeChannel.ts.
+  const channel = resolveModeChannel({
+    configOptions,
+    availableModes,
+    currentModeId,
+    legacyMode,
+    pendingConfigOption,
+    allowLegacyFallback: profile.capabilities.legacyModeFallback,
+  });
 
-  // Pick "current": agent-reported id wins; else map legacyMode → id.
-  const fallbackId =
-    LEGACY_MODES.find((m) => m.legacyId === legacyMode)?.id ?? "default";
-  const activeId = currentModeId ?? fallbackId;
-  const current = modes.find((m) => m.id === activeId) ?? modes[0]!;
-
-  // Tint the chip by id pattern so destructive modes are visually loud.
-  const tone = toneForId(activeId);
-
-  // Close on outside click / Esc.
+  // Close on outside click / Esc. Declared before the early return so
+  // hook order stays stable across renders where `channel` is null.
   useEffect(() => {
     if (!open) return;
     const onClick = (e: MouseEvent) => {
@@ -916,26 +1209,28 @@ function ModePicker({
     };
   }, [open]);
 
-  const select = async (id: string) => {
+  // Nothing advertised on an agent without a claude-style taxonomy:
+  // render no picker rather than a phantom vocabulary it would reject.
+  if (!channel) return null;
+
+  const current =
+    channel.modes.find((m) => m.id === channel.activeId) ?? channel.modes[0]!;
+
+  // Tint the chip by id pattern so destructive modes are visually loud.
+  const tone = toneForId(channel.activeId);
+
+  const select = (id: string) => {
     setOpen(false);
-    if (id === activeId) return;
-    try {
-      await fetch(
-        `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/mode`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mode_id: id }),
-        },
-      );
-    } catch {
-      // The agent broadcasts CurrentModeChanged on success; if the
-      // request fails the UI stays on the current mode.
+    if (id === channel.activeId || id === channel.pendingId) return;
+    if (channel.kind === "config") {
+      void setConfigOption(channel.configId, id);
+    } else {
+      void postLegacyMode(sessionId, id);
     }
   };
 
   return (
-    <div ref={ref} className="relative">
+    <div ref={ref} {...tourAnchor(TOUR_ANCHORS.modePicker)} className="relative">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -955,39 +1250,47 @@ function ModePicker({
           role="menu"
         >
           <div className="border-b border-surface-800 px-3 py-1.5 text-[10px] uppercase tracking-wider text-text-dim">
-            {usingAgentModes ? "Agent modes" : "Modes"}
+            {channel.label}
           </div>
-          {modes.map((opt) => (
-            <button
-              key={opt.id}
-              type="button"
-              role="menuitem"
-              onClick={() => void select(opt.id)}
-              className={[
-                "flex w-full items-start gap-2 px-3 py-2 text-left text-xs hover:bg-surface-800",
-                opt.id === activeId ? "bg-surface-800/60" : "",
-              ].join(" ")}
-            >
-              <span
+          {channel.modes.map((opt) => {
+            const isPending = opt.id === channel.pendingId;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                role="menuitem"
+                disabled={isPending}
+                onClick={() => select(opt.id)}
                 className={[
-                  "mt-0.5 inline-block h-3 w-3 shrink-0 rounded-full border",
-                  opt.id === activeId
-                    ? "border-brand-500 bg-brand-500"
-                    : "border-surface-700",
+                  "flex w-full items-start gap-2 px-3 py-2 text-left text-xs hover:bg-surface-800",
+                  opt.id === channel.activeId ? "bg-surface-800/60" : "",
+                  isPending ? "cursor-not-allowed opacity-50" : "",
                 ].join(" ")}
-              />
-              <span className="min-w-0 flex-1">
-                <span className="block font-medium text-text-primary">
-                  {opt.name}
-                </span>
-                {opt.description && (
-                  <span className="block text-[11px] text-text-dim">
-                    {opt.description}
+              >
+                <span
+                  className={[
+                    "mt-0.5 inline-block h-3 w-3 shrink-0 rounded-full border",
+                    opt.id === channel.activeId
+                      ? "border-brand-500 bg-brand-500"
+                      : "border-surface-700",
+                  ].join(" ")}
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="block font-medium text-text-primary">
+                    {opt.name}
                   </span>
+                  {opt.description && (
+                    <span className="block text-[11px] text-text-dim">
+                      {opt.description}
+                    </span>
+                  )}
+                </span>
+                {isPending && (
+                  <span className="text-[10px] uppercase text-text-dim">…</span>
                 )}
-              </span>
-            </button>
-          ))}
+              </button>
+            );
+          })}
         </div>
       )}
     </div>
@@ -1058,33 +1361,39 @@ function formatCost(amount: number, currency: string): string {
 
 /* ── Send / Stop ─────────────────────────────────────────────────── */
 
-function SendButton({ connected = true }: { connected?: boolean }) {
+function SendButton({
+  connected = true,
+  onSend,
+}: {
+  connected?: boolean;
+  onSend: () => void;
+}) {
   // When the session is inactive (WS closed, worker stopped, worker
   // restarting) we leave the button clickable: `sendPrompt` routes the
   // text into the local queue and the drain effect fires it on resume.
   // The tooltip swaps so users can tell the click queued rather than
-  // sent. ComposerPrimitive.Send still drives the assistant-ui submit
-  // flow; it does not look at our `connected` flag. See #1359.
+  // sent. A custom button (not ComposerPrimitive.Send) drives submit so
+  // the staged attachments ride along and an attachment-only prompt can
+  // send even with empty text. See #1359 / #1000.
   const title = connected
     ? "Send, Enter"
     : "Session not active, will send on resume";
   const label = connected ? "Send message" : "Queue message until session resumes";
   return (
-    <ComposerPrimitive.Send asChild>
-      <button
-        type="submit"
-        aria-label={label}
-        title={title}
-        className={[
-          "group/send inline-flex items-center justify-center gap-1",
-          "rounded-lg bg-brand-600 px-2.5 py-1.5 text-white shadow-sm",
-          "hover:bg-brand-500 active:scale-[0.98]",
-          "transition-all duration-100",
-        ].join(" ")}
-      >
-        <PaperPlaneIcon />
-      </button>
-    </ComposerPrimitive.Send>
+    <button
+      type="button"
+      aria-label={label}
+      title={title}
+      onClick={onSend}
+      className={[
+        "group/send inline-flex items-center justify-center gap-1",
+        "rounded-lg bg-brand-600 px-2.5 py-1.5 text-white shadow-sm",
+        "hover:bg-brand-500 active:scale-[0.98]",
+        "transition-all duration-100",
+      ].join(" ")}
+    >
+      <PaperPlaneIcon />
+    </button>
   );
 }
 
@@ -1138,6 +1447,7 @@ function QueueSendButton({
     <button
       type="button"
       aria-label="Queue follow-up message"
+      {...tourAnchor(TOUR_ANCHORS.queueSend)}
       title={title}
       onClick={onSend}
       className={[
@@ -1170,13 +1480,21 @@ function QueueSendButton({
 function sendFromTextarea(
   taRef: React.RefObject<HTMLTextAreaElement | null>,
   composerRuntime: ReturnType<typeof useComposerRuntime>,
-  enqueuePrompt: (text: string) => void | Promise<void>,
+  enqueuePrompt: (
+    text: string,
+    attachments?: PromptAttachmentInput[],
+  ) => void | Promise<void>,
+  attachments: PromptAttachmentInput[] = [],
+  clearAttachments?: () => void,
 ): void {
   if (!composerRuntime) return;
   const text = composerRuntime.getState().text.trim();
-  if (!text) return;
-  void enqueuePrompt(text);
+  // Allow an attachment-only prompt (e.g. a pasted screenshot with no
+  // text); otherwise require some text.
+  if (!text && attachments.length === 0) return;
+  void enqueuePrompt(text, attachments.length > 0 ? attachments : undefined);
   composerRuntime.setText("");
+  clearAttachments?.();
   // Manually reset the textarea height; auto-grow runs on input events
   // and we cleared the value without firing one.
   const el = taRef.current;

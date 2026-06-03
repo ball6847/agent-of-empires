@@ -20,6 +20,9 @@ pub struct Config {
     pub updates: UpdatesConfig,
 
     #[serde(default)]
+    pub telemetry: TelemetryConfig,
+
+    #[serde(default)]
     pub worktree: WorktreeConfig,
 
     #[serde(default)]
@@ -303,6 +306,19 @@ pub struct CockpitConfig {
     /// has no effect. See #1240.
     #[serde(default = "default_silent_orphan_fast_grace_secs")]
     pub silent_orphan_fast_grace_secs: u32,
+    /// Auto-stop idle cockpit workers: seconds of inactivity (no cockpit
+    /// events and no in-flight turn) after which the daemon shuts a
+    /// worker down and marks its session dormant so the reconciler does
+    /// not respawn it. The next user prompt wakes the session and the
+    /// reconciler spawns a fresh worker. `0` (default) disables the
+    /// feature entirely; no worker is ever stopped for inactivity. See
+    /// #1689.
+    #[serde(default = "default_auto_stop_idle_secs")]
+    pub auto_stop_idle_secs: u32,
+}
+
+fn default_auto_stop_idle_secs() -> u32 {
+    0
 }
 
 fn default_max_concurrent_resumes() -> u32 {
@@ -370,6 +386,7 @@ impl Default for CockpitConfig {
             force_end_turn_threshold_secs: default_force_end_turn_threshold_secs(),
             silent_orphan_grace_secs: default_silent_orphan_grace_secs(),
             silent_orphan_fast_grace_secs: default_silent_orphan_fast_grace_secs(),
+            auto_stop_idle_secs: default_auto_stop_idle_secs(),
         }
     }
 }
@@ -493,6 +510,13 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_preview_info: Option<bool>,
 
+    /// True once the user has answered the telemetry opt-in prompt (in any
+    /// surface, either by enabling or declining). Gates the one-time
+    /// standalone consent popup shown to users who completed the walkthrough
+    /// before telemetry existed, so it appears once and never again.
+    #[serde(default)]
+    pub has_responded_to_telemetry: bool,
+
     #[serde(default)]
     pub has_seen_custom_instruction_warning: bool,
 
@@ -546,6 +570,16 @@ pub struct SessionConfig {
     #[serde(default = "default_true")]
     pub agent_status_hooks: bool,
 
+    /// Request xterm mouse tracking from the terminal so the TUI handles the
+    /// scroll wheel (preview-pane scroll, #795) and click-to-select rows.
+    /// Disable to hand wheel and text selection back to the terminal, e.g.
+    /// iOS Mosh + Termius/Blink, which don't reliably forward mouse-tracking
+    /// escapes. The `AOE_MOUSE_CAPTURE` env var stays as an opt-out backstop:
+    /// capture is requested only when this is true and the env var hasn't
+    /// disabled it. Default on.
+    #[serde(default = "default_true")]
+    pub mouse_capture: bool,
+
     /// User-defined custom agents: name -> launch command
     /// (e.g., "lenovo-claude" = "ssh -t lenovo claude").
     /// Custom agent names appear in the TUI agent picker alongside built-in agents.
@@ -557,6 +591,18 @@ pub struct SessionConfig {
     /// Maps a custom (or built-in) agent to another agent's status detection heuristics.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub agent_detect_as: HashMap<String, String>,
+
+    /// ACP launch command for a custom agent, enabling it to run in the
+    /// structured cockpit UI (e.g., "oc-superpowers" = "ocp run sp acp").
+    /// A custom agent with an entry here is cockpit-capable; without one it
+    /// is tmux-only.
+    ///
+    /// Note: unlike `custom_agents` (a shell command run in a tmux pane),
+    /// this value is split into argv with shell-word rules and executed
+    /// directly, with no shell. For shell features, wrap explicitly, e.g.
+    /// `sh -lc 'source ~/.profile && ocp run sp acp'`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub agent_cockpit_cmd: HashMap<String, String>,
 
     /// Require SHIFT on letter-based TUI hotkeys (e.g. SHIFT+N for New, SHIFT+D for Delete).
     /// Guards against accidental destructive actions from dictation software, a forgotten
@@ -577,6 +623,19 @@ pub struct SessionConfig {
     /// Default: 30 minutes.
     #[serde(default = "default_snooze_duration_minutes")]
     pub snooze_duration_minutes: u32,
+
+    /// Seconds of inactivity after which a plain TUI/tmux session that has
+    /// been `Idle` this long is auto-stopped (its tmux session and any
+    /// sandbox container are killed and the row becomes a restartable
+    /// `Stopped` row). `0` disables (default); no session is ever auto-stopped
+    /// for inactivity. Idle age is anchored on the later of the last
+    /// transition into `Idle` and the last user interaction, and a session
+    /// with a currently attached tmux client is never stopped, so a session
+    /// the user is reading is spared. Checked about once a minute, so the stop
+    /// can lag the threshold by up to a minute. Cockpit workers use the
+    /// separate `cockpit.auto_stop_idle_secs` knob; see #1689 and #1690.
+    #[serde(default = "default_auto_stop_idle_secs")]
+    pub auto_stop_idle_secs: u32,
 
     /// Text sent to the agent after a successful `aoe session restart` /
     /// `e`-keybind restart, once the post-restart readiness probe says the
@@ -614,6 +673,20 @@ pub struct SessionConfig {
     #[serde(default = "default_live_send_exit_chord")]
     pub live_send_exit_chord: String,
 
+    /// Leader (prefix) chord for live-send mode commands, tmux-style
+    /// (`C-b`, `C-a`, `M-Space`, `F1`, …). In live mode the leader arms
+    /// a one-shot menu: leader then `k` opens the command palette, `b`
+    /// toggles the sidebar, `q` exits. Pressing the leader twice sends a
+    /// literal leader keystroke to the agent (matches tmux `send-prefix`).
+    /// Default `C-b` lines up with tmux and herdr; the only chord it
+    /// steals from the agent is the leader itself, and double-tap still
+    /// delivers it. Set empty to disable the leader entirely (every key,
+    /// including `C-b`, then passes straight through). The dedicated exit
+    /// chord (`live_send_exit_chord`, default `C-q`) is independent of the
+    /// leader and stays a single-press fast exit.
+    #[serde(default = "default_live_send_leader")]
+    pub live_send_leader: String,
+
     /// What the TUI does immediately after a new session finishes
     /// creating. `Tmux` (default) drops into the tmux attach view, the
     /// historical behavior. `LiveSend` enters live-send mode against
@@ -642,6 +715,14 @@ pub struct SessionConfig {
     /// `default_attach_mode` regardless of this setting.
     #[serde(default)]
     pub click_action: ClickAction,
+
+    /// Show a "quit aoe?" confirmation when the user presses `q` to leave
+    /// the home screen, guarding against accidental exits (e.g. a Ctrl+Q
+    /// live-mode-exit habit landing on the home view). On by default;
+    /// the dialog offers a "don't warn me again" option that flips this
+    /// off. Ctrl+C still force-quits without a prompt.
+    #[serde(default = "default_true")]
+    pub confirm_before_quit: bool,
 }
 
 /// What a single mouse click on a session row does in the Agent view.
@@ -710,17 +791,22 @@ impl Default for SessionConfig {
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
             agent_status_hooks: true,
+            mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
+            agent_cockpit_cmd: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
+            auto_stop_idle_secs: default_auto_stop_idle_secs(),
             restart_wake_message: default_restart_wake_message(),
             row_tag: RowTagMode::default(),
             session_id_poller_max_threads: default_session_id_poller_max_threads(),
             live_send_exit_chord: default_live_send_exit_chord(),
+            live_send_leader: default_live_send_leader(),
             new_session_attach_mode: NewSessionAttachMode::default(),
             default_attach_mode: NewSessionAttachMode::default(),
             click_action: ClickAction::default(),
+            confirm_before_quit: true,
         }
     }
 }
@@ -739,6 +825,13 @@ fn default_live_send_exit_chord() -> String {
     "C-q".to_string()
 }
 
+fn default_live_send_leader() -> String {
+    // Ctrl+b: the tmux (and herdr) leader. Familiar to multiplexer users
+    // and steals only one chord from the agent. Kept in sync with
+    // live_send::DEFAULT_LEADER.
+    "C-b".to_string()
+}
+
 /// Upper bound on snooze duration: 30 days (43,200 minutes). Originally
 /// capped at 24 hours but the TUI snooze dialog now offers up to a 1-week
 /// preset and longer ad-hoc values via the API are reasonable for
@@ -750,6 +843,17 @@ pub fn validate_snooze_duration(minutes: u64) -> Result<(), String> {
         return Err(format!(
             "Snooze duration must be between 1 and {} minutes (got {})",
             SNOOZE_MAX_MINUTES, minutes
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_auto_stop_idle_secs(secs: u64) -> Result<(), String> {
+    if secs > u32::MAX as u64 {
+        return Err(format!(
+            "Auto-stop idle seconds must be at most {} (got {})",
+            u32::MAX,
+            secs
         ));
     }
     Ok(())
@@ -809,6 +913,40 @@ impl SessionConfig {
                 );
             }
         }
+        for (name, command) in &self.agent_cockpit_cmd {
+            if name.is_empty() {
+                tracing::warn!(target: "session.store", "agent_cockpit_cmd: entry with empty agent name will be ignored");
+                continue;
+            }
+            if crate::agents::get_agent(name).is_some() {
+                tracing::warn!(target: "session.store",
+                    "agent_cockpit_cmd: '{}' shadows a built-in agent; built-in agents already have a cockpit adapter and the entry will be ignored",
+                    name
+                );
+                continue;
+            }
+            if !self.custom_agents.contains_key(name) {
+                tracing::warn!(target: "session.store",
+                    "agent_cockpit_cmd: '{}' has no matching custom_agents entry; it will not appear in the agent picker",
+                    name
+                );
+            }
+            match shell_words::split(command) {
+                Ok(argv) if argv.is_empty() => {
+                    tracing::warn!(target: "session.store",
+                        "agent_cockpit_cmd: '{}' has an empty command, cockpit will be unavailable for it",
+                        name
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(target: "session.store",
+                        "agent_cockpit_cmd: '{}' has a malformed command ({}), cockpit will be unavailable for it",
+                        name, e
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -823,6 +961,10 @@ pub struct DiffConfig {
     /// Number of context lines to show around changes
     #[serde(default = "default_context_lines")]
     pub context_lines: usize,
+
+    /// Render diffs side-by-side (split) instead of unified.
+    #[serde(default)]
+    pub split_view: bool,
 }
 
 impl Default for DiffConfig {
@@ -830,6 +972,7 @@ impl Default for DiffConfig {
         Self {
             default_branch: None,
             context_lines: 3,
+            split_view: false,
         }
     }
 }
@@ -1031,6 +1174,21 @@ fn default_web_poll_interval_minutes() -> u64 {
     60
 }
 
+/// Anonymous, opt-in usage telemetry. Off by default; mirrors the privacy
+/// posture of [`UpdatesConfig`] (the only other outbound call in the tool).
+///
+/// The single `enabled` flag is the consent boundary the user controls in
+/// every settings surface. The anonymous install id lives in a dedicated
+/// `telemetry.json` (NOT here), so pasting `config.toml` into a bug report
+/// can never leak it. `DO_NOT_TRACK` overrides this flag at runtime and
+/// suppresses both sending and id generation regardless of its value.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TelemetryConfig {
+    /// User opted in to anonymous usage telemetry. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeConfig {
     #[serde(default)]
@@ -1138,9 +1296,19 @@ pub struct SandboxConfig {
     #[serde(default, deserialize_with = "super::serde_helpers::string_or_vec")]
     pub volume_ignores: Vec<String>,
 
+    /// Strategy for mounting volume_ignores paths (anonymous or named)
+    #[serde(default)]
+    pub volume_ignores_strategy: VolumeIgnoresStrategy,
+
     /// Mount ~/.ssh into sandbox containers (default: false)
     #[serde(default)]
     pub mount_ssh: bool,
+
+    /// Append the SELinux relabel flag (`:z`) to sandbox bind mounts so the
+    /// container can read them on SELinux-enforcing hosts (Fedora, RHEL). Off by
+    /// default; only emitted for Docker/Podman. Note: this relabels the host paths.
+    #[serde(default)]
+    pub selinux_relabel: bool,
 
     /// Custom instruction text appended to the agent's system prompt in sandboxed sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1161,6 +1329,21 @@ pub enum ContainerRuntimeName {
     Podman,
 }
 
+/// Volume mounting strategy for volume_ignores paths.
+///
+/// On macOS with Docker Desktop's VirtioFS, anonymous volumes don't always shadow
+/// bind-mount subdirectories. Use `Named` to mount deterministic named Docker/Podman
+/// volumes instead, which live in the Docker VM and bypass VirtioFS reliably.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeIgnoresStrategy {
+    /// Use anonymous volumes (default; works on Linux; may not shadow on macOS/VirtioFS)
+    #[default]
+    Anonymous,
+    /// Use deterministic named volumes (required on macOS/VirtioFS; explicitly cleaned up on session delete)
+    Named,
+}
+
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
@@ -1174,7 +1357,9 @@ impl Default for SandboxConfig {
             port_mappings: Vec::new(),
             default_terminal_mode: DefaultTerminalMode::default(),
             volume_ignores: Vec::new(),
+            volume_ignores_strategy: VolumeIgnoresStrategy::default(),
             mount_ssh: false,
+            selinux_relabel: false,
             custom_instruction: None,
             container_runtime: ContainerRuntimeName::default(),
         }
@@ -1420,6 +1605,10 @@ pub fn effective_profile(profile: &str) -> String {
 
 pub fn get_update_settings() -> UpdatesConfig {
     Config::load_or_warn().updates
+}
+
+pub fn get_telemetry_settings() -> TelemetryConfig {
+    Config::load_or_warn().telemetry
 }
 
 #[cfg(test)]
@@ -2033,6 +2222,16 @@ mod tests {
     }
 
     #[test]
+    fn diff_config_split_view_roundtrips() {
+        let mut cfg = DiffConfig::default();
+        assert!(!cfg.split_view);
+        cfg.split_view = true;
+        let toml = toml::to_string(&cfg).unwrap();
+        let back: DiffConfig = toml::from_str(&toml).unwrap();
+        assert!(back.split_view);
+    }
+
+    #[test]
     fn test_session_config_agent_override_roundtrip() {
         let mut config = Config::default();
         config
@@ -2056,6 +2255,21 @@ mod tests {
             Some(&"--port 8080".to_string()),
             "agent_extra_args should survive roundtrip"
         );
+    }
+
+    #[test]
+    fn test_session_config_confirm_before_quit_defaults_on() {
+        // Default-on so existing users get the accidental-exit guard
+        // without opting in (#1569).
+        assert!(SessionConfig::default().confirm_before_quit);
+    }
+
+    #[test]
+    fn test_confirm_before_quit_absent_from_toml_defaults_on() {
+        // An older config.toml with no `confirm_before_quit` key must
+        // deserialize to the enabled default, not false.
+        let session: SessionConfig = toml::from_str("").unwrap();
+        assert!(session.confirm_before_quit);
     }
 
     #[test]
@@ -2165,6 +2379,18 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_auto_stop_idle_secs_accepts_u32_range() {
+        assert!(validate_auto_stop_idle_secs(0).is_ok());
+        assert!(validate_auto_stop_idle_secs(3600).is_ok());
+        assert!(validate_auto_stop_idle_secs(u32::MAX as u64).is_ok());
+    }
+
+    #[test]
+    fn test_validate_auto_stop_idle_secs_rejects_above_u32() {
+        assert!(validate_auto_stop_idle_secs(u32::MAX as u64 + 1).is_err());
+    }
+
+    #[test]
     fn test_validate_snooze_duration_accepts_dialog_presets() {
         // The TUI dialog presets must all pass the validator; otherwise
         // the API silently rejects what the UI offered. Presets:
@@ -2199,6 +2425,34 @@ mod tests {
             deserialized.session.agent_detect_as.get("lenovo-claude"),
             Some(&"claude".to_string()),
         );
+    }
+
+    #[test]
+    fn test_agent_cockpit_cmd_roundtrip() {
+        let mut config = Config::default();
+        config
+            .session
+            .custom_agents
+            .insert("oc-sp".to_string(), "ocp run sp".to_string());
+        config
+            .session
+            .agent_cockpit_cmd
+            .insert("oc-sp".to_string(), "ocp run sp acp".to_string());
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            deserialized.session.agent_cockpit_cmd.get("oc-sp"),
+            Some(&"ocp run sp acp".to_string()),
+        );
+    }
+
+    #[test]
+    fn test_agent_cockpit_cmd_defaults_empty() {
+        // A config with no agent_cockpit_cmd must deserialize to an empty
+        // map (serde default), not error, so existing configs keep loading.
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.session.agent_cockpit_cmd.is_empty());
     }
 
     #[test]
@@ -2261,5 +2515,42 @@ keep_count = 10
         let reparsed: LoggingConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.output, SinkKind::Stdout);
         assert_eq!(reparsed.rotation, RotationKind::Never);
+    }
+
+    #[test]
+    fn test_volume_ignores_strategy_defaults_to_anonymous() {
+        let config: SandboxConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            config.volume_ignores_strategy,
+            VolumeIgnoresStrategy::Anonymous
+        );
+    }
+
+    #[test]
+    fn test_volume_ignores_strategy_named_roundtrip() {
+        let toml_str = r#"
+volume_ignores = ["node_modules"]
+volume_ignores_strategy = "named"
+"#;
+        let config: SandboxConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.volume_ignores_strategy, VolumeIgnoresStrategy::Named);
+        assert_eq!(config.volume_ignores, vec!["node_modules"]);
+
+        let serialized = toml::to_string(&config).unwrap();
+        let reparsed: SandboxConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            reparsed.volume_ignores_strategy,
+            VolumeIgnoresStrategy::Named
+        );
+    }
+
+    #[test]
+    fn test_volume_ignores_strategy_anonymous_roundtrip() {
+        let toml_str = r#"volume_ignores_strategy = "anonymous""#;
+        let config: SandboxConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.volume_ignores_strategy,
+            VolumeIgnoresStrategy::Anonymous
+        );
     }
 }

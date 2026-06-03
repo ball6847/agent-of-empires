@@ -539,30 +539,62 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         // for, where missing tooling is a hard error rather than a
         // silent fallback to tmux.
         if instance.cockpit_mode && user_picked_cockpit {
+            // A custom agent explicitly opted into cockpit must declare an
+            // ACP command; otherwise we'd silently fall back to aoe-agent
+            // and launch the wrong thing. Fail loudly instead.
+            let has_override = instance
+                .cockpit_agent
+                .as_deref()
+                .is_some_and(|s| !s.is_empty());
+            let is_custom = config.session.custom_agents.contains_key(&instance.tool);
+            if is_custom
+                && !has_override
+                && !config
+                    .session
+                    .agent_cockpit_cmd
+                    .contains_key(&instance.tool)
+            {
+                bail!(
+                    "custom agent `{tool}` has no `agent_cockpit_cmd`, so it can't run in cockpit.\n\
+                     Add an ACP launch command under `[session.agent_cockpit_cmd]`, e.g.\n\
+                     {tool} = \"ocp run sp acp\"\n\
+                     Or skip cockpit: rerun with `--no-cockpit` for a tmux-backed session.",
+                    tool = instance.tool
+                );
+            }
             let registry = crate::cockpit::agent_registry::AgentRegistry::with_defaults();
             let agent_name = pick_cockpit_agent_name(
                 &registry,
+                &config.session,
                 &instance.tool,
                 instance.cockpit_agent.as_deref(),
             );
-            if let Some(spec) = registry.get(&agent_name) {
-                if !crate::cli::cockpit::command_present(&spec.command) {
-                    let hint = crate::cockpit::install_hints::install_hint_for(&spec.command)
-                        .unwrap_or("install via your package manager and re-run");
-                    bail!(
-                        "cockpit ACP adapter `{}` is not installed or not on $PATH.\n\
-                         Install: {}\n\
-                         Or run: aoe cockpit doctor --fix\n\
-                         Or use the bundled fallback: rerun with `--agent aoe-agent`\n\
-                         Or skip cockpit: rerun with `--no-cockpit` for a tmux-backed session.",
-                        spec.command,
-                        hint
-                    );
-                }
-            } else {
+            // Resolve the spec from the registry (built-in) or the custom
+            // agent's configured ACP command, then verify the binary is on
+            // PATH. A missing adapter is a hard error at add-time rather
+            // than a silent 404 on the first prompt.
+            let spec = match registry.get(&agent_name) {
+                Some(spec) => spec.clone(),
+                None => match config.session.agent_cockpit_cmd.get(&agent_name) {
+                    Some(cmd) => crate::cockpit::AgentSpec::from_cockpit_cmd(&agent_name, cmd)
+                        .map_err(|e| anyhow::anyhow!(e))?,
+                    None => bail!(
+                        "cockpit agent `{agent_name}` is not in the registry.\n\
+                         Run `aoe cockpit doctor` to see configured agents."
+                    ),
+                },
+            };
+            if !crate::cli::cockpit::command_present(&spec.command) {
+                let hint = crate::cockpit::install_hints::install_hint_for(&spec.command)
+                    .unwrap_or("install via your package manager and re-run");
                 bail!(
-                    "cockpit agent `{agent_name}` is not in the registry.\n\
-                     Run `aoe cockpit doctor` to see configured agents."
+                    "cockpit ACP adapter `{}` is not installed or not on $PATH.\n\
+                     Install: {}\n\
+                     Or run: aoe cockpit doctor --fix\n\
+                     Or use the bundled fallback: rerun with `--agent aoe-agent`\n\
+                     Or skip cockpit: rerun with `--no-cockpit` for a tmux-backed session.",
+                    spec.command,
+                    hint
                 );
             }
         }
@@ -590,11 +622,11 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             }
 
             let container_name = containers::DockerContainer::generate_name(&instance.id);
-            let image = args
-                .sandbox_image
-                .as_ref()
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| runtime.effective_default_image());
+            let image = resolve_sandbox_image(
+                args.sandbox_image.as_deref(),
+                &config.sandbox.default_image,
+                runtime.default_sandbox_image(),
+            );
             instance.sandbox_info = Some(SandboxInfo {
                 enabled: true,
                 container_id: None,
@@ -623,16 +655,16 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     let should_trust = if args.trust_hooks {
                         true
                     } else {
-                        println!("\nRepository hooks detected in .agent-of-empires/config.toml:");
-                        if !hooks.on_create.is_empty() {
-                            println!("  on_create:");
-                            for cmd in &hooks.on_create {
-                                println!("    {}", cmd);
-                            }
-                        }
-                        if !hooks.on_launch.is_empty() {
-                            println!("  on_launch:");
-                            for cmd in &hooks.on_launch {
+                        // Show the final merged set (repo overrides global/profile
+                        // per type) with source labels, mirroring the TUI trust
+                        // dialog, so the prompt reflects exactly what will run (#596).
+                        println!(
+                            "\nHooks for this session (repo overrides global config per type):"
+                        );
+                        let merged = repo_config::merge_hooks_for_display(profile, &hooks);
+                        for group in repo_config::hook_display_groups(&merged, &hooks, true) {
+                            println!("  {}:{}", group.name, group.source_label());
+                            for cmd in &group.commands {
                                 println!("    {}", cmd);
                             }
                         }
@@ -668,7 +700,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
         if let Some(hooks) = resolved_hooks {
             if !hooks.on_create.is_empty() {
-                println!("Running on_create hooks...");
+                // Show the final merged hook list (repo hooks override global/profile
+                // per type) so the user can see exactly what runs, especially when
+                // `--trust-hooks` skipped the interactive approval prompt (#596).
+                println!("Running on_create hooks:");
+                for cmd in &hooks.on_create {
+                    println!("  {}", cmd);
+                }
                 let hook_env = repo_config::lifecycle_env_vars(&instance);
                 repo_config::execute_hooks(&hooks.on_create, &path, &hook_env)?;
                 println!("✓ on_create hooks completed");
@@ -905,10 +943,12 @@ pub fn is_duplicate_session(instances: &[Instance], title: &str, path: &str) -> 
 /// Sync mirror of `Supervisor::pick_agent_for_tool` so add-time
 /// precondition checks can resolve the agent without spinning up the
 /// async supervisor. Precedence: explicit override → tool-keyed
-/// registry entry → legacy (`claude` → `claude`, else `aoe-agent`).
+/// registry entry → custom agent with `agent_cockpit_cmd` → legacy
+/// (`claude` → `claude`, else `aoe-agent`).
 #[cfg(feature = "serve")]
 fn pick_cockpit_agent_name(
     registry: &crate::cockpit::agent_registry::AgentRegistry,
+    session: &crate::session::config::SessionConfig,
     tool: &str,
     explicit_override: Option<&str>,
 ) -> String {
@@ -918,6 +958,9 @@ fn pick_cockpit_agent_name(
         }
     }
     if registry.get(tool).is_some() {
+        return tool.to_string();
+    }
+    if session.agent_cockpit_cmd.contains_key(tool) {
         return tool.to_string();
     }
     if tool == "claude" {
@@ -1019,4 +1062,58 @@ fn resolve_named_tool(tool: &str, config: &crate::session::Config) -> Result<Nam
         "Unknown tool: {name}\nSupported built-in and configured custom agents: {}",
         safe_names.join(", ")
     )
+}
+
+/// Resolve the sandbox image for a new session.
+///
+/// Precedence: the explicit `--sandbox-image` flag, then the merged
+/// `[sandbox] default_image` from `config` (which `resolve_config_with_repo_or_warn`
+/// already layers repo over profile/global, see #1651), then the runtime's
+/// hardcoded default. The merged value already carries the global config, so
+/// there is no need to reload it from disk for the empty-fallback case.
+fn resolve_sandbox_image(
+    flag: Option<&str>,
+    merged_default: &str,
+    hardcoded_default: &str,
+) -> String {
+    if let Some(flag) = flag {
+        return flag.trim().to_string();
+    }
+    let merged = merged_default.trim();
+    if merged.is_empty() {
+        hardcoded_default.to_string()
+    } else {
+        merged.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_sandbox_image;
+
+    const HARDCODED: &str = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
+
+    #[test]
+    fn flag_overrides_everything() {
+        let image = resolve_sandbox_image(Some(" custom:flag "), "repo:merged", HARDCODED);
+        assert_eq!(image, "custom:flag");
+    }
+
+    #[test]
+    fn merged_default_used_when_no_flag() {
+        let image = resolve_sandbox_image(None, "ghcr.io/example/custom:latest", HARDCODED);
+        assert_eq!(image, "ghcr.io/example/custom:latest");
+    }
+
+    #[test]
+    fn whitespace_merged_falls_back_to_hardcoded() {
+        let image = resolve_sandbox_image(None, "   ", HARDCODED);
+        assert_eq!(image, HARDCODED);
+    }
+
+    #[test]
+    fn empty_merged_falls_back_to_hardcoded() {
+        let image = resolve_sandbox_image(None, "", HARDCODED);
+        assert_eq!(image, HARDCODED);
+    }
 }

@@ -3,6 +3,7 @@
 use crate::session::{
     validate_check_interval, validate_snooze_duration, Config, ContainerRuntimeName,
     DefaultTerminalMode, ProfileConfig, TmuxClipboardMode, TmuxMouseMode, TmuxStatusBarMode,
+    VolumeIgnoresStrategy,
 };
 use crate::sound::{
     validate_sound_exists, volume_from_option, volume_options, volume_to_index, SoundMode,
@@ -16,6 +17,7 @@ use super::SettingsScope;
 pub enum SettingsCategory {
     Theme,
     Updates,
+    Telemetry,
     Worktree,
     Sandbox,
     Tmux,
@@ -27,6 +29,7 @@ pub enum SettingsCategory {
     Hooks,
     Web,
     Cockpit,
+    Diff,
     Logging,
 }
 
@@ -35,6 +38,7 @@ impl SettingsCategory {
         match self {
             Self::Theme => "Theme",
             Self::Updates => "Updates",
+            Self::Telemetry => "Telemetry",
             Self::Worktree => "Worktree",
             Self::Sandbox => "Sandbox",
             Self::Tmux => "Tmux",
@@ -46,6 +50,7 @@ impl SettingsCategory {
             Self::Hooks => "Lifecycle Hooks",
             Self::Web => "Web",
             Self::Cockpit => "Cockpit",
+            Self::Diff => "Diff",
             Self::Logging => "Logging",
         }
     }
@@ -65,6 +70,8 @@ pub enum FieldKey {
     CheckIntervalHours,
     NotifyInCli,
     WebPollIntervalMinutes,
+    // Telemetry
+    TelemetryEnabled,
     // Worktree
     WorktreeEnabled,
     PathTemplate,
@@ -85,7 +92,9 @@ pub enum FieldKey {
     ExtraVolumes,
     PortMappings,
     VolumeIgnores,
+    VolumeIgnoresStrategy,
     MountSsh,
+    SelinuxRelabel,
     CustomInstruction,
     ContainerRuntime,
     // Tmux
@@ -95,7 +104,9 @@ pub enum FieldKey {
     // Session
     DefaultTool,
     StrictHotkeys,
+    ConfirmBeforeQuit,
     SnoozeDurationMinutes,
+    SessionAutoStopIdleSecs,
     RestartWakeMessage,
     RowTag,
     AgentExtraArgs,
@@ -103,12 +114,15 @@ pub enum FieldKey {
     AgentStatusHooks,
     CustomAgents,
     AgentDetectAs,
+    AgentCockpitCmd,
     HostEnvironment,
     SessionIdPollerMaxThreads,
     LiveSendExitChord,
+    LiveSendLeader,
     NewSessionAttachMode,
     DefaultAttachMode,
     ClickAction,
+    MouseCapture,
     // Sound
     SoundEnabled,
     SoundMode,
@@ -154,6 +168,9 @@ pub enum FieldKey {
     CockpitForceEndTurnThresholdSecs,
     CockpitSilentOrphanGraceSecs,
     CockpitSilentOrphanFastGraceSecs,
+    CockpitAutoStopIdleSecs,
+    // Diff
+    DiffSplitView,
     // Logging
     LoggingDefaultLevel,
     /// Per-target override; carries an index into `crate::logging::KNOWN_SUB_TARGETS`
@@ -327,6 +344,10 @@ impl SettingField {
                 validate_snooze_duration(*n)?;
                 Ok(())
             }
+            (FieldKey::SessionAutoStopIdleSecs, FieldValue::Number(n)) => {
+                crate::session::config::validate_auto_stop_idle_secs(*n)?;
+                Ok(())
+            }
             (FieldKey::MemoryLimit, FieldValue::OptionalText(Some(v))) => {
                 crate::session::validate_memory_limit(v)?;
                 Ok(())
@@ -364,6 +385,7 @@ pub fn build_fields_for_category(
     match category {
         SettingsCategory::Theme => build_theme_fields(scope, global, profile),
         SettingsCategory::Updates => build_updates_fields(scope, global, profile),
+        SettingsCategory::Telemetry => build_telemetry_fields(global),
         SettingsCategory::Worktree => build_worktree_fields(scope, global, profile),
         SettingsCategory::Sandbox => build_sandbox_fields(scope, global, profile),
         SettingsCategory::Tmux => build_tmux_fields(scope, global, profile),
@@ -375,6 +397,7 @@ pub fn build_fields_for_category(
         SettingsCategory::Hooks => build_hooks_fields(scope, global, profile),
         SettingsCategory::Web => build_web_fields(scope, global, profile),
         SettingsCategory::Cockpit => build_cockpit_fields(scope, global, profile),
+        SettingsCategory::Diff => build_diff_fields(scope, global, profile),
         SettingsCategory::Logging => build_logging_fields(global),
     }
 }
@@ -660,6 +683,11 @@ fn build_cockpit_fields(
         global.cockpit.silent_orphan_fast_grace_secs,
         p.and_then(|c| c.silent_orphan_fast_grace_secs),
     );
+    let (auto_stop_idle_secs, asis_override) = resolve_value(
+        scope,
+        global.cockpit.auto_stop_idle_secs,
+        p.and_then(|c| c.auto_stop_idle_secs),
+    );
 
     vec![
         SettingField {
@@ -794,6 +822,15 @@ fn build_cockpit_fields(
             has_override: sofg_override,
             inherited_display: None,
         },
+        SettingField {
+            key: FieldKey::CockpitAutoStopIdleSecs,
+            label: "Auto-stop idle workers (s)",
+            description: "Seconds of inactivity (no cockpit events, no in-flight turn) after which the daemon stops an idle cockpit worker and frees its resources. The session stays stopped until the next prompt, which respawns the worker seamlessly. Default 0 disables the feature; no worker is ever auto-stopped for inactivity. Evaluated roughly once a minute, so the effective stop time can lag the threshold by up to a minute. See #1689.",
+            value: FieldValue::Number(u64::from(auto_stop_idle_secs)),
+            category: SettingsCategory::Cockpit,
+            has_override: asis_override,
+            inherited_display: None,
+        },
     ]
 }
 
@@ -854,6 +891,30 @@ fn build_web_fields(
             inherited_display: None,
         },
     ]
+}
+
+fn build_diff_fields(
+    scope: SettingsScope,
+    global: &Config,
+    profile: &ProfileConfig,
+) -> Vec<SettingField> {
+    let diff = profile.diff.as_ref();
+
+    let (split_view, has_override) = resolve_value(
+        scope,
+        global.diff.split_view,
+        diff.and_then(|d| d.split_view),
+    );
+
+    vec![SettingField {
+        key: FieldKey::DiffSplitView,
+        label: "Side-by-side diff",
+        description: "Show diffs in a split (side-by-side) layout instead of unified",
+        value: FieldValue::Bool(split_view),
+        category: SettingsCategory::Diff,
+        has_override,
+        inherited_display: inherited_if(has_override, FieldValue::Bool(global.diff.split_view)),
+    }]
 }
 
 fn build_theme_fields(
@@ -1057,6 +1118,29 @@ fn build_updates_fields(
     ]
 }
 
+/// Telemetry is a single install-level consent toggle, so it is global-only
+/// (no profile override) and mirrors the `build_logging_fields` shape. When
+/// `DO_NOT_TRACK` is set the description calls out that nothing is sent
+/// regardless of the toggle, so the suppressed state is never silent.
+fn build_telemetry_fields(global: &Config) -> Vec<SettingField> {
+    let description = if crate::telemetry::do_not_track() {
+        "Anonymous, opt-in usage telemetry. DO_NOT_TRACK is set, so nothing is sent and no \
+         install id is generated regardless of this toggle. Off by default; never sends content."
+    } else {
+        "Anonymous, opt-in usage telemetry (counts of sessions, agents, version, OS). Off by \
+         default. Never sends prompts, paths, names, or commands. Honors DO_NOT_TRACK."
+    };
+    vec![SettingField {
+        key: FieldKey::TelemetryEnabled,
+        label: "Enable usage telemetry",
+        description,
+        value: FieldValue::Bool(global.telemetry.enabled),
+        category: SettingsCategory::Telemetry,
+        has_override: false,
+        inherited_display: None,
+    }]
+}
+
 fn build_worktree_fields(
     scope: SettingsScope,
     global: &Config,
@@ -1239,6 +1323,11 @@ fn build_sandbox_fields(
         global.sandbox.mount_ssh,
         sb.and_then(|s| s.mount_ssh),
     );
+    let (selinux_relabel, o_sel) = resolve_value(
+        scope,
+        global.sandbox.selinux_relabel,
+        sb.and_then(|s| s.selinux_relabel),
+    );
     let (custom_instruction, o_ci) = resolve_optional(
         scope,
         global.sandbox.custom_instruction.clone(),
@@ -1249,6 +1338,11 @@ fn build_sandbox_fields(
         scope,
         global.sandbox.container_runtime,
         sb.and_then(|s| s.container_runtime),
+    );
+    let (volume_ignores_strategy, o_vis) = resolve_value(
+        scope,
+        global.sandbox.volume_ignores_strategy,
+        sb.and_then(|s| s.volume_ignores_strategy),
     );
 
     let terminal_mode_selected = match default_terminal_mode {
@@ -1275,6 +1369,16 @@ fn build_sandbox_fields(
     };
     let container_runtime_options =
         vec!["Docker".into(), "Podman".into(), "Apple Container".into()];
+
+    let volume_ignores_strategy_selected = match volume_ignores_strategy {
+        VolumeIgnoresStrategy::Anonymous => 0,
+        VolumeIgnoresStrategy::Named => 1,
+    };
+    let global_volume_ignores_strategy_selected = match global.sandbox.volume_ignores_strategy {
+        VolumeIgnoresStrategy::Anonymous => 0,
+        VolumeIgnoresStrategy::Named => 1,
+    };
+    let volume_ignores_strategy_options = vec!["anonymous".into(), "named".into()];
 
     vec![
         SettingField {
@@ -1401,6 +1505,24 @@ fn build_sandbox_fields(
             ),
         },
         SettingField {
+            key: FieldKey::VolumeIgnoresStrategy,
+            label: "Volume Ignores Strategy",
+            description: "anonymous: default, works on Linux. named: use deterministic Docker/Podman named volumes, required on macOS/VirtioFS to reliably shadow bind-mount subdirectories.",
+            value: FieldValue::Select {
+                selected: volume_ignores_strategy_selected,
+                options: volume_ignores_strategy_options.clone(),
+            },
+            category: SettingsCategory::Sandbox,
+            has_override: o_vis,
+            inherited_display: inherited_if(
+                o_vis,
+                FieldValue::Select {
+                    selected: global_volume_ignores_strategy_selected,
+                    options: volume_ignores_strategy_options,
+                },
+            ),
+        },
+        SettingField {
             key: FieldKey::MountSsh,
             label: "Mount SSH",
             description: "Mount ~/.ssh into sandbox containers (for git SSH access)",
@@ -1408,6 +1530,15 @@ fn build_sandbox_fields(
             category: SettingsCategory::Sandbox,
             has_override: o8,
             inherited_display: inherited_if(o8, FieldValue::Bool(global.sandbox.mount_ssh)),
+        },
+        SettingField {
+            key: FieldKey::SelinuxRelabel,
+            label: "SELinux Relabel",
+            description: "Append the :z SELinux relabel flag to sandbox bind mounts (needed on Fedora/RHEL; relabels host paths)",
+            value: FieldValue::Bool(selinux_relabel),
+            category: SettingsCategory::Sandbox,
+            has_override: o_sel,
+            inherited_display: inherited_if(o_sel, FieldValue::Bool(global.sandbox.selinux_relabel)),
         },
         SettingField {
             key: FieldKey::CustomInstruction,
@@ -1581,6 +1712,14 @@ fn build_session_fields(
             .map(|v| v as u64),
     );
 
+    let (auto_stop_idle_secs, auto_stop_idle_secs_override) = resolve_value(
+        scope,
+        global.session.auto_stop_idle_secs as u64,
+        session
+            .and_then(|s| s.auto_stop_idle_secs)
+            .map(|v| v as u64),
+    );
+
     let (restart_wake_message, restart_wake_message_override) = resolve_value(
         scope,
         global.session.restart_wake_message.clone(),
@@ -1638,6 +1777,18 @@ fn build_session_fields(
             ),
         },
         SettingField {
+            key: FieldKey::SessionAutoStopIdleSecs,
+            label: "Auto-stop Idle Sessions (seconds)",
+            description: "Stop a plain tmux session after it sits idle this long (0 disables; attached or recently-used sessions are spared)",
+            value: FieldValue::Number(auto_stop_idle_secs),
+            category: SettingsCategory::Session,
+            has_override: auto_stop_idle_secs_override,
+            inherited_display: inherited_if(
+                auto_stop_idle_secs_override,
+                FieldValue::Number(global.session.auto_stop_idle_secs as u64),
+            ),
+        },
+        SettingField {
             key: FieldKey::RestartWakeMessage,
             label: "Restart Wake Message",
             description: "Sent to the agent after restart to resume work. Empty = no wake nudge.",
@@ -1684,6 +1835,16 @@ fn build_session_fields(
     ];
 
     if scope == SettingsScope::Global {
+        fields.push(SettingField {
+            key: FieldKey::ConfirmBeforeQuit,
+            label: "Confirm Before Quit",
+            description: "Warn before quitting aoe when you press `q` on the home screen \
+                          (the dialog can also turn this off). Ctrl+C always force-quits.",
+            value: FieldValue::Bool(global.session.confirm_before_quit),
+            category: SettingsCategory::Session,
+            has_override: false,
+            inherited_display: None,
+        });
         fields.push(SettingField {
             key: FieldKey::SessionIdPollerMaxThreads,
             label: "Max Session-ID Poller Threads",
@@ -1828,6 +1989,30 @@ fn build_agents_fields(
         items
     };
 
+    let (cockpit_cmd_map, cockpit_cmd_override) = resolve_value(
+        scope,
+        global.session.agent_cockpit_cmd.clone(),
+        session.and_then(|s| s.agent_cockpit_cmd.clone()),
+    );
+    let cockpit_cmd_list: Vec<String> = {
+        let mut items: Vec<_> = cockpit_cmd_map
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        items.sort();
+        items
+    };
+    let global_cockpit_cmd_list: Vec<String> = {
+        let mut items: Vec<_> = global
+            .session
+            .agent_cockpit_cmd
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        items.sort();
+        items
+    };
+
     vec![
         SettingField {
             key: FieldKey::DefaultTool,
@@ -1898,6 +2083,19 @@ fn build_agents_fields(
             ),
         },
         SettingField {
+            key: FieldKey::AgentCockpitCmd,
+            label: "Agent Cockpit Command",
+            description:
+                "ACP launch command enabling a custom agent in cockpit: agent=command (e.g. oc-sp=ocp run sp acp)",
+            value: FieldValue::List(cockpit_cmd_list),
+            category: SettingsCategory::Agents,
+            has_override: cockpit_cmd_override,
+            inherited_display: inherited_if(
+                cockpit_cmd_override,
+                FieldValue::List(global_cockpit_cmd_list),
+            ),
+        },
+        SettingField {
             key: FieldKey::AgentStatusHooks,
             label: "Agent Status Hooks",
             description: "Install status-detection hooks into the agent's config file",
@@ -1929,6 +2127,12 @@ fn build_interaction_fields(
         session.and_then(|s| s.live_send_exit_chord.clone()),
     );
 
+    let (live_send_leader, live_send_leader_override) = resolve_value(
+        scope,
+        global.session.live_send_leader.clone(),
+        session.and_then(|s| s.live_send_leader.clone()),
+    );
+
     let (new_session_attach_mode, new_session_attach_mode_override) = resolve_value(
         scope,
         global.session.new_session_attach_mode,
@@ -1945,6 +2149,12 @@ fn build_interaction_fields(
         scope,
         global.session.click_action,
         session.and_then(|s| s.click_action),
+    );
+
+    let (mouse_capture, mouse_capture_override) = resolve_value(
+        scope,
+        global.session.mouse_capture,
+        session.and_then(|s| s.mouse_capture),
     );
 
     vec![
@@ -2042,6 +2252,41 @@ fn build_interaction_fields(
             inherited_display: inherited_if(
                 live_send_exit_chord_override,
                 FieldValue::Text(global.session.live_send_exit_chord.clone()),
+            ),
+        },
+        SettingField {
+            key: FieldKey::LiveSendLeader,
+            label: "Live-Send Leader",
+            description: "Tmux-style leader (prefix) chord for live-send commands. \
+                 Default `C-b` matches tmux. In live mode the leader arms a \
+                 menu: leader then `k` opens the command palette, `b` toggles \
+                 the sidebar, `q` exits. Press the leader twice to send it \
+                 through to the agent. Leave empty to disable the leader. The \
+                 exit chord above stays a separate single-press exit.",
+            value: FieldValue::Text(live_send_leader),
+            category: SettingsCategory::Interaction,
+            has_override: live_send_leader_override,
+            inherited_display: inherited_if(
+                live_send_leader_override,
+                FieldValue::Text(global.session.live_send_leader.clone()),
+            ),
+        },
+        SettingField {
+            key: FieldKey::MouseCapture,
+            label: "Mouse Capture",
+            description: "Request xterm mouse tracking so the TUI handles the \
+                 scroll wheel (preview-pane scroll) and click-to-select rows. \
+                 Disable to hand the wheel and text selection back to the \
+                 terminal, e.g. iOS Mosh + Termius/Blink where mouse-tracking \
+                 escapes aren't forwarded reliably. The AOE_MOUSE_CAPTURE env \
+                 var remains an opt-out backstop and can still force capture \
+                 off when set.",
+            value: FieldValue::Bool(mouse_capture),
+            category: SettingsCategory::Interaction,
+            has_override: mouse_capture_override,
+            inherited_display: inherited_if(
+                mouse_capture_override,
+                FieldValue::Bool(global.session.mouse_capture),
             ),
         },
     ]
@@ -2495,6 +2740,8 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         (FieldKey::WebPollIntervalMinutes, FieldValue::Number(v)) => {
             config.updates.web_poll_interval_minutes = *v
         }
+        // Telemetry
+        (FieldKey::TelemetryEnabled, FieldValue::Bool(v)) => config.telemetry.enabled = *v,
         // Worktree
         (FieldKey::WorktreeEnabled, FieldValue::Bool(v)) => config.worktree.enabled = *v,
         (FieldKey::PathTemplate, FieldValue::Text(v)) => config.worktree.path_template = v.clone(),
@@ -2515,14 +2762,23 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         }
         (FieldKey::YoloModeDefault, FieldValue::Bool(v)) => config.session.yolo_mode_default = *v,
         (FieldKey::StrictHotkeys, FieldValue::Bool(v)) => config.session.strict_hotkeys = *v,
+        (FieldKey::ConfirmBeforeQuit, FieldValue::Bool(v)) => {
+            config.session.confirm_before_quit = *v
+        }
         (FieldKey::SnoozeDurationMinutes, FieldValue::Number(v)) => {
             config.session.snooze_duration_minutes = *v as u32;
+        }
+        (FieldKey::SessionAutoStopIdleSecs, FieldValue::Number(v)) => {
+            config.session.auto_stop_idle_secs = (*v).min(u32::MAX as u64) as u32;
         }
         (FieldKey::RestartWakeMessage, FieldValue::Text(v)) => {
             config.session.restart_wake_message = v.clone();
         }
         (FieldKey::LiveSendExitChord, FieldValue::Text(v)) => {
             config.session.live_send_exit_chord = v.clone();
+        }
+        (FieldKey::LiveSendLeader, FieldValue::Text(v)) => {
+            config.session.live_send_leader = v.clone();
         }
         (FieldKey::NewSessionAttachMode, FieldValue::Select { selected, .. }) => {
             config.session.new_session_attach_mode = index_to_new_session_attach_mode(*selected);
@@ -2539,12 +2795,16 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         (FieldKey::AgentStatusHooks, FieldValue::Bool(v)) => {
             config.session.agent_status_hooks = *v;
         }
+        (FieldKey::MouseCapture, FieldValue::Bool(v)) => {
+            config.session.mouse_capture = *v;
+        }
         (FieldKey::DefaultImage, FieldValue::Text(v)) => config.sandbox.default_image = v.clone(),
         (FieldKey::Environment, FieldValue::List(v)) => config.sandbox.environment = v.clone(),
         (FieldKey::ExtraVolumes, FieldValue::List(v)) => config.sandbox.extra_volumes = v.clone(),
         (FieldKey::PortMappings, FieldValue::List(v)) => config.sandbox.port_mappings = v.clone(),
         (FieldKey::VolumeIgnores, FieldValue::List(v)) => config.sandbox.volume_ignores = v.clone(),
         (FieldKey::MountSsh, FieldValue::Bool(v)) => config.sandbox.mount_ssh = *v,
+        (FieldKey::SelinuxRelabel, FieldValue::Bool(v)) => config.sandbox.selinux_relabel = *v,
         (FieldKey::SandboxAutoCleanup, FieldValue::Bool(v)) => config.sandbox.auto_cleanup = *v,
         (FieldKey::CpuLimit, FieldValue::OptionalText(v)) => {
             config.sandbox.cpu_limit = v.clone();
@@ -2566,6 +2826,12 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
                 0 => ContainerRuntimeName::Docker,
                 1 => ContainerRuntimeName::Podman,
                 _ => ContainerRuntimeName::AppleContainer,
+            };
+        }
+        (FieldKey::VolumeIgnoresStrategy, FieldValue::Select { selected, .. }) => {
+            config.sandbox.volume_ignores_strategy = match selected {
+                1 => VolumeIgnoresStrategy::Named,
+                _ => VolumeIgnoresStrategy::Anonymous,
             };
         }
         // Tmux
@@ -2606,6 +2872,9 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         }
         (FieldKey::AgentDetectAs, FieldValue::List(v)) => {
             config.session.agent_detect_as = parse_key_value_list(v);
+        }
+        (FieldKey::AgentCockpitCmd, FieldValue::List(v)) => {
+            config.session.agent_cockpit_cmd = parse_key_value_list(v);
         }
         // Sound
         (FieldKey::SoundEnabled, FieldValue::Bool(v)) => config.sound.enabled = *v,
@@ -2683,6 +2952,8 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         (FieldKey::WebNotifyOnError, FieldValue::Bool(v)) => {
             config.web.notify_on_error = *v;
         }
+        // Diff
+        (FieldKey::DiffSplitView, FieldValue::Bool(v)) => config.diff.split_view = *v,
         // Cockpit
         (FieldKey::CockpitEnabled, FieldValue::Bool(v)) => config.cockpit.enabled = *v,
         (FieldKey::CockpitDefaultForClaude, FieldValue::Bool(v)) => {
@@ -2733,6 +3004,9 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
             // tight fast grace.
             let raw = (*v).min(u32::MAX as u64) as u32;
             config.cockpit.silent_orphan_fast_grace_secs = if raw == 0 { 0 } else { raw.max(5) };
+        }
+        (FieldKey::CockpitAutoStopIdleSecs, FieldValue::Number(v)) => {
+            config.cockpit.auto_stop_idle_secs = (*v).min(u32::MAX as u64) as u32;
         }
         // Logging
         (FieldKey::LoggingDefaultLevel, FieldValue::Select { selected, options }) => {
@@ -2880,6 +3154,10 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
         (FieldKey::InitSubmodules, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.worktree, |s, val| s.init_submodules = val);
         }
+        // Diff
+        (FieldKey::DiffSplitView, FieldValue::Bool(v)) => {
+            set_profile_override(*v, &mut config.diff, |d, val| d.split_view = val);
+        }
         // Sandbox
         (FieldKey::SandboxEnabledByDefault, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.sandbox, |s, val| s.enabled_by_default = val);
@@ -2909,6 +3187,9 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
         }
         (FieldKey::MountSsh, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.sandbox, |s, val| s.mount_ssh = val);
+        }
+        (FieldKey::SelinuxRelabel, FieldValue::Bool(v)) => {
+            set_profile_override(*v, &mut config.sandbox, |s, val| s.selinux_relabel = val);
         }
         (FieldKey::SandboxAutoCleanup, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.sandbox, |s, val| s.auto_cleanup = val);
@@ -2951,6 +3232,15 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
             };
             set_profile_override(runtime, &mut config.sandbox, |s, val| {
                 s.container_runtime = val
+            });
+        }
+        (FieldKey::VolumeIgnoresStrategy, FieldValue::Select { selected, .. }) => {
+            let strategy = match selected {
+                1 => VolumeIgnoresStrategy::Named,
+                _ => VolumeIgnoresStrategy::Anonymous,
+            };
+            set_profile_override(strategy, &mut config.sandbox, |s, val| {
+                s.volume_ignores_strategy = val
             });
         }
         // Tmux
@@ -2998,6 +3288,13 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
                 s.snooze_duration_minutes = val
             });
         }
+        (FieldKey::SessionAutoStopIdleSecs, FieldValue::Number(v)) => {
+            set_profile_override(
+                (*v).min(u32::MAX as u64) as u32,
+                &mut config.session,
+                |s, val| s.auto_stop_idle_secs = val,
+            );
+        }
         (FieldKey::RestartWakeMessage, FieldValue::Text(v)) => {
             set_profile_override(v.clone(), &mut config.session, |s, val| {
                 s.restart_wake_message = val
@@ -3006,6 +3303,11 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
         (FieldKey::LiveSendExitChord, FieldValue::Text(v)) => {
             set_profile_override(v.clone(), &mut config.session, |s, val| {
                 s.live_send_exit_chord = val
+            });
+        }
+        (FieldKey::LiveSendLeader, FieldValue::Text(v)) => {
+            set_profile_override(v.clone(), &mut config.session, |s, val| {
+                s.live_send_leader = val
             });
         }
         (FieldKey::NewSessionAttachMode, FieldValue::Select { selected, .. }) => {
@@ -3041,6 +3343,11 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
                 s.agent_status_hooks = val;
             });
         }
+        (FieldKey::MouseCapture, FieldValue::Bool(v)) => {
+            set_profile_override(*v, &mut config.session, |s, val| {
+                s.mouse_capture = val;
+            });
+        }
         (FieldKey::AgentExtraArgs, FieldValue::List(v)) => {
             let map = parse_key_value_list(v);
             use crate::session::SessionConfigOverride;
@@ -3072,6 +3379,14 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
                 .session
                 .get_or_insert_with(SessionConfigOverride::default);
             s.agent_detect_as = Some(map);
+        }
+        (FieldKey::AgentCockpitCmd, FieldValue::List(v)) => {
+            let map = parse_key_value_list(v);
+            use crate::session::SessionConfigOverride;
+            let s = config
+                .session
+                .get_or_insert_with(SessionConfigOverride::default);
+            s.agent_cockpit_cmd = Some(map);
         }
         // Sound
         (FieldKey::SoundEnabled, FieldValue::Bool(v)) => {
@@ -3252,6 +3567,12 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
                 s.silent_orphan_fast_grace_secs = val
             });
         }
+        (FieldKey::CockpitAutoStopIdleSecs, FieldValue::Number(v)) => {
+            let clamped = (*v).min(u32::MAX as u64) as u32;
+            set_profile_override(clamped, &mut config.cockpit, |s, val| {
+                s.auto_stop_idle_secs = val
+            });
+        }
         (FieldKey::HostEnvironment, FieldValue::List(v)) => {
             // Empty list clears the override (no env entries); otherwise store
             // the list as the profile-scope replacement of the global list.
@@ -3265,6 +3586,35 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
 mod tests {
     use super::*;
     use crate::session::{Config, ProfileConfig};
+
+    #[test]
+    fn test_cockpit_auto_stop_idle_secs_applies_to_global_and_profile() {
+        let mut global = Config::default();
+        let mut profile = ProfileConfig::default();
+
+        // Pull the real field from the builder so the test tracks the
+        // production definition (label/category), then pin the value.
+        let mut field = build_fields_for_category(
+            SettingsCategory::Cockpit,
+            SettingsScope::Global,
+            &global,
+            &profile,
+        )
+        .into_iter()
+        .find(|f| f.key == FieldKey::CockpitAutoStopIdleSecs)
+        .expect("CockpitAutoStopIdleSecs field must exist in the Cockpit category");
+        field.value = FieldValue::Number(28800);
+
+        apply_field_to_config(&field, SettingsScope::Global, &mut global, &mut profile);
+        assert_eq!(global.cockpit.auto_stop_idle_secs, 28800);
+
+        apply_field_to_config(&field, SettingsScope::Profile, &mut global, &mut profile);
+        assert_eq!(
+            profile.cockpit.as_ref().and_then(|c| c.auto_stop_idle_secs),
+            Some(28800),
+            "profile scope must store the value as an override"
+        );
+    }
 
     #[test]
     fn test_profile_field_has_no_override_after_global_change() {
@@ -3532,6 +3882,25 @@ mod tests {
     }
 
     #[test]
+    fn test_diff_split_view_applies_to_global() {
+        let mut global = Config::default();
+        assert!(!global.diff.split_view);
+
+        let field = SettingField {
+            key: FieldKey::DiffSplitView,
+            label: "Side-by-side diff",
+            description: "",
+            value: FieldValue::Bool(true),
+            category: SettingsCategory::Diff,
+            has_override: false,
+            inherited_display: None,
+        };
+        apply_field_to_global(&field, &mut global);
+
+        assert!(global.diff.split_view);
+    }
+
+    #[test]
     fn test_status_hook_debounce_field_uses_default() {
         let global = Config::default();
         let profile = ProfileConfig::default();
@@ -3654,6 +4023,7 @@ mod tests {
             FieldKey::CockpitForceEndTurnThresholdSecs,
             FieldKey::CockpitSilentOrphanGraceSecs,
             FieldKey::CockpitSilentOrphanFastGraceSecs,
+            FieldKey::CockpitAutoStopIdleSecs,
         ];
         for k in advanced_keys {
             let pos = fields.iter().position(|f| f.key == k).unwrap();
@@ -3691,6 +4061,7 @@ mod tests {
             FieldKey::AgentCommandOverride,
             FieldKey::CustomAgents,
             FieldKey::AgentDetectAs,
+            FieldKey::AgentCockpitCmd,
             FieldKey::AgentStatusHooks,
         ] {
             assert!(
@@ -3715,6 +4086,8 @@ mod tests {
             FieldKey::NewSessionAttachMode,
             FieldKey::ClickAction,
             FieldKey::LiveSendExitChord,
+            FieldKey::LiveSendLeader,
+            FieldKey::MouseCapture,
         ] {
             assert!(
                 interaction_keys.contains(&k),

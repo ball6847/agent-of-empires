@@ -9,6 +9,7 @@ use clap_complete::Shell;
 use super::add::AddArgs;
 #[cfg(feature = "serve")]
 use super::cockpit::CockpitCommands;
+use super::extract_session_id::ExtractSessionIdArgs;
 use super::group::GroupCommands;
 use super::init::InitArgs;
 use super::list::ListArgs;
@@ -24,6 +25,7 @@ use super::serve::ServeArgs;
 use super::session::SessionCommands;
 use super::sounds::SoundsCommands;
 use super::status::StatusArgs;
+use super::telemetry::TelemetryCommands;
 use super::theme::ThemeCommands;
 use super::tmux::TmuxCommands;
 use super::uninstall::UninstallArgs;
@@ -143,6 +145,12 @@ pub enum Commands {
         command: ThemeCommands,
     },
 
+    /// Manage anonymous opt-in usage telemetry
+    Telemetry {
+        #[command(subcommand)]
+        command: TelemetryCommands,
+    },
+
     /// Start a web dashboard for remote session access
     #[cfg(feature = "serve")]
     Serve(ServeArgs),
@@ -164,6 +172,12 @@ pub enum Commands {
     #[cfg(feature = "serve")]
     #[command(name = "__cockpit-runner", hide = true)]
     CockpitRunner(Box<crate::cockpit::runner::CockpitRunnerArgs>),
+
+    /// Internal: extract Claude's `session_id` from a hook stdin payload
+    /// and write it to the sidecar file. Spawned by the host-side
+    /// `SessionStart`/`UserPromptSubmit` hook. Hidden from help.
+    #[command(name = "__extract-session-id", hide = true)]
+    ExtractSessionId(ExtractSessionIdArgs),
 
     /// Uninstall Agent of Empires
     Uninstall(UninstallArgs),

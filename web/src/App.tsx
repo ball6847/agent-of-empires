@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useMatch, useNavigate } from "react-router-dom";
+import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { useSessions } from "./hooks/useSessions";
 import { clearCockpitCache } from "./hooks/useCockpit";
@@ -8,7 +8,10 @@ import { CockpitPrefsProvider } from "./lib/cockpitPrefs";
 import { safeGetItem, safeSetItem } from "./lib/safeStorage";
 import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useRepoGroups } from "./hooks/useRepoGroups";
+import { useSessionGroups } from "./hooks/useSessionGroups";
 import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
+import { useSidebarAxis } from "./hooks/useSidebarAxis";
+import { repoGroupToSidebarGroup } from "./lib/sidebarGroups";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { useResolvedTheme } from "./hooks/useResolvedTheme";
 import { useWebSettings } from "./hooks/useWebSettings";
@@ -27,6 +30,9 @@ import {
   deleteSession,
   fetchAbout,
   fetchSettings,
+  fetchTelemetryStatus,
+  setTelemetryConsent,
+  reportTelemetrySeen,
   isDebugBuild,
   updateWorkspaceOrdering,
 } from "./lib/api";
@@ -64,7 +70,10 @@ import { MobileMainPane } from "./components/MobileMainPane";
 import { DiffFileViewer } from "./components/diff/DiffFileViewer";
 import { SettingsView } from "./components/SettingsView";
 import { ProjectsView } from "./components/ProjectsView";
+import { ProfilesPage } from "./components/profiles/ProfilesPage";
 import { HelpOverlay } from "./components/HelpOverlay";
+import { useTour } from "./hooks/useTour";
+import type { TourScope } from "./lib/tourSteps";
 import { SessionWizard } from "./components/session-wizard/SessionWizard";
 import type { WizardPrefill } from "./components/session-wizard/SessionWizard";
 import type { SessionResponse } from "./lib/types";
@@ -77,6 +86,7 @@ import {
   resetTokenExpired,
 } from "./lib/fetchInterceptor";
 import { AboutModal } from "./components/AboutModal";
+import { TelemetryConsentModal } from "./components/TelemetryConsentModal";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
@@ -189,15 +199,18 @@ function isInsideEditable(target: EventTarget | null): boolean {
 
 function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLogout: () => void }) {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const { settings: webSettings } = useWebSettings();
   const sessionMatch = useMatch("/session/:sessionId");
   const settingsRootMatch = useMatch("/settings");
   const settingsTabMatch = useMatch("/settings/:tab");
   const projectsMatch = useMatch("/projects");
+  const profilesMatch = useMatch("/profiles");
   const activeSessionId = sessionMatch?.params.sessionId ?? null;
   const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
   const showProjects = projectsMatch !== null;
+  const showProfiles = profilesMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
   const {
@@ -230,12 +243,30 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   }, [sessionsLoaded, sessions]);
 
   const [sidebarSortMode, setSidebarSortMode] = useSidebarSortMode();
+  const [sidebarAxis, setSidebarAxis] = useSidebarAxis();
 
-  const { groups, toggleRepoCollapsed, updateRepoAppearance } = useRepoGroups(
-    workspaces,
-    workspaceOrdering,
-    sidebarSortMode,
+  const {
+    groups: repoGroups,
+    toggleRepoCollapsed,
+    updateRepoAppearance,
+    reorderRepoGroups,
+  } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode);
+  const { groups: sessionGroups, toggleGroupCollapsed } =
+    useSessionGroups(workspaces);
+
+  // The sidebar render path consumes one honest model (SidebarGroup): the
+  // repo axis maps in via an adapter, the user-group axis is already in
+  // that shape. Collapse routing follows the active axis so the two
+  // axes keep independent collapse state. See #1234.
+  const sidebarGroups = useMemo(
+    () =>
+      sidebarAxis === "group"
+        ? sessionGroups
+        : repoGroups.map(repoGroupToSidebarGroup),
+    [sidebarAxis, sessionGroups, repoGroups],
   );
+  const toggleSidebarGroup =
+    sidebarAxis === "group" ? toggleGroupCollapsed : toggleRepoCollapsed;
 
   // Drag-end handler for the sidebar. Optimistically applies the new
   // order locally so the row snaps into place, then persists to the
@@ -290,6 +321,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const [showHelp, setShowHelp] = useState(false);
   const [showPalette, setShowPalette] = useState(false);
   const [showAbout, setShowAbout] = useState(false);
+  const [telemetryConsentNeeded, setTelemetryConsentNeeded] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(
     () => window.innerWidth >= 768,
   );
@@ -457,15 +489,49 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
   const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
+  // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
+  // the tour gates auto-launch on an explicit loaded flag instead.
+  const [serverAboutLoaded, setServerAboutLoaded] = useState(false);
 
   const refreshServerAbout = useCallback(async () => {
-    const about = await fetchAbout();
-    if (about) setServerAbout(about);
+    try {
+      const about = await fetchAbout();
+      if (about) setServerAbout(about);
+    } finally {
+      setServerAboutLoaded(true);
+    }
   }, []);
 
   useEffect(() => {
     refreshServerAbout();
   }, [refreshServerAbout]);
+
+  // Telemetry: once authenticated and on a writable server, report that the
+  // web dashboard was opened (folded into the daemon's next opt-in snapshot)
+  // and, if the user has not yet answered the opt-in prompt, show the consent
+  // modal. The browser never posts to the telemetry backend; it only talks to
+  // the local daemon. Read-only servers can't persist a choice, so skip.
+  useEffect(() => {
+    // AppContent only renders past the login gate, so reaching here means the
+    // session is usable. Read-only servers can't persist a choice, so skip.
+    if (!serverAboutLoaded || serverAbout?.read_only) return;
+    reportTelemetrySeen("web");
+    let active = true;
+    void fetchTelemetryStatus().then((status) => {
+      if (!active || !status) return;
+      if (!status.responded && !status.do_not_track) {
+        setTelemetryConsentNeeded(true);
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [serverAboutLoaded, serverAbout?.read_only]);
+
+  const handleTelemetryConsent = useCallback((enabled: boolean) => {
+    setTelemetryConsentNeeded(false);
+    void setTelemetryConsent(enabled);
+  }, []);
 
   const deletingWorkspace = deletingWorkspaceId
     ? workspaces.find((w) => w.id === deletingWorkspaceId)
@@ -580,6 +646,19 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     }
   }, [navigate, activeSessionId]);
 
+  const handleOpenProfiles = useCallback(() => {
+    navigate("/profiles");
+    if (window.innerWidth < 768) setSidebarOpen(false);
+  }, [navigate]);
+
+  const handleCloseProfiles = useCallback(() => {
+    if (activeSessionId) {
+      navigate(`/session/${encodeURIComponent(activeSessionId)}`);
+    } else {
+      navigate("/");
+    }
+  }, [navigate, activeSessionId]);
+
   const handleCloseSettings = useCallback(() => {
     if (activeSessionId) {
       navigate(`/session/${encodeURIComponent(activeSessionId)}`);
@@ -620,10 +699,20 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     onSwipe: openDiff,
   });
 
+  // Read-only mode hides mutation UI. Guard creation at the handler so every
+  // caller (keyboard shortcut, command palette) is a no-op rather than opening
+  // a wizard that 403s on submit. Caught by the live read-only-mode spec.
   const handleNewSession = useCallback(() => {
+    if (serverAbout?.read_only) return;
     setWizardPrefill(undefined);
     setShowSessionWizard(true);
-  }, []);
+  }, [serverAbout?.read_only]);
+
+  const handleNewScratch = useCallback(() => {
+    if (serverAbout?.read_only) return;
+    setWizardPrefill({ scratch: true, skipToReview: true });
+    setShowSessionWizard(true);
+  }, [serverAbout?.read_only]);
 
   const handleCloneFromUrl = useCallback(() => {
     setWizardPrefill({ initialTab: "clone" });
@@ -689,23 +778,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   useKeyboardShortcuts(
     useCallback(
       () => ({
-        onNew: () => {
-          // Read-only mode hides mutation UI. The "n" shortcut must
-          // not open the wizard or the user gets a dead-end form that
-          // 403s on submit. Caught by the live read-only-mode spec.
-          if (serverAbout?.read_only) return;
-          setWizardPrefill(undefined);
-          setShowSessionWizard(true);
-        },
-        onNewScratch: () => {
-          // Same read-only guard as `onNew`: the wizard cannot land a
-          // POST /api/sessions when the server returns 403 on every
-          // mutation, and a scratch fast-create that 403s on submit is
-          // a worse footgun than a no-op.
-          if (serverAbout?.read_only) return;
-          setWizardPrefill({ scratch: true, skipToReview: true });
-          setShowSessionWizard(true);
-        },
+        onNew: handleNewSession,
+        onNewScratch: handleNewScratch,
         onDiff: () => toggleDiff(),
         // Escape closes local UI surfaces only (dialogs, palette,
         // wizard, settings, help, file viewer). Never wire this to
@@ -743,7 +817,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         handleCloseSettings,
         navigate,
         handleToggleTerminalFocus,
-        serverAbout,
+        handleNewSession,
+        handleNewScratch,
       ],
     ),
   );
@@ -753,7 +828,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     activeSessionId,
     loginRequired,
     hasActiveSession: !!activeSession,
+    readOnly: !!serverAbout?.read_only,
     onNewSession: handleNewSession,
+    onNewScratch: handleNewScratch,
     onSelectSession: handleSelectSession,
     onToggleDiff: toggleDiff,
     onOpenSettings: handleOpenSettings,
@@ -770,9 +847,20 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         <SettingsView
           tab={settingsTab}
           onClose={handleCloseSettings}
-          onSelectTab={(t) => navigate(`/settings/${t}`)}
+          onSelectTab={(t) => {
+            const p = searchParams.get("profile");
+            navigate(
+              `/settings/${t}${p ? `?profile=${encodeURIComponent(p)}` : ""}`,
+            );
+          }}
           serverAbout={serverAbout}
           onServerAboutRefresh={refreshServerAbout}
+          profile={searchParams.get("profile")}
+          onSelectProfile={(p) => {
+            const next = new URLSearchParams(searchParams);
+            next.set("profile", p);
+            setSearchParams(next, { replace: true });
+          }}
         />
       );
     }
@@ -781,6 +869,15 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return (
         <ProjectsView
           onClose={handleCloseProjects}
+          readOnly={serverAbout?.read_only}
+        />
+      );
+    }
+
+    if (showProfiles) {
+      return (
+        <ProfilesPage
+          onClose={handleCloseProfiles}
           readOnly={serverAbout?.read_only}
         />
       );
@@ -1004,6 +1101,32 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     ],
   );
 
+  const tourScope: TourScope =
+    !activeWorkspace || !activeSession
+      ? "dashboard"
+      : activeSession.cockpit_mode
+        ? "cockpit"
+        : "session";
+  // Only auto-launch on a settled, unobstructed dashboard. Any open overlay or
+  // an in-flight session route defers it (the flag stays unset until then).
+  const tourAutoLaunchReady =
+    serverAboutLoaded &&
+    sessionsLoaded &&
+    !activeSessionId &&
+    !showSettings &&
+    !showProjects &&
+    !showProfiles &&
+    !showSessionWizard &&
+    !showHelp &&
+    !showAbout &&
+    !showPalette;
+  const tour = useTour({
+    scope: tourScope,
+    readOnly: !!serverAbout?.read_only,
+    isDesktop: !isCoarse,
+    autoLaunchReady: tourAutoLaunchReady,
+  });
+
   return (
     <CockpitPrefsProvider value={cockpitPrefs}>
     <div
@@ -1019,6 +1142,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         diffCollapsed={diffCollapsed}
         onOpenHelp={handleOpenHelp}
         onOpenAbout={handleOpenAbout}
+        onStartTutorial={tour.startTour}
         onLogout={onLogout}
         loginRequired={loginRequired}
         isOffline={!!error}
@@ -1032,22 +1156,26 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       <div className="flex flex-1 min-h-0">
         {!showSettings && !showProjects && (
           <WorkspaceSidebar
-            groups={groups}
+            groups={sidebarGroups}
             onReorderWorkspaces={handleReorderWorkspaces}
+            onReorderGroups={reorderRepoGroups}
             activeId={activeWorkspace?.id ?? null}
             open={sidebarOpen}
             onToggle={() => setSidebarOpen(false)}
             onSelect={handleSelectWorkspace}
-            onToggleRepo={toggleRepoCollapsed}
+            onToggleGroup={toggleSidebarGroup}
             onUpdateRepoAppearance={updateRepoAppearance}
             onNew={() => { setWizardPrefill(undefined); setShowSessionWizard(true); }}
             onCreateSession={handleCreateSession}
             onSettings={handleOpenSettings}
             onProjects={handleOpenProjects}
+            onProfiles={handleOpenProfiles}
             onDeleteSession={handleDeleteSession}
             readOnly={serverAbout?.read_only}
             sortMode={sidebarSortMode}
             onSortModeChange={setSidebarSortMode}
+            axis={sidebarAxis}
+            onAxisChange={setSidebarAxis}
           />
         )}
 
@@ -1075,9 +1203,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         />
       )}
 
+      {tour.tourElement}
+
       {showHelp && <HelpOverlay onClose={() => setShowHelp(false)} />}
 
       {showAbout && <AboutModal onClose={() => setShowAbout(false)} />}
+      {telemetryConsentNeeded && (
+        <TelemetryConsentModal onChoose={handleTelemetryConsent} />
+      )}
 
       {deletingSession && (
         <DeleteSessionDialog

@@ -443,3 +443,137 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     }
   });
 });
+
+describe("activityToThreadMessages; diff-comments user card (#1123)", () => {
+  it("emits a user message with the structured payload on metadata.custom", () => {
+    const row: ActivityRow = {
+      id: "user-seq-1",
+      kind: "user_diff_comments",
+      text: "Take a look:\n\n## Diff comments\n\n...\n",
+      diffComments: {
+        intro: "Take a look:",
+        outro: "Please address these comments.",
+        isMultiRepo: true,
+        comments: [
+          {
+            id: "c-1",
+            repoName: "repoA",
+            filePath: "src/main.rs",
+            side: "new",
+            startLine: 42,
+            endLine: 45,
+            body: "rename this",
+            capturedSnippet: "fn main() {}",
+            language: "rust",
+            createdAt: "2026-01-01T00:00:00Z",
+          },
+        ],
+      },
+      at: "2026-05-12T00:00:00Z",
+    };
+    const messages = activityToThreadMessages([row], false);
+    const user = messages.find((m) => m.role === "user")!;
+    // The text part stays the assembled markdown so copy / fallback work.
+    const parts = user.content as Array<{ type: string; text?: string }>;
+    expect(parts[0]!.type).toBe("text");
+    expect(parts[0]!.text).toContain("## Diff comments");
+    // The structured payload rides on metadata.custom.diffComments for
+    // UserText to render the rich card without parsing any sentinel.
+    const custom = (
+      user.metadata as
+        | { custom?: { diffComments?: { comments?: unknown[] } } }
+        | undefined
+    )?.custom;
+    expect(custom?.diffComments?.comments).toHaveLength(1);
+  });
+
+  it("omits metadata when the structured payload is absent", () => {
+    const row: ActivityRow = {
+      id: "user-seq-2",
+      kind: "user_diff_comments",
+      text: "plain body\n",
+      at: "2026-05-12T00:00:00Z",
+    };
+    const messages = activityToThreadMessages([row], false);
+    const user = messages.find((m) => m.role === "user")!;
+    expect(user.metadata).toBeUndefined();
+  });
+});
+
+function toolStopped(id: string, text = ""): ActivityRow {
+  return {
+    id: `stopped-${id}-9`,
+    kind: "tool_stopped",
+    text,
+    toolCallId: id,
+    at: "2026-05-12T00:00:02Z",
+  };
+}
+
+describe("activityToThreadMessages; stopped status threading (#1646)", () => {
+  it("carries stopped onto a top-level tool-call part's result", () => {
+    const messages = activityToThreadMessages(
+      [userRow("go"), toolStart("t1"), toolStopped("t1")],
+      false,
+    );
+    const assistant = messages.find((m) => m.role === "assistant")!;
+    const parts = assistant.content as Array<{
+      type: string;
+      result?: { stopped?: boolean };
+      isError?: boolean;
+    }>;
+    const tool = parts.find((p) => p.type === "tool-call")!;
+    expect(tool.result?.stopped).toBe(true);
+    // Stopped is not an error; assistant-ui's isError stays falsy.
+    expect(tool.isError).toBeFalsy();
+  });
+
+  it("preserves stopped on a subagent child through the payload round-trip", () => {
+    const parent: ToolCall = {
+      id: "task-1",
+      name: "Task",
+      kind: "think",
+      args_preview: JSON.stringify({ _aoe_title: "Task" }),
+      started_at: "2026-05-12T00:00:00Z",
+    };
+    const parentRow: ActivityRow = {
+      id: "start-task-1",
+      kind: "tool_start",
+      text: "Task",
+      toolCallId: "task-1",
+      tool: parent,
+      at: "2026-05-12T00:00:00Z",
+    };
+    const child: ToolCall = {
+      id: "ch-1",
+      name: "Read",
+      kind: "read",
+      args_preview: JSON.stringify({ path: "/x" }),
+      started_at: "2026-05-12T00:00:01Z",
+      parent_tool_call_id: "task-1",
+    };
+    const childRow: ActivityRow = {
+      id: "start-ch-1",
+      kind: "tool_start",
+      text: "Read",
+      toolCallId: "ch-1",
+      tool: child,
+      at: "2026-05-12T00:00:01Z",
+    };
+    const messages = activityToThreadMessages(
+      [userRow("go"), parentRow, childRow, toolStopped("ch-1")],
+      false,
+    );
+    const assistant = messages.find((m) => m.role === "assistant")!;
+    const parts = assistant.content as Array<{
+      type: string;
+      toolName?: string;
+      argsText?: string;
+    }>;
+    const subagent = parts.find(
+      (p) => p.type === "tool-call" && p.toolName === SUBAGENT_TASK_NAME,
+    )!;
+    const payload = JSON.parse(subagent.argsText!);
+    expect(payload.children[0].result.stopped).toBe(true);
+  });
+});

@@ -339,7 +339,7 @@ function writeFakeClaudeShim(binDir: string): void {
   // so without these the picker only offers claude and persistence
   // specs that pick a non-default tool would hang on a missing button.
   const script = "#!/bin/bash\nexec tail -f /dev/null\n";
-  for (const name of ["claude", "codex", "gemini"]) {
+  for (const name of ["claude", "codex", "gemini", "opencode"]) {
     const path = join(binDir, name);
     writeFileSync(path, script);
     chmodSync(path, 0o755);
@@ -378,7 +378,7 @@ function writeFakeAcpShim(
     scriptLines.push(`export ${key}=${JSON.stringify(value)}`);
   }
   const script = `#!/bin/bash\n${scriptLines.join("\n")}\nexec node ${JSON.stringify(fakeAgentJs)} "$@"\n`;
-  for (const name of ["claude", "claude-agent-acp", "aoe-agent"]) {
+  for (const name of ["claude", "claude-agent-acp", "aoe-agent", "opencode"]) {
     const path = join(binDir, name);
     writeFileSync(path, script);
     chmodSync(path, 0o755);
@@ -515,6 +515,15 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     // under contention and triggering an optimistic-update revert).
     // Override via process env if a future investigation needs it.
     AOE_LOG_LEVEL: process.env.AOE_LOG_LEVEL ?? "info",
+    // Suppress the first-load telemetry consent modal. Every live spec boots
+    // a fresh HOME where `has_responded_to_telemetry` is false, so the modal
+    // (`telemetry-modal-title`, a z-50 full-screen backdrop) would otherwise
+    // intercept pointer events and time out every `click`. `DO_NOT_TRACK`
+    // makes `/api/telemetry/status` report `do_not_track: true`, which App.tsx
+    // treats as "never auto-show the modal". The consent flow itself is
+    // covered by the Vitest + RTL contract tests, not the live suite. A future
+    // live spec that exercises the modal can unset this in its own env.
+    DO_NOT_TRACK: process.env.DO_NOT_TRACK ?? "1",
   };
 
   if (authMode === "token") {

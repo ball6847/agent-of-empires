@@ -61,6 +61,14 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// settings (or hand-editing the line out) restores the new default.
 pub(super) const DEFAULT_EXIT_CHORD: &str = "C-q";
 
+/// Default live-send leader (prefix) chord. `Ctrl+b` matches the tmux
+/// and herdr leader, so multiplexer users already have the muscle
+/// memory, and it's the one chord we steal from the agent (double-tap
+/// `C-b C-b` still delivers a literal `C-b` downstream). Kept in sync
+/// with `default_live_send_leader()` in `session::config`. An empty
+/// configured value disables the leader entirely.
+pub(super) const DEFAULT_LEADER: &str = "C-b";
+
 /// Parse a tmux-style chord spec into a `(KeyCode, KeyModifiers)`
 /// pair. Accepts `C-` / `Ctrl-`, `M-` / `Alt-`, `S-` / `Shift-`
 /// prefixes (any order, separated by `-` or `+`) followed by a key
@@ -275,6 +283,14 @@ pub(in crate::tui) struct LiveSendState {
     /// setting at entry time. Captured per-entry so config edits
     /// don't change behavior mid-session.
     pub exit_chords: Vec<(KeyCode, KeyModifiers)>,
+    /// Leader (prefix) chord parsed from the user's configured leader
+    /// setting at entry time. `None` when the user cleared the setting
+    /// (leader disabled, every key passes through). When `Some`, the
+    /// first press arms the live-send command menu; the next key picks
+    /// a command (or a second leader press passes a literal leader to
+    /// the agent). Snapshotted per-entry for the same reason as
+    /// `exit_chords`.
+    pub leader: Option<(KeyCode, KeyModifiers)>,
 }
 
 /// Which paired tmux pane a live-send dispatch targets. The agent
@@ -395,7 +411,12 @@ pub(in crate::tui) struct LiveSendWorker {
 }
 
 impl LiveSendWorker {
-    pub(super) fn spawn(tmux_name: String) -> Self {
+    /// `capture_wake`, when present, nudges the preview capture worker out
+    /// of its inter-capture wait right after each dispatched keystroke
+    /// batch, so the typed echo is captured immediately instead of waiting
+    /// up to a full fast-cadence cycle. That ties echo latency to actual
+    /// input rather than the background capture phase.
+    pub(super) fn spawn(tmux_name: String, capture_wake: Option<LiveCaptureWake>) -> Self {
         let (tx, rx) = channel::<WorkerMsg>();
         std::thread::spawn(move || {
             // Block until the first message, then drain anything else
@@ -410,6 +431,9 @@ impl LiveSendWorker {
                     batch.push(msg);
                 }
                 dispatch_batch(&tmux_name, batch);
+                if let Some(wake) = &capture_wake {
+                    wake.wake();
+                }
             }
         });
         Self { tx }
@@ -432,6 +456,284 @@ impl LiveSendWorker {
     /// size (matters when an agent uses cursor-position escapes).
     pub(super) fn resize(&self, cols: u16, rows: u16) {
         let _ = self.tx.send(WorkerMsg::Resize { cols, rows });
+    }
+}
+
+/// How often the off-thread capture worker forks `tmux capture-pane`.
+/// It free-runs at roughly this cadence (a fork is ~3-13ms on macOS, so
+/// the real cycle is interval + fork time), keeping the preview fresh on
+/// a background thread so the render loop never forks capture-pane
+/// itself. Sits just under the 33ms render ticker so a frame almost
+/// always finds content that postdates the last keystroke, while keeping
+/// the steady-state fork rate close to the old render-driven ~30/s (a
+/// tighter value buys little perceived freshness for a lot more idle
+/// forks, since the render only paints every ~33ms anyway).
+/// Capture cadence while live-send is attached to the displayed pane: tight
+/// so typed echo and agent output appear with near-attach latency.
+const LIVE_CAPTURE_INTERVAL_FAST_MS: u64 = 25;
+/// Capture cadence when the worker is just keeping the home-list preview warm
+/// (no live-send). Matches the old render-driven `PREVIEW_REFRESH_MS` throttle
+/// so moving the fork off the render thread doesn't raise the idle fork rate.
+const LIVE_CAPTURE_INTERVAL_IDLE_MS: u64 = 250;
+
+/// Cloneable handle that nudges a [`LiveCaptureWorker`] out of its
+/// inter-capture wait. Handed to [`LiveSendWorker`] so a dispatched
+/// keystroke batch triggers an immediate capture of the typed echo rather
+/// than waiting up to a full fast-cadence cycle. Backed by the same condvar
+/// `set_live` / `set_target` use, so a wake just runs one capture early.
+#[derive(Clone)]
+pub(in crate::tui) struct LiveCaptureWake {
+    nudge: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
+}
+
+impl LiveCaptureWake {
+    fn wake(&self) {
+        if let Ok(_guard) = self.nudge.0.lock() {
+            self.nudge.1.notify_one();
+        }
+    }
+}
+
+/// Off-thread preview capture. One long-lived thread forks `tmux
+/// capture-pane` and publishes fresh pane content into a single-slot
+/// mailbox the render loop drains, so the render loop applies the latest
+/// content without forking. That moves the per-frame capture cost (~8.5ms
+/// measured on macOS, ~90% of a live-send frame) off the hot path.
+/// Dropping the worker flips `stop` so the thread exits after its current
+/// cycle; like `LiveSendWorker` we don't join.
+///
+/// Tracks whichever pane the preview is currently displaying (agent,
+/// terminal, container shell, or tool), not just the agent: the home view
+/// points it via `set_target` (from `sync_preview_capture_worker`) whenever
+/// the selected session or view mode changes, so every preview path reads
+/// fresh content without ever forking on the render thread, and a switch
+/// swaps the target in place instead of spawning a new thread. The capture
+/// cadence adapts (`set_live`): tight while live-send is attached,
+/// `PREVIEW_REFRESH_MS`-matched otherwise so the background preview costs
+/// no more idle forks than the old render-driven throttle did.
+pub(in crate::tui) struct LiveCaptureWorker {
+    /// Lines the render loop wants captured (height + scrollback + buffer).
+    /// `0` means "not set yet"; the worker skips capturing until the first
+    /// render publishes a real value. `capture_lines_for` never yields 0.
+    capture_lines: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// tmux session name the worker is currently capturing. Swapped in
+    /// place by `set_target` when the displayed pane changes, so one
+    /// long-lived thread serves every view without per-switch respawns.
+    /// Empty string means "idle, capture nothing" (no selection).
+    target: std::sync::Arc<std::sync::Mutex<String>>,
+    /// Single-slot mailbox holding the newest capture not yet consumed by
+    /// the render loop. A new capture overwrites an unconsumed one (the
+    /// render only ever wants the latest), so this can't grow unbounded if
+    /// the render thread stalls.
+    latest: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Sleep between captures, in ms. Adaptive: fast under live-send, idle
+    /// otherwise. Read by the worker thread each cycle.
+    interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Whether an empty capture should be forwarded (clearing stale preview
+    /// text) or dropped (preserving the last-good frame, the #1501 kill
+    /// switch). Terminal / container panes forward empties so a cleared
+    /// shell doesn't keep showing stale output; agent / tool panes preserve.
+    /// Set per target by `set_forward_empty`, read by the worker each cycle.
+    forward_empty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Interrupts the worker's inter-capture wait so a cadence or target
+    /// change takes effect immediately instead of after the current (up to
+    /// 250ms idle) sleep. Without this, entering live-send mid-idle-sleep
+    /// would lag the first fast capture by ~250ms.
+    nudge: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for LiveCaptureWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // Wake the worker so it sees `stop` and exits now rather than after
+        // its current inter-capture sleep.
+        self.nudge();
+    }
+}
+
+impl LiveCaptureWorker {
+    pub(in crate::tui) fn spawn(wake: std::sync::Arc<tokio::sync::Notify>) -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+        let capture_lines = Arc::new(AtomicUsize::new(0));
+        let target: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let latest: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let interval_ms = Arc::new(AtomicU64::new(LIVE_CAPTURE_INTERVAL_IDLE_MS));
+        let forward_empty = Arc::new(AtomicBool::new(false));
+        let nudge: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let lines_cell = capture_lines.clone();
+        let target_cell = target.clone();
+        let slot = latest.clone();
+        let interval_cell = interval_ms.clone();
+        let forward_empty_cell = forward_empty.clone();
+        let nudge_thread = nudge.clone();
+        let stop_flag = stop.clone();
+        std::thread::spawn(move || {
+            let mut last_target = String::new();
+            let mut last_captured: Option<String> = None;
+            while !stop_flag.load(Ordering::Relaxed) {
+                let lines = lines_cell.load(Ordering::Relaxed);
+                // Read the target without holding the lock across the fork:
+                // `set_target` must never wait on a `capture-pane`.
+                let name = target_cell
+                    .lock()
+                    .ok()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                // A retarget resets the dedup so the new pane's first frame
+                // always publishes, even if its bytes happen to match the
+                // previous pane's last capture.
+                if name != last_target {
+                    last_target = name.clone();
+                    last_captured = None;
+                }
+                if lines > 0 && !name.is_empty() {
+                    let session = crate::tmux::Session::from_name(&name);
+                    let forward_empty = forward_empty_cell.load(Ordering::Relaxed);
+                    // A failed fork reads as "gone". For preserve panes that
+                    // means hold the last-good frame (drop it); for forward
+                    // panes (terminals) surface it as empty so stale text clears.
+                    let capture = match session.capture_pane(lines) {
+                        Ok(content) => Some(content),
+                        Err(_) if forward_empty => Some(String::new()),
+                        Err(_) => None,
+                    };
+                    if let Some(content) = capture {
+                        // Skip unchanged frames (no point waking a re-parse).
+                        // Empties are skipped too unless this pane forwards
+                        // them; only changed captures reach (and wake) the
+                        // render loop, so an idle pane never repaints.
+                        let changed = last_captured.as_deref() != Some(content.as_str());
+                        if (forward_empty || !content.is_empty()) && changed {
+                            // Publish only if the target hasn't changed during
+                            // the fork. Otherwise these are the *old* pane's
+                            // bytes and would flash under the new view's header
+                            // (`set_target` also clears the mailbox, but the
+                            // fork may have started before that switch).
+                            let still_current =
+                                target_cell.lock().ok().map(|g| *g == name).unwrap_or(false);
+                            if still_current {
+                                if let Ok(mut guard) = slot.lock() {
+                                    *guard = Some(content.clone());
+                                }
+                                last_captured = Some(content);
+                                wake.notify_one();
+                            }
+                        }
+                    }
+                }
+                // Interruptible wait: `set_live` / `set_target` notify the
+                // condvar so a cadence or target change is picked up at once
+                // rather than after the current sleep. Spurious wakeups just
+                // run an extra capture cycle, which the dedup makes harmless.
+                let ms = interval_cell.load(Ordering::Relaxed);
+                if let Ok(guard) = nudge_thread.0.lock() {
+                    let _ = nudge_thread
+                        .1
+                        .wait_timeout(guard, std::time::Duration::from_millis(ms));
+                }
+            }
+        });
+        Self {
+            capture_lines,
+            target,
+            latest,
+            interval_ms,
+            forward_empty,
+            nudge,
+            stop,
+        }
+    }
+
+    /// A cloneable handle the send worker uses to nudge this worker after
+    /// each dispatched keystroke batch (echo latency). Backed by the same
+    /// condvar `set_live` / `set_target` use, so a wake just runs one
+    /// capture cycle early.
+    pub(in crate::tui) fn waker(&self) -> LiveCaptureWake {
+        LiveCaptureWake {
+            nudge: self.nudge.clone(),
+        }
+    }
+
+    /// Choose whether empty captures clear the preview (terminal / container
+    /// panes) or preserve the last-good frame (agent / tool panes, the #1501
+    /// kill switch). Cheap (one atomic store); called from the render
+    /// reconcile alongside `set_target` so the policy tracks the displayed
+    /// pane type without a respawn.
+    pub(in crate::tui) fn set_forward_empty(&self, forward: bool) {
+        self.forward_empty
+            .store(forward, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Wake the worker out of its inter-capture wait so a just-changed
+    /// cadence or target applies immediately.
+    fn nudge(&self) {
+        if let Ok(_guard) = self.nudge.0.lock() {
+            self.nudge.1.notify_one();
+        }
+    }
+
+    /// Point the worker at a different pane (its tmux session name; empty to
+    /// idle). Cheap: just swaps the shared name and drops any capture queued
+    /// from the previous pane so the render never applies stale bytes under
+    /// the new view. Never blocks on a `capture-pane` fork, so the render
+    /// reconcile can call it freely.
+    pub(in crate::tui) fn set_target(&self, name: String) {
+        let changed = if let Ok(mut guard) = self.target.lock() {
+            if *guard != name {
+                *guard = name;
+                if let Ok(mut latest) = self.latest.lock() {
+                    *latest = None;
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if changed {
+            // Capture the new pane now instead of after the current sleep.
+            self.nudge();
+        }
+    }
+
+    /// Switch the capture cadence between live-send (fast) and background
+    /// preview (idle). Cheap (one atomic store); called from the render
+    /// reconcile so entering/leaving live mode retunes the worker in place
+    /// without a respawn.
+    pub(in crate::tui) fn set_live(&self, live: bool) {
+        let ms = if live {
+            LIVE_CAPTURE_INTERVAL_FAST_MS
+        } else {
+            LIVE_CAPTURE_INTERVAL_IDLE_MS
+        };
+        let prev = self
+            .interval_ms
+            .swap(ms, std::sync::atomic::Ordering::Relaxed);
+        if prev != ms {
+            // Apply the new cadence now: a mid-idle-sleep worker would
+            // otherwise keep the old (up to 250ms) interval for one cycle,
+            // lagging the first live capture on live-send entry.
+            self.nudge();
+        }
+    }
+
+    /// Publish the line count the worker should capture. Cheap (one atomic
+    /// store); called each render so resizes and history scroll reach the
+    /// worker promptly.
+    pub(in crate::tui) fn set_capture_lines(&self, lines: usize) {
+        self.capture_lines
+            .store(lines, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Take the newest capture the worker has produced since the last
+    /// call, if any. Returns `None` when nothing new has arrived (the
+    /// render loop then keeps the current preview).
+    pub(in crate::tui) fn take_latest(&self) -> Option<String> {
+        self.latest.lock().ok().and_then(|mut guard| guard.take())
     }
 }
 
@@ -475,11 +777,11 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
             // `-H` sends each subsequent arg as the hex byte value of an
             // ASCII character. We use this for control bytes (CR, TAB,
             // ESC) and the bracketed-paste markers, none of which can
-            // ride a `-l` payload safely.
-            cmd.args(["send-keys", "-t", &target, "-H"]);
-            for b in bytes {
-                cmd.arg(format!("{:02x}", b));
-            }
+            // ride a `-l` payload safely. One arg per byte means a large
+            // multi-line paste would overflow the OS `execve` argv limit
+            // (macOS ARG_MAX is 256 KiB) and fail with E2BIG, silently
+            // dropping the whole paste, so split it across bounded forks.
+            return dispatch_hex_bytes(&target, bytes);
         }
         TmuxAction::Resize { cols, rows } => {
             cmd.args([
@@ -500,6 +802,50 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
         anyhow::bail!("live-send tmux subprocess exited non-zero for {:?}", action);
     }
     Ok(())
+}
+
+/// Upper bound on the number of bytes encoded into a single
+/// `tmux send-keys -H` fork. Each byte becomes one ~2-char hex argument
+/// plus its argv pointer (~11 bytes of kernel arg space), and macOS caps
+/// `execve` argv+envp at `ARG_MAX` = 256 KiB, so a per-byte encoding of
+/// a large paste overflows around 20 KB and fails wholesale with E2BIG.
+/// 4 KiB per fork keeps every argv under ~45 KiB, comfortably below the
+/// limit on every platform while keeping the fork count low.
+const MAX_HEX_BYTES_PER_SEND: usize = 4096;
+
+/// Dispatch a raw byte payload as one or more `tmux send-keys -H` forks,
+/// each bounded by [`MAX_HEX_BYTES_PER_SEND`]. tmux injects the bytes
+/// into the pane in order, so splitting a bracketed paste across forks is
+/// transparent to the agent: it still reassembles one contiguous paste
+/// from the `\e[200~` ... `\e[201~` byte stream.
+fn dispatch_hex_bytes(target: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::process::{Command, Stdio};
+    for batch in hex_send_batches(bytes) {
+        let mut cmd = Command::new("tmux");
+        cmd.stderr(Stdio::null());
+        cmd.args(["send-keys", "-t", target, "-H"]);
+        cmd.args(&batch);
+        let status = cmd
+            .status()
+            .map_err(|e| anyhow::anyhow!("spawn live-send tmux subprocess: {}", e))?;
+        if !status.success() {
+            anyhow::bail!(
+                "live-send tmux subprocess exited non-zero for {} bytes",
+                bytes.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Split a byte payload into the hex-argument batches passed to
+/// successive `tmux send-keys -H` forks. Pure so the chunking bound and
+/// byte-order preservation are unit-testable without a tmux session.
+fn hex_send_batches(bytes: &[u8]) -> Vec<Vec<String>> {
+    bytes
+        .chunks(MAX_HEX_BYTES_PER_SEND)
+        .map(|chunk| chunk.iter().map(|b| format!("{:02x}", b)).collect())
+        .collect()
 }
 
 /// What the translator says to do with one incoming key event.
@@ -759,6 +1105,32 @@ mod tests {
         // hand exit configure one explicitly.
         assert!(!chords.contains(&(KeyCode::Char(']'), KeyModifiers::CONTROL)));
         assert!(!chords.contains(&(KeyCode::Char('\\'), KeyModifiers::CONTROL)));
+    }
+
+    #[test]
+    fn default_leader_is_ctrl_b() {
+        // Ctrl+B matches the tmux/herdr leader. Kept in sync with
+        // session::config::default_live_send_leader().
+        assert_eq!(
+            parse_chord(DEFAULT_LEADER),
+            Some((KeyCode::Char('b'), KeyModifiers::CONTROL))
+        );
+    }
+
+    #[test]
+    fn leader_matches_only_its_exact_chord() {
+        let leader = parse_chord(DEFAULT_LEADER).unwrap();
+        // The armed leader: Ctrl+B fires it again (passthrough path).
+        assert!(chord_matches(
+            leader,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)
+        ));
+        // Bare `b` is a menu command, not a second leader press, so it
+        // must NOT match the leader chord.
+        assert!(!chord_matches(
+            leader,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE)
+        ));
     }
 
     #[test]
@@ -1108,5 +1480,121 @@ mod tests {
         // verifies the passthrough.
         assert_literal(translate(k(KeyCode::Char('q'))), "q");
         assert_literal(translate(k(KeyCode::Char('Q'))), "Q");
+    }
+
+    #[test]
+    fn large_hex_paste_splits_into_bounded_send_keys_batches() {
+        // Regression for the silently-dropped large paste: a ~100 KB
+        // bracketed paste, encoded one hex arg per byte, overflows the
+        // `execve` argv limit (macOS ARG_MAX = 256 KiB) and the whole
+        // `tmux send-keys` fails with E2BIG. The fix splits the payload
+        // into bounded batches; verify it splits, each batch stays under
+        // the cap, and the bytes reconstruct in order.
+        let payload: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        let batches = hex_send_batches(&payload);
+        assert!(
+            batches.len() > 1,
+            "a large paste must split across multiple forks, got {}",
+            batches.len()
+        );
+        for batch in &batches {
+            assert!(
+                batch.len() <= MAX_HEX_BYTES_PER_SEND,
+                "a single fork's argv must stay under the ARG_MAX bound",
+            );
+        }
+        let roundtrip: Vec<u8> = batches
+            .iter()
+            .flatten()
+            .map(|h| u8::from_str_radix(h, 16).unwrap())
+            .collect();
+        assert_eq!(
+            roundtrip, payload,
+            "chunking must preserve every byte and its order",
+        );
+    }
+
+    #[test]
+    fn small_hex_paste_stays_one_batch() {
+        // A short bracketed paste fits in a single fork: no behavior
+        // change for the common case.
+        let payload = b"\x1b[200~hi\x1b[201~".to_vec();
+        let batches = hex_send_batches(&payload);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].first().map(String::as_str), Some("1b"));
+    }
+
+    #[test]
+    fn live_capture_worker_idle_until_geometry_set() {
+        // With no line count published the worker must not capture at all,
+        // so nothing crosses the channel. (`capture_lines == 0` guard.)
+        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        worker.set_target("aoe_test_capture_no_geometry".into());
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(
+            worker.take_latest().is_none(),
+            "worker should stay idle until set_capture_lines is called",
+        );
+    }
+
+    #[test]
+    fn live_capture_worker_skips_empty_captures() {
+        // A worker pointed at a session that doesn't exist captures empty
+        // strings. Forwarding those would blank the preview, defeating the
+        // #1501 kill switch, so the worker must drop them. Deterministic
+        // without a real tmux session: a missing pane always reads empty.
+        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        worker.set_target("aoe_test_capture_missing_session".into());
+        // Fast cadence so the worker actually captures (and drops the empty
+        // frame) within the wait, instead of still being in its first idle
+        // sleep when we assert.
+        worker.set_live(true);
+        worker.set_capture_lines(40);
+        std::thread::sleep(std::time::Duration::from_millis(
+            LIVE_CAPTURE_INTERVAL_FAST_MS + 60,
+        ));
+        assert!(
+            worker.take_latest().is_none(),
+            "empty captures must never be forwarded",
+        );
+    }
+
+    #[test]
+    fn live_capture_worker_retarget_drops_previous_capture() {
+        // Swapping the target must clear any queued capture so the render
+        // never applies the previous pane's bytes under the new view.
+        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        worker.set_capture_lines(40);
+        if let Ok(mut latest) = worker.latest.lock() {
+            *latest = Some("stale previous-pane content".to_string());
+        }
+        worker.set_target("aoe_test_capture_new_target".into());
+        assert!(
+            worker.take_latest().is_none(),
+            "retarget must drop the previous pane's queued capture",
+        );
+    }
+
+    #[test]
+    fn live_capture_worker_forwards_empty_when_policy_set() {
+        // Terminal / container panes set `forward_empty`, so a missing or
+        // cleared pane must surface as an empty capture (clearing stale
+        // preview text) instead of being dropped like the agent kill switch.
+        // Deterministic without a real tmux session: a missing pane reads empty.
+        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        worker.set_target("aoe_test_capture_forward_empty".into());
+        worker.set_forward_empty(true);
+        // Fast cadence so the worker captures within the wait rather than
+        // still being in its first idle sleep when we assert.
+        worker.set_live(true);
+        worker.set_capture_lines(40);
+        std::thread::sleep(std::time::Duration::from_millis(
+            LIVE_CAPTURE_INTERVAL_FAST_MS + 60,
+        ));
+        assert_eq!(
+            worker.take_latest(),
+            Some(String::new()),
+            "forward-empty policy must surface empty captures",
+        );
     }
 }

@@ -10,7 +10,17 @@ import {
   type MutableRefObject,
 } from "react";
 import { createPortal } from "react-dom";
-import { Archive, Clock, ListOrdered, Moon, Pencil, Pin } from "lucide-react";
+import {
+  Archive,
+  ArrowLeftRight,
+  Clock,
+  GripVertical,
+  Layers,
+  ListOrdered,
+  Moon,
+  Pencil,
+  Pin,
+} from "lucide-react";
 import {
   DndContext,
   MouseSensor,
@@ -18,6 +28,7 @@ import {
   useSensor,
   useSensors,
   closestCenter,
+  type CollisionDetection,
   type DragEndEvent,
 } from "@dnd-kit/core";
 import {
@@ -28,12 +39,15 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import type {
-  RepoGroup,
   SessionResponse,
   SessionStatus,
   Workspace,
 } from "../lib/types";
-import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../hooks/useRepoGroups";
+import type { SidebarAxis } from "../lib/sidebarAxis";
+import {
+  sidebarGroupHasLiveWorkspace,
+  type SidebarGroup,
+} from "../lib/sidebarGroups";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import {
   REPO_COLOR_OPTIONS,
@@ -46,6 +60,7 @@ import {
   isSessionActive,
 } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
+import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import {
   renameSession,
   setSessionArchive,
@@ -54,11 +69,13 @@ import {
   setSessionSnooze,
 } from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
+import { requestOpenSession } from "../lib/sessionRoute";
+import { requestSwitchAgent } from "../lib/switchAgentTrigger";
 import { useClampedMenuPosition } from "../lib/menuPosition";
 import { useHasDraftForSessions } from "../lib/cockpitDrafts";
+import { useQueuedCountForSessions } from "../hooks/useCockpitQueueCount";
 import { reportError } from "../lib/toastBus";
 import {
-  repoGroupHasLiveWorkspace,
   resolveEffectiveSnoozedUntil,
   snoozeTimestampCloseEnough,
   triageMenuShape,
@@ -104,23 +121,44 @@ function closeOtherContextMenus() {
   menuBus.dispatchEvent(new Event("close"));
 }
 
+// Group headers and session rows are both sortable inside the one
+// sidebar DndContext, so a header drag must not collide with a session
+// droppable (or vice versa). dnd-kit registers every sortable in a
+// single droppable registry per context; without filtering, closestCenter
+// would happily report a workspace row as the drop target while dragging a
+// group. Restrict candidates to droppables whose `data.type` matches the
+// dragged item, then defer to closestCenter within that subset. See #1644.
+const typedClosestCenter: CollisionDetection = (args) => {
+  const activeType = args.active.data.current?.type;
+  return closestCenter({
+    ...args,
+    droppableContainers: args.droppableContainers.filter(
+      (container) => container.data.current?.type === activeType,
+    ),
+  });
+};
+
 interface Props {
-  groups: RepoGroup[];
+  groups: SidebarGroup[];
   onReorderWorkspaces: (newOrder: string[]) => void;
+  onReorderGroups: (orderedGroupIds: string[]) => void;
   activeId: string | null;
   open: boolean;
   onToggle: () => void;
   onSelect: (workspaceId: string) => void;
-  onToggleRepo: (repoId: string) => void;
+  onToggleGroup: (groupId: string) => void;
   onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   onNew: () => void;
   onCreateSession: (repoPath: string) => void;
   onSettings: () => void;
   onProjects: () => void;
+  onProfiles: () => void;
   onDeleteSession?: (workspaceId: string) => void;
   readOnly?: boolean;
   sortMode: SidebarSortMode;
   onSortModeChange: (mode: SidebarSortMode) => void;
+  axis: SidebarAxis;
+  onAxisChange: (axis: SidebarAxis) => void;
 }
 
 function bestSession(
@@ -373,7 +411,11 @@ function useSuppressClickAfterDrag(ref: MutableRefObject<number>) {
   }, [ref]);
 }
 
-function SortableSessionRow(props: {
+function SortableSessionRow({
+  rowKey,
+  ...props
+}: {
+  rowKey?: string;
   workspace: Workspace;
   isActive: boolean;
   onClick: () => void;
@@ -390,7 +432,11 @@ function SortableSessionRow(props: {
   // triggers a drag.
   const dragOff = !!props.readOnly || !!props.dragDisabled;
   const { listeners, setNodeRef, transform, transition, isDragging } =
-    useSortable({ id: props.workspace.id, disabled: dragOff });
+    useSortable({
+      id: rowKey ?? props.workspace.id,
+      disabled: dragOff,
+      data: { type: "workspace" },
+    });
   useEffect(() => {
     if (isDragging) {
       // Keep extending the window while dragging so a slow drag still
@@ -442,6 +488,58 @@ function SortableSessionRow(props: {
   );
 }
 
+// Props handed to the grip element so RepoGroupHeader can wire a dedicated
+// drag handle. The whole header is NOT draggable: it already owns an
+// expand/collapse click, a context menu, a rename input, and a new-session
+// button, so a header-wide drag would smother them. The grip is the sole
+// activator. See #1644.
+type DragHandleProps = {
+  setActivatorNodeRef: (el: HTMLElement | null) => void;
+  attributes: ReturnType<typeof useSortable>["attributes"];
+  listeners: ReturnType<typeof useSortable>["listeners"];
+};
+
+// Sortable wrapper around an entire repo-group block (header + its rows),
+// so the group moves as a unit. Only real repo groups are wrapped;
+// synthetic Multi-repo/Scratch groups render plainly and stay pinned.
+function SortableRepoGroup({
+  groupId,
+  disabled,
+  children,
+}: {
+  groupId: string;
+  disabled: boolean;
+  children: (handle: DragHandleProps) => React.ReactNode;
+}) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    setActivatorNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: groupId, disabled, data: { type: "group" } });
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    position: "relative",
+    zIndex: isDragging ? 20 : "auto",
+  } as const;
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={
+        "transition-shadow duration-150 " +
+        (isDragging ? "ring-2 ring-inset ring-brand-500 shadow-lg" : "")
+      }
+    >
+      {children({ setActivatorNodeRef, attributes, listeners })}
+    </div>
+  );
+}
+
 export const SessionRow = memo(function SessionRow({
   workspace,
   isActive,
@@ -470,6 +568,11 @@ export const SessionRow = memo(function SessionRow({
     idleDecayWindowMs,
   );
   const firstSession = workspace.sessions[0];
+  // The cockpit session backing this row, if any. Drives the "Switch
+  // agent" context-menu item, which only makes sense for an ACP cockpit
+  // session (tmux rows have no agent to hand off). Multi-session rows are
+  // rare; pick the first cockpit session in the workspace.
+  const cockpitSession = workspace.sessions.find((s) => s.cockpit_mode);
   const runningSession = workspace.sessions.find((s) =>
     isSessionActive(s, idleDecayWindowMs),
   );
@@ -520,6 +623,11 @@ export const SessionRow = memo(function SessionRow({
     [workspace.sessions],
   );
   const hasDraft = useHasDraftForSessions(sessionIds);
+  // Queued cockpit follow-up prompts waiting to fire when the current
+  // turn ends. Summed across the workspace's sessions, mirroring how
+  // `hasDraft` ORs the same set. Lets a user juggling sessions see at a
+  // glance which rows have prompts pending without opening the cockpit.
+  const queuedCount = useQueuedCountForSessions(sessionIds);
 
   const setNotifyPreset = async (preset: NotifyPreset) => {
     setContextMenu(null);
@@ -635,6 +743,19 @@ export const SessionRow = memo(function SessionRow({
   const openSnoozeModal = () => {
     setContextMenu(null);
     setSnoozeModalOpen(true);
+  };
+
+  // Open the switch-agent dialog for this row's cockpit session. The
+  // dialog lives in that session's Composer (it prefills the composer on
+  // confirm), so we navigate to the session first, then request the open.
+  // When the row is already the active session the navigation is a no-op
+  // and the dispatched event opens the dialog immediately; otherwise the
+  // Composer consumes the pending latch once it mounts.
+  const handleSwitchAgent = () => {
+    setContextMenu(null);
+    if (!cockpitSession) return;
+    requestOpenSession(cockpitSession.id);
+    requestSwitchAgent(cockpitSession.id);
   };
 
   // Effective state for rendering: optimistic overrides win until the
@@ -858,6 +979,15 @@ export const SessionRow = memo(function SessionRow({
                   <Pencil className="h-3 w-3 text-amber-400/90" />
                 </span>
               )}
+              {queuedCount > 0 && (
+                <span
+                  title={`${queuedCount} queued prompt${queuedCount === 1 ? "" : "s"}`}
+                  aria-label={`${queuedCount} queued`}
+                  className="inline-flex shrink-0 items-center rounded border border-sky-700/40 bg-sky-950/30 px-1 text-[10px] font-mono font-medium tabular-nums text-sky-300"
+                >
+                  {queuedCount}
+                </span>
+              )}
               {effectiveArchived && (
                 <span
                   title="Archived"
@@ -957,6 +1087,16 @@ export const SessionRow = memo(function SessionRow({
           >
             Rename
           </button>
+          {!readOnly && cockpitSession && (
+            <button
+              onClick={handleSwitchAgent}
+              data-testid="sidebar-context-menu-switch-agent"
+              className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+            >
+              <ArrowLeftRight className="h-3.5 w-3.5 shrink-0" />
+              Switch agent
+            </button>
+          )}
           <div className="border-t border-surface-700/20 my-1" />
           <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
             Notifications
@@ -1331,21 +1471,28 @@ export function SnoozeModal({
   );
 }
 
-const RepoGroupHeader = memo(function RepoGroupHeader({
+const SidebarGroupHeader = memo(function SidebarGroupHeader({
   group,
   hasActiveChild,
   onClick,
   onNewSession,
   onUpdateAppearance,
   offline,
+  dragHandle,
 }: {
-  group: RepoGroup;
+  group: SidebarGroup;
   hasActiveChild: boolean;
   onClick: () => void;
   onNewSession: () => void;
   onUpdateAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   offline: boolean;
+  dragHandle?: DragHandleProps;
 }) {
+  // Appearance (rename/alias/color) and its context menu are repo-axis
+  // only. The user-group axis has no per-group appearance in v1, so the
+  // menu trigger and rename input are gated off rather than rendered inert.
+  const canAppearance = group.capabilities.appearance;
+  const headerTitle = group.groupPath ?? group.repoPath;
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(group.alias ?? group.displayName);
@@ -1443,19 +1590,38 @@ const RepoGroupHeader = memo(function RepoGroupHeader({
       <div
         data-testid="sidebar-group-header"
         data-group-id={group.id}
-        tabIndex={0}
-        aria-haspopup="menu"
-        aria-label={`Project actions for ${group.displayName}`}
-        onContextMenu={(e) => {
-          e.preventDefault();
-          openMenuAt(e.clientX, e.clientY);
-        }}
-        onKeyDown={handleHeaderKeyDown}
+        tabIndex={canAppearance ? 0 : undefined}
+        aria-haspopup={canAppearance ? "menu" : undefined}
+        aria-label={
+          canAppearance ? `Project actions for ${group.displayName}` : undefined
+        }
+        onContextMenu={
+          canAppearance
+            ? (e) => {
+                e.preventDefault();
+                openMenuAt(e.clientX, e.clientY);
+              }
+            : undefined
+        }
+        onKeyDown={canAppearance ? handleHeaderKeyDown : undefined}
         className={`flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${headerHoverClass} ${
           hasActiveChild ? "border-l-2 border-brand-600" : ""
         }`}
         style={headerStyle}
       >
+        {dragHandle && (
+          <button
+            ref={dragHandle.setActivatorNodeRef}
+            type="button"
+            aria-label={`Reorder project ${group.displayName}`}
+            data-testid="sidebar-group-drag-handle"
+            className="shrink-0 -ml-1 flex h-5 w-4 items-center justify-center text-text-dim hover:text-text-secondary cursor-grab active:cursor-grabbing touch-none"
+            {...dragHandle.attributes}
+            {...dragHandle.listeners}
+          >
+            <GripVertical className="h-3.5 w-3.5" />
+          </button>
+        )}
         <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
         <button
           onClick={onClick}
@@ -1474,7 +1640,7 @@ const RepoGroupHeader = memo(function RepoGroupHeader({
             <path d="M2 3 L5 6.5 L8 3" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
           </svg>
           <OwnerAvatar owner={group.remoteOwner} size={16} />
-          <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={group.repoPath}>
+          <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={headerTitle}>
             {group.displayName}
           </span>
         </button>
@@ -1492,7 +1658,7 @@ const RepoGroupHeader = memo(function RepoGroupHeader({
           </button>
         </Tooltip>
       </div>
-      {contextMenu && createPortal(
+      {canAppearance && contextMenu && createPortal(
         <div
           ref={menuRef}
           data-testid="sidebar-group-context-menu"
@@ -1590,22 +1756,32 @@ function workspaceMatchesFilter(ws: Workspace, q: string): boolean {
 export function WorkspaceSidebar({
   groups,
   onReorderWorkspaces,
+  onReorderGroups,
   activeId,
   open,
   onToggle,
   onSelect,
-  onToggleRepo,
+  onToggleGroup,
   onUpdateRepoAppearance,
   onNew,
   onCreateSession,
   onSettings,
   onProjects,
+  onProfiles,
   onDeleteSession,
   readOnly,
   sortMode,
   onSortModeChange,
+  axis,
+  onAxisChange,
 }: Props) {
   const dragDisabled = !!readOnly || sortMode === "lastActivity";
+  // Reorder (group drag + row drag) is also off whenever any visible group
+  // forbids it, which is the whole user-group axis: groups have no manual
+  // order in v1. Gating here keeps the shared DndContext from firing a
+  // reorder on an axis that cannot persist one.
+  const reorderDisabled =
+    dragDisabled || groups.some((g) => !g.capabilities.reorder);
   const dragSuppressRef = useRef<number>(0);
   useSuppressClickAfterDrag(dragSuppressRef);
   const offline = useServerDown();
@@ -1650,31 +1826,52 @@ export function WorkspaceSidebar({
       const { active, over } = e;
       if (!over || active.id === over.id) return;
 
-      // Drag is constrained to within a single repo group (each group
-      // has its own SortableContext), so finding the active group and
-      // reordering inside it is sufficient.
+      // Two sortable layers share this context: group headers and session
+      // rows. Branch on the typed `data` payload, not on the id shape
+      // (repo paths vs uuid-like ids), so the dispatch stays robust if
+      // either id domain changes. Typed collision detection already keeps
+      // a header drag from landing on a row; the guard here is belt and
+      // braces. See #1644.
+      if (active.data.current?.type === "group") {
+        if (over.data.current?.type !== "group") return;
+        // Persist the full visible group order, synthetic groups
+        // included: they default to the bottom but can be dragged to any
+        // position, after which their stored rank holds. See #1644.
+        const orderedIds = groups.map((g) => g.id);
+        const oldIndex = orderedIds.indexOf(String(active.id));
+        const newIndex = orderedIds.indexOf(String(over.id));
+        if (oldIndex < 0 || newIndex < 0) return;
+        onReorderGroups(arrayMove(orderedIds, oldIndex, newIndex));
+        return;
+      }
+
+      // Workspace-row drag is constrained to within a single repo group
+      // (each group has its own SortableContext), so finding the active
+      // group and reordering inside it is sufficient.
       const groupIndex = groups.findIndex((g) =>
-        g.workspaces.some((w) => w.id === active.id),
+        g.workspaces.some((v) => v.key === active.id),
       );
       const group = groups[groupIndex];
       if (groupIndex < 0 || !group) return;
-      const oldIndex = group.workspaces.findIndex((w) => w.id === active.id);
-      const newIndex = group.workspaces.findIndex((w) => w.id === over.id);
+      const oldIndex = group.workspaces.findIndex((v) => v.key === active.id);
+      const newIndex = group.workspaces.findIndex((v) => v.key === over.id);
       if (oldIndex < 0 || newIndex < 0) return;
 
       // Build the new full visual order by replacing the affected
       // group's local order, then concat in the existing group order.
-      // We persist the full flat list so cross-device clients can render
-      // the same layout without re-deriving per-group ordering.
+      // We persist the full flat list of workspace ids so cross-device
+      // clients can render the same layout without re-deriving per-group
+      // ordering. Reorder only ever runs on the repo axis (the user-group
+      // axis disables drag), where each view key equals its workspace id.
       const reordered = arrayMove(group.workspaces, oldIndex, newIndex);
       const flat: string[] = [];
       groups.forEach((g, i) => {
-        const ws = i === groupIndex ? reordered : g.workspaces;
-        ws.forEach((w) => flat.push(w.id));
+        const views = i === groupIndex ? reordered : g.workspaces;
+        views.forEach((v) => flat.push(v.workspace.id));
       });
       onReorderWorkspaces(flat);
     },
-    [groups, onReorderWorkspaces],
+    [groups, onReorderWorkspaces, onReorderGroups],
   );
 
   const q = filterQuery.trim().toLowerCase();
@@ -1683,8 +1880,8 @@ export function WorkspaceSidebar({
     ? groups
         .map((g) => ({
           ...g,
-          workspaces: g.workspaces.filter((ws) =>
-            workspaceMatchesFilter(ws, q) ||
+          workspaces: g.workspaces.filter((v) =>
+            workspaceMatchesFilter(v.workspace, q) ||
             g.displayName.toLowerCase().includes(q),
           ),
         }))
@@ -1746,6 +1943,7 @@ export function WorkspaceSidebar({
         onClick={onToggle}
       />
       <div
+        {...tourAnchor(TOUR_ANCHORS.sidebar)}
         style={{ width }}
         className={`fixed top-12 bottom-0 left-0 z-40 md:static md:z-auto bg-surface-800 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
           open ? "translate-x-0" : "-translate-x-full md:hidden"
@@ -1753,8 +1951,34 @@ export function WorkspaceSidebar({
       >
         <div className="px-3 pt-3 pb-1 flex items-center">
           <span className="text-sm text-text-muted flex-1">
-            Projects
+            {axis === "group" ? "Groups" : "Projects"}
           </span>
+          <Tooltip
+            text={
+              axis === "group"
+                ? "Grouping: by user group"
+                : "Grouping: by repository"
+            }
+          >
+            <button
+              onClick={() => onAxisChange(axis === "repo" ? "group" : "repo")}
+              aria-pressed={axis === "group"}
+              aria-label={
+                axis === "group"
+                  ? "Group sessions by user group, currently pressed"
+                  : "Group sessions by repository"
+              }
+              data-testid="sidebar-axis-toggle"
+              data-axis={axis}
+              className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
+                axis === "group"
+                  ? "text-brand-500"
+                  : "text-text-dim hover:text-text-secondary"
+              }`}
+            >
+              <Layers className="h-3.5 w-3.5" />
+            </button>
+          </Tooltip>
           <Tooltip
             text={
               sortMode === "lastActivity"
@@ -1865,75 +2089,125 @@ export function WorkspaceSidebar({
           <DragSuppressContext.Provider value={dragSuppressRef}>
           <DndContext
             sensors={sensors}
-            collisionDetection={closestCenter}
-            onDragEnd={dragDisabled ? undefined : handleDragEnd}
+            collisionDetection={typedClosestCenter}
+            onDragEnd={reorderDisabled ? undefined : handleDragEnd}
           >
-            {filteredGroups.filter(repoGroupHasLiveWorkspace).map((group) => {
-              const showExpanded = q ? true : !group.collapsed;
-              const hasActiveChild = group.workspaces.some(
-                (ws) => ws.id === displayedActiveId,
+            {(() => {
+              const liveGroups = filteredGroups.filter(
+                sidebarGroupHasLiveWorkspace,
               );
+              // Every visible group is sortable, synthetic Multi-repo /
+              // Scratch included: they default to the bottom but can be
+              // dragged to any position. Group drag is off while a filter
+              // is active (the visible list is a partial projection),
+              // whenever row drag is off (read-only or last-activity
+              // sort), or on the user-group axis (no manual order). See
+              // #1644, #1234.
+              const sortableGroupIds = liveGroups.map((g) => g.id);
+              const groupDragDisabled = reorderDisabled || q.length > 0;
+
+              const renderGroupBody = (
+                group: SidebarGroup,
+                dragHandle?: DragHandleProps,
+              ) => {
+                const showExpanded = q ? true : !group.collapsed;
+                const hasActiveChild = group.workspaces.some(
+                  (v) => v.workspace.id === displayedActiveId,
+                );
+                return (
+                  <>
+                    <SidebarGroupHeader
+                      group={{ ...group, collapsed: !showExpanded }}
+                      hasActiveChild={!showExpanded && hasActiveChild}
+                      onClick={() => !q && onToggleGroup(group.id)}
+                      onUpdateAppearance={onUpdateRepoAppearance}
+                      onNewSession={() =>
+                        group.capabilities.create === "repo" && group.repoPath
+                          ? onCreateSession(group.repoPath)
+                          : onNew()
+                      }
+                      offline={offline}
+                      dragHandle={dragHandle}
+                    />
+                    {showExpanded &&
+                      (() => {
+                        // Each group renders only its live tier. Sunk
+                        // workspaces (archived or actively snoozed across
+                        // every session) are pulled out into a single
+                        // global "Snoozed & archived" section at the very
+                        // bottom of the sidebar, rather than one footer
+                        // per repo group. See #1581.
+                        const liveWorkspaces = group.workspaces.filter(
+                          (v) => !workspaceIsSunk(v.workspace),
+                        );
+                        return (
+                          <SortableContext
+                            items={liveWorkspaces.map((v) => v.key)}
+                            strategy={verticalListSortingStrategy}
+                          >
+                            {liveWorkspaces.map((v) => (
+                              <SortableSessionRow
+                                key={v.key}
+                                rowKey={v.key}
+                                workspace={v.workspace}
+                                isActive={
+                                  v.workspace.id === displayedActiveId
+                                }
+                                onClick={() => {
+                                  setOptimisticActive({
+                                    id: v.workspace.id,
+                                    fromActiveId: activeId,
+                                  });
+                                  onSelect(v.workspace.id);
+                                }}
+                                onDelete={onDeleteSession}
+                                readOnly={readOnly}
+                                // Drag is disabled when the tier
+                                // comparator already controls placement:
+                                // lastActivity mode has no manual
+                                // concept, pinned rows always float to
+                                // the top of their group, and the
+                                // user-group axis has no manual order.
+                                // See #1581, #1234.
+                                dragDisabled={
+                                  reorderDisabled ||
+                                  workspaceIsPinned(v.workspace)
+                                }
+                              />
+                            ))}
+                          </SortableContext>
+                        );
+                      })()}
+                  </>
+                );
+              };
+
               return (
-                <div key={group.id}>
-                  <RepoGroupHeader
-                    group={{ ...group, collapsed: !showExpanded }}
-                    hasActiveChild={!showExpanded && hasActiveChild}
-                    onClick={() => !q && onToggleRepo(group.id)}
-                    onUpdateAppearance={onUpdateRepoAppearance}
-                    onNewSession={() =>
-                      group.id === MULTI_REPO_GROUP_ID ||
-                      group.id === SCRATCH_GROUP_ID
-                        ? onNew()
-                        : onCreateSession(group.repoPath)
-                    }
-                    offline={offline}
-                  />
-                  {showExpanded && (() => {
-                    // Each group renders only its live tier. Sunk
-                    // workspaces (archived or actively snoozed across
-                    // every session) are pulled out into a single
-                    // global "Snoozed & archived" section at the very
-                    // bottom of the sidebar, rather than one footer
-                    // per repo group. See #1581.
-                    const liveWorkspaces = group.workspaces.filter(
-                      (ws) => !workspaceIsSunk(ws),
-                    );
-                    return (
-                      <SortableContext
-                        items={liveWorkspaces.map((ws) => ws.id)}
-                        strategy={verticalListSortingStrategy}
-                      >
-                        {liveWorkspaces.map((ws) => (
-                          <SortableSessionRow
-                            key={ws.id}
-                            workspace={ws}
-                            isActive={ws.id === displayedActiveId}
-                            onClick={() => {
-                              setOptimisticActive({
-                                id: ws.id,
-                                fromActiveId: activeId,
-                              });
-                              onSelect(ws.id);
-                            }}
-                            onDelete={onDeleteSession}
-                            readOnly={readOnly}
-                            // Drag is disabled when the tier comparator
-                            // already controls placement: lastActivity
-                            // mode has no manual concept, pinned rows
-                            // always float to the top of their group.
-                            // See #1581.
-                            dragDisabled={
-                              sortMode === "lastActivity" ||
-                              workspaceIsPinned(ws)
-                            }
-                          />
-                        ))}
-                      </SortableContext>
-                    );
-                  })()}
-                </div>
+                <SortableContext
+                  items={sortableGroupIds}
+                  strategy={verticalListSortingStrategy}
+                >
+                  {liveGroups.map((group) => (
+                    <SortableRepoGroup
+                      key={group.id}
+                      groupId={group.id}
+                      disabled={groupDragDisabled}
+                    >
+                      {(handle) =>
+                        // Hide the grip when group drag is off (the
+                        // visible order is computed or filtered) so
+                        // there is no dead affordance, mirroring how
+                        // session rows drop their drag wiring.
+                        renderGroupBody(
+                          group,
+                          groupDragDisabled ? undefined : handle,
+                        )
+                      }
+                    </SortableRepoGroup>
+                  ))}
+                </SortableContext>
               );
-            })}
+            })()}
           </DndContext>
           </DragSuppressContext.Provider>
           {(() => {
@@ -1946,7 +2220,7 @@ export function WorkspaceSidebar({
             // surfaces the title/branch/repo chips that anchor it to
             // its project. See #1581.
             const sunkWorkspaces = filteredGroups.flatMap((g) =>
-              g.workspaces.filter(workspaceIsSunk),
+              g.workspaces.filter((v) => workspaceIsSunk(v.workspace)),
             );
             if (sunkWorkspaces.length === 0) return null;
             return (
@@ -1980,17 +2254,17 @@ export function WorkspaceSidebar({
                   </span>
                 </button>
                 {sunkExpanded &&
-                  sunkWorkspaces.map((ws) => (
+                  sunkWorkspaces.map((v) => (
                     <SessionRow
-                      key={ws.id}
-                      workspace={ws}
-                      isActive={ws.id === displayedActiveId}
+                      key={v.key}
+                      workspace={v.workspace}
+                      isActive={v.workspace.id === displayedActiveId}
                       onClick={() => {
                         setOptimisticActive({
-                          id: ws.id,
+                          id: v.workspace.id,
                           fromActiveId: activeId,
                         });
-                        onSelect(ws.id);
+                        onSelect(v.workspace.id);
                       }}
                       onDelete={onDeleteSession}
                       readOnly={readOnly}
@@ -2031,7 +2305,30 @@ export function WorkspaceSidebar({
             </svg>
           </button>
           <button
+            onClick={onProfiles}
+            className="w-8 h-8 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
+            title="Profiles"
+            aria-label="Profiles"
+          >
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+              <circle cx="9" cy="7" r="4" />
+              <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+              <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+            </svg>
+          </button>
+          <button
             onClick={onSettings}
+            {...tourAnchor(TOUR_ANCHORS.sidebarSettings)}
             className="w-8 h-8 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
             title="Settings"
             aria-label="Settings"

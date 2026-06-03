@@ -10,7 +10,7 @@ use std::fs;
 
 use super::config::{
     ColorMode, Config, ContainerRuntimeName, DefaultTerminalMode, TmuxClipboardMode, TmuxMouseMode,
-    TmuxStatusBarMode,
+    TmuxStatusBarMode, VolumeIgnoresStrategy,
 };
 use super::get_profile_dir;
 
@@ -52,6 +52,9 @@ pub struct ProfileConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cockpit: Option<CockpitConfigOverride>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<DiffConfigOverride>,
 
     /// Per-profile override for the host-side `environment` list. When
     /// `Some`, replaces the global list entirely (matching the existing
@@ -96,6 +99,8 @@ pub struct CockpitConfigOverride {
     pub silent_orphan_grace_secs: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub silent_orphan_fast_grace_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_stop_idle_secs: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -202,10 +207,16 @@ pub struct SandboxConfigOverride {
     pub mount_ssh: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selinux_relabel: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_instruction: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_runtime: Option<ContainerRuntimeName>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_ignores_strategy: Option<VolumeIgnoresStrategy>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -238,16 +249,25 @@ pub struct SessionConfigOverride {
     pub agent_status_hooks: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mouse_capture: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_agents: Option<HashMap<String, String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_detect_as: Option<HashMap<String, String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_cockpit_cmd: Option<HashMap<String, String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strict_hotkeys: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snooze_duration_minutes: Option<u32>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_stop_idle_secs: Option<u32>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_wake_message: Option<String>,
@@ -259,6 +279,9 @@ pub struct SessionConfigOverride {
     pub live_send_exit_chord: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_send_leader: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_session_attach_mode: Option<super::config::NewSessionAttachMode>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -266,6 +289,13 @@ pub struct SessionConfigOverride {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub click_action: Option<super::config::ClickAction>,
+}
+
+/// Per-profile override for diff view preferences.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DiffConfigOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_view: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -340,6 +370,7 @@ pub fn profile_has_overrides(config: &ProfileConfig) -> bool {
         || config.sound.is_some()
         || config.status_hooks.is_some()
         || config.cockpit.is_some()
+        || config.diff.is_some()
         || config.environment.is_some()
 }
 
@@ -403,11 +434,17 @@ pub fn apply_sandbox_overrides(
     if let Some(mount_ssh) = source.mount_ssh {
         target.mount_ssh = mount_ssh;
     }
+    if let Some(selinux_relabel) = source.selinux_relabel {
+        target.selinux_relabel = selinux_relabel;
+    }
     if let Some(ref custom_instruction) = source.custom_instruction {
         target.custom_instruction = Some(custom_instruction.clone());
     }
     if let Some(container_runtime) = source.container_runtime {
         target.container_runtime = container_runtime;
+    }
+    if let Some(volume_ignores_strategy) = source.volume_ignores_strategy {
+        target.volume_ignores_strategy = volume_ignores_strategy;
     }
 }
 
@@ -478,17 +515,26 @@ pub fn apply_session_overrides(
     if let Some(agent_status_hooks) = source.agent_status_hooks {
         target.agent_status_hooks = agent_status_hooks;
     }
+    if let Some(mouse_capture) = source.mouse_capture {
+        target.mouse_capture = mouse_capture;
+    }
     if let Some(ref custom_agents) = source.custom_agents {
         target.custom_agents = custom_agents.clone();
     }
     if let Some(ref detect_as) = source.agent_detect_as {
         target.agent_detect_as = detect_as.clone();
     }
+    if let Some(ref cockpit_cmd) = source.agent_cockpit_cmd {
+        target.agent_cockpit_cmd = cockpit_cmd.clone();
+    }
     if let Some(strict_hotkeys) = source.strict_hotkeys {
         target.strict_hotkeys = strict_hotkeys;
     }
     if let Some(snooze_duration_minutes) = source.snooze_duration_minutes {
         target.snooze_duration_minutes = snooze_duration_minutes;
+    }
+    if let Some(auto_stop_idle_secs) = source.auto_stop_idle_secs {
+        target.auto_stop_idle_secs = auto_stop_idle_secs;
     }
     if let Some(ref restart_wake_message) = source.restart_wake_message {
         target.restart_wake_message = restart_wake_message.clone();
@@ -498,6 +544,9 @@ pub fn apply_session_overrides(
     }
     if let Some(ref live_send_exit_chord) = source.live_send_exit_chord {
         target.live_send_exit_chord = live_send_exit_chord.clone();
+    }
+    if let Some(ref live_send_leader) = source.live_send_leader {
+        target.live_send_leader = live_send_leader.clone();
     }
     if let Some(new_session_attach_mode) = source.new_session_attach_mode {
         target.new_session_attach_mode = new_session_attach_mode;
@@ -627,6 +676,15 @@ pub fn merge_configs(mut global: Config, profile: &ProfileConfig) -> Config {
         }
         if let Some(v) = cockpit_override.silent_orphan_fast_grace_secs {
             global.cockpit.silent_orphan_fast_grace_secs = v;
+        }
+        if let Some(v) = cockpit_override.auto_stop_idle_secs {
+            global.cockpit.auto_stop_idle_secs = v;
+        }
+    }
+
+    if let Some(ref diff_override) = profile.diff {
+        if let Some(split_view) = diff_override.split_view {
+            global.diff.split_view = split_view;
         }
     }
 
@@ -1161,5 +1219,19 @@ mod tests {
 
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.environment, vec!["FROM_GLOBAL=1".to_string()]);
+    }
+
+    #[test]
+    fn profile_diff_split_view_override_applies() {
+        let mut global = Config::default();
+        global.diff.split_view = false;
+        let profile = ProfileConfig {
+            diff: Some(DiffConfigOverride {
+                split_view: Some(true),
+            }),
+            ..Default::default()
+        };
+        let merged = merge_configs(global, &profile);
+        assert!(merged.diff.split_view);
     }
 }

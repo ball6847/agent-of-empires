@@ -69,6 +69,86 @@ fn test_cli_add_next_steps_uses_aoe_binary_name() {
     );
 }
 
+/// #1909: `aoe add --interactive` must fail loudly when stdin is not a
+/// terminal instead of hanging on the name prompt. `run_cli` runs the
+/// binary as a plain subprocess with no controlling TTY, which is the
+/// non-interactive case the guard protects.
+#[test]
+#[serial]
+fn test_cli_add_interactive_requires_tty() {
+    let h = TuiTestHarness::new("cli_add_interactive_no_tty");
+    let project = h.project_path();
+
+    let output = h.run_cli(&["add", project.to_str().unwrap(), "-i"]);
+    assert!(
+        !output.status.success(),
+        "aoe add -i without a TTY should fail, not hang or succeed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires a terminal"),
+        "expected the --interactive TTY guard message.\nstderr: {}",
+        stderr
+    );
+
+    // The guard runs before any persistence, so no session row is written.
+    let sessions_path =
+        crate::harness::app_dir_in(h.home_path()).join("profiles/default/sessions.json");
+    assert!(
+        !sessions_path.exists(),
+        "the TTY guard must bail before writing sessions.json"
+    );
+}
+
+/// #1909: `aoe add --interactive` should prompt for a session name like
+/// the TUI `n` flow. Driven through a tmux pane so stdin is a real
+/// terminal; the typed name must become the session title.
+#[test]
+#[serial]
+fn test_cli_add_interactive_prompts_for_name() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("cli_add_interactive_prompt");
+    let project = h.project_path();
+    let project_arg = project.to_str().unwrap().to_string();
+
+    h.spawn(&["add", &project_arg, "-i"]);
+    h.wait_for("Session name [");
+    h.type_text("InteractivePrompted");
+    h.send_keys("Enter");
+
+    // The add command exits as soon as it persists, tearing down the tmux
+    // pane, so the screen goes blank. Poll the on-disk session store
+    // instead of waiting on screen output.
+    let sessions_path =
+        crate::harness::app_dir_in(h.home_path()).join("profiles/default/sessions.json");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let landed = loop {
+        let found = std::fs::read_to_string(&sessions_path)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .map(|j| {
+                j.as_array().is_some_and(|sessions| {
+                    sessions
+                        .iter()
+                        .any(|s| s["title"].as_str() == Some("InteractivePrompted"))
+                })
+            })
+            .unwrap_or(false);
+        if found {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    assert!(
+        landed,
+        "interactive prompt should persist a session titled InteractivePrompted"
+    );
+}
+
 #[test]
 #[serial]
 fn test_cli_add_invalid_path() {
@@ -173,6 +253,62 @@ agent_command_override = {{ claude = "my-custom-claude" }}
         session["command"].as_str().unwrap_or(""),
         "my-custom-claude",
         "command should be populated from config agent_command_override"
+    );
+}
+
+#[test]
+#[serial]
+fn test_cli_add_cmd_respects_command_override_for_availability() {
+    // `qwen` is a built-in agent whose binary is not installed in CI. The
+    // override remaps it to a wrapper that we shim on PATH. Pre-fix, the
+    // `--cmd` availability check ran `which qwen` and bailed because the
+    // bare binary was absent; post-fix it verifies the override binary
+    // (`qwen-plannotator`) that will actually launch. See #1910.
+    let mut h = TuiTestHarness::new("cli_add_cmd_override_avail");
+    h.install_path_command("qwen-plannotator");
+    let project = h.project_path();
+
+    let config_dir = crate::harness::app_dir_in(h.home_path());
+    let config_content = format!(
+        r#"[updates]
+update_check_mode = "off"
+
+[app_state]
+has_seen_welcome = true
+last_seen_version = "{}"
+
+[session]
+agent_command_override = {{ qwen = "qwen-plannotator" }}
+"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    std::fs::write(config_dir.join("config.toml"), config_content).expect("write config.toml");
+
+    let add_output = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "QwenOverride",
+        "--cmd",
+        "qwen",
+    ]);
+    assert!(
+        add_output.status.success(),
+        "aoe add --cmd qwen should succeed when the override binary is on PATH: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let sessions = read_sessions_json(&h);
+    let session = &sessions[0];
+    assert_eq!(
+        session["tool"].as_str().unwrap_or(""),
+        "qwen",
+        "tool should resolve to the built-in qwen"
+    );
+    assert_eq!(
+        session["command"].as_str().unwrap_or(""),
+        "qwen-plannotator",
+        "command should resolve through session.agent_command_override"
     );
 }
 
@@ -861,6 +997,79 @@ fn test_cli_rename_preserves_tmux_session() {
     // Cleanup
     let _ = Command::new("tmux")
         .args(["kill-session", "-t", &new_tmux_name])
+        .output();
+}
+
+/// Removing a session via CLI must kill its agent tmux session. Locks the
+/// invariant "session removed implies tmux gone" that the audit identified
+/// as untested on every removal path.
+#[test]
+#[serial]
+fn test_cli_rm_kills_agent_tmux_session() {
+    require_tmux!();
+
+    let h = TuiTestHarness::new("cli_rm_tmux");
+    let project = h.project_path();
+
+    let add_output = h.run_cli(&["add", project.to_str().unwrap(), "-t", "RmTarget"]);
+    assert!(
+        add_output.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let sessions = read_sessions_json(&h);
+    let session_id = sessions[0]["id"].as_str().expect("session should have id");
+    let truncated_id = &session_id[..8.min(session_id.len())];
+
+    let tmux_name = format!(
+        "{}RmTarget_{}",
+        agent_of_empires::tmux::SESSION_PREFIX,
+        truncated_id
+    );
+
+    let create = Command::new("tmux")
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &tmux_name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "sleep",
+            "60",
+        ])
+        .output()
+        .expect("tmux new-session");
+    assert!(
+        create.status.success(),
+        "failed to create tmux session: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let rm_output = h.run_cli(&["rm", session_id, "--force"]);
+    assert!(
+        rm_output.status.success(),
+        "aoe rm failed: {}",
+        String::from_utf8_lossy(&rm_output.stderr)
+    );
+
+    let still_alive = Command::new("tmux")
+        .args(["has-session", "-t", &tmux_name])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(
+        !still_alive,
+        "tmux session '{}' should be gone after aoe rm",
+        tmux_name
+    );
+
+    // Cleanup
+    let _ = Command::new("tmux")
+        .args(["kill-session", "-t", &tmux_name])
         .output();
 }
 

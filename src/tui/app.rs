@@ -184,6 +184,47 @@ impl App {
         }
     }
 
+    /// Peel a trailing Enter off a paste burst so plain-Enter Submit
+    /// semantics survive when the user types or dictates fast enough to
+    /// pump everything through the burst path.
+    ///
+    /// Without this peel, an "hi<Enter>" with sub-5ms key gaps
+    /// (fast typing, clipboard paste with trailing newline, VoiceInk
+    /// dictation that punctuates with a return) lands as a single
+    /// burst `[h, i, Enter]` whose string is `"hi\n"`. The current
+    /// code forwards that whole string through `handle_paste`, which
+    /// inserts `\n` as a literal newline in the textarea, so the
+    /// `Enter` never reaches the dialog's Submit branch and the
+    /// message never sends.
+    ///
+    /// The fix preserves embedded `\n` (mid-burst sentence breaks from
+    /// Mosh-stripped voice paste; the original reason Enter was added
+    /// to `is_burst_candidate`) and only peels the trailing Enter,
+    /// which is intent-to-submit, not data.
+    ///
+    /// Returns `(paste_text, trailing_enter)`:
+    ///   * `paste_text`: the string to forward to `handle_paste` with
+    ///     any trailing `\n` removed.
+    ///   * `trailing_enter`: `Some(KeyEvent)` to replay via
+    ///     `handle_key` after `handle_paste` runs, so the dialog's
+    ///     plain-Enter Submit branch fires; `None` if the burst did
+    ///     not end on Enter.
+    fn split_trailing_enter(
+        burst_str: &str,
+        burst_keys: &[KeyEvent],
+    ) -> (String, Option<KeyEvent>) {
+        match burst_keys.last() {
+            Some(last) if last.code == KeyCode::Enter => {
+                let trimmed = burst_str
+                    .strip_suffix('\n')
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| burst_str.to_string());
+                (trimmed, Some(*last))
+            }
+            _ => (burst_str.to_string(), None),
+        }
+    }
+
     pub fn new(
         profile: &str,
         available_tools: AvailableTools,
@@ -577,8 +618,11 @@ impl App {
 
         // Telemetry (opt-in, no-op otherwise): announce this surface on boot,
         // send an initial snapshot, then refresh it periodically and once more
-        // on graceful exit. All sends are detached and swallow errors.
-        const TELEMETRY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+        // on graceful exit. All sends are detached and swallow errors. The
+        // periodic interval carries bounded jitter (4h + up to 30m) so installs
+        // that boot together don't snapshot in lockstep; the boot snapshot above
+        // stays immediate.
+        let telemetry_snapshot_interval = crate::telemetry::snapshot_interval();
         crate::telemetry::spawn_process_start(crate::telemetry::Surface::Tui);
         self.emit_telemetry_snapshot();
         let mut last_telemetry_snapshot = std::time::Instant::now();
@@ -677,11 +721,25 @@ impl App {
                                     }
                                 }
                                 if burst_keys.len() >= PASTE_BURST_MIN_LEN {
-                                    tracing::debug!(target: "tui.input",
-                                        "paste-burst: routed {} chars via handle_paste (chars={:?})",
-                                        burst_str.len(), burst_str
-                                    );
-                                    self.home.handle_paste(&burst_str);
+                                    // Peel a trailing Enter so the dialog's
+                                    // plain-Enter Submit branch still fires.
+                                    // Embedded mid-burst Enters stay as '\n'
+                                    // in the paste text (the original reason
+                                    // Enter is a burst candidate).
+                                    let (paste_text, trailing_enter) =
+                                        Self::split_trailing_enter(&burst_str, &burst_keys);
+                                    if !paste_text.is_empty() {
+                                        tracing::debug!(target: "tui.input",
+                                            "paste-burst: routed {} chars via handle_paste (chars={:?})",
+                                            paste_text.len(), paste_text
+                                        );
+                                        self.home.handle_paste(&paste_text);
+                                    }
+                                    if let Some(enter) = trailing_enter {
+                                        if !self.should_quit {
+                                            self.handle_key(enter, terminal).await?;
+                                        }
+                                    }
                                 } else {
                                     for k in burst_keys {
                                         self.handle_key(k, terminal).await?;
@@ -1181,7 +1239,7 @@ impl App {
                 last_heartbeat = std::time::Instant::now();
             }
 
-            if last_telemetry_snapshot.elapsed() >= TELEMETRY_SNAPSHOT_INTERVAL {
+            if last_telemetry_snapshot.elapsed() >= telemetry_snapshot_interval {
                 last_telemetry_snapshot = std::time::Instant::now();
                 self.emit_telemetry_snapshot();
             }
@@ -1314,16 +1372,21 @@ impl App {
     }
 
     /// Build a `usage_snapshot` from the current session list, or `None` when
-    /// telemetry is not opted in. The TUI never hosts the web dashboard, so
-    /// `web_seen` / `cockpit_seen` are false and the create-trend counter is
-    /// left at 0 (the `aoe serve` daemon is the surface that tracks those).
+    /// telemetry is not opted in. The TUI never hosts the web dashboard, so the
+    /// `usage_seen` map is reported zeroed (a stable full key set), the
+    /// per-client form-factor maps stay empty (and so omitted), the create-trend
+    /// counter is left at 0, and the cockpit-interaction counts are empty (the
+    /// `aoe serve` daemon is the surface that tracks all of those).
     fn build_telemetry_snapshot(&self) -> Option<crate::telemetry::UsageSnapshot> {
         crate::telemetry::build_usage_snapshot(
             crate::telemetry::Surface::Tui,
             self.home.instances(),
-            false,
-            false,
+            crate::telemetry::usage_signals::zeroed(),
             0,
+            // The TUI hosts no server, so it has no auth or exposure mode.
+            None,
+            None,
+            &crate::telemetry::CockpitInteractionCounts::default(),
         )
     }
 
@@ -2819,5 +2882,97 @@ mod tests {
             Some('\n'),
             "Enter must map to \\n so embedded sentence-breaks land in the burst"
         );
+    }
+
+    #[test]
+    fn split_trailing_enter_peels_terminating_enter() {
+        // Regression: typing "hi<Enter>" with <5ms key gaps used to land
+        // as a single burst whose string `"hi\n"` was forwarded to
+        // handle_paste, so the textarea inserted `\n` as data and the
+        // dialog's Submit branch never fired. Peel the trailing Enter
+        // so handle_paste sees `"hi"` and we replay Enter for Submit.
+        let burst_keys = vec![
+            key(KeyCode::Char('h'), KeyModifiers::NONE),
+            key(KeyCode::Char('i'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        let (paste, enter) = App::split_trailing_enter("hi\n", &burst_keys);
+        assert_eq!(paste, "hi");
+        assert!(enter.is_some());
+        assert_eq!(enter.unwrap().code, KeyCode::Enter);
+    }
+
+    #[test]
+    fn split_trailing_enter_preserves_embedded_newlines() {
+        // Voice/dictation pastes with sentence breaks land embedded
+        // Enters in the burst. Those are data, not intent-to-submit.
+        // Only the trailing Enter is peeled.
+        let burst_keys = vec![
+            key(KeyCode::Char('a'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            key(KeyCode::Char('b'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        let (paste, enter) = App::split_trailing_enter("a\nb\n", &burst_keys);
+        assert_eq!(paste, "a\nb");
+        assert!(enter.is_some());
+    }
+
+    #[test]
+    fn split_trailing_enter_keeps_mid_burst_enter_when_burst_ends_on_char() {
+        // Burst ends on a printable char, so there is no trailing Enter to peel.
+        // The embedded Enter stays in the paste text.
+        let burst_keys = vec![
+            key(KeyCode::Char('h'), KeyModifiers::NONE),
+            key(KeyCode::Char('i'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            key(KeyCode::Char('t'), KeyModifiers::NONE),
+            key(KeyCode::Char('h'), KeyModifiers::NONE),
+            key(KeyCode::Char('e'), KeyModifiers::NONE),
+            key(KeyCode::Char('r'), KeyModifiers::NONE),
+            key(KeyCode::Char('e'), KeyModifiers::NONE),
+        ];
+        let (paste, enter) = App::split_trailing_enter("hi\nthere", &burst_keys);
+        assert_eq!(paste, "hi\nthere");
+        assert!(enter.is_none());
+    }
+
+    #[test]
+    fn split_trailing_enter_no_enter_at_all() {
+        let burst_keys = vec![
+            key(KeyCode::Char('a'), KeyModifiers::NONE),
+            key(KeyCode::Char('b'), KeyModifiers::NONE),
+            key(KeyCode::Char('c'), KeyModifiers::NONE),
+        ];
+        let (paste, enter) = App::split_trailing_enter("abc", &burst_keys);
+        assert_eq!(paste, "abc");
+        assert!(enter.is_none());
+    }
+
+    #[test]
+    fn split_trailing_enter_single_enter_yields_empty_paste() {
+        // Pathological: burst is just an Enter. paste_text is empty;
+        // caller skips handle_paste and only replays the Enter so
+        // Submit fires on whatever is in the textarea.
+        let burst_keys = vec![key(KeyCode::Enter, KeyModifiers::NONE)];
+        let (paste, enter) = App::split_trailing_enter("\n", &burst_keys);
+        assert_eq!(paste, "");
+        assert!(enter.is_some());
+    }
+
+    #[test]
+    fn split_trailing_enter_consecutive_trailing_enters_only_peels_last() {
+        // Two trailing Enters: keep the first as data (the user's
+        // intentional blank-line break) and peel only the last for
+        // Submit.
+        let burst_keys = vec![
+            key(KeyCode::Char('h'), KeyModifiers::NONE),
+            key(KeyCode::Char('i'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        let (paste, enter) = App::split_trailing_enter("hi\n\n", &burst_keys);
+        assert_eq!(paste, "hi\n");
+        assert!(enter.is_some());
     }
 }

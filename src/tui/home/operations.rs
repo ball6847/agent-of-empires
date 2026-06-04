@@ -458,10 +458,28 @@ impl HomeView {
         Ok(())
     }
 
-    /// Force-remove a session from storage without any cleanup.
-    /// Used for sessions stuck in the Deleting state where the background
-    /// deletion thread never returned a result.
+    /// Force-remove a session from storage. Worktree, branch, and
+    /// container cleanup are skipped (the original deletion already
+    /// attempted them); tmux teardown is fired off-thread so a hung
+    /// tmux call cannot block the storage update on the TUI input
+    /// thread. Used for sessions stuck in the Deleting state where
+    /// the background deletion thread never returned a result.
     pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
+        if let Some(inst) = self.instances.iter().find(|i| i.id == session_id) {
+            let inst = inst.clone();
+            std::thread::spawn(move || {
+                if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    inst.kill_all_tmux_sessions()
+                })) {
+                    tracing::error!(
+                        target: "session.tmux_cleanup",
+                        session_id = %inst.id,
+                        "force_remove tmux teardown panicked: {:?}",
+                        panic
+                    );
+                }
+            });
+        }
         self.remove_instance(session_id);
         self.rebuild_group_trees();
         self.save()?;
@@ -618,6 +636,56 @@ impl HomeView {
             }
         }
 
+        self.save()?;
+        self.reload()?;
+        Ok(())
+    }
+
+    /// Edit the selected session's worktree workdir name: move the worktree
+    /// directory and, optionally, rename its git branch. Persists the new
+    /// `project_path` (and branch) through `apply_user_action`. See #1723.
+    pub(super) fn set_worktree_name_for_selected(
+        &mut self,
+        new_name: &str,
+        rename_branch: bool,
+    ) -> anyhow::Result<()> {
+        let Some(id) = self.selected_session.clone() else {
+            return Ok(());
+        };
+        let snapshot = self
+            .get_instance(&id)
+            .map(|i| (i.worktree_info.clone(), i.status, i.project_path.clone()));
+        let Some((worktree_info, status, project_path)) = snapshot else {
+            anyhow::bail!("Session not found");
+        };
+        let Some(worktree_info) = worktree_info else {
+            anyhow::bail!("Session does not use a worktree");
+        };
+        if status.blocks_worktree_edit() {
+            anyhow::bail!("Stop the session before editing its workdir name");
+        }
+
+        let outcome = crate::session::worktree_edit::edit_worktree_workdir(
+            crate::session::worktree_edit::WorktreeEditRequest {
+                worktree_info: &worktree_info,
+                current_path: std::path::Path::new(&project_path),
+                new_name,
+                rename_branch,
+            },
+        )?;
+        let new_path = outcome.new_path.to_string_lossy().to_string();
+        let new_branch = outcome.new_branch.clone();
+
+        self.apply_user_action(&id, |inst| {
+            inst.project_path = new_path.clone();
+            if let Some(branch) = &new_branch {
+                if let Some(wt) = inst.worktree_info.as_mut() {
+                    wt.branch = branch.clone();
+                }
+            }
+        })?;
+
+        self.rebuild_group_trees();
         self.save()?;
         self.reload()?;
         Ok(())

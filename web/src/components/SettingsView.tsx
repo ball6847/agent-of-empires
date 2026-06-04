@@ -7,12 +7,14 @@ import { TerminalSettings } from "./TerminalSettings";
 import {
   fetchProfiles,
   fetchSettings,
+  getSettingsSchema,
   setCockpitMaster,
   setDefaultProfile,
   updateProfileSettings,
   type ServerAbout,
 } from "../lib/api";
-import type { ProfileInfo } from "../lib/types";
+import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
+import { SchemaSection } from "./settings/SchemaSection";
 import {
   CollapsibleSection,
   ListField,
@@ -137,6 +139,25 @@ export function resolveSelectedProfile(
   return profiles.find((p) => p.is_default)?.name ?? "default";
 }
 
+function formatJsonSetting(value: unknown): string {
+  if (!value || typeof value !== "object") return "{}";
+  return JSON.stringify(value, null, 2);
+}
+
+function parseJsonObjectSetting(value: string): Record<string, unknown> | null {
+  const trimmed = value.trim();
+  if (!trimmed) return {};
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 export function SettingsView({
   onClose,
   tab,
@@ -188,6 +209,12 @@ export function SettingsView({
   );
   const activeTab: TabId = isTabId(tab) ? tab : "session";
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
+  // Settings schema (single source of truth, #1692). The generic SchemaSection
+  // renderer builds sandbox/worktree from this; empty until the one-shot fetch
+  // resolves, at which point those tabs populate.
+  const [schema, setSchema] = useState<SettingsFieldDescriptor[]>([]);
+  const [schemaLoading, setSchemaLoading] = useState(true);
+  const [schemaError, setSchemaError] = useState<string | null>(null);
 
   useEffect(() => {
     fetchProfiles().then((p) => {
@@ -195,6 +222,27 @@ export function SettingsView({
       setSelectedProfile((current) => resolveSelectedProfile(current, p));
     });
   }, []);
+
+  const loadSchema = useCallback(async () => {
+    setSchemaLoading(true);
+    setSchemaError(null);
+    try {
+      const s = await getSettingsSchema();
+      if (!s) {
+        setSchemaError("Failed to load settings schema.");
+        return;
+      }
+      setSchema(s);
+    } catch {
+      setSchemaError("Failed to load settings schema.");
+    } finally {
+      setSchemaLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadSchema();
+  }, [loadSchema]);
 
   // Follow `?profile=` when it changes after mount (e.g. a second deep-link
   // from the Profiles page while Settings stays mounted).
@@ -317,6 +365,18 @@ export function SettingsView({
               description="Install status-detection hooks into agent settings files for reliable status tracking"
               checked={(session.agent_status_hooks as boolean) ?? true}
               onChange={(v) => saveField("session", session, "agent_status_hooks", v)}
+            />
+            <TextField
+              label="Cockpit defaults"
+              description='Per-agent cockpit model and effort defaults as JSON, e.g. {"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
+              value={formatJsonSetting(session.cockpit_defaults)}
+              onChange={(v) => {
+                const parsed = parseJsonObjectSetting(v);
+                if (parsed) void saveField("session", session, "cockpit_defaults", parsed);
+              }}
+              placeholder='{"opencode":{"model":"openai/gpt-5.5","effort":"high"}}'
+              mono
+              multiline
             />
             <NumberField
               label="Auto-stop idle sessions (s)"
@@ -448,62 +508,31 @@ export function SettingsView({
         );
 
       case "worktree":
+        if (schemaLoading) {
+          return <div className="text-sm text-text-dim">Loading settings schema...</div>;
+        }
+        if (schemaError) {
+          return (
+            <div className="space-y-3">
+              <div className="text-sm text-status-error">{schemaError}</div>
+              <button
+                type="button"
+                onClick={() => void loadSchema()}
+                className="rounded px-3 py-1 text-xs font-medium bg-surface-700 text-text-secondary hover:bg-surface-600 cursor-pointer"
+              >
+                Retry
+              </button>
+            </div>
+          );
+        }
         return (
-          <div className="space-y-4">
-            <ToggleField
-              label="Worktrees enabled"
-              description="Create git worktrees for new sessions"
-              checked={(worktree.enabled as boolean) ?? false}
-              onChange={(v) => saveField("worktree", worktree, "enabled", v)}
-            />
-            <TextField
-              label="Path template"
-              description="Template for worktree directories in regular repos ({repo-name}, {branch})"
-              value={(worktree.path_template as string) ?? ""}
-              onChange={(v) => saveField("worktree", worktree, "path_template", v)}
-              placeholder="../{repo-name}-worktrees/{branch}"
-              mono
-            />
-            <ToggleField
-              label="Auto cleanup"
-              description="Delete worktrees when sessions are removed"
-              checked={(worktree.auto_cleanup as boolean) ?? true}
-              onChange={(v) => saveField("worktree", worktree, "auto_cleanup", v)}
-            />
-            <CollapsibleSection
-              title="Advanced"
-              subtitle="Bare-repo and workspace path templates, branch cleanup, and submodules."
-            >
-              <TextField
-                label="Bare repo path template"
-                description="Template for worktree directories in bare repos ({branch})"
-                value={(worktree.bare_repo_path_template as string) ?? ""}
-                onChange={(v) => saveField("worktree", worktree, "bare_repo_path_template", v)}
-                placeholder="./{branch}"
-                mono
-              />
-              <TextField
-                label="Workspace path template"
-                description="Template for multi-repo workspace directories ({branch}, {session-id})"
-                value={(worktree.workspace_path_template as string) ?? ""}
-                onChange={(v) => saveField("worktree", worktree, "workspace_path_template", v)}
-                placeholder="../{branch}-workspace-{session-id}"
-                mono
-              />
-              <ToggleField
-                label="Delete branch on cleanup"
-                description="Also delete the git branch when cleaning up a worktree"
-                checked={(worktree.delete_branch_on_cleanup as boolean) ?? false}
-                onChange={(v) => saveField("worktree", worktree, "delete_branch_on_cleanup", v)}
-              />
-              <ToggleField
-                label="Init submodules"
-                description="Run `git submodule update --init --recursive` after creating a worktree"
-                checked={(worktree.init_submodules as boolean) ?? true}
-                onChange={(v) => saveField("worktree", worktree, "init_submodules", v)}
-              />
-            </CollapsibleSection>
-          </div>
+          <SchemaSection
+            section="worktree"
+            schema={schema}
+            values={worktree}
+            onSaveField={saveSubField}
+            advancedSubtitle="Bare-repo and workspace path templates, branch cleanup, and submodules."
+          />
         );
 
       case "theme":
@@ -791,6 +820,15 @@ function CockpitSettings({
         </button>
       </div>
 
+      <div className="border-t border-surface-800 pt-3">
+        <ToggleField
+          label="Auto-resume after rate limit"
+          description="When a cockpit worker stops because the provider reported a usage/rate limit, automatically respawn it once the reported reset time has passed instead of waiting for manual recovery. Off by default (the session stays parked until you act). Vendor-agnostic: any ACP backend that reports a rate limit is eligible. The reset time is read from the stored event, so the timer survives a daemon restart. Persists to config.toml as cockpit.rate_limit_auto_resume; cross-device. See #1722."
+          checked={(cockpit.rate_limit_auto_resume as boolean) ?? false}
+          onChange={(v) => onSaveField("cockpit", "rate_limit_auto_resume", v)}
+        />
+      </div>
+
       <div className="flex items-start justify-between gap-3 py-1 border-t border-surface-800 pt-3">
         <div>
           <div className="text-sm text-text-bright">Queue drain mode</div>
@@ -891,6 +929,19 @@ function CockpitSettings({
           }
           min={0}
           onChange={(v) => onSaveField("cockpit", "auto_stop_idle_secs", v)}
+        />
+        <NumberField
+          label="Auto-resume grace (s)"
+          description="Seconds added to the reported reset time before auto-resume fires, to absorb clock skew and adapter jitter. Only used when 'Auto-resume after rate limit' is on. Default 15. A hardcoded minimum park window also applies, so a zero grace cannot cause a tight respawn loop. Persists to config.toml as cockpit.rate_limit_auto_resume_grace_secs; cross-device. See #1722."
+          value={
+            typeof cockpit.rate_limit_auto_resume_grace_secs === "number"
+              ? (cockpit.rate_limit_auto_resume_grace_secs as number)
+              : 15
+          }
+          min={0}
+          onChange={(v) =>
+            onSaveField("cockpit", "rate_limit_auto_resume_grace_secs", v)
+          }
         />
       </CollapsibleSection>
 

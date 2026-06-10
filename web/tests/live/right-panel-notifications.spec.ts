@@ -8,7 +8,7 @@
 //      asserts the toggle exists and that the paired-terminal pane
 //      mounts.
 //   2) Comments-banner notification flow on a structured view session. Once a
-//      user stages a comment via the diff "+" gutter, the
+//      user stages a comment by selecting a diff gutter line, the
 //      `CommentsBanner` (`src/components/diff/comments/CommentsBanner.tsx`)
 //      surfaces a notification chip in the right panel with the comment
 //      count, plus Send and Discard-all actions. This exercises the
@@ -17,12 +17,7 @@
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { test as base, expect } from "@playwright/test";
-import {
-  listSessions,
-  resolveAoeBinary,
-  seedSessionViaAoeAdd,
-  spawnAoeServe,
-} from "../helpers/aoeServe";
+import { listSessions, resolveAoeBinary, seedSessionViaAoeAdd, spawnAoeServe } from "../helpers/aoeServe";
 import { commitAll, initWorkingRepo, writeFiles } from "../helpers/gitFixture";
 
 base(
@@ -37,10 +32,7 @@ base(
 
     try {
       await page.goto(`${serve.baseUrl}/`);
-      const sessionRow = page
-        .getByRole("link")
-        .filter({ hasText: "rp-paired" })
-        .first();
+      const sessionRow = page.getByRole("link").filter({ hasText: "rp-paired" }).first();
       await expect(sessionRow).toBeVisible({ timeout: 10_000 });
       await sessionRow.click();
 
@@ -49,20 +41,14 @@ base(
       // first to scope subsequent selectors to that pane. The dashboard
       // mounts both a desktop and a mobile right panel (one hidden via
       // CSS), so use first() on visible-anywhere assertions.
-      await expect(
-        page.getByText("Shell", { exact: true }).first(),
-      ).toBeVisible({
+      await expect(page.getByText("Shell", { exact: true }).first()).toBeVisible({
         timeout: 10_000,
       });
       // Host button is rendered unconditionally; Container only when
       // `is_sandboxed`. The seeded session is not sandboxed, so no
       // Container button should exist in either copy of the panel.
-      await expect(
-        page.getByRole("button", { name: "Host", exact: true }).first(),
-      ).toBeVisible();
-      await expect(
-        page.getByRole("button", { name: "Container", exact: true }),
-      ).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Host", exact: true }).first()).toBeVisible();
+      await expect(page.getByRole("button", { name: "Container", exact: true })).toHaveCount(0);
     } finally {
       await serve.stop();
     }
@@ -81,20 +67,14 @@ base(
         const projectDir = join(home, "project");
         initWorkingRepo(projectDir);
         // Commit a baseline so the modified version produces a real
-        // hunk with gutter "+" buttons (the comments UI requires
-        // line numbers on at least one side).
+        // hunk with selectable gutter line numbers (the comments UI
+        // requires line numbers on at least one side).
         writeFiles(projectDir, { "notes.md": "line a\nline b\nline c\n" });
         commitAll(projectDir, "baseline");
         writeFiles(projectDir, { "notes.md": "line A\nline B\nline C\n" });
-        const addRes = spawnSync(
-          resolveAoeBinary(),
-          ["add", projectDir, "-t", "rp-notif", "-c", "claude"],
-          { env },
-        );
+        const addRes = spawnSync(resolveAoeBinary(), ["add", projectDir, "-t", "rp-notif", "-c", "claude"], { env });
         if (addRes.status !== 0) {
-          throw new Error(
-            `aoe add failed: status=${addRes.status} stderr=${addRes.stderr?.toString() ?? "<none>"}`,
-          );
+          throw new Error(`aoe add failed: status=${addRes.status} stderr=${addRes.stderr?.toString() ?? "<none>"}`);
         }
       },
     });
@@ -103,19 +83,14 @@ base(
       const sessions = await listSessions(serve.baseUrl);
       const sessionId = sessions.find((s) => s.title === "rp-notif")?.id;
       if (!sessionId) {
-        throw new Error(
-          "seeded structured view session not visible in /api/sessions",
-        );
+        throw new Error("seeded structured view session not visible in /api/sessions");
       }
 
       // Flip per-session structured_view so the SPA renders the comments
       // affordances on the diff viewer. Same pattern as
       // acp-spawn-prompt.spec.ts; the supervisor spawn is async, so
       // give it a beat before driving the UI.
-      const enableRes = await fetch(
-        `${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`,
-        { method: "POST" },
-      );
+      const enableRes = await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/acp/enable`, { method: "POST" });
       expect(enableRes.ok).toBeTruthy();
       await new Promise((r) => setTimeout(r, 2_000));
 
@@ -125,19 +100,14 @@ base(
       });
 
       await page.goto(`${serve.baseUrl}/`);
-      const sessionRow = page
-        .getByRole("link")
-        .filter({ hasText: "rp-notif" })
-        .first();
+      const sessionRow = page.getByRole("link").filter({ hasText: "rp-notif" }).first();
       await expect(sessionRow).toBeVisible({ timeout: 10_000 });
       await sessionRow.click();
 
       // Wait for the file list to populate; one modified file expected.
       // first() picks the desktop right-panel copy (the dashboard also
       // mounts a mobile copy hidden via CSS).
-      await expect(
-        page.getByText("1 file", { exact: true }).first(),
-      ).toBeVisible({
+      await expect(page.getByText("1 file", { exact: true }).first()).toBeVisible({
         timeout: 15_000,
       });
       await page
@@ -145,15 +115,13 @@ base(
         .first()
         .click();
 
-      // First gutter "+" click sets range start; the same line again
-      // closes the range and opens the inline form. The buttons are
-      // opacity-0 until hover; click via aria-label + force to bypass
-      // the visibility-driven actionability checks.
-      const plus = page.getByRole("button", {
-        name: /Add comment on new line 1/,
-      });
-      await plus.first().click({ force: true });
-      await plus.first().click({ force: true });
+      // Select a line to comment by clicking its @pierre/diffs gutter line
+      // number. The renderer exposes `[data-line-number-content]` cells that
+      // contain only the number; a single click selects the line and opens
+      // the inline comment form.
+      const gutterLine1 = page.locator("[data-line-number-content]").filter({ hasText: /^1$/ });
+      await expect(gutterLine1.first()).toBeVisible({ timeout: 10_000 });
+      await gutterLine1.first().click();
 
       // Form textarea autofocuses; type a body and save.
       const textarea = page.getByPlaceholder(/Leave a comment/);
@@ -163,26 +131,14 @@ base(
 
       // CommentsBanner now lives in the right panel showing the count
       // and the Send / Discard-all actions.
-      await expect(
-        page.getByText("1 comment", { exact: true }).first(),
-      ).toBeVisible({ timeout: 10_000 });
-      await expect(
-        page.getByRole("button", { name: "Send", exact: true }).first(),
-      ).toBeVisible();
-      await expect(
-        page.getByRole("button", { name: "Discard all", exact: true }).first(),
-      ).toBeVisible();
+      await expect(page.getByText("1 comment", { exact: true }).first()).toBeVisible({ timeout: 10_000 });
+      await expect(page.getByRole("button", { name: "Send", exact: true }).first()).toBeVisible();
+      await expect(page.getByRole("button", { name: "Discard all", exact: true }).first()).toBeVisible();
 
       // Discard-all confirms via window.confirm (auto-accepted above)
       // and clears the store, removing the banner from both panel copies.
-      await page
-        .getByRole("button", { name: "Discard all", exact: true })
-        .first()
-        .click();
-      await expect(page.getByText("1 comment", { exact: true })).toHaveCount(
-        0,
-        { timeout: 10_000 },
-      );
+      await page.getByRole("button", { name: "Discard all", exact: true }).first().click();
+      await expect(page.getByText("1 comment", { exact: true })).toHaveCount(0, { timeout: 10_000 });
     } finally {
       await serve.stop();
     }

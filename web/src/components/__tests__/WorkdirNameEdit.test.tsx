@@ -9,7 +9,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useRef, type ReactNode } from "react";
 
+import { reportError } from "../../lib/toastBus";
 import { DragSuppressContext, SessionRow } from "../WorkspaceSidebar";
+
+vi.mock("../../lib/toastBus", () => ({
+  reportError: vi.fn(),
+  reportInfo: vi.fn(),
+}));
 import { EMPTY_OPTIMISTIC } from "../../lib/sidebarOptimistic";
 import type { SessionResponse, Workspace } from "../../lib/types";
 
@@ -63,11 +69,7 @@ function workspace(id: string, sessions: SessionResponse[]): Workspace {
 
 function Wrap({ children }: { children: ReactNode }) {
   const ref = useRef(0);
-  return (
-    <DragSuppressContext.Provider value={ref}>
-      {children}
-    </DragSuppressContext.Provider>
-  );
+  return <DragSuppressContext.Provider value={ref}>{children}</DragSuppressContext.Provider>;
 }
 
 const fetchSpy = vi.fn<typeof fetch>();
@@ -110,23 +112,24 @@ function openMenu(ws: Workspace) {
 describe("sidebar Edit workdir name", () => {
   it("offers the action for a managed, idle worktree session", () => {
     openMenu(workspace("w", [session()]));
-    expect(
-      screen.queryByTestId("sidebar-context-menu-edit-workdir"),
-    ).not.toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-edit-workdir")).not.toBeNull();
   });
 
   it("hides the action for a non-managed worktree", () => {
     openMenu(workspace("w", [session({ has_managed_worktree: false })]));
-    expect(
-      screen.queryByTestId("sidebar-context-menu-edit-workdir"),
-    ).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-edit-workdir")).toBeNull();
   });
 
   it("hides the action while the session is running", () => {
     openMenu(workspace("w", [session({ status: "Running" })]));
-    expect(
-      screen.queryByTestId("sidebar-context-menu-edit-workdir"),
-    ).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-edit-workdir")).toBeNull();
+  });
+
+  it("hides the action when the session is tied (#1927)", () => {
+    // Tied mode collapses naming into the rename action, so the standalone
+    // workdir edit is not offered.
+    openMenu(workspace("w", [session({ tie_workdir_to_name: true })]));
+    expect(screen.queryByTestId("sidebar-context-menu-edit-workdir")).toBeNull();
   });
 
   it("PATCHes the worktree-name endpoint with name and rename_branch", async () => {
@@ -149,6 +152,46 @@ describe("sidebar Edit workdir name", () => {
     });
   });
 
+  it("inline rename PATCHes the title endpoint", async () => {
+    openMenu(workspace("w", [session()]));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-rename"));
+    fireEvent.change(screen.getByTestId("sidebar-rename-input"), {
+      target: { value: "new title" },
+    });
+    fireEvent.keyDown(screen.getByTestId("sidebar-rename-input"), {
+      key: "Enter",
+    });
+
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0];
+    expect(url).toBe("/api/sessions/s1");
+    expect(init?.method).toBe("PATCH");
+    expect(JSON.parse(init?.body as string)).toEqual({ title: "new title" });
+  });
+
+  it("surfaces the server message when a tied rename is rejected (#1927)", async () => {
+    fetchSpy.mockImplementation(
+      async () =>
+        new Response(
+          JSON.stringify({
+            error: "session_running",
+            message: "Stop the session before renaming it.",
+          }),
+          { status: 409, headers: { "content-type": "application/json" } },
+        ),
+    );
+    openMenu(workspace("w", [session({ tie_workdir_to_name: true })]));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-rename"));
+    fireEvent.change(screen.getByTestId("sidebar-rename-input"), {
+      target: { value: "blocked" },
+    });
+    fireEvent.keyDown(screen.getByTestId("sidebar-rename-input"), {
+      key: "Enter",
+    });
+
+    await vi.waitFor(() => expect(reportError).toHaveBeenCalledWith("Stop the session before renaming it."));
+  });
+
   it("surfaces the server validation message on failure", async () => {
     fetchSpy.mockImplementation(
       async () =>
@@ -164,10 +207,6 @@ describe("sidebar Edit workdir name", () => {
     });
     fireEvent.click(screen.getByTestId("workdir-modal-save"));
 
-    await vi.waitFor(() =>
-      expect(screen.getByTestId("workdir-modal-error").textContent).toContain(
-        "already exists",
-      ),
-    );
+    await vi.waitFor(() => expect(screen.getByTestId("workdir-modal-error").textContent).toContain("already exists"));
   });
 });

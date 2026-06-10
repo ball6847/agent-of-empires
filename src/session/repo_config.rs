@@ -22,6 +22,7 @@ pub enum HookProgress {
 
 use super::config::Config;
 use super::profile_config::ProfileConfig;
+use super::project_mcp::ProjectMcpServer;
 
 /// Config sections a repo `.agent-of-empires/config.toml` may override.
 /// Personal/global sections (theme, status_hooks, acp, web, logging, host
@@ -240,7 +241,7 @@ pub fn profile_to_repo_config(profile: &ProfileConfig) -> RepoConfig {
 /// Only attempts the lookup when `project_path` itself has a `.git` entry,
 /// matching the guard in `compute_volume_paths` (avoids `Repository::discover`
 /// walking up to an unrelated ancestor repo, e.g. a dotfile-managed `$HOME`).
-fn repo_config_source_path(project_path: &Path) -> PathBuf {
+pub fn repo_config_source_path(project_path: &Path) -> PathBuf {
     if project_path.join(".git").exists() {
         if let Ok(main_repo) = crate::git::GitWorktree::find_main_repo(project_path) {
             return main_repo;
@@ -284,11 +285,19 @@ pub fn resolve_config_with_repo_or_warn(profile: &str, project_path: &Path) -> C
 // Hook trust system
 // ---------------------------------------------------------------------------
 
-/// A single trusted repo entry.
+/// A single trusted repo entry. A row may carry hook trust, project-MCP trust,
+/// or both, recorded independently so trusting one surface never silently
+/// re-authorizes a stale version of the other (#1985). `hooks_hash` was a bare
+/// `String` before MCP trust existed; it is now `Option<String>` so a repo
+/// trusted only for its `.mcp.json` (no hooks) is representable. Existing
+/// on-disk rows with a string `hooks_hash` deserialize as `Some`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TrustedRepo {
     path: String,
-    hooks_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hooks_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mcp_hash: Option<String>,
     trusted_at: String,
 }
 
@@ -350,28 +359,58 @@ fn normalize_path(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
 }
 
-/// Check if a repo's hooks are trusted (hash matches stored trust entry).
-/// Normalizes `project_path` before lookup.
-pub fn is_repo_trusted(project_path: &Path, hooks_hash: &str) -> Result<bool> {
+/// Check whether a repo is trusted for the given surface fingerprints. Each
+/// argument is per-surface: `Some(hash)` requires the stored entry to match that
+/// hash for that surface; `None` means "do not care about this surface". A repo
+/// with no stored row is never trusted. So the supervisor's MCP gate calls
+/// `is_repo_trusted(path, None, Some(&mcp_hash))`, while the hook lifecycle
+/// calls `is_repo_trusted(path, Some(&hooks_hash), None)`. Normalizes
+/// `project_path` before lookup.
+pub fn is_repo_trusted(
+    project_path: &Path,
+    hooks_hash: Option<&str>,
+    mcp_hash: Option<&str>,
+) -> Result<bool> {
     let normalized = normalize_path(project_path);
-    is_repo_trusted_normalized(&normalized, hooks_hash)
+    is_repo_trusted_normalized(&normalized, hooks_hash, mcp_hash)
+}
+
+/// Does the stored surface hash satisfy the requested one? `None` requested
+/// means the surface is not being checked; `Some` requires an exact match.
+fn surface_matches(stored: Option<&str>, want: Option<&str>) -> bool {
+    match want {
+        None => true,
+        Some(w) => stored == Some(w),
+    }
 }
 
 /// Like `is_repo_trusted` but expects an already-normalized path.
-fn is_repo_trusted_normalized(normalized_path: &str, hooks_hash: &str) -> Result<bool> {
+fn is_repo_trusted_normalized(
+    normalized_path: &str,
+    hooks_hash: Option<&str>,
+    mcp_hash: Option<&str>,
+) -> Result<bool> {
     let trusted = load_trusted_repos()?;
-    Ok(trusted
-        .repos
-        .iter()
-        .any(|r| r.path == normalized_path && r.hooks_hash == hooks_hash))
+    Ok(trusted.repos.iter().any(|r| {
+        r.path == normalized_path
+            && surface_matches(r.hooks_hash.as_deref(), hooks_hash)
+            && surface_matches(r.mcp_hash.as_deref(), mcp_hash)
+    }))
 }
 
-/// Mark a repo's hooks as trusted.
+/// Record trust for a repo, per surface. `Some(hash)` writes (or updates) that
+/// surface's trust; `None` preserves whatever was already stored for it, so
+/// approving project MCP never wipes an existing hook-trust record and vice
+/// versa. A single approval dialog passes `Some` for every surface it showed.
 ///
 /// Uses file locking to prevent concurrent writes from clobbering each other
 /// (e.g. multiple sessions being created simultaneously). Writes through the
 /// locked file handle to ensure the lock is effective.
-pub fn trust_repo(project_path: &Path, hooks_hash: &str) -> Result<()> {
+pub fn trust_repo(
+    project_path: &Path,
+    hooks_hash: Option<&str>,
+    mcp_hash: Option<&str>,
+) -> Result<()> {
     use fs2::FileExt;
     use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -398,11 +437,21 @@ pub fn trust_repo(project_path: &Path, hooks_hash: &str) -> Result<()> {
         toml::from_str(&content).context("Failed to parse trusted_repos.toml")?
     };
 
+    // Preserve the surface not being updated by carrying its existing hash.
+    let existing = trusted.repos.iter().find(|r| r.path == normalized);
+    let hooks_final = hooks_hash
+        .map(str::to_string)
+        .or_else(|| existing.and_then(|e| e.hooks_hash.clone()));
+    let mcp_final = mcp_hash
+        .map(str::to_string)
+        .or_else(|| existing.and_then(|e| e.mcp_hash.clone()));
+
     trusted.repos.retain(|r| r.path != normalized);
 
     trusted.repos.push(TrustedRepo {
         path: normalized,
-        hooks_hash: hooks_hash.to_string(),
+        hooks_hash: hooks_final,
+        mcp_hash: mcp_final,
         trusted_at: chrono::Utc::now().to_rfc3339(),
     });
 
@@ -414,45 +463,106 @@ pub fn trust_repo(project_path: &Path, hooks_hash: &str) -> Result<()> {
     Ok(())
 }
 
-/// Result of checking hook trust for a project.
-pub enum HookTrustStatus {
-    /// No hooks defined, nothing to trust.
-    NoHooks,
-    /// Hooks are trusted (hash matches).
-    Trusted(HooksConfig),
-    /// Hooks need user approval before execution.
-    NeedsTrust {
-        hooks: HooksConfig,
-        hooks_hash: String,
-    },
+/// Trust state of one reviewable surface (lifecycle hooks or project MCP). Each
+/// surface is resolved independently so an untrusted project-MCP file never
+/// suppresses already-trusted hooks, and vice versa (#1985).
+pub enum TrustSurface<T> {
+    /// Surface absent on disk; nothing to trust.
+    Absent,
+    /// On-disk surface matches the stored trust hash.
+    Trusted(T),
+    /// Present but unapproved at its current fingerprint.
+    NeedsTrust { config: T, hash: String },
 }
 
-/// Check hook trust status for a project path.
-/// Loads the repo config, checks for hooks, and validates trust.
-///
-/// `project_path` may be a worktree path; the repo config and trust entry
-/// live with the main repo, so resolve that before lookup.
-pub fn check_hook_trust(project_path: &Path) -> Result<HookTrustStatus> {
-    let config_path = repo_config_source_path(project_path);
-    let normalized = normalize_path(&config_path);
-    let repo_config = match load_repo_config(Path::new(&normalized))? {
-        Some(rc) => rc,
-        None => return Ok(HookTrustStatus::NoHooks),
-    };
-
-    let hooks = match repo_config.hooks() {
-        Some(h) if !h.is_empty() => h,
-        _ => return Ok(HookTrustStatus::NoHooks),
-    };
-
-    let hooks_hash = compute_hooks_hash(&hooks);
-
-    // Pass already-normalized path to avoid double canonicalization
-    if is_repo_trusted_normalized(&normalized, &hooks_hash)? {
-        Ok(HookTrustStatus::Trusted(hooks))
-    } else {
-        Ok(HookTrustStatus::NeedsTrust { hooks, hooks_hash })
+impl<T> TrustSurface<T> {
+    pub fn needs_trust(&self) -> bool {
+        matches!(self, TrustSurface::NeedsTrust { .. })
     }
+
+    /// The config when the surface is trusted, else `None`. Used by the hook
+    /// lifecycle callers that only run already-trusted hooks.
+    pub fn trusted(self) -> Option<T> {
+        match self {
+            TrustSurface::Trusted(config) => Some(config),
+            _ => None,
+        }
+    }
+}
+
+/// Combined trust state for a repo: hooks plus project MCP, both keyed on the
+/// same normalized main-repo `project_path`. `.mcp.json` is read from the main
+/// repo (the same source as hooks), so the file reviewed in the trust dialog is
+/// exactly the file the supervisor later forwards; per-worktree `.mcp.json`
+/// divergence is intentionally not supported (use the per-profile layer).
+pub struct RepoTrust {
+    pub project_path: String,
+    pub hooks: TrustSurface<HooksConfig>,
+    pub mcp: TrustSurface<Vec<ProjectMcpServer>>,
+}
+
+impl RepoTrust {
+    /// True when any surface needs interactive approval.
+    pub fn needs_prompt(&self) -> bool {
+        self.hooks.needs_trust() || self.mcp.needs_trust()
+    }
+}
+
+/// Check combined repo trust for a project path: hook commands from
+/// `.agent-of-empires/config.toml` and MCP servers from `.mcp.json`, both read
+/// from the main repo (resolved from a worktree path) and checked against the
+/// stored per-surface hashes.
+pub fn check_repo_trust(project_path: &Path) -> Result<RepoTrust> {
+    let source = repo_config_source_path(project_path);
+    let normalized = normalize_path(&source);
+    let trusted = load_trusted_repos()?;
+    let row = trusted.repos.iter().find(|r| r.path == normalized);
+
+    let hooks = match load_repo_config(Path::new(&normalized))?.and_then(|rc| rc.hooks()) {
+        Some(h) if !h.is_empty() => {
+            let hash = compute_hooks_hash(&h);
+            if row.and_then(|r| r.hooks_hash.as_deref()) == Some(hash.as_str()) {
+                TrustSurface::Trusted(h)
+            } else {
+                TrustSurface::NeedsTrust { config: h, hash }
+            }
+        }
+        _ => TrustSurface::Absent,
+    };
+
+    // MCP load errors must not suppress hook trust: a malformed `.mcp.json`
+    // here would otherwise make the whole call fail and silently drop
+    // already-trusted hooks. Treat a load error as "no project MCP" (the
+    // supervisor is the real MCP gate and logs/skips a broken file at spawn).
+    let servers = super::project_mcp::load_project_mcp_servers(Path::new(&normalized))
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "session.store",
+                path = %normalized,
+                error = %e,
+                "failed to load project .mcp.json for trust; treating as absent"
+            );
+            Vec::new()
+        });
+    let mcp = if servers.is_empty() {
+        TrustSurface::Absent
+    } else {
+        let hash = super::project_mcp::fingerprint(&servers);
+        if row.and_then(|r| r.mcp_hash.as_deref()) == Some(hash.as_str()) {
+            TrustSurface::Trusted(servers)
+        } else {
+            TrustSurface::NeedsTrust {
+                config: servers,
+                hash,
+            }
+        }
+    };
+
+    Ok(RepoTrust {
+        project_path: normalized,
+        hooks,
+        mcp,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -851,7 +961,12 @@ fn run_hooks_streamed(
 
     let in_container = matches!(target, HookTarget::Container { .. });
 
-    for cmd in commands {
+    // Streamed lines are consumed live by the progress channel and gone by
+    // the time a failure dialog renders, so keep a bounded tail to attach to
+    // the error; it's the only context that survives to the user.
+    const ERROR_TAIL_LINES: usize = 20;
+
+    for (idx, cmd) in commands.iter().enumerate() {
         tracing::info!(target: "session.store", "Running hook (streamed): {}", cmd);
         let _ = progress_tx.send(HookProgress::Started(cmd.clone()));
 
@@ -870,16 +985,43 @@ fn run_hooks_streamed(
             .spawn()
             .with_context(|| format!("Failed to execute hook: {}", cmd))?;
 
+        let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let mut total_lines = 0usize;
         if let Some(stdout) = child.stdout.take() {
             let reader = std::io::BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
+                total_lines += 1;
+                if tail.len() == ERROR_TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(line.clone());
                 let _ = progress_tx.send(HookProgress::Output(line));
             }
         }
 
         let status = child.wait()?;
         if !status.success() {
-            let detail = format_hook_error(cmd, status.code(), "", "", in_container);
+            let mut detail = format_hook_error(cmd, status.code(), "", "", in_container);
+            if !tail.is_empty() {
+                let label = if total_lines > tail.len() {
+                    format!("output (last {} of {} lines)", tail.len(), total_lines)
+                } else {
+                    "output".to_string()
+                };
+                let lines: Vec<String> = tail.into();
+                detail.push_str(&format!("\n{}:\n{}", label, lines.join("\n")));
+            }
+            if commands.len() > 1 {
+                if idx + 1 < commands.len() {
+                    detail.push_str(&format!(
+                        "\n(hook {} of {}; remaining hooks skipped)",
+                        idx + 1,
+                        commands.len()
+                    ));
+                } else {
+                    detail.push_str(&format!("\n(hook {} of {})", idx + 1, commands.len()));
+                }
+            }
             let _ = progress_tx.send(HookProgress::Output(detail.clone()));
             anyhow::bail!(detail);
         }
@@ -1488,17 +1630,36 @@ mod tests {
         let trusted = TrustedRepos {
             repos: vec![TrustedRepo {
                 path: "/home/user/project".to_string(),
-                hooks_hash: "abc123".to_string(),
+                hooks_hash: Some("abc123".to_string()),
+                mcp_hash: Some("def456".to_string()),
                 trusted_at: "2026-01-31T00:00:00Z".to_string(),
             }],
         };
         let serialized = toml::to_string_pretty(&trusted).unwrap();
         assert!(serialized.contains("path = \"/home/user/project\""));
         assert!(serialized.contains("hooks_hash = \"abc123\""));
+        assert!(serialized.contains("mcp_hash = \"def456\""));
 
         let deserialized: TrustedRepos = toml::from_str(&serialized).unwrap();
         assert_eq!(deserialized.repos.len(), 1);
         assert_eq!(deserialized.repos[0].path, "/home/user/project");
+    }
+
+    /// Back-compat: an existing pre-#1985 `trusted_repos.toml` row has only a
+    /// string `hooks_hash` and no `mcp_hash`; it must still deserialize, with
+    /// `mcp_hash` defaulting to `None` (project MCP never reviewed).
+    #[test]
+    fn test_trusted_repos_legacy_row_deserializes() {
+        let legacy = r#"
+[[repos]]
+path = "/home/user/project"
+hooks_hash = "abc123"
+trusted_at = "2026-01-31T00:00:00Z"
+"#;
+        let parsed: TrustedRepos = toml::from_str(legacy).unwrap();
+        assert_eq!(parsed.repos.len(), 1);
+        assert_eq!(parsed.repos[0].hooks_hash.as_deref(), Some("abc123"));
+        assert_eq!(parsed.repos[0].mcp_hash, None);
     }
 
     #[test]
@@ -1616,6 +1777,85 @@ mod tests {
             "SSH_ASKPASS must be defanged, got:\n{}",
             joined
         );
+    }
+
+    /// A failing streamed hook's error must carry the hook's output, not just
+    /// the exit code. Streamed hooks merge stderr into stdout and send it down
+    /// the progress channel, which the TUI discards once creation fails; the
+    /// returned error is the only context that reaches the "Creation Failed"
+    /// dialog (via `CreationResult::Error`), so it has to include the output
+    /// that explains why the hook failed.
+    #[test]
+    fn streamed_hook_failure_error_includes_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The failure detail lives in a script file, not the hook command
+        // line, mirroring real hooks (`npm install`, `./setup.sh`) whose
+        // command text says nothing about why they failed.
+        let script = tmp.path().join("hook.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'fatal: dependency xyz not found' >&2\nexit 3\n",
+        )
+        .unwrap();
+        let probe = "sh hook.sh".to_string();
+        let (tx, _rx) = mpsc::channel();
+        let err = execute_hooks_streamed(&[probe], tmp.path(), &tx, &[])
+            .expect_err("hook exits non-zero");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("exit code 3"), "got: {}", msg);
+        assert!(
+            msg.contains("fatal: dependency xyz not found"),
+            "error must include the hook's output so the TUI dialog shows the \
+             actual failure, not just the exit code; got:\n{}",
+            msg
+        );
+    }
+
+    /// With multiple on_create hooks the failure detail says which hook
+    /// failed and that the rest were skipped, so the user doesn't assume
+    /// later hooks ran.
+    #[test]
+    fn streamed_hook_failure_names_position_when_multiple() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hooks = vec![
+            "true".to_string(),
+            "sh -c 'exit 7'".to_string(),
+            "true".to_string(),
+        ];
+        let (tx, _rx) = mpsc::channel();
+        let err = execute_hooks_streamed(&hooks, tmp.path(), &tx, &[])
+            .expect_err("second hook exits non-zero");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("(hook 2 of 3; remaining hooks skipped)"),
+            "got: {}",
+            msg
+        );
+    }
+
+    /// When the last hook fails there is nothing left to skip, so the position
+    /// text omits the "remaining hooks skipped" suffix.
+    #[test]
+    fn streamed_hook_failure_omits_skip_note_for_last_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hooks = vec!["true".to_string(), "sh -c 'exit 7'".to_string()];
+        let (tx, _rx) = mpsc::channel();
+        let err = execute_hooks_streamed(&hooks, tmp.path(), &tx, &[])
+            .expect_err("last hook exits non-zero");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("(hook 2 of 2)"), "got: {}", msg);
+        assert!(!msg.contains("remaining hooks skipped"), "got: {}", msg);
+    }
+
+    /// A single hook keeps the error free of position noise.
+    #[test]
+    fn streamed_hook_failure_omits_position_when_single() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let err = execute_hooks_streamed(&["sh -c 'exit 7'".to_string()], tmp.path(), &tx, &[])
+            .expect_err("hook exits non-zero");
+        let msg = format!("{:#}", err);
+        assert!(!msg.contains("remaining hooks skipped"), "got: {}", msg);
     }
 
     /// The CLI/captured path leaves the terminal attached so users running

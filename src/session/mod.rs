@@ -10,8 +10,12 @@ pub(crate) mod environment;
 mod groups;
 pub mod idle_reap;
 mod instance;
+pub mod mcp_model;
+pub mod mcp_overrides;
+pub mod mcp_state;
 pub mod poller;
 pub mod profile_config;
+pub mod project_mcp;
 pub mod projects;
 pub(crate) mod recovery;
 pub mod repo_config;
@@ -44,6 +48,7 @@ pub(crate) use instance::{persist_session_to_storage, ResumeIntent, SidWrite};
 pub use instance::{
     EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo, StartOutcome,
     Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    TMUX_SESSION_GONE_ERROR,
 };
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
@@ -53,10 +58,10 @@ pub use profile_config::{
 pub use projects::{Project, ProjectScope};
 pub use recovery::HookTimeoutScope;
 pub use repo_config::{
-    check_hook_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
+    check_repo_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
     merge_repo_config, profile_to_repo_config, repo_config_to_profile, resolve_config_with_repo,
-    resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HookTrustStatus, HooksConfig,
-    RepoConfig,
+    resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HooksConfig, RepoConfig,
+    RepoTrust, TrustSurface,
 };
 pub(crate) use storage::atomic_write;
 pub use storage::{load_workspace_ordering, update_workspace_ordering, Storage, WorkspaceOrdering};
@@ -907,7 +912,7 @@ mod tests {
         assert_eq!(resolved, "default");
         assert!(dir.join("profiles").join("default").exists());
 
-        let storage = Storage::new("default").unwrap();
+        let storage = Storage::new_unwatched("default").unwrap();
         assert_eq!(storage.profile(), "default");
     }
 

@@ -66,6 +66,8 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe telemetry enable`↴](#aoe-telemetry-enable)
 * [`aoe telemetry disable`↴](#aoe-telemetry-disable)
 * [`aoe telemetry reset-id`↴](#aoe-telemetry-reset-id)
+* [`aoe mcp`↴](#aoe-mcp)
+* [`aoe mcp list`↴](#aoe-mcp-list)
 * [`aoe serve`↴](#aoe-serve)
 * [`aoe url`↴](#aoe-url)
 * [`aoe acp`↴](#aoe-acp)
@@ -116,6 +118,7 @@ Run without arguments to launch the TUI dashboard.
 * `sounds` — Manage sound effects for agent state transitions
 * `theme` — Manage color themes (list, export, customize)
 * `telemetry` — Manage anonymous opt-in usage telemetry
+* `mcp` — Inspect the effective MCP server set (provenance, conflicts, drift)
 * `serve` — Start a web dashboard for remote session access
 * `url` — Print the current dashboard URL of a running `aoe serve` daemon
 * `acp` — Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
@@ -158,7 +161,7 @@ Add a new session
 * `-s`, `--sandbox` — Run session in a container sandbox
 * `--sandbox-image <SANDBOX_IMAGE>` — Custom container image for sandbox (implies --sandbox)
 * `-y`, `--yolo` — Enable YOLO mode (skip permission prompts)
-* `--trust-hooks` — Automatically trust repository hooks without prompting
+* `--trust-hooks` — Automatically trust this repository's hooks and project-local MCP servers without prompting
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
 * `--cmd-override <CMD_OVERRIDE>` — Override the agent binary command
 * `--structured-view` — Render this session in the structured view (ACP-based native rendering) instead of the default terminal view. `aoe add` defaults to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this (or `--agent`) to opt into the structured rendering. Ignored for tools with no ACP adapter
@@ -399,6 +402,7 @@ Rename a session
 
 * `-t`, `--title <TITLE>` — New title for the session
 * `-g`, `--group <GROUP>` — New group for the session (empty string to ungroup)
+* `--rename-branch` — When the session is tied (session.tie_workdir_to_name) and an aoe-managed worktree, also rename the underlying git branch to match. Off by default; ignored for untied / non-worktree sessions
 
 
 
@@ -986,6 +990,31 @@ Opt out of telemetry (deletes the local install id)
 Generate a fresh anonymous install id (only while opted in)
 
 **Usage:** `aoe telemetry reset-id`
+
+
+
+## `aoe mcp`
+
+Inspect the effective MCP server set (provenance, conflicts, drift)
+
+**Usage:** `aoe mcp <COMMAND>`
+
+###### **Subcommands:**
+
+* `list` — List the merged effective MCP server set with provenance, plus any conflicts and servers kept after removal from a native config
+
+
+
+## `aoe mcp list`
+
+List the merged effective MCP server set with provenance, plus any conflicts and servers kept after removal from a native config
+
+**Usage:** `aoe mcp list [OPTIONS]`
+
+###### **Options:**
+
+* `--agent <AGENT>` — Agent whose effective set to resolve. Defaults to the configured default tool. MCP forwarding is per-agent because the agent-native layer differs
+* `--json` — Output machine-readable JSON instead of a table
 
 
 

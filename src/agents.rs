@@ -631,6 +631,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_kimi_status,
         container_env: &[],
         hook_config: None,
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--session"),
         host_only: false,
         send_keys_enter_delay_ms: 0,

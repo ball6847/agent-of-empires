@@ -89,6 +89,12 @@ pub struct SessionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<String>,
     pub has_managed_worktree: bool,
+    /// Whether renaming this session also moves its worktree directory (the
+    /// resolved `session.tie_workdir_to_name` for an aoe-managed worktree).
+    /// Populated by `list_sessions` from the per-profile config; single-session
+    /// responses leave it `false` and the sidebar reads the list value. #1927.
+    #[serde(default)]
+    pub tie_workdir_to_name: bool,
     pub has_terminal: bool,
     pub profile: String,
     pub cleanup_defaults: CleanupDefaults,
@@ -256,6 +262,8 @@ impl SessionResponse {
                 .worktree_info
                 .as_ref()
                 .is_some_and(|w| w.managed_by_aoe),
+            // Overlaid per-profile in list_sessions; see the field doc.
+            tie_workdir_to_name: false,
             has_terminal: inst.terminal_info.is_some(),
             profile: inst.source_profile.clone(),
             cleanup_defaults: CleanupDefaults {
@@ -472,6 +480,25 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
         fresh
     };
 
+    // Overlay the per-profile tie setting (#1927) so the sidebar can collapse
+    // the standalone workdir action for tied worktree sessions. Resolved once
+    // per distinct profile, not per session.
+    {
+        use std::collections::HashMap;
+        let mut tie_cache: HashMap<String, bool> = HashMap::new();
+        for session in &mut sessions {
+            if !session.has_managed_worktree {
+                continue;
+            }
+            let tied = *tie_cache.entry(session.profile.clone()).or_insert_with(|| {
+                crate::session::profile_config::resolve_config_or_warn(&session.profile)
+                    .session
+                    .tie_workdir_to_name
+            });
+            session.tie_workdir_to_name = tied;
+        }
+    }
+
     // Resolve remote owners with a permanent cache on AppState
     {
         let cache = state.remote_owner_cache.read().await;
@@ -686,6 +713,12 @@ pub async fn update_workspace_ordering(
 #[derive(Deserialize)]
 pub struct RenameSessionBody {
     pub title: String,
+    /// When the session is tied (`session.tie_workdir_to_name`) and an
+    /// aoe-managed worktree, also rename the underlying git branch to match
+    /// the new title. Off by default; ignored for untied / non-worktree
+    /// sessions. See #1927.
+    #[serde(default)]
+    pub rename_branch: bool,
 }
 
 fn apply_session_title_rename(inst: &mut Instance, title: String) {
@@ -726,44 +759,160 @@ pub async fn rename_session(
             .into_response();
     }
 
-    let mut instances = state.instances.write().await;
-    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "message": "Session not found" })),
+    // Serialize against other mutations on this session (start, delete,
+    // worktree edit) so the tied git move and the metadata write don't race.
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let (worktree_info, current_path, status, profile) = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        (
+            inst.worktree_info.clone(),
+            inst.project_path.clone(),
+            inst.status,
+            inst.source_profile.clone(),
         )
-            .into_response();
     };
 
-    apply_session_title_rename(inst, title.clone());
+    // Tied mode (#1927): renaming an aoe-managed worktree session also moves
+    // its directory leaf to match the title, so title and dir cannot drift.
+    let tied = crate::session::profile_config::resolve_config_or_warn(&profile)
+        .session
+        .tie_workdir_to_name
+        && worktree_info.as_ref().is_some_and(|w| w.managed_by_aoe);
 
-    let response =
-        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
-    let profile = inst.source_profile.clone();
-    drop(instances);
+    // What to write to disk + memory once any git side effect has landed.
+    let mut new_path: Option<String> = None;
+    let mut new_branch: Option<String> = None;
 
-    if let Ok(storage) = Storage::new(&profile) {
-        let title_clone = title.clone();
-        let id_clone = id.clone();
-        match tokio::task::spawn_blocking(move || {
-            storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                    apply_session_title_rename(inst, title_clone);
-                }
-                Ok(())
-            })
+    if tied {
+        // The dir move is gated on a quiescent worktree, exactly like the
+        // standalone worktree-name edit. A running session must be stopped
+        // first; the setting is the escape hatch for free-form relabeling.
+        if status.blocks_worktree_edit() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "session_running",
+                    "message": "Stop the session before renaming it: its worktree directory moves to match the new name. Disable \"Tie Worktree Directory to Session Name\" to relabel a running session."
+                })),
+            )
+                .into_response();
+        }
+
+        let wt = worktree_info.expect("tied implies worktree_info is Some");
+        let cur = current_path.clone();
+        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&title);
+        let rename_branch = body.rename_branch;
+        let edit = tokio::task::spawn_blocking(move || {
+            crate::session::worktree_edit::edit_worktree_workdir(
+                crate::session::worktree_edit::WorktreeEditRequest {
+                    worktree_info: &wt,
+                    current_path: std::path::Path::new(&cur),
+                    new_name: &leaf,
+                    rename_branch,
+                },
+            )
+            .map(|o| (o.new_path.to_string_lossy().to_string(), o.new_branch))
         })
-        .await
-        {
-            Ok(Ok(())) => {}
+        .await;
+
+        match edit {
+            Ok(Ok((path, branch))) => {
+                new_path = Some(path);
+                new_branch = branch;
+            }
+            // The title slug maps to the current leaf and no branch rename was
+            // requested: nothing to move, fall through to a plain title rename.
+            Ok(Err(crate::session::worktree_edit::WorktreeEditError::Unchanged)) => {}
             Ok(Err(e)) => {
-                tracing::error!(target: "http.api.sessions", "Failed to save after rename: {e}")
+                tracing::warn!(target: "http.api.sessions", session = %id, "tied rename worktree edit failed: {e}");
+                let (code, msg) = worktree_edit_error_response(&e);
+                return (code, Json(serde_json::json!({ "message": msg }))).into_response();
             }
             Err(e) => {
-                tracing::error!(target: "http.api.sessions", "Rename persist join failed: {e}")
+                tracing::error!(target: "http.api.sessions", "tied rename worktree edit join failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "message": "Worktree edit task failed" })),
+                )
+                    .into_response();
             }
         }
     }
+
+    // Persist BEFORE mutating in-memory state: when a git move has landed, a
+    // silent persist failure would otherwise leave metadata pointing at the
+    // old path after a daemon restart, so it returns 500 rather than a
+    // misleading 200.
+    let persisted = {
+        let storage = Storage::new(&profile, state.file_watch.clone());
+        let title_clone = title.clone();
+        let id_clone = id.clone();
+        let new_path_clone = new_path.clone();
+        let new_branch_clone = new_branch.clone();
+        match storage {
+            Ok(storage) => tokio::task::spawn_blocking(move || {
+                storage.update(|instances, _groups| {
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
+                        if let Some(path) = new_path_clone.as_deref() {
+                            apply_worktree_name_edit(inst, path, new_branch_clone.as_deref());
+                        }
+                        apply_session_title_rename(inst, title_clone);
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string())),
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    if let Err(e) = persisted {
+        tracing::error!(target: "http.api.sessions", session = %id, "Failed to save after rename: {e}");
+        // Persist-first: never fall through to mutate in-memory state on a
+        // failed write, or the rename silently reverts on restart. When a dir
+        // move already landed, say so; otherwise it is a plain title persist.
+        let message = if new_path.is_some() {
+            "Worktree was moved on disk, but persisting the new session metadata failed"
+        } else {
+            "Persisting the renamed session failed"
+        };
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "persist_failed", "message": message })),
+        )
+            .into_response();
+    }
+
+    let mut response = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        if let Some(path) = new_path.as_deref() {
+            apply_worktree_name_edit(inst, path, new_branch.as_deref());
+        }
+        apply_session_title_rename(inst, title.clone());
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
+    };
+    // Single-session responses are not run through list_sessions' overlay, so
+    // carry the resolved tie value here too (#1927); otherwise a client that
+    // trusts the mutation response would see a managed worktree claim it is
+    // untied until the next list refresh.
+    response.tie_workdir_to_name = tied;
 
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
@@ -889,6 +1038,23 @@ pub async fn set_worktree_name(
         )
             .into_response();
     };
+    // When tied (#1927), the directory is not edited independently: it follows
+    // the title. Reject the standalone edit so no client can drift the two
+    // apart, pointing callers at the unified rename.
+    if worktree_info.managed_by_aoe
+        && crate::session::profile_config::resolve_config_or_warn(&profile)
+            .session
+            .tie_workdir_to_name
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "tied",
+                "message": "Renaming is unified while \"Tie Worktree Directory to Session Name\" is on; rename the session instead, and its directory follows."
+            })),
+        )
+            .into_response();
+    }
     if status.blocks_worktree_edit() {
         return (
             StatusCode::CONFLICT,
@@ -948,7 +1114,7 @@ pub async fn set_worktree_name(
             .into_response()
     };
 
-    let storage = match Storage::new(&profile) {
+    let storage = match Storage::new(&profile, state.file_watch.clone()) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(target: "http.api.sessions", session = %id, "Storage::new failed after worktree edit: {e}");
@@ -1081,11 +1247,16 @@ pub async fn update_session_group(
     // Persist first; only mutate memory once disk is durable. See #1589.
     let persist_id = id.clone();
     let persist_group = group.clone();
-    if persist_session_update(profile, "group update", move |instances| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-            apply_session_group(inst, persist_group);
-        }
-    })
+    if persist_session_update(
+        profile,
+        "group update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                apply_session_group(inst, persist_group);
+            }
+        },
+    )
     .await
     .is_err()
     {
@@ -1163,12 +1334,13 @@ where
 async fn persist_session_update<F>(
     profile: String,
     label: &'static str,
+    file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
     mutate: F,
 ) -> Result<(), ()>
 where
     F: FnOnce(&mut Vec<Instance>) + Send + 'static,
 {
-    let storage = match Storage::new(&profile) {
+    let storage = match Storage::new(&profile, file_watch) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(
@@ -1270,13 +1442,18 @@ pub async fn update_session_notifications(
     // Persist first; only mutate memory once disk is durable so a write
     // failure leaves the two in agreement. See #1589.
     let persist_id = id.clone();
-    if persist_session_update(profile, "notification update", move |instances| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-            apply(&mut inst.notify_on_waiting, waiting);
-            apply(&mut inst.notify_on_idle, idle);
-            apply(&mut inst.notify_on_error, error);
-        }
-    })
+    if persist_session_update(
+        profile,
+        "notification update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                apply(&mut inst.notify_on_waiting, waiting);
+                apply(&mut inst.notify_on_idle, idle);
+                apply(&mut inst.notify_on_error, error);
+            }
+        },
+    )
     .await
     .is_err()
     {
@@ -1363,11 +1540,16 @@ pub async fn update_session_diff_base(
     // Persist first; only mutate memory once disk is durable. See #1589.
     let persist_id = id.clone();
     let persist_override = new_override.clone();
-    if persist_session_update(profile, "diff-base update", move |instances| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-            inst.base_branch_override = persist_override;
-        }
-    })
+    if persist_session_update(
+        profile,
+        "diff-base update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                inst.base_branch_override = persist_override;
+            }
+        },
+    )
     .await
     .is_err()
     {
@@ -1471,15 +1653,20 @@ pub async fn update_session_pin(
 
     // Persist first; only mutate memory once disk is durable. See #1589.
     let persist_id = id.clone();
-    if persist_session_update(profile, "pin update", move |instances| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-            if pinned {
-                inst.pin();
-            } else {
-                inst.unpin();
+    if persist_session_update(
+        profile,
+        "pin update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                if pinned {
+                    inst.pin();
+                } else {
+                    inst.unpin();
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .is_err()
     {
@@ -1547,15 +1734,20 @@ pub async fn update_session_archive(
 
     let archived = body.archived;
     let persist_id = id.clone();
-    if persist_session_update(profile, "archive update", move |instances| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-            if archived {
-                inst.archive();
-            } else {
-                inst.unarchive();
+    if persist_session_update(
+        profile,
+        "archive update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                if archived {
+                    inst.archive();
+                } else {
+                    inst.unarchive();
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .is_err()
     {
@@ -1732,14 +1924,19 @@ pub async fn update_session_snooze(
     // Persist first; only mutate memory once disk is durable, and only fire
     // the structured view teardown below on a write that landed. See #1589.
     let persist_id = id.clone();
-    if persist_session_update(profile, "snooze update", move |instances| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-            match minutes {
-                Some(m) => inst.snooze(m),
-                None => inst.unsnooze(),
+    if persist_session_update(
+        profile,
+        "snooze update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                match minutes {
+                    Some(m) => inst.snooze(m),
+                    None => inst.unsnooze(),
+                }
             }
-        }
-    })
+        },
+    )
     .await
     .is_err()
     {
@@ -1924,7 +2121,7 @@ pub async fn delete_session(
             // would silently re-add the entry from disk on the next tick
             // and the user would see "deleted" then the session
             // reappearing seconds later.
-            let storage = match Storage::new(&profile) {
+            let storage = match Storage::new(&profile, state.file_watch.clone()) {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(target: "http.api.sessions",
@@ -2081,6 +2278,14 @@ pub struct CreateSessionBody {
     /// on either combination.
     #[serde(default)]
     pub scratch: bool,
+    /// Approve the repo's `on_create` lifecycle hooks (and any project MCP) for
+    /// this non-interactive create, mirroring the CLI `--trust-hooks` flag and
+    /// the TUI trust dialog (#2066). When a repo defines hooks that need
+    /// approval and this is unset/false, the handler returns a structured
+    /// `hooks_need_trust` error so the caller can prompt and resubmit with
+    /// `trust_hooks: true`. Already-trusted hooks run regardless.
+    #[serde(default)]
+    pub trust_hooks: Option<bool>,
 }
 
 fn validate_session_tool_identity(
@@ -2126,6 +2331,204 @@ fn upsert_instance(
     } else {
         instances.push(instance);
     }
+}
+
+/// Carried out of `create_session` to mark a create that was refused because
+/// the repo's hooks (or project MCP) need approval and the request did not pass
+/// `trust_hooks: true` (#2066). The outer match downcasts this to emit a
+/// structured `hooks_need_trust` response instead of the generic
+/// `create_failed`, so a caller can show the commands and resubmit.
+#[derive(Debug)]
+struct HooksNeedTrust {
+    /// The `on_create` commands that would run, for display in the prompt.
+    on_create: Vec<String>,
+    /// The `on_launch` commands the same approval would trust. They don't run
+    /// on this create, but the recorded trust covers them for every later
+    /// session (TUI/CLI included), so the prompt must show them too.
+    on_launch: Vec<String>,
+    /// Likewise for `on_destroy`, run when a session is deleted.
+    on_destroy: Vec<String>,
+    /// True when the repo's `.mcp.json` also needs approval at this fingerprint.
+    needs_mcp_trust: bool,
+}
+
+impl std::fmt::Display for HooksNeedTrust {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Repository hooks require trust before this session can be created"
+        )
+    }
+}
+
+impl std::error::Error for HooksNeedTrust {}
+
+/// Resolved plan for a web-API create's `on_create` lifecycle hooks (#2066).
+/// Computed before the worktree is built so an untrusted repo fails fast
+/// without leaving an orphan worktree; executed after the build once the
+/// session directory exists.
+#[derive(Debug)]
+struct CreateHookPlan {
+    /// Commands to run, already merged (repo overrides global/profile per type).
+    on_create: Vec<String>,
+    /// `(hooks_hash, mcp_hash)` to persist into `trusted_repos.toml` when the
+    /// caller passed `trust_hooks: true` and a surface needed approval. `None`
+    /// when nothing new needs recording (already trusted, or no hooks/MCP).
+    trust_write: Option<(Option<String>, Option<String>)>,
+}
+
+/// Resolve the repo's `on_create` hooks and the trust decision for a web-API
+/// create. Returns `Err(HooksNeedTrust)` when a surface needs approval and the
+/// caller did not pass `trust_hooks: true`; the surrounding handler maps that to
+/// a structured `hooks_need_trust` response. Mirrors the CLI `--trust-hooks`
+/// path in `src/cli/add.rs`, adapted for the API's non-interactive context.
+fn resolve_create_hook_plan(
+    profile: &str,
+    project_path: &std::path::Path,
+    scratch: bool,
+    trust_hooks_requested: bool,
+) -> anyhow::Result<CreateHookPlan> {
+    use crate::session::repo_config::{self, TrustSurface};
+
+    // Scratch sessions have no `.agent-of-empires/config.toml` anchored on a
+    // repo path, so skip the repo trust check entirely and fall back to
+    // profile-level hooks (matching the CLI scratch branch).
+    if scratch {
+        let on_create = repo_config::resolve_global_profile_hooks(profile)
+            .map(|h| h.on_create)
+            .unwrap_or_default();
+        return Ok(CreateHookPlan {
+            on_create,
+            trust_write: None,
+        });
+    }
+
+    let trust = match repo_config::check_repo_trust(project_path) {
+        Ok(t) => t,
+        Err(e) => {
+            // A failed trust check must not silently drop already-trusted hooks
+            // run via global/profile; degrade to profile hooks like the CLI does.
+            tracing::warn!(target: "http.api.sessions", "Failed to check repo trust: {e:#}");
+            let on_create = repo_config::resolve_global_profile_hooks(profile)
+                .map(|h| h.on_create)
+                .unwrap_or_default();
+            return Ok(CreateHookPlan {
+                on_create,
+                trust_write: None,
+            });
+        }
+    };
+
+    // Refuse only when HOOKS need approval and the caller did not opt in.
+    // Project MCP is deliberately not a gate here: the supervisor skips an
+    // untrusted `.mcp.json` at spawn (it's the real MCP gate), so blocking
+    // creation on it would be more aggressive than the CLI, which still
+    // creates the session when MCP is declined. A passed `trust_hooks` still
+    // records MCP trust below, bundling approval the way the CLI does.
+    if trust.hooks.needs_trust() && !trust_hooks_requested {
+        // Approving trusts the repo's whole hooks hash, so the refusal must
+        // carry every hook type the trust would cover (on_launch runs on every
+        // later session start, on_destroy on delete), not just on_create;
+        // mirrors hook_display_groups in the CLI/TUI prompts.
+        let merged = match &trust.hooks {
+            TrustSurface::Trusted(h) | TrustSurface::NeedsTrust { config: h, .. } => {
+                repo_config::merge_hooks_for_display(profile, h)
+            }
+            TrustSurface::Absent => {
+                repo_config::resolve_global_profile_hooks(profile).unwrap_or_default()
+            }
+        };
+        return Err(anyhow::Error::new(HooksNeedTrust {
+            on_create: merged.on_create,
+            on_launch: merged.on_launch,
+            on_destroy: merged.on_destroy,
+            needs_mcp_trust: trust.mcp.needs_trust(),
+        }));
+    }
+
+    // Approved (nothing needed prompting, or the caller passed trust_hooks).
+    let repo_hooks = match &trust.hooks {
+        TrustSurface::Trusted(h) | TrustSurface::NeedsTrust { config: h, .. } => Some(h.clone()),
+        TrustSurface::Absent => None,
+    };
+    let trust_write = if trust_hooks_requested {
+        let hooks_hash = match &trust.hooks {
+            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+            _ => None,
+        };
+        let mcp_hash = match &trust.mcp {
+            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+            _ => None,
+        };
+        if hooks_hash.is_some() || mcp_hash.is_some() {
+            Some((hooks_hash, mcp_hash))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let on_create = match repo_hooks {
+        Some(h) => repo_config::merge_hooks_with_config(profile, h)
+            .map(|m| m.on_create)
+            .unwrap_or_default(),
+        None => repo_config::resolve_global_profile_hooks(profile)
+            .map(|h| h.on_create)
+            .unwrap_or_default(),
+    };
+    Ok(CreateHookPlan {
+        on_create,
+        trust_write,
+    })
+}
+
+/// Record any pending trust and run the planned `on_create` hooks for a
+/// web-API create (#2066). Runs after the worktree exists. Hook output is
+/// streamed to a discarded channel so the shared streamed executor's
+/// terminal-detach (credential-prompt suppression) applies; failures surface
+/// through the returned `Result` with a captured output tail.
+fn run_create_hooks(
+    instance: &mut Instance,
+    plan: &CreateHookPlan,
+    project_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    use crate::session::repo_config;
+
+    if let Some((hooks_hash, mcp_hash)) = &plan.trust_write {
+        repo_config::trust_repo(project_path, hooks_hash.as_deref(), mcp_hash.as_deref())?;
+    }
+
+    if plan.on_create.is_empty() {
+        return Ok(());
+    }
+
+    let hook_env = repo_config::lifecycle_env_vars(instance);
+    // No live consumer: drop the receiver so the executor's sends no-op while
+    // its detach-tty behavior and error-tail capture still apply.
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel::<repo_config::HookProgress>();
+    drop(progress_rx);
+
+    if instance.sandbox_info.is_some() {
+        instance.get_container_for_instance()?;
+        let workdir = instance.container_workdir();
+        if let Some(sandbox) = instance.sandbox_info.as_ref() {
+            repo_config::execute_hooks_in_container_streamed(
+                &plan.on_create,
+                &sandbox.container_name,
+                &workdir,
+                &progress_tx,
+                &hook_env,
+            )?;
+        }
+    } else {
+        repo_config::execute_hooks_streamed(
+            &plan.on_create,
+            std::path::Path::new(&instance.project_path),
+            &progress_tx,
+            &hook_env,
+        )?;
+    }
+    Ok(())
 }
 
 pub async fn create_session(
@@ -2289,6 +2692,8 @@ pub async fn create_session(
         .collect();
     drop(instances);
 
+    let file_watch_for_create = state.file_watch.clone();
+
     let result = tokio::task::spawn_blocking(move || {
         use crate::session::builder::{self, InstanceParams};
         use crate::session::Config;
@@ -2309,6 +2714,21 @@ pub async fn create_session(
             .into_iter()
             .filter(|s| !s.is_empty())
             .collect();
+
+        // Resolve repo hook trust BEFORE building the worktree (#2066): a repo
+        // whose hooks need approval and that was not sent `trust_hooks: true`
+        // is refused here, so the handler never leaves an orphan worktree on
+        // disk. The original `path` is the trust anchor (the same source the
+        // CLI/TUI use); `check_repo_trust` resolves a worktree path to its main
+        // repo, so a worktree created from an already-trusted repo inherits its
+        // trust without a separate prompt.
+        let original_path = body.path.clone();
+        let hook_plan = resolve_create_hook_plan(
+            &profile,
+            std::path::Path::new(&original_path),
+            body.scratch,
+            body.trust_hooks.unwrap_or(false),
+        )?;
 
         // When worktree_branch is empty string, generate a name from civilizations.
         // The generated name is used as both title and branch.
@@ -2357,6 +2777,8 @@ pub async fn create_session(
         let mut instance = build_result.instance;
         instance.source_profile = profile.clone();
         let build_warnings = build_result.warnings;
+        let created_worktree = build_result.created_worktree;
+        let created_workspace_worktrees = build_result.created_workspace_worktrees;
 
         // Apply per-session sandbox overrides from the request body.
         if let Some(ref mut sandbox) = instance.sandbox_info {
@@ -2427,6 +2849,24 @@ pub async fn create_session(
             agent_effort
         };
 
+        // Run on_create hooks now that the worktree exists, before the session
+        // is persisted or started (#2066). Mirrors the TUI/CLI ordering so the
+        // worktree is bootstrapped (`.env` copies, venv symlinks, DB seeds)
+        // before the agent launches. On failure, tear down the just-built
+        // worktree/container so a broken hook doesn't leave an orphan.
+        if let Err(e) = run_create_hooks(
+            &mut instance,
+            &hook_plan,
+            std::path::Path::new(&original_path),
+        ) {
+            builder::cleanup_instance(
+                &instance,
+                created_worktree.as_ref(),
+                &created_workspace_worktrees,
+            );
+            return Err(anyhow::anyhow!("on_create hook failed: {e:#}"));
+        }
+
         // Anything that fails between here and the final `Ok(..)`
         // would otherwise orphan the scratch directory `build_instance`
         // already provisioned (Storage::new, storage.update,
@@ -2435,7 +2875,7 @@ pub async fn create_session(
         // tripped. Matches the CLI cleanup path in
         // `cleanup_partial_session(... scratch_dir: Some(...))`.
         let mut persist_and_start = || -> anyhow::Result<()> {
-            let storage = Storage::new(&profile)?;
+            let storage = Storage::new(&profile, file_watch_for_create.clone())?;
             let to_persist = instance.clone();
             storage.update(|all, _groups| {
                 all.push(to_persist);
@@ -2497,6 +2937,16 @@ pub async fn create_session(
                 crate::claude_settings::read_tui_fullscreen(),
             );
             resp.warnings = warnings;
+            // Carry the resolved tie value (#1927); list_sessions' overlay does
+            // not run on this create response, so a managed worktree would
+            // otherwise report untied until the next list refresh.
+            if resp.has_managed_worktree {
+                resp.tie_workdir_to_name = crate::session::profile_config::resolve_config_or_warn(
+                    &instance.source_profile,
+                )
+                .session
+                .tie_workdir_to_name;
+            }
             if !resp.acp_capable {
                 let acp_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
                     &instance.source_profile,
@@ -2642,6 +3092,23 @@ pub async fn create_session(
             (StatusCode::CREATED, Json(resp)).into_response()
         }
         Ok(Err(e)) => {
+            // A repo whose hooks need approval gets a distinct, structured
+            // response so the caller can surface the commands and resubmit with
+            // `trust_hooks: true` (#2066), rather than the opaque create_failed.
+            if let Some(needs_trust) = e.downcast_ref::<HooksNeedTrust>() {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "hooks_need_trust",
+                        "message": "Repository hooks require trust. Resubmit with trust_hooks: true to approve.",
+                        "on_create": needs_trust.on_create,
+                        "on_launch": needs_trust.on_launch,
+                        "on_destroy": needs_trust.on_destroy,
+                        "needs_mcp_trust": needs_trust.needs_mcp_trust,
+                    })),
+                )
+                    .into_response();
+            }
             tracing::warn!(target: "http.api.sessions", "Session creation failed: {}", e);
             (
                 StatusCode::BAD_REQUEST,
@@ -3162,37 +3629,30 @@ pub struct RichDiffFilesResponse {
     pub warning: Option<String>,
 }
 
+/// Contents-based diff response: raw old/new text that the web client parses
+/// and renders itself via `@pierre/diffs`. See [`MAX_CONTENTS_BYTES`].
 #[derive(Serialize)]
-pub struct RichDiffLine {
-    #[serde(rename = "type")]
-    pub change_type: String,
-    pub old_line_num: Option<usize>,
-    pub new_line_num: Option<usize>,
-    pub content: String,
-}
-
-#[derive(Serialize)]
-pub struct RichDiffHunk {
-    pub old_start: usize,
-    pub old_lines: usize,
-    pub new_start: usize,
-    pub new_lines: usize,
-    pub lines: Vec<RichDiffLine>,
-}
-
-#[derive(Serialize)]
-pub struct RichFileDiffResponse {
+pub struct RichFileContentsResponse {
     pub file: RichDiffFileInfo,
-    pub hunks: Vec<RichDiffHunk>,
+    pub old_content: String,
+    pub new_content: String,
+    /// Server-computed unified diff of old → new. The client parses this as
+    /// text (`parsePatchFiles`) instead of re-diffing the contents, which
+    /// would block the main thread on large files. Empty for binary files.
+    pub patch: String,
     pub is_binary: bool,
-    /// True if the file was too large to diff and hunks were omitted.
+    /// True if the file was too large to send inline; contents are omitted.
     pub truncated: bool,
 }
 
-/// Max combined bytes of old+new content before we bail on diffing.
-const MAX_DIFF_BYTES: usize = 2_000_000;
-/// Max combined line count of old+new before we bail on diffing.
-const MAX_DIFF_LINES: usize = 40_000;
+/// Caps for the contents-based diff endpoint. The client renders with a
+/// virtualized, off-main-thread highlighter (`@pierre/diffs`), so the DOM and
+/// main thread are no longer the bottleneck; the only real cost is JSON
+/// payload size and the client-side parse. The byte cap is the real guard
+/// against pathological payloads (minified bundles, generated code, data
+/// blobs); the line cap is a secondary backstop.
+const MAX_CONTENTS_BYTES: usize = 5_000_000;
+const MAX_CONTENTS_LINES: usize = 200_000;
 
 /// Validate a user-supplied relative file path against a workdir.
 ///
@@ -3348,6 +3808,7 @@ pub async fn session_diff_files(
         Err(resp) => return resp,
     };
 
+    let scan_state = state.clone();
     let result = tokio::task::spawn_blocking(move || {
         use crate::git::diff;
 
@@ -3368,7 +3829,9 @@ pub async fn session_diff_files(
                 path,
             );
             let warning = diff::check_merge_base_status(path, &base_branch);
-            let changed = diff::compute_changed_files(path, &base_branch).unwrap_or_default();
+            let changed = scan_state
+                .changed_files_cached(path, &base_branch)
+                .unwrap_or_default();
 
             for f in changed {
                 all_files.push(RichDiffFileInfo {
@@ -3478,11 +3941,11 @@ pub async fn session_diff_file(
     let selected_repo_name = selected_repo.name;
     let base_branch_override = ctx.base_branch_override.clone();
     let base_from_worktree = ctx.base_from_worktree.clone();
+    let scan_state = state.clone();
 
     let result =
-        tokio::task::spawn_blocking(move || -> Result<RichFileDiffResponse, DiffFileError> {
+        tokio::task::spawn_blocking(move || -> Result<serde_json::Value, DiffFileError> {
             use crate::git::diff;
-            use similar::ChangeTag;
 
             let repo_path = std::path::Path::new(&project_path);
             let file_path = std::path::Path::new(&query.path);
@@ -3501,7 +3964,8 @@ pub async fn session_diff_file(
             // Validate the requested path against the set of actually-changed files.
             // This is the primary security boundary: only files modified on this
             // branch are diffable, preventing arbitrary file reads via ?path=...
-            let changed_files = diff::compute_changed_files(repo_path, &base_branch)
+            let changed_files = scan_state
+                .changed_files_cached(repo_path, &base_branch)
                 .map_err(|e| DiffFileError::Internal(e.into()))?;
             match validate_diff_path(repo_path, file_path, &changed_files) {
                 Ok(_) => {}
@@ -3514,79 +3978,59 @@ pub async fn session_diff_file(
                 }
             }
 
-            let file_diff = diff::compute_file_diff(repo_path, file_path, &base_branch, 3)
+            // Hand the client raw old/new text plus a server-computed unified
+            // patch. `@pierre/diffs` parses and renders that patch client-side
+            // (virtualized, off-main-thread highlighting) without re-running
+            // the diff algorithm in the browser.
+            let contents = diff::compute_file_contents(repo_path, file_path, &base_branch)
                 .map_err(|e| DiffFileError::Internal(e.into()))?;
-
+            // additions/deletions aren't computed on this path; reuse the counts
+            // the changed-files scan already produced for the sidebar.
+            let (additions, deletions) = changed_files
+                .iter()
+                .find(|f| f.path == *file_path)
+                .map(|f| (f.additions, f.deletions))
+                .unwrap_or((0, 0));
             let file = RichDiffFileInfo {
-                path: file_diff.file.path.to_string_lossy().to_string(),
-                old_path: file_diff
-                    .file
-                    .old_path
-                    .map(|p| p.to_string_lossy().to_string()),
-                status: file_diff.file.status.label().to_string(),
-                additions: file_diff.file.additions,
-                deletions: file_diff.file.deletions,
+                path: contents.path.to_string_lossy().to_string(),
+                old_path: contents.old_path.map(|p| p.to_string_lossy().to_string()),
+                status: contents.status.label().to_string(),
+                additions,
+                deletions,
                 repo_name: selected_repo_name.clone(),
             };
-
-            // Size cap: avoid OOM'ing the browser on huge files (minified bundles,
-            // generated code, data blobs that slipped past .gitignore).
-            let total_line_count: usize = file_diff.hunks.iter().map(|h| h.lines.len()).sum();
-            let total_bytes: usize = file_diff
-                .hunks
-                .iter()
-                .flat_map(|h| h.lines.iter())
-                .map(|l| l.content.len())
-                .sum();
-            if total_line_count > MAX_DIFF_LINES || total_bytes > MAX_DIFF_BYTES {
-                return Ok(RichFileDiffResponse {
+            let total_bytes =
+                contents.old_content.len() + contents.new_content.len() + contents.patch.len();
+            let total_lines =
+                contents.old_content.lines().count() + contents.new_content.lines().count();
+            let resp = if total_bytes > MAX_CONTENTS_BYTES || total_lines > MAX_CONTENTS_LINES {
+                RichFileContentsResponse {
                     file,
-                    hunks: Vec::new(),
-                    is_binary: file_diff.is_binary,
+                    old_content: String::new(),
+                    new_content: String::new(),
+                    patch: String::new(),
+                    is_binary: contents.is_binary,
                     truncated: true,
-                });
-            }
-
-            let hunks: Vec<RichDiffHunk> = file_diff
-                .hunks
-                .into_iter()
-                .map(|h| RichDiffHunk {
-                    old_start: h.old_start,
-                    old_lines: h.old_lines,
-                    new_start: h.new_start,
-                    new_lines: h.new_lines,
-                    lines: h
-                        .lines
-                        .into_iter()
-                        .map(|l| RichDiffLine {
-                            change_type: match l.tag {
-                                ChangeTag::Insert => "add".to_string(),
-                                ChangeTag::Delete => "delete".to_string(),
-                                ChangeTag::Equal => "equal".to_string(),
-                            },
-                            old_line_num: l.old_line_num,
-                            new_line_num: l.new_line_num,
-                            content: l.content,
-                        })
-                        .collect(),
-                })
-                .collect();
-
-            Ok(RichFileDiffResponse {
-                file,
-                hunks,
-                is_binary: file_diff.is_binary,
-                truncated: false,
-            })
+                }
+            } else {
+                RichFileContentsResponse {
+                    file,
+                    old_content: contents.old_content,
+                    new_content: contents.new_content,
+                    patch: contents.patch,
+                    is_binary: contents.is_binary,
+                    truncated: false,
+                }
+            };
+            Ok(
+                serde_json::to_value(resp)
+                    .expect("RichFileContentsResponse is always serializable"),
+            )
         })
         .await;
 
     match result {
-        Ok(Ok(resp)) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(resp).expect("RichFileDiffResponse is always serializable")),
-        )
-            .into_response(),
+        Ok(Ok(value)) => (StatusCode::OK, Json(value)).into_response(),
         Ok(Err(DiffFileError::BadRequest(msg))) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "bad_request", "message": msg})),
@@ -3607,6 +4051,91 @@ pub async fn session_diff_file(
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "File diff panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct VolumeIgnoresPreviewQuery {
+    pub path: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct VolumeIgnoresGlobPreview {
+    pub pattern: String,
+    pub matched_paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct VolumeIgnoresPreviewResponse {
+    /// True once the user has acknowledged the snapshot-expansion behavior, so
+    /// the wizard can skip the confirm modal without another round trip.
+    pub acknowledged: bool,
+    /// One entry per glob `volume_ignores` pattern with the directories it
+    /// currently matches (container-side paths). Empty when none are configured.
+    pub globs: Vec<VolumeIgnoresGlobPreview>,
+}
+
+/// Dry-run how glob `volume_ignores` entries would expand for a session rooted at
+/// `path`, without creating anything. The wizard calls this before a sandbox
+/// create to decide whether to show the snapshot-expansion confirm modal (#2045).
+/// Read-only: no `read_only` guard needed.
+pub async fn preview_volume_ignores_globs(
+    axum::extract::Query(query): axum::extract::Query<VolumeIgnoresPreviewQuery>,
+) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(move || {
+        let profile = query.profile.unwrap_or_default();
+        let config = crate::session::repo_config::resolve_config_with_repo(
+            &profile,
+            std::path::Path::new(&query.path),
+        )?;
+        let expansions = crate::session::container_config::preview_glob_volume_ignores(
+            &query.path,
+            None,
+            &config.sandbox.volume_ignores,
+        )?;
+        let acknowledged = crate::session::Config::load()
+            .map(|c| c.app_state.has_acknowledged_volume_ignores_globs)
+            .unwrap_or(false);
+        Ok::<_, anyhow::Error>((acknowledged, expansions))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((acknowledged, expansions))) => {
+            let globs = expansions
+                .into_iter()
+                .map(|e| VolumeIgnoresGlobPreview {
+                    pattern: e.pattern,
+                    matched_paths: e.matched_container_paths,
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(VolumeIgnoresPreviewResponse {
+                    acknowledged,
+                    globs,
+                }),
+            )
+                .into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.sessions", "volume_ignores glob preview failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "preview_failed", "message": "Failed to preview volume_ignores"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "volume_ignores glob preview panicked: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
@@ -4577,7 +5106,7 @@ mod tests {
         let _ = isolated_app_dir(temp_home.path());
 
         let profile = "persist-success";
-        let storage = Storage::new(profile).unwrap();
+        let storage = Storage::new_unwatched(profile).unwrap();
         let seed = make_test_instance();
         let id = seed.id.clone();
         storage
@@ -4588,15 +5117,20 @@ mod tests {
             .unwrap();
 
         let persist_id = id.clone();
-        persist_session_update(profile.to_string(), "test", move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                inst.base_branch_override = Some("release/x".to_string());
-            }
-        })
+        persist_session_update(
+            profile.to_string(),
+            "test",
+            crate::file_watch::FileWatchService::noop(),
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                    inst.base_branch_override = Some("release/x".to_string());
+                }
+            },
+        )
         .await
         .expect("persist should succeed");
 
-        let reloaded = Storage::new(profile).unwrap().load().unwrap();
+        let reloaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
         let inst = reloaded.iter().find(|i| i.id == id).unwrap();
         assert_eq!(
             inst.base_branch_override.as_deref(),
@@ -4618,7 +5152,13 @@ mod tests {
         let dir = crate::session::get_profile_dir(profile).unwrap();
         std::fs::create_dir_all(dir.join("sessions.json")).unwrap();
 
-        let result = persist_session_update(profile.to_string(), "test", |_instances| {}).await;
+        let result = persist_session_update(
+            profile.to_string(),
+            "test",
+            crate::file_watch::FileWatchService::noop(),
+            |_instances| {},
+        )
+        .await;
         assert!(result.is_err(), "a storage failure must surface as Err");
     }
 
@@ -4634,7 +5174,7 @@ mod tests {
         let _ = isolated_app_dir(temp_home.path());
 
         let profile = "group-edit";
-        let storage = Storage::new(profile).unwrap();
+        let storage = Storage::new_unwatched(profile).unwrap();
         let seed = make_test_instance(); // seeded in "work/projects"
         let id = seed.id.clone();
         storage
@@ -4646,15 +5186,20 @@ mod tests {
 
         // Move to a brand-new group.
         let set_id = id.clone();
-        persist_session_update(profile.to_string(), "group update", move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == set_id) {
-                apply_session_group(inst, "team/alpha".to_string());
-            }
-        })
+        persist_session_update(
+            profile.to_string(),
+            "group update",
+            crate::file_watch::FileWatchService::noop(),
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == set_id) {
+                    apply_session_group(inst, "team/alpha".to_string());
+                }
+            },
+        )
         .await
         .expect("set should succeed");
 
-        let reloaded = Storage::new(profile).unwrap().load().unwrap();
+        let reloaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
         assert_eq!(
             reloaded.iter().find(|i| i.id == id).unwrap().group_path,
             "team/alpha",
@@ -4663,19 +5208,236 @@ mod tests {
 
         // Clear to ungrouped via the empty-string sentinel.
         let clear_id = id.clone();
-        persist_session_update(profile.to_string(), "group update", move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == clear_id) {
-                apply_session_group(inst, String::new());
-            }
-        })
+        persist_session_update(
+            profile.to_string(),
+            "group update",
+            crate::file_watch::FileWatchService::noop(),
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == clear_id) {
+                    apply_session_group(inst, String::new());
+                }
+            },
+        )
         .await
         .expect("clear should succeed");
 
-        let reloaded = Storage::new(profile).unwrap().load().unwrap();
+        let reloaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
         assert_eq!(
             reloaded.iter().find(|i| i.id == id).unwrap().group_path,
             "",
             "empty string must clear the group on disk"
+        );
+    }
+
+    // --- #2066: web-API on_create hook trust + execution ---
+
+    /// Write `.agent-of-empires/config.toml` with the given `on_create` hooks
+    /// into a fresh project dir. Returns the dir so the caller keeps it alive.
+    fn project_with_on_create_hooks(commands: &[&str]) -> tempfile::TempDir {
+        let project = tempfile::tempdir().unwrap();
+        let cfg_dir = project.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let list = commands
+            .iter()
+            .map(|c| format!("{c:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            format!("[hooks]\non_create = [{list}]\n"),
+        )
+        .unwrap();
+        project
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_hook_plan_refuses_untrusted_repo_hooks() {
+        // Bug #2066: the web API used to skip hooks entirely. The plan must now
+        // refuse an untrusted repo with hooks unless trust_hooks is passed, so
+        // the caller can prompt rather than silently get an un-bootstrapped
+        // worktree.
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _app_dir = isolated_app_dir(temp_home.path());
+        let project = project_with_on_create_hooks(&["bash scripts/setup-worktree.sh"]);
+        // Approval trusts the whole hooks hash, so the refusal must surface
+        // every hook type, not just on_create.
+        std::fs::write(
+            project.path().join(".agent-of-empires/config.toml"),
+            "[hooks]\non_create = [\"bash scripts/setup-worktree.sh\"]\non_launch = [\"npm start\"]\non_destroy = [\"rm -rf /tmp/seed\"]\n",
+        )
+        .unwrap();
+
+        let err = resolve_create_hook_plan("default", project.path(), false, false)
+            .expect_err("untrusted hooks must be refused");
+        let needs_trust = err
+            .downcast_ref::<HooksNeedTrust>()
+            .expect("error must be HooksNeedTrust");
+        assert_eq!(
+            needs_trust.on_create,
+            vec!["bash scripts/setup-worktree.sh".to_string()],
+            "the refused error must carry the commands for the prompt"
+        );
+        assert_eq!(
+            needs_trust.on_launch,
+            vec!["npm start".to_string()],
+            "approval also trusts on_launch, so the prompt must show it"
+        );
+        assert_eq!(needs_trust.on_destroy, vec!["rm -rf /tmp/seed".to_string()]);
+        assert!(!needs_trust.needs_mcp_trust);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_hook_plan_trusts_and_runs_with_trust_hooks() {
+        // trust_hooks: true mirrors the CLI --trust-hooks flag: approve, record
+        // trust, and return the commands to run.
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _app_dir = isolated_app_dir(temp_home.path());
+        let project = project_with_on_create_hooks(&["echo hi"]);
+
+        let plan = resolve_create_hook_plan("default", project.path(), false, true)
+            .expect("trust_hooks: true must approve");
+        assert_eq!(plan.on_create, vec!["echo hi".to_string()]);
+        let (hooks_hash, mcp_hash) = plan
+            .trust_write
+            .expect("a newly-approved repo must record trust");
+        assert!(hooks_hash.is_some(), "hooks hash must be recorded");
+        assert!(mcp_hash.is_none(), "no .mcp.json means no mcp hash");
+
+        // And the recorded trust makes a later create succeed without opting in.
+        crate::session::repo_config::trust_repo(
+            project.path(),
+            hooks_hash.as_deref(),
+            mcp_hash.as_deref(),
+        )
+        .unwrap();
+        let plan2 = resolve_create_hook_plan("default", project.path(), false, false)
+            .expect("already-trusted hooks must run without trust_hooks");
+        assert_eq!(plan2.on_create, vec!["echo hi".to_string()]);
+        assert!(
+            plan2.trust_write.is_none(),
+            "already-trusted repo needs no new trust record"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_hook_plan_absent_hooks_is_ok() {
+        // A repo with no hooks (and no global hooks) is never refused.
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _app_dir = isolated_app_dir(temp_home.path());
+        let project = tempfile::tempdir().unwrap();
+
+        let plan = resolve_create_hook_plan("default", project.path(), false, false)
+            .expect("no hooks means no trust needed");
+        assert!(plan.on_create.is_empty());
+        assert!(plan.trust_write.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_hook_plan_scratch_skips_repo_trust() {
+        // Scratch sessions have no repo config anchor; even pointing at a path
+        // with untrusted hooks must not refuse (matches the CLI scratch branch).
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _app_dir = isolated_app_dir(temp_home.path());
+        let project = project_with_on_create_hooks(&["echo nope"]);
+
+        let plan = resolve_create_hook_plan("default", project.path(), true, false)
+            .expect("scratch must skip the repo trust check");
+        assert!(
+            plan.on_create.is_empty(),
+            "no global hooks, so scratch resolves to nothing"
+        );
+        assert!(plan.trust_write.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_hook_plan_does_not_block_on_untrusted_mcp_without_hooks() {
+        // A repo with an untrusted `.mcp.json` but no hooks must NOT be refused:
+        // the supervisor gates MCP at spawn, so blocking creation here would be
+        // stricter than the CLI. The session is created with MCP left untrusted.
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _app_dir = isolated_app_dir(temp_home.path());
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".mcp.json"),
+            r#"{"mcpServers": {"foo": {"command": "echo"}}}"#,
+        )
+        .unwrap();
+
+        let plan = resolve_create_hook_plan("default", project.path(), false, false)
+            .expect("untrusted MCP without hooks must not block creation");
+        assert!(plan.on_create.is_empty());
+        assert!(
+            plan.trust_write.is_none(),
+            "MCP is left untrusted when the caller did not opt in"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_hook_plan_inherits_trust_across_worktrees() {
+        // Secondary half of #2066: hook trust is keyed on the main repo
+        // (check_repo_trust resolves a worktree path back to it), so a worktree
+        // created from an already-trusted repo inherits that trust without a
+        // fresh prompt, even with trust_hooks: false.
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _app_dir = isolated_app_dir(temp_home.path());
+
+        let parent = tempfile::Builder::new()
+            .prefix("aoe-test-")
+            .tempdir()
+            .unwrap();
+        let root = parent.path().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        let repo = git2::Repository::init(&root).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        std::fs::create_dir_all(root.join(".agent-of-empires")).unwrap();
+        std::fs::write(
+            root.join(".agent-of-empires/config.toml"),
+            "[hooks]\non_create = [\"echo wt\"]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("README.md"), "proj\n").unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("README.md")).unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+
+        // Trust the main repo at its current hooks hash.
+        let hooks = crate::session::repo_config::load_repo_config(&root)
+            .unwrap()
+            .and_then(|rc| rc.hooks())
+            .unwrap();
+        let hash = crate::session::repo_config::compute_hooks_hash(&hooks);
+        crate::session::repo_config::trust_repo(&root, Some(&hash), None).unwrap();
+
+        // A worktree of that repo inherits the trust.
+        let main_wt = crate::git::GitWorktree::new(root.clone()).unwrap();
+        let wt_path = parent.path().join("proj-wt");
+        main_wt
+            .create_worktree("wt-branch", &wt_path, true, None)
+            .unwrap();
+
+        let plan = resolve_create_hook_plan("default", &wt_path, false, false)
+            .expect("worktree must inherit the main repo's hook trust");
+        assert_eq!(plan.on_create, vec!["echo wt".to_string()]);
+        assert!(
+            plan.trust_write.is_none(),
+            "inherited trust needs no new record"
         );
     }
 }
@@ -4846,7 +5608,7 @@ pub async fn send_message(
             let started_for_save = started.clone();
             let outcome_already_alive = matches!(outcome, EnsureReadyOutcome::AlreadyAlive);
             tokio::task::spawn_blocking(move || {
-                if let Ok(storage) = Storage::new(&profile) {
+                if let Ok(storage) = Storage::new(&profile, state.file_watch.clone()) {
                     if let Err(e) = storage.update(|all, _groups| {
                         if let Some(disk_inst) = all.iter_mut().find(|i| i.id == id_for_save) {
                             if !outcome_already_alive {
@@ -5095,6 +5857,7 @@ mod workspace_ordering_tests {
             is_sandboxed: false,
             scratch: false,
             has_managed_worktree: false,
+            tie_workdir_to_name: false,
             has_terminal: false,
             profile: "default".to_string(),
             cleanup_defaults: CleanupDefaults {

@@ -67,6 +67,11 @@ export interface SessionResponse {
    *  treat any non-null value as an active snooze. See #1581. */
   snoozed_until?: string | null;
   has_managed_worktree: boolean;
+  /** True when renaming this session also moves its worktree directory (the
+   *  resolved `session.tie_workdir_to_name` for an aoe-managed worktree). The
+   *  sidebar uses this to collapse the standalone "edit workdir name" action
+   *  into the unified rename. Populated by the list endpoint. See #1927. */
+  tie_workdir_to_name?: boolean;
   has_terminal: boolean;
   profile: string;
   cleanup_defaults: CleanupDefaults;
@@ -199,14 +204,7 @@ export interface TimingPongMessage {
 export interface RichDiffFile {
   path: string;
   old_path: string | null;
-  status:
-    | "added"
-    | "modified"
-    | "deleted"
-    | "renamed"
-    | "copied"
-    | "untracked"
-    | "conflicted";
+  status: "added" | "modified" | "deleted" | "renamed" | "copied" | "untracked" | "conflicted";
   additions: number;
   deletions: number;
   /** Workspace repo this file belongs to. Omitted for single-repo
@@ -251,12 +249,20 @@ export interface RichDiffHunk {
   lines: RichDiffLine[];
 }
 
-/** Response from /api/sessions/{id}/diff/file?path=... */
-export interface RichFileDiffResponse {
+/**
+ * Response from /api/sessions/{id}/diff/file?path=...
+ * Raw old/new file text that the client parses and renders itself via
+ * `@pierre/diffs` (virtualized, off-main-thread highlighting).
+ */
+export interface RichFileContentsResponse {
   file: RichDiffFile;
-  hunks: RichDiffHunk[];
+  old_content: string;
+  new_content: string;
+  /** Server-computed unified diff of old → new. Parsed client-side as text
+   *  (no client diff algorithm); empty for binary files. */
+  patch: string;
   is_binary: boolean;
-  /** True if the file was too large to diff inline. */
+  /** True if the file was too large to send inline; contents are empty. */
   truncated: boolean;
 }
 
@@ -327,7 +333,7 @@ export interface ProfileInfo {
  *  HooksConfigOverride (src/session/profile_config.rs): a field that is
  *  absent/undefined means "inherit the global hooks"; an explicit array
  *  (including the empty array) means "override". Hooks are read-only on
- *  the dashboard; see HooksReadOnlyPanel and PROFILE_WRITABLE_SECTIONS. */
+ *  the dashboard; see HooksReadOnlyPanel and profileWritableSections. */
 export interface HooksOverride {
   on_create?: string[];
   on_launch?: string[];
@@ -412,6 +418,12 @@ export interface CreateSessionRequest {
    *  Mutually exclusive with `worktree_branch` and `extra_repo_paths`;
    *  the server returns 400 on either combination. */
   scratch?: boolean;
+  /** Approve the repo's `on_create` lifecycle hooks for this create,
+   *  mirroring the CLI `--trust-hooks` flag and the TUI trust dialog
+   *  (#2066). When a repo defines hooks that need approval and this is
+   *  unset, the server returns a `hooks_need_trust` 403; the wizard then
+   *  prompts and resubmits with this set to true. */
+  trust_hooks?: boolean;
 }
 
 /** Live acp worker lifecycle, mirrored from

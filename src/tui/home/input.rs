@@ -14,10 +14,10 @@ use crate::tui::app::Action;
 use crate::tui::dialogs::ServeAction;
 use crate::tui::dialogs::{
     builtin_commands, CommandPaletteDialog, ConfirmDialog, ContextMenuAction, ContextMenuDialog,
-    DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog, HookTrustAction,
-    HooksInstallDialog, InfoDialog, IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction,
-    PaletteAction, PaletteCommand, PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog,
-    RenameMode, RestartDialog, SendMessageDialog, UnifiedDeleteDialog, WorktreeNameDialog,
+    DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog, HooksInstallDialog, InfoDialog,
+    IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction, PaletteAction, PaletteCommand,
+    PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog, RenameMode, RepoTrustAction,
+    RestartDialog, SendMessageDialog, UnifiedDeleteDialog, WorktreeNameDialog,
 };
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
@@ -257,6 +257,23 @@ pub(super) fn build_tool_hotkey_cache(
         .collect()
 }
 
+/// Pull the cell symbols in columns `[from, to_excl)` out of a parsed
+/// scrollback `Line`. The line is laid back out into a one-row buffer at
+/// the pane width so wide characters, combining marks, and right-edge
+/// truncation resolve exactly as ratatui rendered them on screen; reading
+/// cell symbols then mirrors the old frame-buffer extraction cell for
+/// cell. Unwritten cells read as a single space, which the caller trims.
+fn slice_line_columns(line: &ratatui::text::Line, from: u16, to_excl: u16, width: u16) -> String {
+    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, width, 1));
+    buf.set_line(0, 0, line, width);
+    let hi = to_excl.min(width);
+    let mut out = String::new();
+    for col in from..hi {
+        out.push_str(buf[(col, 0)].symbol());
+    }
+    out
+}
+
 impl HomeView {
     pub fn is_diff_open(&self) -> bool {
         self.diff_view.is_some()
@@ -368,10 +385,16 @@ impl HomeView {
         if self.has_non_live_send_overlay() {
             return false;
         }
-        if self.hit_preview(col, row) {
+        // Seed the selection in content coords so it survives a scroll
+        // and can span more than one page. `contains` also requires the
+        // pane to hold real scrollback, so a drag over an empty / not-yet
+        // -captured pane is a no-op rather than a phantom selection.
+        let view = self.preview_text_view;
+        if view.contains(col, row) {
+            let cell = view.screen_to_content(col, row);
             self.preview_selection = Some(PreviewSelection {
-                anchor: (col, row),
-                extent: (col, row),
+                anchor: cell,
+                extent: cell,
                 finalized: false,
             });
             self.drag_state = Some(DragKind::PreviewSelect);
@@ -449,23 +472,23 @@ impl HomeView {
                 true
             }
             Some(DragKind::PreviewSelect) => {
+                let view = self.preview_text_view;
+                let pane = view.pane;
+                if view.total_lines == 0 || pane.width == 0 || pane.height == 0 {
+                    return false;
+                }
+                // Record the live pointer cell so the ticker-driven
+                // auto-scroll (`tick_preview_autoscroll`) can keep
+                // extending while the cursor is held at the edge. The
+                // scroll itself is NOT done here: crossterm only emits
+                // Drag events on movement, so scrolling per-event makes
+                // a held cursor stall and a moving one lurch one line per
+                // event. The ticker advances it smoothly instead.
+                self.preview_drag_pos = Some((col, row));
+                let new_extent = view.screen_to_content(col, row);
                 let Some(sel) = self.preview_selection.as_mut() else {
                     return false;
                 };
-                // Clamp the drag extent to the preview pane so a
-                // mouse-out below the pane (very common: users drag down
-                // through the last visible row, expecting the selection
-                // to stop at the bottom) doesn't try to highlight
-                // chrome rows on neighbouring widgets.
-                let area = self.preview_area;
-                if area.width == 0 || area.height == 0 {
-                    return false;
-                }
-                let max_x = area.right().saturating_sub(1);
-                let max_y = area.bottom().saturating_sub(1);
-                let clamped_x = col.clamp(area.x, max_x);
-                let clamped_y = row.clamp(area.y, max_y);
-                let new_extent = (clamped_x, clamped_y);
                 if sel.extent == new_extent {
                     return false;
                 }
@@ -474,6 +497,86 @@ impl HomeView {
             }
             None => false,
         }
+    }
+
+    /// Advance an edge-held preview drag by one line. Driven by the event
+    /// loop's ~33ms ticker (not by mouse events) so holding the cursor at
+    /// the pane's top or bottom edge scrolls continuously and grows the
+    /// selection past a single page. Returns whether anything moved, so
+    /// the caller can redraw.
+    pub fn tick_preview_autoscroll(&mut self) -> bool {
+        if !matches!(self.drag_state, Some(DragKind::PreviewSelect)) {
+            return false;
+        }
+        let Some((col, row)) = self.preview_drag_pos else {
+            return false;
+        };
+        let view = self.preview_text_view;
+        let pane = view.pane;
+        if view.total_lines == 0 || pane.width == 0 || pane.height == 0 {
+            return false;
+        }
+        let at_top = row <= pane.y;
+        let at_bottom = row >= pane.bottom().saturating_sub(1);
+        if !at_top && !at_bottom {
+            // Cursor pulled back inside the pane: arm the next edge entry
+            // to scroll immediately rather than wait out the interval.
+            self.preview_autoscroll_at = None;
+            return false;
+        }
+        // Pace the scroll to a steady cadence regardless of how often the
+        // loop woke this iteration, so the speed is even instead of racing
+        // with capture-worker activity.
+        const AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.preview_autoscroll_at {
+            if now.duration_since(prev) < AUTOSCROLL_INTERVAL {
+                return false;
+            }
+        }
+        let scrolled = if at_top {
+            self.scroll_preview_offset(1)
+        } else {
+            self.scroll_preview_offset(-1)
+        };
+        if !scrolled {
+            return false;
+        }
+        self.preview_autoscroll_at = Some(now);
+        let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
+        // Pin the extent to the now-revealed edge line in `from_bottom`
+        // terms, which the new scroll offset gives directly: the bottom
+        // visible line sits `offset` lines up from the newest line, the top
+        // visible line `offset + height - 1`. Deriving it from the offset
+        // (not the stale pre-scroll `total_lines`) keeps it correct even
+        // before the next frame re-captures.
+        let offset = self.preview_scroll_offset as usize;
+        let from_bottom = if at_top {
+            offset + (pane.height as usize).saturating_sub(1)
+        } else {
+            offset
+        };
+        if let Some(sel) = self.preview_selection.as_mut() {
+            sel.extent = (col_off, from_bottom);
+        }
+        true
+    }
+
+    /// Shift the preview scroll offset by `delta` lines (positive scrolls
+    /// up toward older output), clamped to the captured window. Returns
+    /// whether the offset actually moved. Factored out of the wheel
+    /// handlers so the edge auto-scroll can move the pane without dragging
+    /// the whole `handle_scroll_*` routing along with it.
+    fn scroll_preview_offset(&mut self, delta: i32) -> bool {
+        let cache = self.active_preview_cache();
+        let visible_height = cache.dimensions.1.saturating_sub(1) as usize;
+        let real_max = cache.captured_lines.saturating_sub(visible_height) as i32;
+        let new = (self.preview_scroll_offset as i32 + delta).clamp(0, real_max) as u16;
+        if new == self.preview_scroll_offset {
+            return false;
+        }
+        self.preview_scroll_offset = new;
+        true
     }
 
     /// End any active drag. For the list divider, persist the final
@@ -491,6 +594,10 @@ impl HomeView {
         let Some(state) = self.drag_state.take() else {
             return false;
         };
+        // The pointer is up, so edge auto-scroll stops; drop the tracked
+        // position so a finalized highlight doesn't keep scrolling.
+        self.preview_drag_pos = None;
+        self.preview_autoscroll_at = None;
         match state {
             DragKind::ListDivider { .. } => {
                 self.save_list_width();
@@ -525,68 +632,52 @@ impl HomeView {
         matches!(self.drag_state, Some(DragKind::PreviewSelect))
     }
 
-    /// Read the characters underneath the current preview selection
-    /// from the rendered frame buffer, joined into a tmux-style flow
-    /// string. Called from `paint_preview_selection` on the render
-    /// that follows `handle_drag_end`, when `preview_copy_pending`
-    /// is set and the buffer still holds the cells the user dragged
-    /// over.
+    /// Join the text under the current preview selection into a tmux-style
+    /// flow string. Called from `paint_preview_selection` on the render
+    /// that follows `handle_drag_end`, when `preview_copy_pending` is set.
     ///
-    /// The frame buffer is the authoritative source: it carries exactly
-    /// what the user sees, with ansi-to-tui decoding and scroll already
-    /// applied. Reading the parsed `Text` upstream of the renderer would
-    /// duplicate the wrap math and skew when the preview is mid-scroll.
-    pub(super) fn extract_preview_selection_text(
-        &self,
-        buffer: &ratatui::buffer::Buffer,
-    ) -> Option<String> {
+    /// The selection is anchored to absolute scrollback lines, so this
+    /// reads straight from the active cache's parsed `Text` rather than
+    /// the visible frame buffer. That is what makes a multi-page copy work:
+    /// the buffer only holds the current page, but the parsed cache holds
+    /// the whole captured window, including the lines that have scrolled
+    /// off screen. Each line is laid back out into a one-row buffer at the
+    /// pane width so column slicing handles wide chars and truncation
+    /// exactly as the on-screen render did.
+    pub(super) fn extract_preview_selection_text(&self) -> Option<String> {
         let sel = self.preview_selection?;
-        let preview = self.preview_area;
-        let buf_area = buffer.area;
-        let preview = preview.intersection(buf_area);
-        if preview.width == 0 || preview.height == 0 {
+        let view = self.preview_text_view;
+        let width = view.pane.width;
+        if width == 0 || view.total_lines == 0 {
             return None;
         }
-        let ((start_col, start_row), (end_col, end_row)) = sel.ordered();
-        if start_row == end_row && start_col == end_col {
+        let lines = self.active_preview_cache().parsed_text.as_ref()?;
+        // Resolve `from_bottom` distances to absolute indices against the
+        // SAME `total_lines` the renderer used this frame, so the copied
+        // range matches the painted highlight cell for cell.
+        let ((start_col, start_line), (end_col, end_line)) = sel.ordered_abs(view);
+        if start_line == end_line && start_col == end_col {
             return None;
         }
-        let preview_right_excl = preview.right();
-        let preview_left = preview.x;
         let mut out = String::new();
-        for row in start_row..=end_row {
-            if row < preview.y || row >= preview.bottom() {
-                if row < end_row {
-                    out.push('\n');
-                }
-                continue;
-            }
-            let row_start_col = if row == start_row {
-                start_col.max(preview_left)
+        for line_idx in start_line..=end_line {
+            let from = if line_idx == start_line { start_col } else { 0 };
+            let to_excl = if line_idx == end_line {
+                end_col.saturating_add(1).min(width)
             } else {
-                preview_left
+                width
             };
-            let row_end_excl = if row == end_row {
-                end_col.saturating_add(1).min(preview_right_excl)
-            } else {
-                preview_right_excl
-            };
-            if row_end_excl <= row_start_col {
-                if row < end_row {
-                    out.push('\n');
+            if let Some(line) = lines.lines.get(line_idx) {
+                if to_excl > from {
+                    // Trim only trailing whitespace per row, not leading:
+                    // a selection over indented code keeps the indentation,
+                    // while right-edge padding on unfilled rows doesn't
+                    // bloat the paste.
+                    let slice = slice_line_columns(line, from, to_excl, width);
+                    out.push_str(slice.trim_end());
                 }
-                continue;
             }
-            let mut line = String::new();
-            for col in row_start_col..row_end_excl {
-                line.push_str(buffer[(col, row)].symbol());
-            }
-            // Trim only trailing whitespace per row, not leading: a
-            // selection over indented code keeps the indentation,
-            // while padding at the right edge of the preview (the
-            // common case for unfilled rows) doesn't bloat the paste.
-            out.push_str(line.trim_end());
-            if row < end_row {
+            if line_idx < end_line {
                 out.push('\n');
             }
         }
@@ -611,10 +702,13 @@ impl HomeView {
     pub fn clear_preview_selection(&mut self) -> bool {
         if self.preview_selection.take().is_some() {
             // Cancel any in-progress drag too so the next Up(Left)
-            // doesn't re-finalize a stale selection.
+            // doesn't re-finalize a stale selection, and stop the edge
+            // auto-scroll from chasing a now-cleared selection.
             if matches!(self.drag_state, Some(DragKind::PreviewSelect)) {
                 self.drag_state = None;
             }
+            self.preview_drag_pos = None;
+            self.preview_autoscroll_at = None;
             // A pending capture from a previous finalized drag is
             // moot once the selection is gone; drop it so the next
             // selection starts clean.
@@ -650,6 +744,12 @@ impl HomeView {
                 }
                 None
             }
+            "archive_group" => {
+                if let Err(e) = self.archive_selected_group() {
+                    tracing::error!(target: "tui.input", "Failed to archive group: {}", e);
+                }
+                None
+            }
             "stop_session" => self.pending_stop_session.take().map(Action::StopSession),
             "force_remove_session" => {
                 if let Some(session_id) = self.pending_force_remove_session.take() {
@@ -659,10 +759,82 @@ impl HomeView {
                 }
                 None
             }
+            "pull_sandbox_image" => self.pending_image_pull.take().map(Action::SpawnImagePull),
             "quit_during_creation" => Some(Action::Quit),
             "quit" => Some(Action::Quit),
             _ => None,
         }
+    }
+
+    /// Open a neutral confirm dialog offering to pull the newer sandbox image
+    /// the registry check surfaced. The image is stashed in
+    /// `pending_image_pull` because the generic `ConfirmDialog` only carries an
+    /// action string; the Submit handler reads it back to emit the pull.
+    pub(crate) fn prompt_pull_sandbox_image(&mut self, image: String) {
+        if self.confirm_dialog.is_some() {
+            return;
+        }
+        self.pending_image_pull = Some(image.clone());
+        self.confirm_dialog = Some(
+            ConfirmDialog::new(
+                "Update sandbox image",
+                &format!(
+                    "Pull the latest {image}? This downloads the new image and uses it for new sandbox sessions."
+                ),
+                "pull_sandbox_image",
+            )
+            .neutral(),
+        );
+    }
+
+    /// Confirm before archiving every active session under the focused group.
+    /// Archiving a whole project at once is a bigger hammer than the single-row
+    /// `z`, so it routes through a prompt. Archiving is reversible, hence the
+    /// calmer neutral tone rather than the destructive red. No-ops silently
+    /// (no prompt) when the group has no active sessions left to archive.
+    pub(super) fn prompt_archive_selected_group(&mut self) {
+        let Some(group_path) = self.selected_group.clone() else {
+            return;
+        };
+        let count = self.active_sessions_in_selected_group().len();
+        if count == 0 {
+            return;
+        }
+        // Project mode groups by repo, Manual mode by user-assigned path; name
+        // the scope accordingly and show the full path so nested groups that
+        // share a leaf segment aren't ambiguous.
+        let (title, scope) = if self.group_by == crate::session::config::GroupByMode::Project {
+            ("Archive project", "project")
+        } else {
+            ("Archive group", "group")
+        };
+        let noun = if count == 1 { "session" } else { "sessions" };
+        self.confirm_dialog = Some(
+            ConfirmDialog::new(
+                title,
+                &format!("Archive all {count} {noun} in {scope} \"{group_path}\"?"),
+                "archive_group",
+            )
+            .neutral(),
+        );
+    }
+
+    /// Discard unsaved Settings changes: force-close the view, clear the
+    /// confirm state, and revert any live theme preview back to the saved
+    /// config theme. Shared by the keyboard (Esc/q -> confirm) and mouse
+    /// (click [Yes]) discard paths so the two can't drift. The mouse path
+    /// previously skipped the theme revert, so discarding via a click left a
+    /// previewed theme applied until the next restart.
+    pub(super) fn discard_settings_changes(&mut self) -> Action {
+        if let Some(ref mut settings) = self.settings_view {
+            settings.force_close();
+        }
+        self.settings_view = None;
+        self.confirm_dialog = None;
+        self.settings_close_confirm = false;
+        // Theme is a global preference, not profile-merged: revert any live
+        // preview to the saved global theme so boot and Settings agree.
+        Action::SetTheme(crate::session::config::resolve_theme_name())
     }
 
     pub fn handle_dialog_click(&mut self, col: u16, row: u16) -> bool {
@@ -751,6 +923,7 @@ impl HomeView {
                         self.confirm_dialog = None;
                         self.pending_stop_session = None;
                         self.pending_force_remove_session = None;
+                        self.pending_image_pull = None;
                         // The settings close path mirrors the keyboard
                         // route: Cancel here means "don't discard," so
                         // settings stays open and `settings_close_confirm`
@@ -761,18 +934,19 @@ impl HomeView {
                         let dont_ask_again = dialog.dont_ask_again();
                         self.confirm_dialog = None;
                         if self.settings_close_confirm {
-                            // Discard branch: force-close settings (the
-                            // keyboard path runs the same sequence).
-                            if let Some(ref mut settings) = self.settings_view {
-                                settings.force_close();
+                            // Discard branch: run the exact same sequence as the
+                            // keyboard path, including the theme revert. Omitting
+                            // it here stranded a live theme preview until the next
+                            // restart when the user discarded via a mouse click.
+                            self.pending_dialog_click_action =
+                                Some(self.discard_settings_changes());
+                        } else {
+                            if action == "quit" && dont_ask_again {
+                                self.disable_confirm_before_quit();
                             }
-                            self.settings_view = None;
-                            self.settings_close_confirm = false;
+                            self.pending_dialog_click_action =
+                                self.dispatch_confirm_submit(&action);
                         }
-                        if action == "quit" && dont_ask_again {
-                            self.disable_confirm_before_quit();
-                        }
-                        self.pending_dialog_click_action = self.dispatch_confirm_submit(&action);
                     }
                 }
             }
@@ -996,6 +1170,29 @@ impl HomeView {
                             }
                         }
                         if let Some(data) = self.pending_hooks_install_data.take() {
+                            self.pending_dialog_click_action =
+                                self.maybe_confirm_volume_ignores_globs(data);
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        if let Some(dialog) = &self.volume_ignores_glob_dialog {
+            if let Some(result) = dialog.handle_click(col, row) {
+                let dont_ask_again = dialog.dont_ask_again();
+                match result {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel => {
+                        self.volume_ignores_glob_dialog = None;
+                        self.pending_volume_ignores_glob_data = None;
+                    }
+                    DialogResult::Submit(_) => {
+                        self.volume_ignores_glob_dialog = None;
+                        if dont_ask_again {
+                            self.persist_volume_ignores_globs_ack();
+                        }
+                        if let Some(data) = self.pending_volume_ignores_glob_data.take() {
                             self.pending_dialog_click_action = self.continue_session_creation(data);
                         }
                     }
@@ -1003,37 +1200,42 @@ impl HomeView {
             }
             return true;
         }
-        if let Some(dialog) = &self.hook_trust_dialog {
+        if let Some(dialog) = &self.repo_trust_dialog {
             if let Some(result) = dialog.handle_click(col, row) {
                 match result {
                     DialogResult::Continue => {}
                     DialogResult::Cancel => {
-                        self.hook_trust_dialog = None;
-                        self.pending_hook_trust_data = None;
+                        self.repo_trust_dialog = None;
+                        self.pending_repo_trust_data = None;
                     }
                     DialogResult::Submit(action) => {
-                        self.hook_trust_dialog = None;
-                        if let Some(data) = self.pending_hook_trust_data.take() {
+                        self.repo_trust_dialog = None;
+                        if let Some(data) = self.pending_repo_trust_data.take() {
                             let emit = match action {
-                                HookTrustAction::Trust {
-                                    hooks,
+                                RepoTrustAction::Trust {
                                     hooks_hash,
+                                    mcp_hash,
                                     project_path,
+                                    hooks,
                                 } => {
+                                    // If persisting trust fails, abort creation:
+                                    // launching anyway leaves a split state where
+                                    // hooks are treated as approved but project MCP
+                                    // stays gated off (it is read back from the
+                                    // unwritten hashes).
                                     if let Err(e) = repo_config::trust_repo(
                                         std::path::Path::new(&project_path),
-                                        &hooks_hash,
+                                        hooks_hash.as_deref(),
+                                        mcp_hash.as_deref(),
                                     ) {
-                                        tracing::error!(target: "tui.input", "Failed to trust repo: {}", e);
+                                        tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
+                                        None
+                                    } else {
+                                        self.create_session_with_hooks(data, hooks)
                                     }
-                                    let merged =
-                                        repo_config::merge_hooks_with_config(&data.profile, hooks);
-                                    self.create_session_with_hooks(data, merged)
                                 }
-                                HookTrustAction::Skip => {
-                                    let fallback =
-                                        repo_config::resolve_global_profile_hooks(&data.profile);
-                                    self.create_session_with_hooks(data, fallback)
+                                RepoTrustAction::Skip { hooks } => {
+                                    self.create_session_with_hooks(data, hooks)
                                 }
                             };
                             self.pending_dialog_click_action = emit;
@@ -1093,19 +1295,7 @@ impl HomeView {
                     }
                     DialogResult::Submit(_) => {
                         // User chose to discard changes
-                        if let Some(ref mut settings) = self.settings_view {
-                            settings.force_close();
-                        }
-                        self.settings_view = None;
-                        self.confirm_dialog = None;
-                        self.settings_close_confirm = false;
-                        let config = resolve_config_or_warn(&self.config_profile());
-                        let theme_name = if config.theme.name.is_empty() {
-                            "default".to_string()
-                        } else {
-                            config.theme.name
-                        };
-                        return Some(Action::SetTheme(theme_name));
+                        return Some(self.discard_settings_changes());
                     }
                 }
             }
@@ -1121,14 +1311,11 @@ impl HomeView {
                     self.settings_view = None;
                     // Refresh config-dependent state in case settings changed
                     self.refresh_from_config();
-                    // Reload theme from saved config
-                    let config = resolve_config_or_warn(&self.config_profile());
-                    let theme_name = if config.theme.name.is_empty() {
-                        "default".to_string()
-                    } else {
-                        config.theme.name
-                    };
-                    return Some(Action::SetTheme(theme_name));
+                    // Reload the theme from the global config (theme is a global
+                    // preference, not profile-merged) so the repaint matches boot.
+                    return Some(Action::SetTheme(
+                        crate::session::config::resolve_theme_name(),
+                    ));
                 }
                 SettingsAction::UnsavedChangesWarning => {
                     // Show confirmation dialog
@@ -1403,6 +1590,27 @@ impl HomeView {
                     }
                     // Resume session creation
                     if let Some(data) = self.pending_hooks_install_data.take() {
+                        return self.maybe_confirm_volume_ignores_globs(data);
+                    }
+                }
+            }
+            return None;
+        }
+
+        if let Some(dialog) = &mut self.volume_ignores_glob_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => {
+                    self.volume_ignores_glob_dialog = None;
+                    self.pending_volume_ignores_glob_data = None;
+                }
+                DialogResult::Submit(_) => {
+                    let dont_ask_again = dialog.dont_ask_again();
+                    self.volume_ignores_glob_dialog = None;
+                    if dont_ask_again {
+                        self.persist_volume_ignores_globs_ack();
+                    }
+                    if let Some(data) = self.pending_volume_ignores_glob_data.take() {
                         return self.continue_session_creation(data);
                     }
                 }
@@ -1410,36 +1618,38 @@ impl HomeView {
             return None;
         }
 
-        if let Some(dialog) = &mut self.hook_trust_dialog {
+        if let Some(dialog) = &mut self.repo_trust_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => {
-                    self.hook_trust_dialog = None;
-                    self.pending_hook_trust_data = None;
+                    self.repo_trust_dialog = None;
+                    self.pending_repo_trust_data = None;
                 }
                 DialogResult::Submit(action) => {
-                    self.hook_trust_dialog = None;
-                    if let Some(data) = self.pending_hook_trust_data.take() {
+                    self.repo_trust_dialog = None;
+                    if let Some(data) = self.pending_repo_trust_data.take() {
                         match action {
-                            HookTrustAction::Trust {
-                                hooks,
+                            RepoTrustAction::Trust {
                                 hooks_hash,
+                                mcp_hash,
                                 project_path,
+                                hooks,
                             } => {
+                                // Abort creation if trust cannot be persisted, to
+                                // avoid a split state (hooks approved but project
+                                // MCP gated off the unwritten hashes).
                                 if let Err(e) = repo_config::trust_repo(
                                     std::path::Path::new(&project_path),
-                                    &hooks_hash,
+                                    hooks_hash.as_deref(),
+                                    mcp_hash.as_deref(),
                                 ) {
-                                    tracing::error!(target: "tui.input", "Failed to trust repo: {}", e);
+                                    tracing::error!(target: "tui.input", "Failed to persist repo trust; aborting session creation: {}", e);
+                                    return None;
                                 }
-                                let merged =
-                                    repo_config::merge_hooks_with_config(&data.profile, hooks);
-                                return self.create_session_with_hooks(data, merged);
+                                return self.create_session_with_hooks(data, hooks);
                             }
-                            HookTrustAction::Skip => {
-                                let fallback =
-                                    repo_config::resolve_global_profile_hooks(&data.profile);
-                                return self.create_session_with_hooks(data, fallback);
+                            RepoTrustAction::Skip { hooks } => {
+                                return self.create_session_with_hooks(data, hooks);
                             }
                         }
                     }
@@ -1493,7 +1703,7 @@ impl HomeView {
                         }
                     }
 
-                    return self.continue_session_creation(data);
+                    return self.maybe_confirm_volume_ignores_globs(data);
                 }
             }
             return None;
@@ -1506,6 +1716,7 @@ impl HomeView {
                     self.confirm_dialog = None;
                     self.pending_stop_session = None;
                     self.pending_force_remove_session = None;
+                    self.pending_image_pull = None;
                 }
                 DialogResult::Submit(_) => {
                     let action = dialog.action().to_string();
@@ -1623,7 +1834,11 @@ impl HomeView {
                     self.restart_dialog = None;
                     let profile = data.profile.as_deref();
                     let tool = data.tool.as_deref();
-                    if let Err(e) = self.restart_selected_session(profile, tool) {
+                    let extra_args = data.extra_args.as_deref();
+                    let command_override = data.command_override.as_deref();
+                    if let Err(e) =
+                        self.restart_selected_session(profile, tool, extra_args, command_override)
+                    {
                         // Surface the restart error to the user via the
                         // InfoDialog rather than only the debug log; the
                         // user explicitly initiated this action and needs
@@ -1737,6 +1952,9 @@ impl HomeView {
                     ProfilePickerAction::Deleted(name) => {
                         match crate::session::delete_profile(&name) {
                             Ok(()) => {
+                                if let Some(entry) = self.disk_watch_handles.remove(&name) {
+                                    super::drop_disk_watch_entry(entry);
+                                }
                                 self.show_profile_picker();
                             }
                             Err(e) => {
@@ -1886,6 +2104,7 @@ impl HomeView {
             view_mode: self.view_mode.clone(),
             sort_order: self.sort_order,
             has_search: !self.search_matches.is_empty(),
+            project_group_selected: self.project_group_at_cursor().is_some(),
         };
         if let Some(id) = bindings::resolve(&key, self.strict_hotkeys, &ctx) {
             return self.run_action(id, update_info);
@@ -2051,7 +2270,9 @@ impl HomeView {
             ActionId::Restart => self.open_restart_dialog(),
             ActionId::Update => return self.run_update(update_info),
             ActionId::ToggleArchive => {
-                if let Err(e) = self.toggle_archive_at_cursor() {
+                if self.selected_group.is_some() {
+                    self.prompt_archive_selected_group();
+                } else if let Err(e) = self.toggle_archive_at_cursor() {
                     tracing::error!("toggle_archive_at_cursor failed: {}", e);
                 }
             }
@@ -2069,6 +2290,7 @@ impl HomeView {
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
             ActionId::SortPicker => self.show_sort_picker(),
             ActionId::GroupBy => self.show_group_picker(),
+            ActionId::ToggleProjectPin => self.toggle_project_pin_at_cursor(),
             ActionId::NextWaiting => self.jump_to_next_waiting(),
         }
         None
@@ -2082,15 +2304,27 @@ impl HomeView {
             ));
             return;
         }
+        // Same gate as `open_new_session_dialog`: with no agent available the
+        // dialog has nothing to create, so point the user at setup instead of
+        // opening an unusable form. Keeps `'N'` and the group menu's New
+        // Session in step with `'n'` and the empty-sidebar menu.
+        if !self.available_tools.any_available() {
+            self.show_no_agents();
+            return;
+        }
         let prefill_path = self
             .selected_session
             .as_ref()
             .and_then(|id| self.get_instance(id))
-            .map(|inst| {
-                inst.worktree_info
+            .map(|inst| inst.repo_path().to_string())
+            .or_else(|| {
+                // No session selected (the project/group right-click menu, or
+                // `'N'` on a group header): borrow a member's repo path so the
+                // new session lands in the same project, matching the web
+                // sidebar's per-project "+".
+                self.selected_group
                     .as_ref()
-                    .map(|wt| wt.main_repo_path.clone())
-                    .unwrap_or_else(|| inst.project_path.clone())
+                    .and_then(|g| self.group_repo_path(g))
             });
         let prefill_group = self
             .selected_session
@@ -2125,14 +2359,49 @@ impl HomeView {
             if let Some(group) = prefill_group {
                 dialog.set_group(group);
             }
-            // Only skip to the title when the path was inherited from a
-            // session. In the group-only fallback the path is still the
-            // default cwd, so leaving focus there lets the user confirm it.
+            // Skip to the title whenever the path is genuinely prefilled,
+            // whether inherited from a session or borrowed from a project/group
+            // member, so the user lands directly on naming. Only an empty group
+            // (no member to borrow a path from) leaves focus on the default cwd
+            // so the user can confirm it.
             if has_prefilled_path {
                 dialog.focus_title();
             }
             self.new_dialog = Some(dialog);
         }
+    }
+
+    /// Pick a representative repo path for a selected group so "New Session"
+    /// from a project/group can prefill the working directory. In project mode
+    /// the group label is a derived basename, so match members by
+    /// `project_group_name`; in manual mode match by the stored `group_path`,
+    /// including nested subgroups. Returns `None` for an empty group (no member
+    /// to borrow a path from), leaving the dialog on the default cwd.
+    pub(super) fn group_repo_path(&self, group_path: &str) -> Option<String> {
+        self.instances
+            .iter()
+            .find(|inst| match self.group_by {
+                GroupByMode::Project => super::project_group_name(inst) == group_path,
+                _ => {
+                    inst.group_path == group_path
+                        || inst.group_path.starts_with(&format!("{group_path}/"))
+                }
+            })
+            .map(|inst| inst.repo_path().to_string())
+            .or_else(|| {
+                // An empty pinned project has no member sessions to borrow a
+                // path from; fall back to the registered project's path so
+                // "New Session" can still launch under it (the point of pinning
+                // an empty project).
+                if self.group_by == GroupByMode::Project {
+                    self.registered_projects
+                        .iter()
+                        .find(|p| crate::session::projects::repo_label(&p.path) == group_path)
+                        .map(|p| p.path.clone())
+                } else {
+                    None
+                }
+            })
     }
 
     fn attach_terminal_for_selected(&mut self) -> Option<Action> {
@@ -2203,6 +2472,7 @@ impl HomeView {
             profile,
             base_override,
             worktree_base,
+            self.file_watch.clone(),
         ) {
             Ok(view) => self.diff_view = Some(view),
             Err(e) => {
@@ -2237,7 +2507,7 @@ impl HomeView {
         }
     }
 
-    fn open_settings(&mut self) {
+    pub(super) fn open_settings(&mut self) {
         let project_path = self
             .selected_session
             .as_ref()
@@ -2817,11 +3087,11 @@ impl HomeView {
     /// its scroll boundary or has no session selected.
     pub fn handle_scroll_up(&mut self, col: u16, row: u16) -> bool {
         const STEP: u16 = 3;
-        // Any scroll repositions the preview content under the
-        // selection rect, so a leftover highlight from a previous drag
-        // would point at unrelated text. Drop it before changing
-        // offsets so the highlight disappears alongside the scroll.
-        self.clear_preview_selection();
+        // A preview selection is anchored to absolute scrollback lines,
+        // not screen cells, so scrolling no longer invalidates it: the
+        // highlight tracks its text as the pane moves and the copy spans
+        // the full range even where it has scrolled off screen. So we
+        // deliberately do NOT clear it here.
         if let Some(ref mut diff) = self.diff_view {
             diff.scroll_up(STEP);
             return true;
@@ -2979,10 +3249,29 @@ impl HomeView {
             // row reads as "Rename Group / Delete Group" instead of bare
             // "Rename / Delete".
             let is_group = matches!(self.flat_items[idx], super::Item::Group { .. });
-            self.context_menu = Some(if is_group {
+            // A real project header in project view gets the pin menu; the
+            // cursor was just moved onto this row, so `project_group_at_cursor`
+            // reflects it. Manual/synthetic group rows keep Rename/Delete.
+            let project_label = self.project_group_at_cursor();
+            self.context_menu = Some(if let Some(label) = project_label {
+                ContextMenuDialog::for_project_group(anchor, self.is_project_label_pinned(&label))
+            } else if is_group {
                 ContextMenuDialog::for_group(anchor)
             } else {
-                ContextMenuDialog::for_session(anchor)
+                let (is_archived, is_snoozed) = match &self.flat_items[idx] {
+                    super::Item::Session { id, .. } => self
+                        .get_instance(id)
+                        .map(|inst| (inst.is_archived(), inst.is_snoozed()))
+                        .unwrap_or((false, false)),
+                    super::Item::Group { .. } => (false, false),
+                };
+                // Snooze is an Attention-sort triage primitive: the `'h'`
+                // keybinding only fires in Attention sort, so the menu omits
+                // the Snooze row everywhere else to keep the mouse and keyboard
+                // paths in step.
+                let snooze = (self.sort_order == crate::session::config::SortOrder::Attention)
+                    .then_some(is_snoozed);
+                ContextMenuDialog::for_session(anchor, is_archived, snooze)
             });
             return true;
         }
@@ -3044,9 +3333,35 @@ impl HomeView {
         match action {
             ContextMenuAction::Rename => self.open_rename_for_selected(),
             ContextMenuAction::Delete => self.open_delete_for_selected(),
+            ContextMenuAction::ToggleArchive => {
+                // The right-click already moved the cursor onto the row, so the
+                // toggle acts on the same session the menu was opened for.
+                if let Err(e) = self.toggle_archive_at_cursor() {
+                    tracing::error!("toggle_archive_at_cursor (context menu) failed: {}", e);
+                }
+            }
+            ContextMenuAction::ToggleSnooze => {
+                // Same cursor-on-the-clicked-row guarantee as ToggleArchive:
+                // snoozing an active row opens the duration picker, unsnoozing
+                // wakes it immediately.
+                if let Err(e) = self.toggle_snooze_at_cursor() {
+                    tracing::error!("toggle_snooze_at_cursor (context menu) failed: {}", e);
+                }
+            }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),
+            // The right-click already moved the cursor onto the group row, so
+            // reuse the "new from selection" path: with a group selected it
+            // prefills the project's repo path (and group) the same way `'N'`
+            // does on a session.
+            ContextMenuAction::NewFromGroup => self.open_new_from_selection(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
+            ContextMenuAction::TogglePin => {
+                // The right-click already moved the cursor onto the project
+                // header, so the toggle acts on the same project the menu was
+                // opened for.
+                self.toggle_project_pin_at_cursor();
+            }
         }
     }
 
@@ -3178,6 +3493,13 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return;
         };
+        // Tied mode (#1927) collapses naming into a single Rename action: the
+        // directory follows the title, so route the standalone workdir edit to
+        // the rename dialog instead of editing the directory independently.
+        if self.tie_workdir_applies_for(&id) {
+            self.open_rename_for_selected();
+            return;
+        }
         let snapshot = self.get_instance(&id).map(|inst| {
             (
                 inst.worktree_info.clone(),
@@ -3392,21 +3714,53 @@ impl HomeView {
                     self.cursor = abs_idx;
                     self.update_selected();
                 }
-                // Single-click behavior is user-configurable via
+                // An archived row is parked: its pane was killed on archive.
+                // A single click is a "let me look at this" gesture, so it
+                // must NOT enter live-send, because `start_live_send` would
+                // respawn the pane (ensure_pane_ready) and the live-send path
+                // would auto-unarchive it (touch_last_accessed), silently
+                // resurrecting a session the user deliberately parked. Stop at
+                // the cursor update so the row just gets selected. Bringing it
+                // back stays explicit: `z` to unarchive, or a deliberate
+                // double-click / Enter to open it.
+                let archived = self
+                    .get_instance(&id)
+                    .map(|inst| inst.is_archived())
+                    .unwrap_or(false);
+                // Single-click behavior is otherwise user-configurable via
                 // `SessionConfig::click_action`. `LiveSend` (default,
                 // historical behavior) enters live-send for the clicked
                 // row, or switches the live target when already in live
                 // mode. `SelectOnly` stops at the cursor update above so
                 // the user can browse preview content without ever
-                // entering live-send; double-click still activates via
+                // entering live-send (and, if a *different* row was already
+                // live, exits live mode so keystrokes don't stay aimed at the
+                // old session); double-click still activates via
                 // `default_attach_mode`. `click_action` returns `None`
                 // for structured view-mode sessions, where `start_live_send`
                 // already short-circuits, so the historical fall-through
                 // is fine.
-                if matches!(
-                    self.click_action(&id),
-                    Some(crate::session::ClickAction::SelectOnly)
-                ) {
+                if archived
+                    || matches!(
+                        self.click_action(&id),
+                        Some(crate::session::ClickAction::SelectOnly)
+                    )
+                {
+                    // The click only moves the cursor, but if we're live-sending
+                    // to a *different* row, leave live mode rather than stranding
+                    // keystrokes on the old session while the cursor / preview
+                    // walks away. In `LiveSend` mode the `start_live_send` branch
+                    // below already retargets, so this only matters for the
+                    // select-only (and archived) gesture, which is precisely a
+                    // "stop touching that, let me look at this" intent.
+                    if let Some(state) = self
+                        .live_send
+                        .as_ref()
+                        .filter(|s| s.session_id != id)
+                        .cloned()
+                    {
+                        self.exit_live_send_and_restore_sizing(&state);
+                    }
                     None
                 } else {
                     self.start_live_send()
@@ -3453,7 +3807,7 @@ impl HomeView {
         if let Some(dialog) = &mut self.no_agents_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
-        if let Some(dialog) = &mut self.hook_trust_dialog {
+        if let Some(dialog) = &mut self.repo_trust_dialog {
             overlay_changed |= dialog.handle_hover(col, row);
         }
         if let Some(picker) = &mut self.tool_picker_dialog {
@@ -3507,9 +3861,8 @@ impl HomeView {
     /// Route a mouse-wheel-down at (col, row); see handle_scroll_up.
     pub fn handle_scroll_down(&mut self, col: u16, row: u16) -> bool {
         const STEP: u16 = 3;
-        // Mirror handle_scroll_up: a stale highlight pinned to cells
-        // whose content just moved would mislead, so drop it first.
-        self.clear_preview_selection();
+        // Mirror handle_scroll_up: the selection is anchored to scrollback
+        // lines, so it survives the scroll and is left in place.
         if let Some(ref mut diff) = self.diff_view {
             diff.scroll_down(STEP);
             return true;
@@ -3639,12 +3992,16 @@ impl HomeView {
             inst.source_profile.clone()
         };
         let current_tool = inst.tool.clone();
+        let current_command = inst.command.clone();
+        let current_extra_args = inst.extra_args.clone();
         let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
         let tools: Vec<String> = self.available_tools.available_list().to_vec();
         self.restart_dialog = Some(RestartDialog::new(
             &current_title,
             &current_profile,
             &current_tool,
+            &current_command,
+            &current_extra_args,
             profiles,
             tools,
         ));
@@ -4122,36 +4479,152 @@ impl HomeView {
         }
     }
 
+    /// Gate sandbox session creation on a one-time confirmation when the resolved
+    /// config has glob `volume_ignores` (e.g. `**/bin`). Those entries are expanded
+    /// against the workspace at create time, a point-in-time snapshot that won't
+    /// shadow directories a build creates later inside the container (#2045). Shows
+    /// the dialog once (unless already acknowledged or no glob is configured),
+    /// otherwise proceeds straight to creation.
+    fn maybe_confirm_volume_ignores_globs(&mut self, data: NewSessionData) -> Option<Action> {
+        if data.sandbox && !Self::volume_ignores_globs_acknowledged() {
+            if let Some(message) = Self::volume_ignores_glob_confirm_message(&data) {
+                self.volume_ignores_glob_dialog = Some(
+                    crate::tui::dialogs::ConfirmDialog::new(
+                        "Glob volume_ignores",
+                        &message,
+                        "volume_ignores_globs",
+                    )
+                    .neutral()
+                    .offering_dont_ask_again(),
+                );
+                self.pending_volume_ignores_glob_data = Some(data);
+                return None;
+            }
+        }
+        self.continue_session_creation(data)
+    }
+
+    fn volume_ignores_globs_acknowledged() -> bool {
+        load_config()
+            .ok()
+            .flatten()
+            .map(|c| c.app_state.has_acknowledged_volume_ignores_globs)
+            .unwrap_or(false)
+    }
+
+    fn persist_volume_ignores_globs_ack(&self) {
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            config.app_state.has_acknowledged_volume_ignores_globs = true;
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.input", "Failed to save volume_ignores ack: {e}");
+            }
+        }
+    }
+
+    /// Build the confirm message describing how this session's glob volume_ignores
+    /// will expand, or `None` when there is no glob entry (nothing to confirm).
+    fn volume_ignores_glob_confirm_message(data: &NewSessionData) -> Option<String> {
+        let config =
+            repo_config::resolve_config_with_repo(&data.profile, std::path::Path::new(&data.path))
+                .ok()?;
+        let expansions = crate::session::container_config::preview_glob_volume_ignores(
+            &data.path,
+            None,
+            &config.sandbox.volume_ignores,
+        )
+        .ok()?;
+        if expansions.is_empty() {
+            return None;
+        }
+        let match_count: usize = expansions
+            .iter()
+            .map(|e| e.matched_container_paths.len())
+            .sum();
+        // Name the patterns (capped) so the user sees what will expand.
+        let mut patterns: Vec<&str> = expansions.iter().map(|e| e.pattern.as_str()).collect();
+        let pattern_list = if patterns.len() > 3 {
+            patterns.truncate(3);
+            format!("{}, ...", patterns.join(", "))
+        } else {
+            patterns.join(", ")
+        };
+        Some(format!(
+            "volume_ignores globs ({}) match {} director{} in the workspace right now. Each \
+             becomes an ignore mount at create time; directories a build creates later inside the \
+             container are not hidden. Proceed?",
+            pattern_list,
+            match_count,
+            if match_count == 1 { "y" } else { "ies" },
+        ))
+    }
+
     /// Continue session creation after agent hooks acknowledgment.
     /// Runs the repo hook trust check and then creates the session.
     fn continue_session_creation(&mut self, data: NewSessionData) -> Option<Action> {
-        match repo_config::check_hook_trust(std::path::Path::new(&data.path)) {
-            Ok(repo_config::HookTrustStatus::NeedsTrust { hooks, hooks_hash }) => {
-                use crate::tui::dialogs::HookTrustDialog;
-                let merged_hooks = repo_config::merge_hooks_for_display(&data.profile, &hooks);
-                self.hook_trust_dialog = Some(HookTrustDialog::new(
-                    hooks,
-                    merged_hooks,
-                    hooks_hash,
-                    data.path.clone(),
-                ));
-                self.pending_hook_trust_data = Some(data);
-                None
-            }
-            Ok(repo_config::HookTrustStatus::Trusted(repo_hooks)) => {
-                let merged = repo_config::merge_hooks_with_config(&data.profile, repo_hooks);
-                self.create_session_with_hooks(data, merged)
-            }
-            Ok(repo_config::HookTrustStatus::NoHooks) => {
-                let fallback = repo_config::resolve_global_profile_hooks(&data.profile);
-                self.create_session_with_hooks(data, fallback)
-            }
+        use crate::session::TrustSurface;
+        let trust = match repo_config::check_repo_trust(std::path::Path::new(&data.path)) {
+            Ok(t) => t,
             Err(e) => {
-                tracing::warn!(target: "tui.input", "Failed to check repo hooks: {}", e);
+                tracing::warn!(target: "tui.input", "Failed to check repo trust: {}", e);
                 let fallback = repo_config::resolve_global_profile_hooks(&data.profile);
-                self.create_session_with_hooks(data, fallback)
+                return self.create_session_with_hooks(data, fallback);
             }
+        };
+
+        let repo_hooks: Option<crate::session::HooksConfig> = match &trust.hooks {
+            TrustSurface::Trusted(h) | TrustSurface::NeedsTrust { config: h, .. } => {
+                Some(h.clone())
+            }
+            TrustSurface::Absent => None,
+        };
+        let hooks_hash = match &trust.hooks {
+            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+            _ => None,
+        };
+        let mcp_hash = match &trust.mcp {
+            TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+            _ => None,
+        };
+        let mcp_servers = match &trust.mcp {
+            TrustSurface::Trusted(s) | TrustSurface::NeedsTrust { config: s, .. } => s.clone(),
+            TrustSurface::Absent => Vec::new(),
+        };
+
+        // Hooks to run if approved (repo hooks, else global) vs skipped
+        // (already-trusted repo hooks still run; newly-prompted hooks fall back
+        // to the global set, matching the prior TUI skip behavior).
+        let hooks_on_trust = match &repo_hooks {
+            Some(h) => repo_config::merge_hooks_with_config(&data.profile, h.clone()),
+            None => repo_config::resolve_global_profile_hooks(&data.profile),
+        };
+        let hooks_on_skip = match &trust.hooks {
+            TrustSurface::Trusted(h) => {
+                repo_config::merge_hooks_with_config(&data.profile, h.clone())
+            }
+            _ => repo_config::resolve_global_profile_hooks(&data.profile),
+        };
+
+        if !trust.needs_prompt() {
+            return self.create_session_with_hooks(data, hooks_on_trust);
         }
+
+        use crate::tui::dialogs::RepoTrustDialog;
+        let merged_hooks = repo_hooks
+            .as_ref()
+            .map(|h| repo_config::merge_hooks_for_display(&data.profile, h))
+            .unwrap_or_default();
+        self.repo_trust_dialog = Some(RepoTrustDialog::new(
+            merged_hooks,
+            repo_hooks.unwrap_or_default(),
+            mcp_servers,
+            hooks_on_trust,
+            hooks_on_skip,
+            hooks_hash,
+            mcp_hash,
+            data.path.clone(),
+        ));
+        self.pending_repo_trust_data = Some(data);
+        None
     }
 
     /// Create a session with optional hooks. Delegates to the background
@@ -4416,5 +4889,65 @@ mod tests {
         let cache = build_tool_hotkey_cache(&tools);
         assert_eq!(cache[0].0, "alpha");
         assert_eq!(cache[1].0, "beta");
+    }
+
+    fn glob_session_data(path: &str) -> NewSessionData {
+        NewSessionData {
+            profile: String::new(),
+            title: String::new(),
+            path: path.to_string(),
+            group: String::new(),
+            tool: "claude".to_string(),
+            worktree_enabled: false,
+            worktree_branch: None,
+            create_new_branch: false,
+            base_branch: None,
+            extra_repo_paths: Vec::new(),
+            sandbox: true,
+            sandbox_image: "ubuntu:latest".to_string(),
+            yolo_mode: false,
+            extra_env: Vec::new(),
+            extra_args: String::new(),
+            command_override: String::new(),
+            scratch: false,
+        }
+    }
+
+    /// The confirm gate only fires when the resolved config has a glob ignore
+    /// that the message can name; literal-only ignores produce no dialog.
+    #[test]
+    #[serial_test::serial]
+    fn volume_ignores_glob_confirm_message_fires_only_on_globs() {
+        let temp_home = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join("src/App/bin")).unwrap();
+        git2::Repository::init(project.path()).unwrap();
+        let cfg = project.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let path = project.path().to_str().unwrap();
+
+        std::fs::write(
+            cfg.join("config.toml"),
+            "[sandbox]\nvolume_ignores = [\"**/bin\", \"target\"]\n",
+        )
+        .unwrap();
+        let msg = HomeView::volume_ignores_glob_confirm_message(&glob_session_data(path))
+            .expect("glob ignore should produce a confirm message");
+        assert!(msg.contains("**/bin"), "message names the pattern: {msg}");
+        assert!(msg.contains("1 directory"), "one match counted: {msg}");
+
+        std::fs::write(
+            cfg.join("config.toml"),
+            "[sandbox]\nvolume_ignores = [\"target\", \".venv\"]\n",
+        )
+        .unwrap();
+        assert!(
+            HomeView::volume_ignores_glob_confirm_message(&glob_session_data(path)).is_none(),
+            "literal-only ignores must not trigger the gate"
+        );
     }
 }

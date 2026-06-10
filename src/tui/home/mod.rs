@@ -9,6 +9,9 @@ mod render;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod file_watch_tests;
+
 // LiveSendState is intentionally NOT re-exported: it's an internal
 // detail of the home module. Tests that need to install it directly
 // go through the `super::live_send::LiveSendState` path.
@@ -33,10 +36,11 @@ use super::deletion_poller::DeletionPoller;
 use super::dialogs::ServeView;
 use super::dialogs::{
     ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
-    GroupDeleteOptionsDialog, GroupPickerDialog, HookTrustDialog, HooksInstallDialog, InfoDialog,
-    IntroDialog, NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
-    ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RestartDialog, SnoozeDurationDialog,
-    SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog, WorktreeNameDialog,
+    GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog, InfoDialog, IntroDialog,
+    NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
+    ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RepoTrustDialog, RestartDialog,
+    SnoozeDurationDialog, SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog,
+    WorktreeNameDialog,
 };
 use super::diff::DiffView;
 use super::settings::SettingsView;
@@ -53,23 +57,7 @@ fn project_group_name(inst: &Instance) -> String {
         return "scratch".to_string();
     }
 
-    let base_path = inst
-        .worktree_info
-        .as_ref()
-        .map(|wt| wt.main_repo_path.as_str())
-        .unwrap_or(&inst.project_path);
-
-    let path = std::path::Path::new(base_path);
-    path.file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| {
-            // For root paths like "/", use a readable fallback
-            if base_path == "/" || base_path.is_empty() {
-                "(root)".to_string()
-            } else {
-                base_path.to_string()
-            }
-        })
+    crate::session::projects::repo_label(inst.repo_path())
 }
 
 /// Kinds of in-progress mouse drags. Today only the list/preview divider
@@ -92,99 +80,159 @@ pub(super) enum DragKind {
     PreviewSelect,
 }
 
+/// The output pane's text layout, captured at render time so the input
+/// handlers (which run between frames) can map a screen cell to the
+/// absolute content line beneath it and back. `pane` is the on-screen
+/// rect the parsed agent output is painted into (the info header and
+/// banner are already stripped off); `first_line` is the index of the
+/// content line drawn on `pane`'s top row (i.e. `compute_scroll`'s
+/// result for the current scroll offset); `total_lines` is the parsed
+/// scrollback length. The output Paragraph renders with no wrap and no
+/// horizontal scroll, so screen row `pane.y + k` shows content line
+/// `first_line + k`, and screen col `pane.x + c` shows content column
+/// `c`. A `total_lines` of 0 means "no selectable content" (creating /
+/// no-selection / empty panes).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct PreviewTextView {
+    pub(super) pane: ratatui::layout::Rect,
+    pub(super) first_line: usize,
+    pub(super) total_lines: usize,
+}
+
+impl PreviewTextView {
+    /// True when `(col, row)` lands on a row/col that maps to real
+    /// content. Used to gate drag-select start.
+    pub(super) fn contains(self, col: u16, row: u16) -> bool {
+        self.total_lines > 0
+            && self
+                .pane
+                .contains(ratatui::layout::Position::from((col, row)))
+    }
+
+    /// Absolute parsed-text index of the line painted on screen row
+    /// `row`, clamped into the pane and the scrollback.
+    fn abs_line_at_row(self, row: u16) -> usize {
+        let pane = self.pane;
+        let max_y = pane.bottom().saturating_sub(1);
+        let cy = row.clamp(pane.y, max_y);
+        let mut line = self.first_line + (cy - pane.y) as usize;
+        if self.total_lines > 0 {
+            line = line.min(self.total_lines - 1);
+        }
+        line
+    }
+
+    /// Map a screen cell to selection coords `(col_offset, from_bottom)`,
+    /// clamped into the pane and the scrollback. `col_offset` is 0-based
+    /// from the pane's left edge; `from_bottom` counts lines up from the
+    /// newest captured line (0 = the bottom line). See `PreviewSelection`
+    /// for why selections anchor to the bottom rather than an absolute
+    /// index.
+    pub(super) fn screen_to_content(self, col: u16, row: u16) -> (u16, usize) {
+        let pane = self.pane;
+        let max_x = pane.right().saturating_sub(1);
+        let col_off = col.clamp(pane.x, max_x) - pane.x;
+        let abs = self.abs_line_at_row(row);
+        (
+            col_off,
+            self.total_lines.saturating_sub(1).saturating_sub(abs),
+        )
+    }
+
+    /// Absolute parsed-text index for a `from_bottom` distance under this
+    /// view's current `total_lines`. The inverse of the `from_bottom` term
+    /// in `screen_to_content`.
+    fn abs_from_bottom(self, from_bottom: usize) -> usize {
+        self.total_lines
+            .saturating_sub(1)
+            .saturating_sub(from_bottom)
+    }
+}
+
 /// Flow-style text selection in the preview pane, matching tmux's
-/// default mouse selection: from the anchor cell, the selection runs
-/// in reading order (left-to-right, top-to-bottom) wrapping across
-/// every row in between, and ends at the extent cell. Coordinates are
-/// absolute terminal cells (matching the frame buffer's coords) so the
-/// renderer can apply a reversed-style highlight without re-deriving
-/// pane geometry.
+/// default mouse selection: from the anchor cell, the selection runs in
+/// reading order (left-to-right, top-to-bottom) wrapping across every
+/// row in between, and ends at the extent cell.
+///
+/// Coordinates are *content* coords, not screen cells: `col` is a 0-based
+/// offset from the output pane's left edge and `from_bottom` counts lines
+/// up from the newest captured line (0 = the bottom line). Anchoring to
+/// the bottom (not an absolute index) is load-bearing: in live mode the
+/// preview re-captures every frame, and the captured window *grows from
+/// the top* as the user scrolls back (`capture_lines_for` adds the scroll
+/// offset), so an absolute index would silently point at an older line as
+/// the window grew, the exact bug where a drag-to-scroll copied the wrong
+/// range. Distance from the newest line is invariant under that top-side
+/// growth, so the highlight and the copy stay locked to the same text as
+/// the user scrolls. The renderer re-derives screen rects each frame from
+/// the live `PreviewTextView` via `screen_flow_rects`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PreviewSelection {
-    /// Cell the user pressed Down(Left) on.
-    pub(super) anchor: (u16, u16),
+    /// Content cell the user pressed Down(Left) on: `(col_offset, from_bottom)`.
+    pub(super) anchor: (u16, usize),
     /// Current (or final) extent. Equals `anchor` at drag start.
-    pub(super) extent: (u16, u16),
+    pub(super) extent: (u16, usize),
     /// True once Up(Left) has fired. The renderer keeps the highlight
-    /// visible after release until the user dismisses it (next key,
-    /// click, or scroll), so they can verify what was copied.
+    /// visible after release until the user dismisses it (next key or
+    /// click), so they can verify what was copied.
     pub(super) finalized: bool,
 }
 
 impl PreviewSelection {
-    /// Anchor and extent ordered in reading order (row first, then
-    /// column). The first tuple is the cell where the selection starts
-    /// in the flow; the second is where it ends. A drag that runs
-    /// up-and-right still resolves to the higher row as the start.
-    pub(super) fn ordered(self) -> ((u16, u16), (u16, u16)) {
-        let (ac, ar) = self.anchor;
-        let (ec, er) = self.extent;
-        if (ar, ac) <= (er, ec) {
-            ((ac, ar), (ec, er))
+    /// Anchor and extent resolved to absolute parsed-text indices under
+    /// `total_lines` and ordered in reading order (line first, then
+    /// column). The first tuple is where the selection starts in the flow;
+    /// the second is where it ends. A drag that runs up-and-right still
+    /// resolves to the higher line as the start.
+    pub(super) fn ordered_abs(self, view: PreviewTextView) -> ((u16, usize), (u16, usize)) {
+        let (ac, ad) = self.anchor;
+        let (ec, ed) = self.extent;
+        let a = (ac, view.abs_from_bottom(ad));
+        let e = (ec, view.abs_from_bottom(ed));
+        if (a.1, a.0) <= (e.1, e.0) {
+            (a, e)
         } else {
-            ((ec, er), (ac, ar))
+            (e, a)
         }
     }
 
-    /// Decompose the selection into one to three flow-shape `Rect`
-    /// segments inside `preview_area`. Returns an empty vec when the
-    /// preview area is zero-sized. The shape is the tmux default:
-    ///
-    /// * single-row selection: one segment between the two columns.
-    /// * multi-row selection: (1) start col to the preview's right
-    ///   edge on the first row, (2) full-width middle rows when any
-    ///   exist, (3) the preview's left edge to the end col on the
-    ///   last row.
-    pub(super) fn flow_rects(
-        self,
-        preview_area: ratatui::layout::Rect,
-    ) -> Vec<ratatui::layout::Rect> {
+    /// Decompose the selection into per-row flow-shape screen `Rect`s,
+    /// clipped to the visible window described by `view`. Lines above or
+    /// below the visible window are skipped (the highlight just doesn't
+    /// paint there); a partially-visible multi-line selection runs to the
+    /// pane's right edge on every row but its last and from the left edge
+    /// on every row but its first, matching the tmux default flow shape.
+    /// Returns an empty vec when the pane is zero-sized.
+    pub(super) fn screen_flow_rects(self, view: PreviewTextView) -> Vec<ratatui::layout::Rect> {
+        let pane = view.pane;
         let mut out = Vec::new();
-        if preview_area.width == 0 || preview_area.height == 0 {
+        if pane.width == 0 || pane.height == 0 {
             return out;
         }
-        let ((start_col, start_row), (end_col, end_row)) = self.ordered();
-        let left = preview_area.x;
-        let right_excl = preview_area.right();
-
-        if start_row == end_row {
-            let lo = start_col.min(end_col);
-            let hi = start_col.max(end_col);
-            let width = hi.saturating_sub(lo).saturating_add(1);
-            out.push(ratatui::layout::Rect {
-                x: lo,
-                y: start_row,
-                width,
-                height: 1,
-            });
-            return out;
-        }
-
-        let first_width = right_excl.saturating_sub(start_col);
-        if first_width > 0 {
-            out.push(ratatui::layout::Rect {
-                x: start_col,
-                y: start_row,
-                width: first_width,
-                height: 1,
-            });
-        }
-        if end_row > start_row + 1 {
-            out.push(ratatui::layout::Rect {
-                x: left,
-                y: start_row + 1,
-                width: preview_area.width,
-                height: end_row - start_row - 1,
-            });
-        }
-        let last_width = end_col.saturating_sub(left).saturating_add(1);
-        if last_width > 0 {
-            out.push(ratatui::layout::Rect {
-                x: left,
-                y: end_row,
-                width: last_width,
-                height: 1,
-            });
+        let ((start_col, start_line), (end_col, end_line)) = self.ordered_abs(view);
+        let top = view.first_line;
+        let bottom_excl = top + pane.height as usize;
+        for line in start_line..=end_line {
+            if line < top || line >= bottom_excl {
+                continue;
+            }
+            let row = pane.y + (line - top) as u16;
+            let left_off = if line == start_line { start_col } else { 0 };
+            let right_off_excl = if line == end_line {
+                end_col.saturating_add(1).min(pane.width)
+            } else {
+                pane.width
+            };
+            let left = pane.x + left_off.min(pane.width);
+            let right_excl = pane.x + right_off_excl;
+            if right_excl > left {
+                out.push(ratatui::layout::Rect {
+                    x: left,
+                    y: row,
+                    width: right_excl - left,
+                    height: 1,
+                });
+            }
         }
         out
     }
@@ -330,6 +378,9 @@ pub(super) const ICON_STOPPED: &str = "⠒";
 pub(super) const ICON_DELETING: &str = "✕";
 pub(super) const ICON_COLLAPSED: &str = "▶";
 pub(super) const ICON_EXPANDED: &str = "▼";
+/// Marks a pinned project header in project view. Geometric per DESIGN.md
+/// (clean readable glyphs, not emoji).
+pub(super) const ICON_PINNED: &str = "◆";
 
 /// Hook progress for a session being created in the background
 pub(super) struct CreatingHookProgress {
@@ -390,6 +441,12 @@ pub struct HomeView {
     pub(super) profile_default_attach_mode: crate::session::NewSessionAttachMode,
     /// Collapsed state for project-mode groups (persists across rebuilds)
     pub(super) project_group_collapsed: HashMap<String, bool>,
+    /// Merged project registry (global + active profile), refreshed on reload
+    /// and after a pin/unpin. Project view injects the registered projects
+    /// with no live sessions as empty "pinned" headers, and the renderer reads
+    /// it to mark pinned headers. Mirrors the WebUI, where an empty project is
+    /// just a registry entry decoupled from any session.
+    pub(super) registered_projects: Vec<crate::session::Project>,
 
     // Dialogs
     pub(super) show_help: bool,
@@ -405,12 +462,19 @@ pub struct HomeView {
     /// position when opened; the renderer clamps it into view.
     pub(super) context_menu: Option<ContextMenuDialog>,
     pub(super) group_rename_context: Option<GroupRenameContext>,
-    pub(super) hook_trust_dialog: Option<HookTrustDialog>,
-    /// Session data pending hook trust approval
-    pub(super) pending_hook_trust_data: Option<NewSessionData>,
+    pub(super) repo_trust_dialog: Option<RepoTrustDialog>,
+    /// Session data pending repo trust approval (hooks and/or project MCP)
+    pub(super) pending_repo_trust_data: Option<NewSessionData>,
     pub(super) hooks_install_dialog: Option<HooksInstallDialog>,
     /// Session data pending agent hooks acknowledgment
     pub(super) pending_hooks_install_data: Option<NewSessionData>,
+    /// One-time confirm shown before a sandbox session whose resolved config
+    /// has glob `volume_ignores` (e.g. `**/bin`), explaining the create-time
+    /// snapshot expansion (#2045). Reuses [`ConfirmDialog`] with a
+    /// "don't warn me again" checkbox persisted to app_state.
+    pub(super) volume_ignores_glob_dialog: Option<ConfirmDialog>,
+    /// Session data pending the volume_ignores glob expansion acknowledgment.
+    pub(super) pending_volume_ignores_glob_data: Option<NewSessionData>,
     pub(super) intro_dialog: Option<IntroDialog>,
     /// Theme name queued by a click on the intro dialog (live preview or
     /// final pick). Drained by the `App` mouse handler after
@@ -514,6 +578,10 @@ pub struct HomeView {
     pub(super) pending_attach_after_warning: Option<String>,
     /// Session to stop after the confirmation dialog is accepted
     pub(super) pending_stop_session: Option<String>,
+    /// Sandbox image to pull after the "image update available" confirm dialog
+    /// is accepted. Carries the image through the generic `ConfirmDialog`,
+    /// which only knows its action string.
+    pub(super) pending_image_pull: Option<String>,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
     /// Action emitted by a mouse-click on a modal dialog (e.g. clicking
@@ -595,6 +663,12 @@ pub struct HomeView {
     /// every consumer of "how many rows are visible" agrees with what's on
     /// screen.
     pub(super) preview_visible_rows: usize,
+    /// Snapshot of the output pane's text layout from the last render,
+    /// used by the drag-select handlers to map screen cells to absolute
+    /// content lines (and back) between frames. Set in `render_preview`
+    /// for the output-bearing paths; left at `total_lines == 0` for the
+    /// creating / no-selection paths so a drag there is inert.
+    pub(super) preview_text_view: PreviewTextView,
     /// Outer rect of the preview pane (block + borders + content), captured
     /// during `render_preview`. The live-send preview-only fast path uses
     /// this to call back into `render_preview` with the correct OUTER area,
@@ -677,6 +751,21 @@ pub struct HomeView {
     /// today), updated on each `Drag(Left)`, cleared on `Up(Left)`.
     pub(super) drag_state: Option<DragKind>,
 
+    /// Last pointer cell reported during a `PreviewSelect` drag, `None`
+    /// outside one. The event-loop ticker reads it (`tick_preview_autoscroll`)
+    /// to keep scrolling while the cursor is held at the pane edge:
+    /// crossterm only emits `Drag` events on movement, so without a
+    /// ticker-driven scroll, holding still at the edge wouldn't advance.
+    pub(super) preview_drag_pos: Option<(u16, u16)>,
+
+    /// When the edge auto-scroll last advanced a line. Paces the scroll to
+    /// a steady cadence so it doesn't race: the event loop wakes more often
+    /// than the ticker (capture-worker wakes, post-key wakes), and stepping
+    /// once per wake made the scroll speed lurch with pane activity.
+    /// Reset whenever the cursor leaves the edge so re-entering scrolls at
+    /// once.
+    pub(super) preview_autoscroll_at: Option<std::time::Instant>,
+
     /// In-app text selection over the preview pane, populated only in
     /// live-send mode (where terminal-native drag-select doesn't reach
     /// us because mouse capture is on). The renderer reads this to
@@ -748,12 +837,162 @@ pub struct HomeView {
         crossterm::event::KeyModifiers,
     )>,
     pub(super) tool_picker_dialog: Option<super::dialogs::ToolPickerDialog>,
+
+    /// Process-wide file-watch primitive. Threaded into per-profile
+    /// `Storage` instances so writes from this process surface
+    /// immediately via the in-process Local fast path, and used to
+    /// register per-profile subscriptions on `sessions.json` /
+    /// `groups.json` so peer-process writes propagate within the
+    /// primitive's debounce window.
+    pub(super) file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
+    /// Set by the per-profile forwarder tasks; swapped to `false` by the
+    /// tick loop when it consumes the kick. Cap-1 fan-in across all
+    /// profile forwarders: idempotent `store(true, Release)` collapses
+    /// multiple events between two reloads into one reload regardless of
+    /// source file.
+    pub(super) disk_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Per-profile subscription pairs; see `rewire_disk_subscriptions`
+    /// for the canonical drop-then-abort removal order.
+    pub(super) disk_watch_handles: HashMap<String, DiskWatchEntry>,
+    /// Tracks tick-driven reload failures so a malformed `sessions.json`
+    /// or `groups.json` does not crash the TUI. Populated by
+    /// `handle_tick_reload_storage`; consumed once per tick to surface a
+    /// single aggregated `info_dialog` and avoid spamming on every tick
+    /// while a file remains broken.
+    pub(super) reload_failure_state: ReloadFailureState,
+}
+
+/// Per-profile subscription pair, held in `HomeView::disk_watch_handles`.
+///
+/// Two teardown paths exist:
+/// 1. Explicit-remove (rewire / profile delete via `drop_disk_watch_entry`):
+///    drop the `SubscriptionHandle` first to close the source channel; the
+///    forwarder's `rx.recv().await` returns `None` and exits naturally;
+///    `forwarder.abort()` then runs as a fast-path safeguard for any
+///    `recv` future that has not yet observed the close.
+/// 2. HomeView field-drop on shutdown: the same order falls out of struct
+///    field declaration order. `disk_watch_handles` drops, each entry's
+///    handle drops first (channel-close cascade), the forwarder exits
+///    naturally; the AbortHandle drop is a no-op (Tokio's `AbortHandle`
+///    does not abort on drop) but the forwarder is already gone.
+pub(super) struct DiskWatchEntry {
+    handle: crate::file_watch::SubscriptionHandle,
+    forwarder: tokio::task::AbortHandle,
+    /// Canonicalized profile dir at install time. Compared against the
+    /// current canonical dir on rewire to detect peer-driven
+    /// delete-and-recreate (same name, new inode); on mismatch the entry
+    /// is treated as needing rewire even when the profile name set is
+    /// unchanged. notify NonRecursive watches do not auto-reattach to a
+    /// recreated directory on Linux inotify (IN_IGNORED) or macOS
+    /// FSEvents (path-based but inconsistent across platforms).
+    canonical_dir: std::path::PathBuf,
+}
+
+/// Drop the subscription handle FIRST. Closing the source channel
+/// before aborting the forwarder ensures no in-flight event reaches
+/// an aborted task.
+fn drop_disk_watch_entry(entry: DiskWatchEntry) {
+    let DiskWatchEntry {
+        handle,
+        forwarder,
+        canonical_dir: _,
+    } = entry;
+    drop(handle);
+    forwarder.abort();
+}
+
+/// Per-tick reload failure tracking. Tick-driven reload paths in
+/// `App::run` (heartbeat `reload()`, watcher-driven `reload_storage_only()`)
+/// route results through `handle_tick_reload_storage`, which records
+/// failures here so the tick loop surfaces a single aggregated
+/// `info_dialog` per failure burst rather than one dialog per tick.
+///
+/// `dialog_acknowledged` latches once the dialog is shown and clears
+/// only after every source returns to healthy, so the user is
+/// notified once per failure burst, not once per tick.
+#[derive(Default)]
+pub(super) struct ReloadFailureState {
+    storage_failed: bool,
+    storage_error: Option<String>,
+    /// Latched description of the most recent watcher-init failure
+    /// (typically `subscribe_channel` returning Err). Surfaced in the
+    /// reload-failure dialog body so the user sees that live propagation
+    /// is degraded for this profile. Cleared on the next successful
+    /// rewire pass for that profile.
+    watcher_init_error: Option<String>,
+    dialog_acknowledged: bool,
+}
+
+impl ReloadFailureState {
+    pub(super) fn record_storage(&mut self, result: &anyhow::Result<()>) {
+        match result {
+            Ok(()) => {
+                if self.storage_failed {
+                    self.storage_failed = false;
+                    self.storage_error = None;
+                    if !self.has_any_failure() {
+                        self.dialog_acknowledged = false;
+                    }
+                }
+            }
+            Err(e) => {
+                if !self.storage_failed {
+                    self.dialog_acknowledged = false;
+                }
+                self.storage_failed = true;
+                self.storage_error = Some(format!("{e:#}"));
+            }
+        }
+    }
+
+    pub(super) fn record_watcher_init_failure(&mut self, detail: &str) {
+        let was_clear = self.watcher_init_error.is_none();
+        self.watcher_init_error = Some(detail.to_string());
+        if was_clear {
+            self.dialog_acknowledged = false;
+        }
+    }
+
+    pub(super) fn clear_watcher_init_failure(&mut self) {
+        if self.watcher_init_error.is_some() {
+            self.watcher_init_error = None;
+            if !self.has_any_failure() {
+                self.dialog_acknowledged = false;
+            }
+        }
+    }
+
+    pub(super) fn has_any_failure(&self) -> bool {
+        self.storage_failed || self.watcher_init_error.is_some()
+    }
+
+    pub(super) fn has_unacknowledged_failure(&self) -> bool {
+        self.has_any_failure() && !self.dialog_acknowledged
+    }
+
+    pub(super) fn build_dialog_body(&self) -> String {
+        let mut lines: Vec<String> = vec!["The following reload sources are degraded:".to_string()];
+        if let Some(e) = &self.storage_error {
+            lines.push(format!("- Storage: {e}"));
+        }
+        if let Some(e) = &self.watcher_init_error {
+            lines.push(format!("- Watcher init: {e}"));
+        }
+        lines.push(String::new());
+        lines.push("Previous in-memory state preserved; will retry on next tick.".to_string());
+        lines.join("\n")
+    }
+
+    pub(super) fn acknowledge_dialog(&mut self) {
+        self.dialog_acknowledged = true;
+    }
 }
 
 impl HomeView {
     pub fn new(
         active_profile: Option<String>,
         available_tools: AvailableTools,
+        file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
     ) -> anyhow::Result<Self> {
         use crate::session::list_profiles;
 
@@ -767,7 +1006,7 @@ impl HomeView {
         };
 
         for profile_name in &profile_names {
-            let storage = Storage::new(profile_name)?;
+            let storage = Storage::new(profile_name, file_watch.clone())?;
             let (mut instances, groups) = storage.load_with_groups()?;
             for inst in &mut instances {
                 inst.source_profile = profile_name.clone();
@@ -829,6 +1068,8 @@ impl HomeView {
             .unwrap_or(default_group_by);
         let view_mode = ViewMode::default();
 
+        let disk_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let mut view = Self {
             storages,
             active_profile,
@@ -849,6 +1090,7 @@ impl HomeView {
             row_tag_mode: resolved.session.row_tag,
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: HashMap::new(),
+            registered_projects: Vec::new(),
             show_help: false,
             help_scroll: 0,
             new_dialog: None,
@@ -860,10 +1102,12 @@ impl HomeView {
             restart_dialog: None,
             context_menu: None,
             group_rename_context: None,
-            hook_trust_dialog: None,
-            pending_hook_trust_data: None,
+            repo_trust_dialog: None,
+            pending_repo_trust_data: None,
             hooks_install_dialog: None,
             pending_hooks_install_data: None,
+            volume_ignores_glob_dialog: None,
+            pending_volume_ignores_glob_data: None,
             intro_dialog: None,
             pending_intro_theme: None,
             no_agents_dialog: None,
@@ -897,6 +1141,7 @@ impl HomeView {
             pending_paste: None,
             pending_attach_after_warning: None,
             pending_stop_session: None,
+            pending_image_pull: None,
             pending_force_remove_session: None,
             pending_dialog_click_action: None,
             search_active: false,
@@ -919,6 +1164,7 @@ impl HomeView {
             container_terminal_preview_cache: PreviewCache::default(),
             tool_preview_cache: PreviewCache::default(),
             preview_scroll_offset: 0,
+            preview_text_view: PreviewTextView::default(),
             preview_area: Rect::default(),
             preview_pane_area: Rect::default(),
             preview_visible_rows: 0,
@@ -947,6 +1193,8 @@ impl HomeView {
             divider_col: None,
             main_area_width: 0,
             drag_state: None,
+            preview_drag_pos: None,
+            preview_autoscroll_at: None,
             preview_selection: None,
             preview_copy_pending: false,
             preview_copy_text: None,
@@ -968,6 +1216,10 @@ impl HomeView {
                 .unwrap_or_default(),
             tool_hotkey_cache: Vec::new(),
             tool_picker_dialog: None,
+            file_watch,
+            disk_dirty,
+            disk_watch_handles: HashMap::new(),
+            reload_failure_state: ReloadFailureState::default(),
         };
 
         view.tool_hotkey_cache = input::build_tool_hotkey_cache(&view.tool_configs);
@@ -1072,27 +1324,45 @@ impl HomeView {
             .map(|i| (i.id.clone(), i.clone()))
             .collect();
 
+        view.refresh_registered_projects();
         view.flat_items = view.build_flat_items();
         view.update_selected();
+        let initial_profiles: Vec<String> = view.storages.keys().cloned().collect();
+        view.rewire_disk_subscriptions(&initial_profiles)?;
         Ok(view)
     }
 
+    /// Full reload: status-hook config-cache refresh + storage. Used by
+    /// the 5s heartbeat tick and by event-driven sites (attach-return,
+    /// save+reload pairs, profile switch). Watcher-driven ticks call
+    /// `reload_storage_only` because the watcher only fires on
+    /// `sessions.json` / `groups.json`; status-hook config is not
+    /// watched.
     pub fn reload(&mut self) -> anyhow::Result<()> {
+        self.refresh_status_hook_config_cache();
+        self.reload_storage_only()
+    }
+
+    /// Storage-only reload: profile rediscovery + per-profile load + tree
+    /// rebuild + cursor restore. Skips the status-hook config-cache refresh,
+    /// which is driven by the full `reload()` path. Used by the watcher-
+    /// driven tick.
+    pub(super) fn reload_storage_only(&mut self) -> anyhow::Result<()> {
         use crate::session::list_profiles;
 
         let mut all_instances = Vec::new();
 
-        // Re-discover profiles in "all" mode
         if self.active_profile.is_none() {
             let current_profiles = list_profiles()?;
             for name in &current_profiles {
                 if !self.storages.contains_key(name) {
-                    self.storages.insert(name.clone(), Storage::new(name)?);
+                    self.storages
+                        .insert(name.clone(), Storage::new(name, self.file_watch.clone())?);
                 }
             }
             self.storages.retain(|k, _| current_profiles.contains(k));
+            self.rewire_disk_subscriptions(&current_profiles)?;
         }
-        self.refresh_status_hook_config_cache();
 
         for (profile_name, storage) in &self.storages {
             let (mut instances, groups) = storage.load_with_groups()?;
@@ -1155,6 +1425,10 @@ impl HomeView {
             .iter()
             .map(|i| (i.id.clone(), i.clone()))
             .collect();
+        // Refresh the project registry so project view's empty pinned headers
+        // and pin indicators reflect the current on-disk registry.
+        self.refresh_registered_projects();
+
         // Remember what the cursor was pointing at so we can follow it
         let prev_selected_session = self.selected_session.clone();
         let prev_selected_group = self.selected_group.clone();
@@ -1196,6 +1470,155 @@ impl HomeView {
         }
 
         self.update_selected();
+        Ok(())
+    }
+
+    /// Reconcile per-profile file-watch subscriptions against `current`
+    /// via set-diff: drop entries for profiles in `prior - current`,
+    /// keep entries in `prior ∩ current` untouched, install fresh
+    /// entries for profiles in `current - prior`. Same-set rewires are
+    /// a no-op.
+    ///
+    /// Inode-invalidation case (profile dir deleted and recreated under
+    /// the same name): the caller must drop the stale entry first via
+    /// `drop_disk_watch_entry` before invoking this helper, so the name
+    /// is missing from `prior` and the install path runs.
+    pub(super) fn rewire_disk_subscriptions(&mut self, current: &[String]) -> anyhow::Result<()> {
+        use crate::file_watch::{FileMatcher, WatchSpec};
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Ok(());
+        }
+
+        let prior: HashSet<String> = self.disk_watch_handles.keys().cloned().collect();
+        let target: HashSet<&String> = current.iter().collect();
+
+        // Detect peer-driven delete-and-recreate of any prior profile dir
+        // by comparing each prior entry's stored canonical_dir against the
+        // current canonical resolution. Mismatch forces a rewire of that
+        // entry even when the name set is unchanged, since notify
+        // NonRecursive watches do not auto-reattach across the inode
+        // change on Linux inotify or macOS FSEvents. Resolve via the
+        // non-creating `get_profile_dir_path`: this is a read-only
+        // existence/canonicalization probe, and `get_profile_dir` would
+        // resurrect a profile dir that a peer just deleted, leaving the
+        // removed profile visible in `list_profiles()` forever.
+        let inode_invalidated: HashSet<String> = prior
+            .iter()
+            .filter(|name| {
+                let entry = match self.disk_watch_handles.get(*name) {
+                    Some(e) => e,
+                    None => return false,
+                };
+                let current_canonical = crate::session::get_profile_dir_path(name)
+                    .ok()
+                    .and_then(|p| std::fs::canonicalize(&p).ok());
+                match current_canonical {
+                    Some(canonical) => canonical != entry.canonical_dir,
+                    None => true,
+                }
+            })
+            .cloned()
+            .collect();
+
+        if prior == current.iter().cloned().collect() && inode_invalidated.is_empty() {
+            return Ok(());
+        }
+
+        // Clear the latch ahead of the install loop. `record_watcher_init_failure`
+        // re-latches it on any `subscribe_channel` Err below, so the latch
+        // reflects the outcome of this rewire pass.
+        self.reload_failure_state.clear_watcher_init_failure();
+
+        let to_remove: Vec<String> = prior
+            .iter()
+            .filter(|n| !target.contains(*n) || inode_invalidated.contains(*n))
+            .cloned()
+            .collect();
+        let to_add: Vec<String> = current
+            .iter()
+            .filter(|n| !prior.contains(*n) || inode_invalidated.contains(*n))
+            .cloned()
+            .collect();
+
+        for name in &to_remove {
+            if let Some(entry) = self.disk_watch_handles.remove(name) {
+                drop_disk_watch_entry(entry);
+            }
+        }
+
+        for name in &to_add {
+            let dir = match crate::session::get_profile_dir(name) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tui.file_watch",
+                        profile = %name,
+                        error = %e,
+                        "skipping subscribe; profile dir resolution failed"
+                    );
+                    continue;
+                }
+            };
+            let canonical_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+            let sessions_path = dir.join("sessions.json");
+            let groups_path = dir.join("groups.json");
+            let spec = WatchSpec {
+                dir: dir.clone(),
+                matcher: FileMatcher::AnyOf(vec![sessions_path, groups_path]),
+                debounce: Some(Duration::from_millis(75)),
+            };
+            match self.file_watch.subscribe_channel(spec, 16) {
+                Ok((mut rx, handle)) => {
+                    use tracing::Instrument;
+                    let dirty = self.disk_dirty.clone();
+                    // Forwarder exits via `rx.recv() = None` when its
+                    // SubscriptionHandle is dropped (rewire / HomeView
+                    // teardown). The TUI has no graceful-drain phase, so
+                    // no `CancellationToken` is plumbed through here.
+                    let span = tracing::debug_span!(
+                        "tui.disk_watch.forwarder",
+                        profile = %name
+                    );
+                    let join = crate::task_util::spawn_supervised(
+                        "tui.disk_watch.forwarder",
+                        crate::task_util::PanicPolicy::Log,
+                        async move {
+                            while rx.recv().await.is_some() {
+                                dirty.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                        }
+                        .instrument(span),
+                    );
+                    self.disk_watch_handles.insert(
+                        name.clone(),
+                        DiskWatchEntry {
+                            handle,
+                            forwarder: join.abort_handle(),
+                            canonical_dir,
+                        },
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tui.file_watch",
+                        profile = %name,
+                        error = %e,
+                        "subscribe_channel failed; falling back to 5s heartbeat for this profile"
+                    );
+                    self.reload_failure_state
+                        .record_watcher_init_failure(&format!("{}: {}", name, e));
+                }
+            }
+        }
+        tracing::debug!(
+            target: "tui.file_watch",
+            added = ?to_add,
+            removed = ?to_remove,
+            "reconciled per-profile disk-watch subscriptions"
+        );
         Ok(())
     }
 
@@ -1472,13 +1895,16 @@ impl HomeView {
                 id,
                 session_id,
                 expected_prior.as_deref(),
+                &self.file_watch,
             ) {
                 crate::session::SidWrite::Applied => {
                     to_apply.push((id.clone(), session_id.clone()));
                 }
                 crate::session::SidWrite::Skipped => {
                     let mut reloaded = false;
-                    if let Ok(storage) = crate::session::Storage::new(&profile) {
+                    if let Ok(storage) =
+                        crate::session::Storage::new(&profile, self.file_watch.clone())
+                    {
                         if let Ok(disk_insts) = storage.load() {
                             if let Some(disk_inst) = disk_insts.iter().find(|i| i.id == *id) {
                                 to_rollback.push((id.clone(), disk_inst.agent_session_id.clone()));
@@ -2066,7 +2492,7 @@ impl HomeView {
 
                 // Ensure target profile storage exists
                 if !self.storages.contains_key(&target_profile) {
-                    if let Ok(s) = Storage::new(&target_profile) {
+                    if let Ok(s) = Storage::new(&target_profile, self.file_watch.clone()) {
                         self.storages.insert(target_profile.clone(), s);
                     }
                 }
@@ -2103,28 +2529,10 @@ impl HomeView {
                 if !warnings.is_empty() {
                     let body = warnings.join("\n\n");
                     let message = format!(
-                        "Session was created, but the following warnings were emitted during worktree setup:\n\n{}",
+                        "Session was created, but the following warnings were emitted during setup:\n\n{}",
                         body
                     );
-                    // Size to fit content. The default 50x9 truncates everything
-                    // past the prefix sentence, so the user only sees the prefix
-                    // and a blank line. Mirrors the math in app.rs:show_startup_warning.
-                    const WIDTH: u16 = 96;
-                    let inner_width = WIDTH.saturating_sub(4) as usize;
-                    let visual_lines: usize = message
-                        .lines()
-                        .map(|l| {
-                            if l.is_empty() {
-                                1
-                            } else {
-                                l.len().div_ceil(inner_width)
-                            }
-                        })
-                        .sum();
-                    let height = ((visual_lines as u16).saturating_add(7)).clamp(9, 35);
-                    self.info_dialog = Some(
-                        InfoDialog::new("Worktree warnings", &message).with_size(WIDTH, height),
-                    );
+                    self.info_dialog = Some(InfoDialog::sized_to_fit("Session warnings", &message));
                 }
 
                 Some(session_id)
@@ -2136,7 +2544,9 @@ impl HomeView {
                     self.rebuild_group_trees();
                     self.flat_items = self.build_flat_items();
                     self.update_selected();
-                    self.info_dialog = Some(InfoDialog::new("Creation Failed", &error));
+                    // Hook failures carry multi-line output; size to fit so
+                    // the actual error isn't clipped at the default 50x9.
+                    self.info_dialog = Some(InfoDialog::sized_to_fit("Creation Failed", &error));
                 } else if let Some(dialog) = &mut self.new_dialog {
                     dialog.set_loading(false);
                     dialog.set_error(error);
@@ -2255,6 +2665,16 @@ impl HomeView {
         }
     }
 
+    /// Expire the settings view's transient "Settings saved" toast when its
+    /// window passes, so it fades even while the keyboard is idle. Returns true
+    /// when a redraw is needed. No-op when the settings overlay isn't open.
+    pub fn tick_settings_status(&mut self) -> bool {
+        self.settings_view
+            .as_mut()
+            .map(|view| view.tick_status())
+            .unwrap_or(false)
+    }
+
     /// Tick dialog animations/timers and drain hook progress.
     /// Returns true when a redraw is needed.
     pub fn tick_dialog(&mut self) -> bool {
@@ -2365,8 +2785,9 @@ impl HomeView {
             || self.worktree_name_dialog.is_some()
             || self.restart_dialog.is_some()
             || self.context_menu.is_some()
-            || self.hook_trust_dialog.is_some()
+            || self.repo_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
+            || self.volume_ignores_glob_dialog.is_some()
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()
@@ -2402,8 +2823,9 @@ impl HomeView {
             || self.worktree_name_dialog.is_some()
             || self.restart_dialog.is_some()
             || self.context_menu.is_some()
-            || self.hook_trust_dialog.is_some()
+            || self.repo_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
+            || self.volume_ignores_glob_dialog.is_some()
             || self.intro_dialog.is_some()
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()
@@ -2499,6 +2921,23 @@ impl HomeView {
     /// leaving live mode hands the resize off and back).
     pub(super) fn clear_preview_pane_sync(&mut self) {
         self.preview_pane_synced = None;
+    }
+
+    /// Expand the synthetic Archived section if it is collapsed, persisting
+    /// the change. Used when archiving a session in the non-Attention sort so
+    /// the freshly archived row is visible and can stay selected under the
+    /// cursor. No-op (and no save) when the section is already open.
+    pub(super) fn reveal_archived_section(&mut self) {
+        if !self.archived_section_collapsed {
+            return;
+        }
+        self.archived_section_collapsed = false;
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            config.app_state.archived_section_collapsed = Some(false);
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
+            }
+        }
     }
 
     pub fn toggle_archived_section(&mut self) {
@@ -2658,7 +3097,40 @@ impl HomeView {
             })
             .collect();
 
-        let mut tree = GroupTree::new_with_groups(&grouped, &[]);
+        // Project headers are derived purely from the live sessions, not a
+        // persisted group list, so build the tree from non-archived members
+        // only. An archived session already shows under the synthetic
+        // Archived section (nested by project below); if it also seeded a
+        // project node here, a project whose only remaining member is
+        // archived would render an empty phantom header in the main flow.
+        // That header is undeletable in project mode ("Project groups are
+        // automatic"), leaving the user no way to clear it.
+        let tree_seed: Vec<Instance> = grouped
+            .iter()
+            .filter(|i| !i.is_archived())
+            .cloned()
+            .collect();
+
+        // Surface registered projects with no live session as empty "pinned"
+        // headers, so a project can persist in the view without any sessions,
+        // matching the WebUI where an empty project is just a registry entry.
+        // Seed them as empty groups; their headers render even with zero
+        // members (the phantom-header guard above only excludes archived-only
+        // session groups, not deliberately pinned ones).
+        let populated_labels: std::collections::HashSet<String> = tree_seed
+            .iter()
+            .map(|i| i.group_path.clone())
+            .filter(|p| !p.is_empty())
+            .collect();
+        let empty_pinned: Vec<crate::session::Group> =
+            crate::session::projects::unpopulated_projects(
+                &populated_labels,
+                &self.registered_projects,
+            )
+            .into_iter()
+            .map(|p| crate::session::Group::new(&p.label, &p.label))
+            .collect();
+        let mut tree = GroupTree::new_with_groups(&tree_seed, &empty_pinned);
         for (path, &collapsed) in &self.project_group_collapsed {
             if collapsed {
                 tree.set_collapsed(path, true);
@@ -2686,6 +3158,16 @@ impl HomeView {
     /// Pass `None` for all-profiles mode, or `Some(name)` to filter to one profile.
     pub fn switch_profile(&mut self, new_profile: Option<String>) -> anyhow::Result<()> {
         self.active_profile = new_profile;
+        if let Some(profile) = self.active_profile.clone() {
+            if !self.storages.contains_key(&profile) {
+                self.storages.insert(
+                    profile.clone(),
+                    Storage::new(&profile, self.file_watch.clone())?,
+                );
+            }
+            self.storages.retain(|name, _| name == &profile);
+            self.rewire_disk_subscriptions(std::slice::from_ref(&profile))?;
+        }
         // Clear selection before reload so stale session/group refs don't linger
         self.selected_session = None;
         self.selected_group = None;
@@ -2722,7 +3204,7 @@ impl HomeView {
         let mut entries: Vec<ProfileEntry> = profiles
             .iter()
             .map(|name| {
-                let session_count = Storage::new(name)
+                let session_count = Storage::new(name, self.file_watch.clone())
                     .and_then(|s| s.load())
                     .map(|instances| instances.len())
                     .unwrap_or(0);
@@ -2833,11 +3315,15 @@ impl HomeView {
         let size = crate::terminal::get_size();
         // Same pane-readiness cascades as live-send: agent runs the
         // full `ensure_pane_ready` (Docker, splash, resume); terminals
-        // just need their tmux session to exist with a live pane.
+        // just need their tmux session to exist with a live pane. Seed a
+        // cold/dead agent pane at the terminal size for the same reason
+        // live-send does (see `ensure_pane_ready_with_size`): otherwise it
+        // boots at tmux's 80x24 default and runs narrow until something
+        // resizes it.
         let stale_sid = match target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
-                    inst.ensure_pane_ready().map_err(Into::into)
+                    inst.ensure_pane_ready_with_size(size).map_err(Into::into)
                 });
                 match outcome {
                     Ok(Some(EnsureReadyOutcome::Respawned {
@@ -2923,6 +3409,25 @@ impl HomeView {
         stale_sid
     }
 
+    /// Size to boot a cold/dead agent pane at on live-send entry: the visible
+    /// preview output rect when known, else the full terminal. `preview_pane_area`
+    /// is the exact rect `finalize_live_send_resize` resizes to, so seeding the
+    /// boot here makes the post-boot resize a no-op for cold starts (no reflow,
+    /// no SIGWINCH race). Falls back to the terminal size for the rare entry
+    /// with no prior preview frame (e.g. attach-on-create), and to `None` if
+    /// neither is available so tmux keeps its default.
+    fn live_send_boot_size(&self) -> Option<(u16, u16)> {
+        let pane = self.preview_pane_area;
+        if pane.width > 0 && pane.height > 0 {
+            Some((pane.width, pane.height))
+        } else {
+            // A zero-dimension terminal size is as unusable as no size at all;
+            // drop it so the start path keeps tmux's default instead of being
+            // handed `-x 0`/`-y 0`.
+            crate::terminal::get_size().filter(|(cols, rows)| *cols > 0 && *rows > 0)
+        }
+    }
+
     /// Stage live-send mode against `session_id`. Mirrors
     /// `execute_send_message`'s revive cascade so a cold-start (Docker
     /// pull, agent splash) is handled before the user starts typing,
@@ -2953,10 +3458,19 @@ impl HomeView {
         // targets are simpler: the paired terminal is a plain shell,
         // so we just ensure the tmux session exists and re-spawn it if
         // the pane has died (matches `attach_terminal`).
+        //
+        // Boot the agent at the size it will be shown at, not tmux's 80x24
+        // default. A cold-started agent that boots narrow relies on
+        // `finalize_live_send_resize`'s single post-boot SIGWINCH to grow into
+        // the live area, a resize that races the agent's startup and, when
+        // lost, leaves the pane pinned at ~50% width until live mode is
+        // re-entered. See `Instance::ensure_pane_ready_with_size`.
+        let agent_boot_size = self.live_send_boot_size();
         let stale_sid = match target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
-                    inst.ensure_pane_ready().map_err(Into::into)
+                    inst.ensure_pane_ready_with_size(agent_boot_size)
+                        .map_err(Into::into)
                 });
                 match outcome {
                     Ok(Some(EnsureReadyOutcome::Respawned {
@@ -3498,8 +4012,10 @@ impl HomeView {
         }
 
         if !self.storages.contains_key(target) {
-            self.storages
-                .insert(target.to_string(), Storage::new(target)?);
+            self.storages.insert(
+                target.to_string(),
+                Storage::new(target, self.file_watch.clone())?,
+            );
         }
 
         self.pending_deletions
@@ -3829,6 +4345,91 @@ impl HomeView {
             .unwrap_or_else(crate::session::config::resolve_default_profile)
     }
 
+    /// Reload the merged project registry into `registered_projects`. Called on
+    /// every storage reload and after a pin/unpin so the project view's empty
+    /// headers and pin indicators track the on-disk registry.
+    ///
+    /// In all-profiles mode `build_flat_items_by_project` merges sessions from
+    /// every loaded profile, so the registry must too: a profile-scoped pin
+    /// would otherwise lose its header (and glyph) the moment its sessions are
+    /// gone. Dedupe across profiles by canonical path since each
+    /// `load_merged` repeats the global entries.
+    pub(super) fn refresh_registered_projects(&mut self) {
+        use crate::session::projects::{canonical_key, load_merged};
+        if self.active_profile.is_some() {
+            self.registered_projects = load_merged(&self.config_profile()).unwrap_or_default();
+            return;
+        }
+        let profiles: Vec<String> = self.storages.keys().cloned().collect();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut merged = Vec::new();
+        for profile in &profiles {
+            for p in load_merged(profile).unwrap_or_default() {
+                if seen.insert(canonical_key(&p.path)) {
+                    merged.push(p);
+                }
+            }
+        }
+        self.registered_projects = merged;
+    }
+
+    /// The canonical repo path of the first live (non-archived) session under
+    /// project header `label`, or `None` when no live session populates the
+    /// header (an empty pinned header). This is the header's stable repo
+    /// identity, so two repos that merely share a basename are judged against
+    /// their own paths rather than the shared display label.
+    ///
+    /// Archived sessions are excluded on purpose: an empty main-flow header is
+    /// injected by LABEL match against the registry, so its pin state and
+    /// unpin toggle must resolve by the same rule. Letting an archived row
+    /// lend the header its path made a registry entry with a different
+    /// recorded path (repo deleted or moved, so `canonical_key` compares raw
+    /// strings) render an unpinnable phantom header: pinned by label, judged
+    /// by path.
+    pub(super) fn project_header_repo_path(&self, label: &str) -> Option<String> {
+        self.instances
+            .iter()
+            .find(|i| !i.is_archived() && project_group_name(i) == label)
+            .map(|i| crate::session::projects::canonical_key(i.repo_path()))
+    }
+
+    /// Whether the project-view header `label` is backed by a registered
+    /// (pinned) project. A header with live sessions is pinned iff its own repo
+    /// path is in the registry, so two repos sharing a basename are judged
+    /// independently. An empty header exists only because a registered project
+    /// carries that basename, so it is pinned by construction (matched by
+    /// label). Used for the pin indicator and the pin toggle.
+    pub(super) fn is_project_label_pinned(&self, label: &str) -> bool {
+        match self.project_header_repo_path(label) {
+            Some(path) => self
+                .registered_projects
+                .iter()
+                .any(|p| crate::session::projects::canonical_key(&p.path) == path),
+            None => self
+                .registered_projects
+                .iter()
+                .any(|p| crate::session::projects::repo_label(&p.path) == label),
+        }
+    }
+
+    /// The project-view header label under the cursor when it is a real,
+    /// pinnable project: project grouping is active, the cursor is on a group
+    /// header, and that header is neither the synthetic Archived section nor
+    /// the `scratch` bucket (scratch sessions have no backing repo to pin).
+    pub(super) fn project_group_at_cursor(&self) -> Option<String> {
+        if self.group_by != GroupByMode::Project {
+            return None;
+        }
+        match self.flat_items.get(self.cursor) {
+            Some(Item::Group { path, name, .. })
+                if !crate::session::is_within_archived_section(path) && name != "scratch" =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        }
+    }
+
     /// Resolve the effective `SessionConfig` for an existing session
     /// row, honoring per-profile overrides. Reads the instance's
     /// `source_profile` so the picked config matches whatever profile
@@ -3853,6 +4454,26 @@ impl HomeView {
             inst.source_profile.clone()
         };
         Some(crate::session::resolve_config_or_warn(&profile).session)
+    }
+
+    /// Whether renaming this session should also move its worktree directory
+    /// leaf, per the resolved `session.tie_workdir_to_name` setting. True only
+    /// for aoe-managed worktree sessions. Unlike `resolve_session_config_for`,
+    /// this does not bypass structured-view sessions: the directory tie is
+    /// orthogonal to the view. See #1927.
+    pub(super) fn tie_workdir_applies_for(&self, session_id: &str) -> bool {
+        let Some(inst) = self.get_instance(session_id) else {
+            return false;
+        };
+        let profile = if inst.source_profile.is_empty() {
+            self.config_profile()
+        } else {
+            inst.source_profile.clone()
+        };
+        let tie = crate::session::resolve_config_or_warn(&profile)
+            .session
+            .tie_workdir_to_name;
+        inst.tie_workdir_applies(tie)
     }
 
     /// Resolve `new_session_attach_mode` for a freshly-created session.

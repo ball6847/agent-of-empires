@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
 import { getToken } from "../lib/token";
+import { wheelMouseBytes } from "../lib/liveMouse";
 import { retryDelayMs } from "./useTerminal";
 
 // Capture-snapshot live view transport (mobile). Mirrors the TUI's
@@ -29,6 +30,16 @@ export interface LiveFrame {
   history: number;
   /** Cursor cell, or null when hidden (DECTCEM off) or unavailable. */
   cursor: LiveCursor | null;
+  /** Pane is on the alternate screen (a full-screen / TUI app). Its
+   *  scrollback is not capturable, so scroll gestures forward the wheel
+   *  to the app instead of widening the capture window. */
+  altScreen: boolean;
+  /** App has some mouse tracking mode on (it will consume forwarded wheel
+   *  events). Forwarding only happens when this AND altScreen are set. */
+  mouse: boolean;
+  /** App is in SGR (1006) mouse encoding; picks the forwarded wire format
+   *  (SGR vs legacy X10). */
+  mouseSgr: boolean;
 }
 
 export interface LiveTerminalState {
@@ -36,11 +47,13 @@ export interface LiveTerminalState {
   reconnecting: boolean;
   retryCount: number;
   retryCountdown: number;
-  /** Frame to RENDER. While reading scrollback this is the frozen
-   *  full-history snapshot; at the live edge it tracks the stream. */
+  /** Frame to RENDER. Always tracks the stream (the agent keeps running
+   *  while you read, like the TUI's live mode); reading scrollback just
+   *  asks for a bigger capture window. */
   frame: LiveFrame | null;
   /** True from the moment the user leaves the live edge until they
-   *  return: drives the jump-to-latest affordance. */
+   *  return: widens the capture window and drives the jump-to-latest
+   *  affordance. */
   reading: boolean;
 }
 
@@ -52,14 +65,6 @@ const INITIAL_STATE: LiveTerminalState = {
   frame: null,
   reading: false,
 };
-
-/** Cheap line count for the freeze trigger; capture content terminates
- *  every line with `\n`, so count terminators. */
-function contentLineCount(content: string): number {
-  let n = 0;
-  for (let i = 0; i < content.length; i++) if (content.charCodeAt(i) === 10) n++;
-  return n;
-}
 
 export function useLiveTerminal(sessionId: string | null, wsPath: string = "live-ws") {
   const wsRef = useRef<WebSocket | null>(null);
@@ -74,18 +79,10 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
     resize: { cols: number; rows: number } | null;
     window: number | null;
     fast: boolean;
-    hold: boolean;
-  }>({ resize: null, window: null, fast: true, hold: false });
-  // Scrollback read machine (see LiveTerminalState.reading). "fetching"
-  // means the full-history window was requested and the next covering
-  // frame will be frozen; "held" means the server push-freeze is active.
-  const readPhaseRef = useRef<"live" | "fetching" | "held">("live");
-  // Freeze threshold: the requested window, capped by what the pane can
-  // actually provide (rows + history at request time).
-  const fetchTargetRef = useRef(0);
-  // Newest frame from the wire, regardless of freeze state, so returning
-  // to the live edge can repaint instantly while a fresh frame arrives.
-  const latestFrameRef = useRef<LiveFrame | null>(null);
+  }>({ resize: null, window: null, fast: true });
+  // Whether the user is reading scrollback (off the live edge). Guards
+  // enterReading/returnToLive against repeat fires from scroll events.
+  const readingRef = useRef(false);
 
   const storeRef = useRef<{
     snapshot: LiveTerminalState;
@@ -107,6 +104,17 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
   }, []);
   const getSnapshot = useCallback(() => storeRef.current!.snapshot, []);
   const state = useSyncExternalStore(subscribe, getSnapshot);
+
+  // Declared ahead of the connect effect: the onmessage handler widens
+  // the window while reading (see below).
+  const setWindowInternal = (lines: number) => {
+    if (desiredRef.current.window === lines) return;
+    desiredRef.current.window = lines;
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "window", lines }));
+    }
+  };
 
   useEffect(() => {
     if (!sessionId) return;
@@ -152,9 +160,6 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
           ws.send(JSON.stringify({ type: "window", lines: desired.window }));
         }
         ws.send(JSON.stringify({ type: "cadence", fast: desired.fast }));
-        if (desired.hold) {
-          ws.send(JSON.stringify({ type: "hold", hold: true }));
-        }
       };
 
       let hasReceivedData = false;
@@ -166,6 +171,9 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
           rows?: number;
           history?: number;
           cursor?: LiveCursor | null;
+          altScreen?: boolean;
+          mouse?: boolean;
+          mouseSgr?: boolean;
         };
         try {
           msg = JSON.parse(event.data) as typeof msg;
@@ -184,28 +192,23 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
           rows: msg.rows ?? 0,
           history: msg.history ?? 0,
           cursor: msg.cursor ?? null,
+          altScreen: msg.altScreen ?? false,
+          mouse: msg.mouse ?? false,
+          mouseSgr: msg.mouseSgr ?? false,
         };
-        latestFrameRef.current = incoming;
-        if (readPhaseRef.current === "held") {
-          // Frozen: the rendered frame must not move under the reader.
-          // (The server holds pushes anyway; this guards stragglers.)
-          setState((prev) => ({
-            ...prev,
-            retryCount: retryCountRef.current,
-            retryCountdown: 0,
-          }));
-          return;
+        // While reading, keep the capture window covering the FULL
+        // history as the agent appends: the window was sized at entry,
+        // so without this the oldest lines fall out of the capture and
+        // re-render as blank spacer under the reader. Deduped, so it is
+        // one control message per growth step at idle cadence.
+        if (readingRef.current) {
+          const full = Math.min(4000, incoming.rows + incoming.history);
+          if (full > (desiredRef.current.window ?? 0)) setWindowInternal(full);
         }
-        if (
-          readPhaseRef.current === "fetching" &&
-          contentLineCount(incoming.content) >= Math.min(fetchTargetRef.current, incoming.rows + incoming.history)
-        ) {
-          // This frame covers the requested history: freeze it and stop
-          // the server's pushes until the reader returns to the edge.
-          readPhaseRef.current = "held";
-          desiredRef.current.hold = true;
-          ws.send(JSON.stringify({ type: "hold", hold: true }));
-        }
+        // Always render the freshest frame. While reading scrollback the
+        // window is wider, but the component's spacer model keeps the
+        // user's position stable as the agent streams (above-viewport
+        // pixels are invariant), so no freeze is needed.
         setState((prev) => ({
           ...prev,
           retryCount: retryCountRef.current,
@@ -298,6 +301,17 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
     }
   }, []);
 
+  /** Forward a wheel notch to a full-screen mouse app (alternate screen),
+   *  encoded as the app expects. Sent as raw input bytes, NOT as a window
+   *  request: the alternate screen has no capturable scrollback, so the
+   *  app scrolls its own content and the next frame reflects it. */
+  const forwardWheel = useCallback((up: boolean, sgr: boolean, col: number, row: number) => {
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(wheelMouseBytes(up, sgr, col, row));
+    }
+  }, []);
+
   const sendResize = useCallback((cols: number, rows: number) => {
     // Dedup: the sizing observer recomputes on every container change,
     // but rows are latched to the no-keyboard height, so keyboard cycles
@@ -311,14 +325,6 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
     }
   }, []);
 
-  const setWindowInternal = (lines: number) => {
-    if (desiredRef.current.window === lines) return;
-    desiredRef.current.window = lines;
-    const ws = wsRef.current;
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "window", lines }));
-    }
-  };
   const setWindow = useCallback((lines: number) => {
     setWindowInternal(lines);
   }, []);
@@ -332,34 +338,30 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
     }
   }, []);
 
-  /** The user left the live edge: request the full history once; the
-   *  covering frame freezes and the server push-freezes (see onmessage). */
+  /** The user left the live edge: widen the capture window to the full
+   *  history once so a flick lands on real content (the spacer is
+   *  already sized for it). The stream keeps flowing; the component's
+   *  spacer keeps the reading position stable. */
   const enterReading = useCallback(
     (rows: number) => {
-      if (readPhaseRef.current !== "live") return;
-      const latest = latestFrameRef.current;
+      if (readingRef.current) return;
+      readingRef.current = true;
+      const latest = storeRef.current!.snapshot.frame;
       const full = Math.min(4000, Math.max(rows, latest ? latest.rows + latest.history : rows));
-      readPhaseRef.current = "fetching";
-      fetchTargetRef.current = full;
       setWindowInternal(full);
       setState((prev) => ({ ...prev, reading: true }));
     },
     [setState],
   );
 
-  /** Back at the live edge: release the hold, shrink the window, and
-   *  resume rendering the freshest frame immediately. */
+  /** Back at the live edge: shrink the window to the live screen so the
+   *  next frame is small again. */
   const returnToLive = useCallback(
     (rows: number) => {
-      if (readPhaseRef.current === "live") return;
-      readPhaseRef.current = "live";
-      desiredRef.current.hold = false;
-      const ws = wsRef.current;
-      if (ws?.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "hold", hold: false }));
-      }
+      if (!readingRef.current) return;
+      readingRef.current = false;
       if (rows > 0) setWindowInternal(rows);
-      setState((prev) => ({ ...prev, reading: false, frame: latestFrameRef.current ?? prev.frame }));
+      setState((prev) => ({ ...prev, reading: false }));
     },
     [setState],
   );
@@ -386,6 +388,7 @@ export function useLiveTerminal(sessionId: string | null, wsPath: string = "live
   return {
     state,
     sendData,
+    forwardWheel,
     sendResize,
     setWindow,
     setCadence,

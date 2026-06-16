@@ -386,14 +386,9 @@ fn parse_node_major(raw: &str) -> Option<u32> {
 }
 
 fn find_in_path(binary: &str) -> Option<String> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(binary);
-        if candidate.is_file() {
-            return Some(candidate.to_string_lossy().into_owned());
-        }
-    }
-    None
+    which::which(binary)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 pub(crate) fn command_present(command: &str) -> bool {
@@ -872,6 +867,8 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::ToolCallUpdated { .. } => "tool_call_updated",
         Event::ApprovalRequested { .. } => "approval_requested",
         Event::ApprovalResolved { .. } => "approval_resolved",
+        Event::ElicitationRequested { .. } => "elicitation_requested",
+        Event::ElicitationResolved { .. } => "elicitation_resolved",
         Event::DiffEmitted { .. } => "diff_emitted",
         Event::ThinkingStarted => "thinking_started",
         Event::ThinkingEnded => "thinking_ended",

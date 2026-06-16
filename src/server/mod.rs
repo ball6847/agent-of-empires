@@ -1393,6 +1393,8 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/snooze",
             patch(api::update_session_snooze),
         )
+        .route("/api/sessions/{id}/stop", post(api::stop_session))
+        .route("/api/sessions/{id}/start", post(api::start_session))
         .route("/api/sessions/{id}/terminal", post(api::ensure_terminal))
         .route(
             "/api/sessions/{id}/container-terminal",
@@ -1435,6 +1437,11 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/app-state/web-tour-seen",
             post(api::mark_web_tour_seen),
+        )
+        .route("/api/app-state/dismiss-update", post(api::dismiss_update))
+        .route(
+            "/api/app-state/web-ui-state",
+            get(api::get_web_ui_state).patch(api::patch_web_ui_state),
         )
         .route(
             "/api/app-state/volume-ignores-globs-acknowledged",
@@ -1563,6 +1570,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/sessions/{id}/acp/approvals/{nonce}",
             post(api::resolve_approval),
+        )
+        .route(
+            "/api/sessions/{id}/acp/elicitations/{nonce}",
+            post(api::resolve_elicitation),
         )
         .route("/api/acp/agents", get(api::list_acp_agents));
 
@@ -3291,7 +3302,7 @@ async fn daemon_startup_recovery_cascade(
                         &id,
                     );
                 }
-                Ok((mut updated, Err(e))) => {
+                Ok((updated, Err(e))) => {
                     tracing::warn!(
                         target: "session.startup_recovery",
                         instance_id = %id,
@@ -3299,28 +3310,6 @@ async fn daemon_startup_recovery_cascade(
                         error = %e,
                         "recovery cascade failed",
                     );
-                    // The cascade leaves last_error=None on every Err exit
-                    // (no failure path sets it) and self.status as either
-                    // `Status::Starting` (the common case: probe_settle
-                    // returned Dead, or Tier-2 failed after finalize_launch
-                    // ran at instance.rs:1403) or `Status::Idle` (rare:
-                    // kill_clean failed, or Tier-1 start_with_size_opts
-                    // failed before finalize_launch). In either case,
-                    // without an explicit Error transition the next
-                    // status_poll_loop tick falls through to
-                    // update_status_with_metadata and generates a generic
-                    // "tmux session is gone" message, hiding the
-                    // cascade-specific error.
-                    updated.status = crate::session::Status::Error;
-                    updated.last_error = Some(format!("recovery cascade: {}", e));
-                    // Stamp last_error_check so the in-memory error overlay
-                    // in status_poll_loop arms the 30s stickiness in
-                    // update_status_with_metadata_inner. Without this
-                    // (#[serde(skip)] would otherwise leave it None on the
-                    // next disk reload), the cascade-specific message is
-                    // overwritten by the generic "tmux session is gone" on
-                    // the very next poll tick.
-                    updated.last_error_check = Some(std::time::Instant::now());
                     let mut instances = inst_state.instances.write().await;
                     if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
                         *slot = updated;
@@ -3721,10 +3710,14 @@ pub(crate) enum StatusIntent {
 pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusIntent> {
     use crate::acp::Event;
     match event {
-        Event::UserPromptSent { .. } | Event::ApprovalResolved { .. } => {
-            Some(StatusIntent::Set(Status::Running))
+        Event::UserPromptSent { .. }
+        | Event::ApprovalResolved { .. }
+        | Event::ElicitationResolved { .. } => Some(StatusIntent::Set(Status::Running)),
+        // A pending approval or elicitation both block the turn on the
+        // user, so the sidebar dot goes yellow either way.
+        Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. } => {
+            Some(StatusIntent::Set(Status::Waiting))
         }
-        Event::ApprovalRequested { .. } => Some(StatusIntent::Set(Status::Waiting)),
         // All Stopped reasons surface as Idle, including the
         // rate-limit park: the worker is not crashed, the user just
         // hit a provider quota and the session is waiting for reset
@@ -4419,6 +4412,30 @@ mod tests {
             derive_acp_status(&Event::ApprovalResolved {
                 nonce: Nonce("x".into()),
                 decision: ApprovalDecision::Allow,
+            }),
+            Some(StatusIntent::Set(Status::Running))
+        );
+        // A pending elicitation blocks the turn on the user just like an
+        // approval, so the sidebar dot must go yellow (Waiting) and recover
+        // to Running on resolution.
+        let elicitation = crate::acp::elicitations::Elicitation {
+            nonce: Nonce("e-1".into()),
+            message: "Pick".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: Vec::new(),
+            requested_at: chrono::Utc::now(),
+            resolved: None,
+        };
+        assert_eq!(
+            derive_acp_status(&Event::ElicitationRequested { elicitation }),
+            Some(StatusIntent::Set(Status::Waiting))
+        );
+        assert_eq!(
+            derive_acp_status(&Event::ElicitationResolved {
+                nonce: Nonce("e-1".into()),
+                outcome: crate::acp::elicitations::ElicitationOutcome::Accepted,
             }),
             Some(StatusIntent::Set(Status::Running))
         );

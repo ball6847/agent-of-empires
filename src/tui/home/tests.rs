@@ -5,7 +5,7 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tui_input::Input;
 
-use super::{HomeView, ViewMode};
+use super::{ConfigRefreshOrigin, ConfigWatchKey, HomeView, ViewMode};
 use crate::session::{GroupTree, Instance, Item, Storage};
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
@@ -44,6 +44,39 @@ fn create_test_env_empty() -> TestEnv {
     TestEnv { _temp: temp, view }
 }
 
+// #1897 / CodeRabbit follow-up: `add_instance` is the funnel for both the
+// `Creating` placeholder stub (async creation flow) and the finalized session
+// row. The opt-in create-trend counter must bump only for finalized inserts, or
+// a successful background create double-counts (stub + real) and a cancelled one
+// counts a session that never existed. Asserts deltas (not absolutes) since the
+// counter is a process-global shared with the `telemetry_creates` serial group.
+#[test]
+#[serial_test::serial(telemetry_creates)]
+fn add_instance_counts_only_finalized_creates() {
+    use crate::session::Status;
+    let mut env = create_test_env_empty();
+    let before = crate::tui::app::session_create_count_for_test();
+
+    let mut stub = Instance::new("stub", "/tmp/test");
+    stub.source_profile = "test".to_string();
+    stub.status = Status::Creating;
+    env.view.add_instance(stub);
+    assert_eq!(
+        crate::tui::app::session_create_count_for_test(),
+        before,
+        "a Creating placeholder stub must not bump the create counter"
+    );
+
+    let mut real = Instance::new("real", "/tmp/test");
+    real.source_profile = "test".to_string();
+    env.view.add_instance(real);
+    assert_eq!(
+        crate::tui::app::session_create_count_for_test(),
+        before + 1,
+        "a finalized session insert must bump the create counter exactly once"
+    );
+}
+
 #[test]
 #[serial]
 fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
@@ -63,7 +96,7 @@ fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
         view.disk_watch_handles.is_empty(),
         "construction outside a tokio runtime must not prewire subscriptions"
     );
-    view.rewire_disk_subscriptions(&current).unwrap();
+    view.rewire_disk_subscriptions(&current);
     assert!(
         view.disk_watch_handles.is_empty(),
         "rewire outside a tokio runtime must stay a no-op for lib tests"
@@ -71,6 +104,234 @@ fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
     assert!(
         !view.disk_dirty.load(std::sync::atomic::Ordering::Acquire),
         "the noop branch must leave disk_dirty clear outside a runtime"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn config_watch_keys_distinguish_global_from_profile_named_global() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let profile_name = "<global>";
+    let _storage = Storage::new_unwatched(profile_name).unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let view = HomeView::new(
+        Some(profile_name.to_string()),
+        tools,
+        crate::file_watch::FileWatchService::new().unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(view.config_watch_handles.len(), 2);
+    assert!(view
+        .config_watch_handles
+        .contains_key(&ConfigWatchKey::Global));
+    assert!(view
+        .config_watch_handles
+        .contains_key(&ConfigWatchKey::profile(profile_name)));
+}
+
+#[test]
+#[serial]
+fn watcher_refresh_does_not_reopen_hotkey_warning_dialog() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(
+        &global_config,
+        "[tools.alpha]\ncommand = \"alpha\"\nhotkey = \"Ctrl+g\"\n",
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["alpha"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert!(
+        view.info_dialog.is_some(),
+        "precondition: initial load shows warning dialog"
+    );
+    view.info_dialog = None;
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert!(
+        view.info_dialog.is_none(),
+        "watcher-driven refresh must not reopen the hotkey warning dialog"
+    );
+}
+
+#[test]
+#[serial]
+fn interactive_refresh_reopens_hotkey_warning_dialog() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(
+        &global_config,
+        "[tools.alpha]\ncommand = \"alpha\"\nhotkey = \"Ctrl+g\"\n",
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["alpha"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.info_dialog = None;
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Interactive);
+    assert!(
+        view.info_dialog.is_some(),
+        "interactive refresh must still surface the hotkey warning dialog"
+    );
+}
+
+#[test]
+#[serial]
+fn watcher_refresh_stashes_pending_watcher_theme() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert!(
+        view.pending_watcher_theme.is_none(),
+        "precondition: HomeView::new must not stash a pending watcher theme"
+    );
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert_eq!(
+        view.pending_watcher_theme.as_deref(),
+        Some("dracula"),
+        "watcher-driven refresh must stash the resolved theme name so the tick loop can dispatch App::set_theme"
+    );
+}
+
+#[test]
+#[serial]
+fn interactive_refresh_does_not_stash_pending_watcher_theme() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert!(
+        view.pending_watcher_theme.is_none(),
+        "precondition: HomeView::new must not stash a pending watcher theme"
+    );
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Interactive);
+    assert!(
+        view.pending_watcher_theme.is_none(),
+        "interactive refresh must not stash a pending theme; settings/intro input handlers dispatch Action::SetTheme directly"
+    );
+}
+
+#[test]
+#[serial]
+fn take_pending_watcher_theme_clears_the_field() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.pending_watcher_theme = Some("zinc".to_string());
+
+    let first = view.take_pending_watcher_theme();
+    let second = view.take_pending_watcher_theme();
+    assert_eq!(first.as_deref(), Some("zinc"));
+    assert!(
+        second.is_none(),
+        "take must drain the pending field so a single watcher refresh dispatches at most one set_theme"
+    );
+}
+
+#[test]
+#[serial]
+fn watcher_refresh_stashes_global_theme_not_profile_override() {
+    use crate::session::profile_config::{save_profile_config, ProfileConfig};
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
+
+    let profile_overrides: ProfileConfig =
+        serde_json::from_value(serde_json::json!({"theme": {"name": "empire"}}))
+            .expect("legacy hand-edited overrides may carry a theme key even though theme is global by contract");
+    save_profile_config("test", &profile_overrides).unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert!(
+        view.pending_watcher_theme.is_none(),
+        "precondition: HomeView::new must not stash a pending watcher theme"
+    );
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert_eq!(
+        view.pending_watcher_theme.as_deref(),
+        Some("dracula"),
+        "watcher path must stash the global theme name via resolve_theme_name; a stale per-profile theme override (legacy or hand-edited) must not mask the global value"
+    );
+}
+
+#[test]
+#[serial]
+fn second_watcher_refresh_overwrites_stale_stash() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert_eq!(view.pending_watcher_theme.as_deref(), Some("dracula"));
+
+    std::fs::write(&global_config, "[theme]\nname = \"empire\"\n").unwrap();
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert_eq!(
+        view.pending_watcher_theme.as_deref(),
+        Some("empire"),
+        "second watcher refresh must overwrite the stale stash; first-write-wins would silently drop the latest theme change"
     );
 }
 
@@ -1443,6 +1704,7 @@ fn create_test_env_with_group_sessions() -> TestEnv {
         container_name: "test-container".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
     });
     instances.push(inst3);
 
@@ -1541,6 +1803,7 @@ fn test_group_has_containers() {
         container_name: "test-container".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
     });
 
     let mut inst2 = Instance::new("other-session", "/tmp/other");
@@ -1891,6 +2154,7 @@ fn test_delete_group_with_sessions_respects_container_option() {
         container_name: "test-container".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
     });
 
     {
@@ -5364,6 +5628,8 @@ fn toggle_favorite_at_cursor_noop_with_no_selection() {
 #[serial]
 fn toggle_archive_at_cursor_round_trip() {
     let mut env = create_test_env_with_sessions(1);
+    // Keep the Archived section expanded so the archived row stays reachable.
+    env.view.archived_section_collapsed = false;
     let id = env.view.instances[0].id.clone();
     env.view.selected_session = Some(id.clone());
 
@@ -5373,6 +5639,10 @@ fn toggle_archive_at_cursor_round_trip() {
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(env.view.instances[0].is_archived());
 
+    // Archiving moved the selection off the row (it advances to the next
+    // active session; here there is none). Navigate back onto the archived
+    // row, as a user would, before toggling it back.
+    env.view.select_session_by_id(&id);
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(!env.view.instances[0].is_archived());
 }
@@ -5386,21 +5656,24 @@ fn toggle_archive_at_cursor_noop_with_no_selection() {
     env.view.toggle_archive_at_cursor().unwrap();
 }
 
-/// Approach 2: archiving in the default (non-Attention) sort keeps the cursor
-/// AND selection on the just-archived session instead of swapping to a
-/// neighbor, and reveals the Archived section so the row stays visible. This is
-/// what lets the preview render the calm "Archived" placeholder for the same
-/// row the user is looking at, rather than flashing a dead-pane warning and
-/// then snapping selection to the session below.
+/// Archiving in the default (non-Attention) sort advances the cursor to the
+/// next active session below instead of following the archived row into the
+/// Archived section. The section is NOT auto-revealed; its header count is
+/// the feedback. The preview follows the new selection through the normal
+/// per-frame retarget (cache gates on session id, worker drops stale frames).
 #[test]
 #[serial]
-fn archive_keeps_selection_and_reveals_section() {
-    let mut env = create_test_env_with_sessions(2);
-    // Start with the Archived section collapsed (the default / reported repro).
+fn archive_advances_cursor_to_next_session() {
+    let mut env = create_test_env_with_sessions(3);
+    // Start with the Archived section collapsed (the default).
     env.view.archived_section_collapsed = true;
     env.view.cursor = 0;
     env.view.update_selected();
     let id = env.view.selected_session.clone().unwrap();
+    let next_id = match env.view.flat_items.get(1) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        other => panic!("expected a session row below the cursor, got {other:?}"),
+    };
 
     env.view.toggle_archive_at_cursor().unwrap();
 
@@ -5410,19 +5683,132 @@ fn archive_keeps_selection_and_reveals_section() {
     );
     assert_eq!(
         env.view.selected_session.as_deref(),
-        Some(id.as_str()),
-        "selection must stay on the archived session, not swap to a neighbor"
+        Some(next_id.as_str()),
+        "selection must advance to the next active session"
     );
     assert!(
-        !env.view.archived_section_collapsed,
-        "archiving must reveal the Archived section so the row stays visible"
+        env.view.archived_section_collapsed,
+        "single-row archive must not auto-reveal the Archived section"
     );
     match env.view.flat_items.get(env.view.cursor) {
         Some(Item::Session { id: cur, .. }) => {
-            assert_eq!(cur, &id, "cursor must land on the archived row")
+            assert_eq!(cur, &next_id, "cursor must sit on the next session's row")
         }
-        _ => panic!("cursor should be on the archived session row"),
+        _ => panic!("cursor should be on the next session row"),
     }
+}
+
+/// Archiving the bottom session has no row below to advance to, so the
+/// cursor falls back to the nearest active session above.
+#[test]
+#[serial]
+fn archive_bottom_row_falls_back_to_session_above() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.archived_section_collapsed = true;
+    let last = env.view.flat_items.len() - 1;
+    env.view.cursor = last;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+    let above_id = match env.view.flat_items.get(last - 1) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        other => panic!("expected a session row above the cursor, got {other:?}"),
+    };
+
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(above_id.as_str()),
+        "with nothing below, selection must land on the session above"
+    );
+}
+
+/// Archiving the only active session leaves nothing to advance to: the
+/// cursor clamps into the remaining list (the Archived section header) and
+/// the selection clears instead of pointing at a vanished row.
+#[test]
+#[serial]
+fn archive_last_active_session_clears_selection() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view.archived_section_collapsed = true;
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session, None,
+        "no active session remains, so nothing should be selected"
+    );
+    assert!(
+        env.view.cursor < env.view.flat_items.len(),
+        "cursor must stay clamped inside the rebuilt list"
+    );
+}
+
+/// The successor scan must skip rows already parked under an EXPANDED
+/// Archived section: archiving the last active row with an archived row
+/// visible below clears the selection instead of advancing into the section.
+#[test]
+#[serial]
+fn archive_successor_skips_archived_rows() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.archived_section_collapsed = false;
+
+    // Park the second session first, so an archived row sits below.
+    let parked_id = match env.view.flat_items.get(1) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        other => panic!("expected a second session row, got {other:?}"),
+    };
+    env.view.select_session_by_id(&parked_id);
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(env.view.get_instance(&parked_id).unwrap().is_archived());
+
+    // Archive the remaining active session. The only session row left below
+    // the cursor is the parked one, which must NOT become the selection.
+    let id = env.view.selected_session.clone().unwrap();
+    assert_ne!(
+        id, parked_id,
+        "selection must have fallen back to the active row"
+    );
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session, None,
+        "the cursor must not advance onto a row inside the Archived section"
+    );
+}
+
+/// Attention sort: archiving the only active session with the Archived
+/// section collapsed leaves no session row for `select_top_attention` to
+/// land on. Selection must clear (not stay pinned to the invisible archived
+/// row) and the cursor must clamp into the shrunken list.
+#[test]
+#[serial]
+fn archive_last_active_session_attention_sort_clears_selection() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view.sort_order = crate::session::config::SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.archived_section_collapsed = true;
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session, None,
+        "selection must not point at the archived row hidden in the collapsed section"
+    );
+    assert!(
+        env.view.cursor < env.view.flat_items.len(),
+        "cursor must stay clamped inside the rebuilt list"
+    );
 }
 
 /// Restoring with `z` unarchives the row and keeps it selected, following it
@@ -5440,6 +5826,9 @@ fn unarchive_keeps_selection() {
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(env.view.get_instance(&id).unwrap().is_archived());
 
+    // The archive advanced the cursor to the neighbor; navigate back onto
+    // the archived row (visible because the section is expanded) to restore.
+    env.view.select_session_by_id(&id);
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(
         !env.view.get_instance(&id).unwrap().is_archived(),
@@ -7258,6 +7647,131 @@ mod scroll_pane_isolation {
     fn setup_panes(env: &mut TestEnv) {
         env.view.list_area = Rect::new(0, 0, 30, 40);
         env.view.preview_area = Rect::new(30, 0, 100, 40);
+    }
+
+    /// Build a live-send env whose preview-capture worker reports the
+    /// given cursor, so the alternate-screen wheel-forwarding branch can
+    /// be exercised without a real full-screen pane.
+    fn live_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
+        use crate::tui::home::live_send::{LiveSendState, LiveSendTarget, LiveSendWorker};
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_cache.captured_lines = 200;
+        env.view.preview_scroll_offset = 10;
+        env.view.live_send = Some(LiveSendState {
+            session_id: "fake".to_string(),
+            title: "fake".to_string(),
+            tmux_name: "fake".to_string(),
+            target: LiveSendTarget::Agent,
+            exit_chords: crate::tui::home::live_send::parse_chord_list(
+                crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
+            ),
+            leader: None,
+        });
+        env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
+        // Spawn the capture worker, then inject the cursor (set_target
+        // clears it, so the injection must come after).
+        env.view
+            .sync_preview_capture_worker(Some("fake".to_string()));
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .expect("capture worker spawned")
+            .set_cursor_for_test(Some(cursor));
+        env
+    }
+
+    fn alt_screen_cursor(
+        alternate_on: bool,
+        mouse_tracking: bool,
+        mouse_sgr: bool,
+    ) -> crate::tmux::PaneCursor {
+        crate::tmux::PaneCursor {
+            x: 0,
+            y: 0,
+            visible: true,
+            pane_height: 24,
+            history_size: 1800,
+            pane_width: 80,
+            alternate_on,
+            mouse_tracking,
+            mouse_sgr,
+        }
+    }
+
+    /// Live-send target is a full-screen app with SGR mouse tracking on:
+    /// the wheel is forwarded to the app (returns to the live edge) instead
+    /// of growing the useless normal-buffer capture window. This is the fix
+    /// for the "scroll up a little then snap to the very first part of the
+    /// session" report on alternate-screen agents.
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_sgr_mouse_pane_forwards_instead_of_scrollback() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up, "wheel over a full-screen SGR-mouse pane is handled");
+        assert_eq!(
+            env.view.preview_scroll_offset, 0,
+            "forwarding pins the preview to the live edge, never the normal-buffer history"
+        );
+
+        env.view.preview_scroll_offset = 10;
+        let down = env.view.handle_scroll_down(50, 10);
+        assert!(down);
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// Guard the gate: a full-screen app WITHOUT any mouse tracking must
+    /// not get raw SGR bytes (it would read them as garbage keystrokes).
+    /// The wheel falls back to the existing capture-window scroll.
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_without_mouse_uses_capture_scroll() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up);
+        assert!(
+            env.view.preview_scroll_offset > 10,
+            "no mouse tracking: keep the capture-window scroll (offset advances)"
+        );
+    }
+
+    /// A full-screen app with mouse tracking but in the LEGACY (non-SGR)
+    /// encoding is still forwarded; the byte builder emits X10-encoded
+    /// bytes for it instead of SGR (see `wheel_mouse_bytes_legacy_encodes_x10`).
+    /// Forwarding pins the preview to the live edge like the SGR case.
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_legacy_mouse_forwards() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, false));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up, "wheel over a full-screen legacy-mouse pane is handled");
+        assert_eq!(
+            env.view.preview_scroll_offset, 0,
+            "legacy mouse is forwarded too (X10 encoding), not dead-scrolled"
+        );
+    }
+
+    /// And a normal-screen agent (no alternate screen) keeps the capture
+    /// scroll even if it happens to have SGR mouse on: the preview's
+    /// scrollback is genuinely useful there.
+    #[test]
+    #[serial]
+    fn wheel_over_normal_screen_pane_uses_capture_scroll() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(false, true, true));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up);
+        assert!(
+            env.view.preview_scroll_offset > 10,
+            "normal screen: capture-window scroll still drives the preview"
+        );
     }
 
     /// Wheel-down over preview when offset is already at the bottom (0)
@@ -10322,7 +10836,8 @@ mod default_attach_mode {
             "cache should initialize to the historical Tmux default"
         );
         write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
-        env.view.refresh_from_config();
+        env.view
+            .refresh_from_config(ConfigRefreshOrigin::Interactive);
         assert_eq!(
             env.view.profile_default_attach_mode,
             NewSessionAttachMode::LiveSend,

@@ -75,7 +75,11 @@
       "id": "terminal.mobile-live-view",
       "kind": "mocked-playwright",
       "risk": "high",
-      "specs": ["tests/mobile-dom-renderer.spec.ts"],
+      "specs": [
+        "tests/mobile-dom-renderer.spec.ts",
+        "tests/keyboard-auto-resize.spec.ts",
+        "tests/mobile-keyboard.spec.ts"
+      ],
       "components": [
         "web/src/components/MobileLiveTerminal.tsx",
         "web/src/components/LiveTerminalView.tsx",
@@ -95,6 +99,32 @@
       "risk": "high",
       "specs": ["tests/scrollback-exit.spec.ts"],
       "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
+      "id": "terminal.mobile-live-wheel-forward",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/__tests__/liveMouse.test.ts",
+        "src/hooks/useLiveTerminal.forward.test.ts",
+        "src/components/__tests__/MobileLiveTerminal.forward.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/liveMouse.ts",
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/hooks/useLiveTerminal.ts"
+      ]
+    },
+    {
+      "id": "terminal.mobile-live-wheel-forward-e2e",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/live-wheel-forward.spec.ts"],
+      "components": [
+        "web/src/lib/liveMouse.ts",
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/hooks/useLiveTerminal.ts"
+      ]
     },
     {
       "id": "auth.no-auth",
@@ -826,6 +856,13 @@
       "components": ["web/src/components/DeleteSessionDialog.tsx"]
     },
     {
+      "id": "session.stop-dialog-keyboard",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/StopSessionDialog.test.tsx"],
+      "components": ["web/src/components/StopSessionDialog.tsx"]
+    },
+    {
       "id": "storage.quota-crash-regression",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -1054,6 +1091,24 @@
       "components": ["web/src/hooks/useAcpSession.ts"]
     },
     {
+      "id": "acp.elicitation-card",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/acp/AskUserQuestionCard.test.tsx", "src/lib/acpTypes.test.ts"],
+      "components": ["web/src/components/acp/AskUserQuestionCard.tsx", "web/src/lib/acpTypes.ts"]
+    },
+    {
+      "id": "acp.elicitation",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/ask-user-question.spec.ts"],
+      "components": [
+        "web/src/components/acp/AskUserQuestionCard.tsx",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/hooks/useAcpSession.ts"
+      ]
+    },
+    {
       "id": "acp.force-end-turn-gate",
       "kind": "vitest",
       "risk": "medium",
@@ -1086,13 +1141,23 @@
       "components": []
     },
     {
+      "id": "acp.composer-ios-keyboard-reservation",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/acp-composer-keyboard.spec.ts",
+        "src/components/acp/StructuredView.layout.test.ts",
+        "src/components/acp/__tests__/StructuredViewRoot.test.tsx"
+      ],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
       "id": "acp.config-pickers",
       "kind": "live-playwright",
       "risk": "medium",
       "specs": [
         "tests/live/acp-config-pickers.spec.ts",
         "tests/acp-config-pickers-ui.spec.ts",
-        "tests/live/acp-session-model.spec.ts",
         "src/components/acp/SessionConfigControls.test.tsx",
         "src/hooks/useAcpSession.configOption.test.ts"
       ],

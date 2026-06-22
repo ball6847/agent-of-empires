@@ -654,6 +654,7 @@ pub const AGENTS: &[AgentDef] = &[
         detection: DetectionMethod::Which("kimi"),
         yolo: Some(YoloMode::CliFlag("--yolo")),
         instruction_flag: None,
+        oneshot_flag: None,
         set_default_command: false,
         detect_status: status_detection::detect_kimi_status,
         container_env: &[],

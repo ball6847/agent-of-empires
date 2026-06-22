@@ -132,6 +132,16 @@ pub struct App {
     home: HomeView,
     should_quit: bool,
     theme: Theme,
+    /// Identity of the currently applied `theme` (global theme name +
+    /// palette-downsample mode). `set_theme` compares against this so a
+    /// re-apply with the same identity is a no-op. The config-file watcher
+    /// re-dispatches the theme on EVERY `config.toml` save (it can't tell
+    /// what changed), and a needless `set_theme` there sets `needs_redraw`,
+    /// forcing a full-screen `clear_terminal` that flickers. Guarding here
+    /// keeps any config save (collapse persistence, list resize, `i`,
+    /// settings) from clearing the screen when the theme is unchanged.
+    theme_name: String,
+    theme_palette_mode: bool,
     needs_redraw: bool,
     update_info: Option<UpdateInfo>,
     update_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<UpdateInfo>>>,
@@ -213,6 +223,15 @@ pub fn check_version_change() -> Result<Option<String>> {
     } else {
         Ok(None)
     }
+}
+
+/// Whether applying `next` `(theme name, palette-downsample mode)` would change
+/// the active theme `current`. Pulled out of `App::set_theme` so the
+/// idempotency guard (which keeps a config-file-watcher theme re-dispatch from
+/// forcing a flickering full-screen clear on every `config.toml` save) is
+/// unit-testable without constructing a full `App`.
+fn theme_apply_needed(current: (&str, bool), next: (&str, bool)) -> bool {
+    current != next
 }
 
 impl App {
@@ -349,6 +368,8 @@ impl App {
             home,
             should_quit: false,
             theme,
+            theme_name,
+            theme_palette_mode: palette_mode,
             needs_redraw: true,
             update_info: None,
             update_rx: None,
@@ -466,10 +487,6 @@ impl App {
 
         let result = f();
 
-        // Recreate the event stream with a fresh reader before re-entering
-        // the event loop.
-        self.event_stream = Some(EventStream::new());
-
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(
             terminal.backend_mut(),
@@ -484,7 +501,12 @@ impl App {
         self.sync_mouse_capture(terminal)?;
         std::io::Write::flush(terminal.backend_mut())?;
 
-        terminal.clear()?;
+        // Recreate the event stream with a fresh reader before re-entering the
+        // event loop, then force a full redraw of the home screen. The stream is
+        // recreated after raw mode and the alternate screen are restored so it is
+        // born into raw mode rather than attached to a briefly-cooked tty.
+        self.event_stream = Some(EventStream::new());
+        crate::tui::clear_terminal(terminal)?;
 
         Ok(result)
     }
@@ -530,7 +552,20 @@ impl App {
         // global config: theme (and its color_mode) is a global preference,
         // not profile-merged.
         let palette_mode = crate::session::config::resolve_theme_palette_mode();
+        // No-op when the theme is already applied. The config watcher
+        // re-dispatches the theme on every `config.toml` save, so without
+        // this a list-resize / `i` / collapse-persistence / settings save
+        // would force a full-screen `clear_terminal` and flicker even though
+        // nothing visual changed.
+        if !theme_apply_needed(
+            (&self.theme_name, self.theme_palette_mode),
+            (name, palette_mode),
+        ) {
+            return;
+        }
         self.theme = crate::tui::styles::load_theme_with_mode(name, palette_mode);
+        self.theme_name = name.to_string();
+        self.theme_palette_mode = palette_mode;
         self.needs_redraw = true;
     }
 
@@ -539,7 +574,7 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
         // Initial render
-        terminal.clear()?;
+        crate::tui::clear_terminal(terminal)?;
         // Sync mouse capture before the first paint so any onboarding
         // surface that wants native drag-to-select (intro Welcome page,
         // changelog, info dialog) gets capture turned off on frame 1.
@@ -671,7 +706,7 @@ impl App {
             // with_raw_mode_disabled drops and recreates the EventStream, so
             // there are no stale events to drain.
             if self.needs_redraw {
-                terminal.clear()?;
+                crate::tui::clear_terminal(terminal)?;
                 self.needs_redraw = false;
             }
 
@@ -822,6 +857,15 @@ impl App {
                                                             // non-burst path so dialog buttons are
                                                             // clickable even when a mouse event lands
                                                             // right after a paste/dictation burst.
+                                                        } else if self.home.handle_sidebar_collapse_click(mouse.column, mouse.row) {
+                                                            // Sidebar collapse/expand toggle; must
+                                                            // precede hit_list (button is on the
+                                                            // list's top border).
+                                                        } else if self.home.handle_tips_badge_click(mouse.column, mouse.row) {
+                                                            // Footer tips badge opened the overlay;
+                                                            // drop any stale preview highlight, like
+                                                            // the non-burst click path does.
+                                                            let _ = self.home.clear_preview_selection();
                                                         } else if hit_list {
                                                             let action = self.home.handle_click(mouse.column, mouse.row);
                                                             if action.is_none() {
@@ -898,6 +942,29 @@ impl App {
                             continue;
                         }
                         Some(Ok(Event::Mouse(mouse))) => {
+                            // Footer toolbar: a left-click on a button
+                            // synthesizes its shortcut and routes it through
+                            // the full key handler, so clicking behaves
+                            // exactly like pressing the key (global handling,
+                            // action dispatch, structured-view drain). The
+                            // footer is a disjoint area from the list/preview/
+                            // diff, so nothing else in this arm needs to run.
+                            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                                if let Some(key) =
+                                    self.home.footer_button_at(mouse.column, mouse.row)
+                                {
+                                    let _ = self.home.clear_preview_selection();
+                                    self.handle_key(key, terminal).await?;
+                                    self.sync_mouse_capture(terminal)?;
+                                    if !self.needs_redraw {
+                                        self.draw(terminal)?;
+                                    }
+                                    if self.should_quit {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            }
                             let hit_list = self.home.hit_list(mouse.column, mouse.row);
                             let hit_preview = self.home.hit_preview(mouse.column, mouse.row);
                             let hit_diff = self.home.is_diff_open()
@@ -949,6 +1016,25 @@ impl App {
                                         self.set_theme(&name);
                                     }
                                     self.sync_mouse_capture(terminal)?;
+                                    self.draw(terminal)?;
+                                    None
+                                } else if self
+                                    .home
+                                    .handle_sidebar_collapse_click(mouse.column, mouse.row)
+                                {
+                                    // Collapse button (expanded list border) or
+                                    // the collapsed strip toggled the sidebar.
+                                    // Runs before hit_list because the button
+                                    // lives on the list's top border.
+                                    let _ = self.home.clear_preview_selection();
+                                    self.draw(terminal)?;
+                                    None
+                                } else if self
+                                    .home
+                                    .handle_tips_badge_click(mouse.column, mouse.row)
+                                {
+                                    // Footer tips badge opened the overlay.
+                                    let _ = self.home.clear_preview_selection();
                                     self.draw(terminal)?;
                                     None
                                 } else if self
@@ -1184,13 +1270,19 @@ impl App {
             // and the pointer sits at the edge.
             //
             // Request a normal (diffed) redraw via `refresh_needed`, NOT
-            // `needs_redraw`: the latter forces a `terminal.clear()` at the
+            // `needs_redraw`: the latter forces a `clear_terminal` at the
             // top of the loop, and clearing every ticker frame while the
             // scroll runs strobes the screen blank-then-repaint. The diffed
             // draw at the bottom of the loop repaints smoothly.
             if self.home.tick_preview_autoscroll() {
                 refresh_needed = true;
                 needs_full_refresh = true;
+            }
+
+            // Dwell-to-read: a session kept selected (list in the foreground)
+            // for a few seconds counts as read and clears its unread marker.
+            if self.home.tick_unread_dwell(std::time::Instant::now()) {
+                refresh_needed = true;
             }
 
             // Update-check / install-status polls can flip the
@@ -1260,6 +1352,11 @@ impl App {
             }
 
             if self.home.apply_recovery_updates() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
+            if self.home.apply_restart_results() {
                 refresh_needed = true;
                 needs_full_refresh = true;
             }
@@ -1481,6 +1578,10 @@ impl App {
         }
 
         self.home.apply_session_id_updates();
+        // Drain any restart result that completed since the last tick so the
+        // post-cascade snapshot (cleared stale sid, container id, final status)
+        // is persisted instead of the stale `Starting` row.
+        self.home.apply_restart_results();
         self.home.cleanup_pending_creation();
 
         if let Err(e) = self.home.save() {
@@ -2239,7 +2340,7 @@ impl App {
             // restarts; the banner returns automatically when a newer
             // release ships (per #1140).
             //
-            // No `needs_redraw = true` here: that forces a `terminal.clear()`
+            // No `needs_redraw = true` here: that forces a `clear_terminal`
             // before the next event arrives, so the whole screen blanks for
             // a beat (visible flash). Ratatui's diff renderer handles the
             // 1-row layout shrink on the next normal draw.
@@ -2315,10 +2416,10 @@ impl App {
         let result =
             crate::tui::structured_view::run(terminal, &mut stream, &self.theme, session_id).await;
         self.event_stream = Some(stream);
-        // Forcing a full redraw on return so the home screen redraws
-        // any cells the acp view painted over.
+        // Force a full redraw so the home screen repaints any cells the acp
+        // view painted over. The main loop's redraw branch runs `clear_terminal`
+        // on the next iteration, so don't clear again here.
         self.needs_redraw = true;
-        terminal.clear()?;
         if let Err(e) = result {
             self.update_status = Some(UpdateStatus::transient(format!("acp closed: {e}")));
         }
@@ -2469,17 +2570,8 @@ impl App {
                     .set_instance_status(&id, crate::session::Status::Starting);
                 self.update_status = Some(UpdateStatus::transient("Reviving session...".into()));
                 self.draw(terminal)?;
-                let stale_sid = self.home.execute_send_message(&id, &message);
-                match stale_sid {
-                    Some(sid) => {
-                        self.update_status = Some(UpdateStatus::transient(format!(
-                            "Resume failed for sid {sid}; sent to fresh session (history not loaded)"
-                        )));
-                    }
-                    None => {
-                        self.update_status = None;
-                    }
-                }
+                self.home.execute_send_message(&id, &message);
+                self.update_status = None;
             }
             Action::EnterLiveSend(id) => {
                 // Same revive flow as SendMessage so cold-start (Docker,
@@ -2501,13 +2593,10 @@ impl App {
                 // the smaller pane, and the first capture would render
                 // shifted up.
                 self.update_status = match &outcome {
-                    Ok(Some(sid)) => Some(UpdateStatus::transient(format!(
-                        "Resume failed for sid {sid}; live-send sent to a fresh pane (history not loaded)"
-                    ))),
                     // On clean ready, drop the toast entirely. On Err the
                     // info_dialog already carries the failure detail, so the
                     // transient toast just gets in the way.
-                    Ok(None) | Err(()) => None,
+                    Ok(()) | Err(()) => None,
                 };
                 if outcome.is_ok() {
                     self.draw(terminal)?;
@@ -2678,10 +2767,11 @@ impl App {
                     )));
                     return Ok(());
                 }
-                Ok(crate::session::StartOutcome::Restarted { stale_sid }) => {
+                Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
                     self.update_status = Some(UpdateStatus::transient(format!(
-                        "Resume failed for sid {stale_sid}; started fresh (history not loaded)"
+                        "Resume failed for sid {sid}; preserved for retry"
                     )));
+                    return Ok(());
                 }
                 Ok(_) => {}
             }
@@ -2708,6 +2798,11 @@ impl App {
         self.home.reload()?;
         self.home
             .apply_status_updates_without_hooks(attached_status_updates);
+        // The user just viewed this session (and any turn that finished
+        // during the attach was applied above without the live-send
+        // exemption). Clear its unread marker on return so the round-trip
+        // nets to read.
+        self.home.clear_unread_on_view(session_id);
         self.home.stamp_last_accessed(session_id);
         // Persist so the attach-return bump survives aoe restart. Same
         // reasoning as the send-message path in home/input.rs: without a
@@ -2986,6 +3081,27 @@ mod tests {
     use super::*;
     use crate::telemetry::SendOutcome;
     use std::sync::atomic::Ordering;
+
+    /// The theme idempotency guard must treat both the name AND the palette
+    /// mode as part of the theme identity, and report "no change" only when
+    /// both match. This is what keeps a config-file-watcher theme re-dispatch
+    /// (fired on every `config.toml` save: sidebar-collapse persistence, list
+    /// resize, `i`, settings) from forcing a flickering full-screen clear.
+    #[test]
+    fn theme_apply_needed_compares_name_and_palette_mode() {
+        assert!(
+            !theme_apply_needed(("empire", false), ("empire", false)),
+            "identical name + mode is a no-op (no redraw, no clear)"
+        );
+        assert!(
+            theme_apply_needed(("empire", false), ("zinc", false)),
+            "a different name must re-apply"
+        );
+        assert!(
+            theme_apply_needed(("empire", false), ("empire", true)),
+            "a different palette mode must re-apply even with the same name"
+        );
+    }
 
     // The TUI create counter is a process-global static, so these tests mutate
     // shared state. `#[serial]` (with the `telemetry_creates` group key) keeps

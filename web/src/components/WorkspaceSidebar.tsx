@@ -15,14 +15,17 @@ import { createPortal } from "react-dom";
 import {
   Archive,
   ArrowLeftRight,
+  CircleDot,
   CircleStop,
-  GripVertical,
+  Folder,
   Hourglass,
   Layers,
   Moon,
   Pencil,
   Pin,
   Play,
+  Plus,
+  Sparkles,
 } from "lucide-react";
 import {
   DndContext,
@@ -36,19 +39,24 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy, arrayMove } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import type { SessionResponse, SessionStatus, Workspace } from "../lib/types";
+import type { ProjectInfo, RepoGroup, SessionResponse, SessionStatus, Workspace } from "../lib/types";
+import { ProjectsSection } from "./ProjectsSection";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
   archivableWorkspaces,
-  nestedSidebarGroupHasLiveWorkspace,
+  nestedSidebarGroupShouldRender,
   sidebarGroupHasLiveWorkspace,
+  sidebarGroupShouldRender,
   type NestedSidebarGroup,
   type SidebarGroup,
 } from "../lib/sidebarGroups";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
-import { REPO_COLOR_OPTIONS, type RepoAppearanceUpdate, type RepoColor } from "../lib/repoAppearance";
+import { menuBus, closeOtherContextMenus } from "../lib/menuBus";
+import { REPO_COLOR_OPTIONS, repoColorStyle, repoSwatchStyle, type RepoAppearanceUpdate } from "../lib/repoAppearance";
 import { STATUS_DOT_CLASS, getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
+import { exceedsTouchSlop } from "../lib/longPress";
+import { useUnreadIndicatorEnabled } from "../lib/unreadIndicator";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { renameSession, setSessionNotifications, setWorktreeName, updateSessionGroup } from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
@@ -69,6 +77,7 @@ import {
   effectiveArchivedOf,
   effectivePinnedOf,
   effectiveSnoozedUntilOf,
+  effectiveUnreadOf,
   type OptimisticTriage,
 } from "../lib/sidebarOptimistic";
 import { useSidebarTriage } from "../hooks/useSidebarTriage";
@@ -108,17 +117,6 @@ export const SNOOZE_PRESETS: readonly { label: string; minutes: number }[] = [
   { label: "1 week", minutes: 10080 },
 ];
 
-// Module-level bus for closing any open SessionRow context menu when a
-// new one opens. Each SessionRow manages its own menu state; without
-// this bus, long-pressing a second session on mobile leaves the first
-// menu visible because document "click" listeners don't fire on
-// touchstart. Publishing on open + subscribing here keeps "one menu at
-// a time" without lifting state up to the parent.
-const menuBus = new EventTarget();
-function closeOtherContextMenus() {
-  menuBus.dispatchEvent(new Event("close"));
-}
-
 // Group headers and session rows are both sortable inside the one
 // sidebar DndContext, so a header drag must not collide with a session
 // droppable (or vice versa). dnd-kit registers every sortable in a
@@ -150,9 +148,20 @@ interface Props {
   onUpdateRepoAppearance: (repoId: string, update: RepoAppearanceUpdate) => void;
   onNew: () => void;
   onCreateSession: (repoPath: string) => void;
+  /** Pin a repo (register it) so it persists with zero sessions. See #2047. */
+  onPinProject?: (repoPath: string) => void;
+  /** Unpin a repo: remove every registry entry for its path. See #2047. */
+  onUnpinProject?: (group: SidebarGroup) => void;
+  /** Saved projects with no live session, for the dedicated Projects section
+   *  (#2212). Pinned projects render above as headers, not here. */
+  savedProjects: RepoGroup[];
+  /** Open the add-project form (directory browser + scope + base branch). */
+  onAddProject: () => void;
+  /** Open the edit form for one registration (default base branch). */
+  onEditProject: (project: ProjectInfo) => void;
+  /** Remove a project: delete every registration for its path. */
+  onRemoveProject: (group: RepoGroup) => void;
   onSettings: () => void;
-  onProjects: () => void;
-  onProfiles: () => void;
   onDeleteSession?: (workspaceId: string) => void;
   onStopSession?: (workspaceId: string) => void;
   onStartSession?: (workspaceId: string) => void;
@@ -289,6 +298,25 @@ function WakeupCountdown({ wakeAt, reason }: { wakeAt: string; reason: string | 
   );
 }
 
+/** Sidebar chip shown while the agent has an armed `Monitor` (a
+ *  background watch). Unlike the wakeup chip there is no fire time, so this
+ *  is a static "monitoring" badge with no countdown. It persists across the
+ *  monitor's re-fires (those resume the agent without a user prompt) and
+ *  the underlying `monitor_active` field clears on the next user prompt. */
+function MonitorBadge({ description }: { description: string | null | undefined }) {
+  const title = description ? `Monitoring: ${description}` : "Monitoring a background job";
+  return (
+    <span
+      title={title}
+      aria-label={`Monitoring${description ? ` ${description}` : ""}`}
+      className="inline-flex shrink-0 items-center gap-0.5 rounded border border-violet-700/40 bg-violet-950/30 px-1 py-0 text-[10px] font-medium text-violet-300"
+    >
+      <span aria-hidden="true">👁</span>
+      monitoring
+    </span>
+  );
+}
+
 /** Compact duration formatting used by the wakeup chip: `45s`, `3m`,
  *  `1h 7m`. Drops sub-minute resolution above one minute since the chip
  *  is read at a glance. */
@@ -345,27 +373,6 @@ function useDragSuppressRef(): MutableRefObject<number> {
   return ref;
 }
 
-const REPO_COLOR_TOKENS: Record<RepoColor, string> = {
-  amber: "--color-status-waiting",
-  teal: "--color-terminal-active",
-  sky: "--color-sandbox",
-  violet: "--color-diff-header",
-  rose: "--color-status-error",
-  slate: "--color-surface-700",
-};
-
-function repoColorStyle(color: RepoColor | null): React.CSSProperties | undefined {
-  if (!color) return undefined;
-  const token = REPO_COLOR_TOKENS[color];
-  return {
-    backgroundColor: `color-mix(in srgb, var(${token}) 14%, transparent)`,
-  };
-}
-
-function repoSwatchStyle(color: RepoColor): React.CSSProperties {
-  return { backgroundColor: `var(${REPO_COLOR_TOKENS[color]})` };
-}
-
 function useSuppressClickAfterDrag(ref: MutableRefObject<number>) {
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -396,12 +403,14 @@ function SortableSessionRow({
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
+  onCreateSession?: (repoPath: string) => void;
   readOnly?: boolean;
   dragDisabled?: boolean;
   optimistic: OptimisticTriage;
   onPinToggle: (ws: Workspace, pinned: boolean) => void;
   onArchiveToggle: (ws: Workspace, archived: boolean) => void;
   onSnooze: (ws: Workspace, minutes: number | null) => void;
+  onUnreadToggle: (ws: Workspace, markUnread: boolean) => void;
 }) {
   const dragSuppressRef = useDragSuppressRef();
   // `disabled` no-ops the sensor listeners. `readOnly` covers viewers
@@ -471,6 +480,7 @@ type DragHandleProps = {
   setActivatorNodeRef: (el: HTMLElement | null) => void;
   attributes: ReturnType<typeof useSortable>["attributes"];
   listeners: ReturnType<typeof useSortable>["listeners"];
+  isDragging: boolean;
 };
 
 // Sortable wrapper around an entire repo-group block (header + its rows),
@@ -502,7 +512,7 @@ function SortableRepoGroup({
       style={style}
       className={"transition-shadow duration-150 " + (isDragging ? "ring-2 ring-inset ring-brand-500 shadow-lg" : "")}
     >
-      {children({ setActivatorNodeRef, attributes, listeners })}
+      {children({ setActivatorNodeRef, attributes, listeners, isDragging })}
     </div>
   );
 }
@@ -515,12 +525,14 @@ export const SessionRow = memo(function SessionRow({
   onDelete,
   onStop,
   onStart,
+  onCreateSession,
   readOnly,
   indented,
   optimistic,
   onPinToggle,
   onArchiveToggle,
   onSnooze,
+  onUnreadToggle,
 }: {
   workspace: Workspace;
   isActive: boolean;
@@ -533,6 +545,9 @@ export const SessionRow = memo(function SessionRow({
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
+  // Open the session wizard prefilled from this row's project (path, agent,
+  // and the latest session's options), mirroring the per-project "+" button.
+  onCreateSession?: (repoPath: string) => void;
   readOnly?: boolean;
   indented?: boolean;
   // Optimistic triage overlay for this row plus the parent-owned mutation
@@ -543,8 +558,10 @@ export const SessionRow = memo(function SessionRow({
   onPinToggle: (ws: Workspace, pinned: boolean) => void;
   onArchiveToggle: (ws: Workspace, archived: boolean) => void;
   onSnooze: (ws: Workspace, minutes: number | null) => void;
+  onUnreadToggle: (ws: Workspace, markUnread: boolean) => void;
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
+  const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
   const { status: sessionStatus, createdAt, idleEnteredAt } = bestSession(workspace, idleDecayWindowMs);
   const textClass = getStatusTextClass(
     {
@@ -554,6 +571,9 @@ export const SessionRow = memo(function SessionRow({
     idleDecayWindowMs,
   );
   const firstSession = workspace.sessions[0];
+  // Repo path used to prefill a "New Session" launched from this row, matching
+  // the per-project "+" button (handleCreateSession keys off this same path).
+  const newSessionRepoPath = firstSession?.main_repo_path || firstSession?.project_path || null;
   // The structured view session backing this row, if any. Drives the "Switch
   // agent" context-menu item, which only makes sense for an ACP structured view
   // session (tmux rows have no agent to hand off). Multi-session rows are
@@ -580,6 +600,17 @@ export const SessionRow = memo(function SessionRow({
   const isPinned = workspace.sessions.some((s) => s.pinned_at != null);
   const isArchived = workspace.sessions.some((s) => s.archived_at != null);
   const snoozedUntil = workspace.sessions.find((s) => s.snoozed_until)?.snoozed_until ?? null;
+  // Unread marker for the row, server value plus optimistic overlay. The
+  // active (open) row is always suppressed: opening reads it and the App
+  // clears it a beat later, so hiding it avoids a flash in the poll window.
+  const serverUnread = workspace.sessions.some((s) => s.unread === true);
+  const effectiveUnread = effectiveUnreadOf(optimistic, serverUnread);
+  const isUnread = unreadIndicatorEnabled && effectiveUnread && !isActive;
+  // Like the TUI, the unread marker *replaces* the resting status glyph with a
+  // solid dot (rather than sitting beside the title). Only for resting states:
+  // a live spinner (Running/Waiting/...) stays, since live status outranks it
+  // and the auto-mark only ever lands on Idle anyway.
+  const showUnreadGlyph = isUnread && (sessionStatus === "Idle" || sessionStatus === "Unknown");
   const sessionId = firstSession?.id;
   const navigationSessionId = runningSession?.id ?? firstSession?.id ?? null;
   const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
@@ -650,6 +681,13 @@ export const SessionRow = memo(function SessionRow({
     onSnooze(workspace, minutes);
   };
 
+  const toggleUnread = () => {
+    setContextMenu(null);
+    // Mark unread when currently read, mark read when currently unread,
+    // mirroring the TUI `u` toggle.
+    onUnreadToggle(workspace, !effectiveUnread);
+  };
+
   // Close the context menu first, then open the modal in the next
   // tick so the menu's document-click dismiss listener does not race
   // with the modal's mount.
@@ -690,6 +728,7 @@ export const SessionRow = memo(function SessionRow({
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const longPressFired = useRef(false);
   const touchOpenedAt = useRef(0);
+  const touchStart = useRef<{ x: number; y: number } | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -751,12 +790,24 @@ export const SessionRow = memo(function SessionRow({
     if (!touch) return;
     const tx = touch.clientX;
     const ty = touch.clientY;
+    touchStart.current = { x: tx, y: ty };
     longPressTimer.current = setTimeout(() => {
       longPressFired.current = true;
       touchOpenedAt.current = Date.now();
       closeOtherContextMenus();
       setContextMenu({ x: tx, y: ty });
     }, 500);
+  };
+
+  // Cancel the pending long-press only once the finger moves past the slop, so
+  // a normal jittery hold still opens the menu while a deliberate drag
+  // (scroll/reorder) cancels it. See exceedsTouchSlop (#2232).
+  const handleTouchMove = (e: React.TouchEvent) => {
+    const touch = e.touches[0];
+    if (!touch || !touchStart.current) return;
+    if (exceedsTouchSlop(touchStart.current, { x: touch.clientX, y: touch.clientY })) {
+      clearLongPress();
+    }
   };
 
   const handleTouchEnd = (e: React.TouchEvent) => {
@@ -882,7 +933,7 @@ export const SessionRow = memo(function SessionRow({
         onContextMenu={handleContextMenu}
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
-        onTouchMove={clearLongPress}
+        onTouchMove={handleTouchMove}
         onTouchCancel={clearLongPress}
         data-selected={isSelected || undefined}
         className={`block w-full text-left py-2 cursor-pointer select-none [-webkit-touch-callout:none] transition-colors duration-75 ${
@@ -897,12 +948,20 @@ export const SessionRow = memo(function SessionRow({
       >
         {isSelected && <span className="sr-only">Selected</span>}
         <div className="flex items-center gap-2">
-          <span className={`text-sm shrink-0 leading-none font-mono ${textClass}`}>
-            <StatusGlyph status={sessionStatus} createdAt={createdAt} idleEnteredAt={idleEnteredAt} />
+          <span
+            className={`text-sm shrink-0 leading-none font-mono ${showUnreadGlyph ? "text-status-unread font-semibold" : textClass}`}
+          >
+            {showUnreadGlyph ? (
+              <span title="Unread" aria-label="Unread" data-testid="sidebar-unread-dot">
+                ●
+              </span>
+            ) : (
+              <StatusGlyph status={sessionStatus} createdAt={createdAt} idleEnteredAt={idleEnteredAt} />
+            )}
           </span>
           <div className="min-w-0 flex-1">
             <span
-              className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${isSessionActive({ status: sessionStatus, idle_entered_at: idleEnteredAt }, idleDecayWindowMs) ? textClass : isActive ? "text-text-primary" : "text-text-secondary"} ${isFavorited || effectivePinned ? "font-semibold" : ""} ${effectiveArchived || effectiveSnoozed ? "italic opacity-70" : ""}`}
+              className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${showUnreadGlyph ? "text-status-unread font-semibold" : isSessionActive({ status: sessionStatus, idle_entered_at: idleEnteredAt }, idleDecayWindowMs) ? textClass : isActive ? "text-text-primary" : "text-text-secondary"} ${isFavorited || effectivePinned ? "font-semibold" : ""} ${effectiveArchived || effectiveSnoozed ? "italic opacity-70" : ""}`}
             >
               {effectivePinned && (
                 <span title="Pinned" aria-label="Pinned" className="shrink-0 inline-flex text-brand-400">
@@ -972,9 +1031,30 @@ export const SessionRow = memo(function SessionRow({
                   Resuming
                 </span>
               )}
+              {firstSession?.smart_rename === "pending" && (
+                <span
+                  title="Will auto-name this session from your first message"
+                  aria-label="Will auto-name"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-surface-700/40 bg-surface-800/40 px-1 py-0 text-[10px] font-mono font-medium text-text-dim"
+                >
+                  <Sparkles className="h-3 w-3" />
+                  <span className="hidden sm:inline">Auto-name</span>
+                </span>
+              )}
+              {firstSession?.smart_rename === "running" && (
+                <span
+                  title="Generating a name from your first message"
+                  aria-label="Naming"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded border border-amber-700/40 bg-amber-950/30 px-1 py-0 text-[10px] font-medium text-amber-300"
+                >
+                  <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400/80" />
+                  Naming…
+                </span>
+              )}
               {firstSession?.next_wakeup_at && (
                 <WakeupCountdown wakeAt={firstSession.next_wakeup_at} reason={firstSession.next_wakeup_reason} />
               )}
+              {firstSession?.monitor_active && <MonitorBadge description={firstSession.monitor_description} />}
             </span>
             {subtitle && (
               <span className="block text-[11px] font-mono text-text-dim truncate" title={subtitleTitle ?? subtitle}>
@@ -1024,6 +1104,19 @@ export const SessionRow = memo(function SessionRow({
               maxHeight: "calc(100vh - 16px)",
             }}
           >
+            {!readOnly && onCreateSession && newSessionRepoPath && (
+              <button
+                onClick={() => {
+                  setContextMenu(null);
+                  onCreateSession(newSessionRepoPath);
+                }}
+                data-testid="sidebar-context-menu-new-session"
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+              >
+                <Plus className="h-3.5 w-3.5 shrink-0" />
+                New Session
+              </button>
+            )}
             <button
               onClick={startRename}
               data-testid="sidebar-context-menu-rename"
@@ -1105,11 +1198,13 @@ export const SessionRow = memo(function SessionRow({
                 <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">Triage</div>
                 {(() => {
                   // Menu actions are gated by the row's current triage
-                  // state so contradictory transitions never appear in
-                  // the UI: an archived row only offers Unarchive, a
-                  // pinned row only offers Unpin, etc. The shape helper
-                  // lives in `lib/sidebarSort.ts` so it can be unit
-                  // tested. See #1581.
+                  // state so contradictory toggles never appear in the
+                  // UI: an archived row only offers Unarchive, a snoozed
+                  // row only offers Unsnooze. A pinned row also offers
+                  // Archive/Snooze, since those are valid transitions
+                  // (the backend clears the pin) and match the TUI. The
+                  // shape helper lives in `lib/sidebarSort.ts` so it can
+                  // be unit tested. See #1581.
                   const shape = triageMenuShape(
                     triageStateOf({
                       isPinned: effectivePinned,
@@ -1177,6 +1272,20 @@ export const SessionRow = memo(function SessionRow({
                         >
                           <Moon className="h-3.5 w-3.5 shrink-0" />
                           Unsnooze
+                        </button>
+                      )}
+                      {/* Unlike the others, the unread toggle is always
+                          offered (any sort), gated only on the feature
+                          flag; the label flips to "Mark as read" when the
+                          row already carries a marker. */}
+                      {unreadIndicatorEnabled && (
+                        <button
+                          onClick={() => void toggleUnread()}
+                          data-testid="sidebar-context-menu-unread"
+                          className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                        >
+                          <CircleDot className="h-3.5 w-3.5 shrink-0" />
+                          {effectiveUnread ? "Mark as read" : "Mark as unread"}
                         </button>
                       )}
                     </>
@@ -1578,13 +1687,15 @@ export function SnoozeModal({
   );
 }
 
-const SidebarGroupHeader = memo(function SidebarGroupHeader({
+export const SidebarGroupHeader = memo(function SidebarGroupHeader({
   group,
   hasActiveChild,
   onClick,
   onNewSession,
   onUpdateAppearance,
   onArchiveAll,
+  onPin,
+  onUnpin,
   offline,
   dragHandle,
 }: {
@@ -1596,6 +1707,12 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   /** Archive every active session under this group. Omitted (read-only /
    *  offline) hides the action; the parent owns the confirmation. */
   onArchiveAll?: () => void;
+  /** Register this repo in the pin registry so it persists with zero
+   *  sessions. Repo axis only; omitted (read-only / offline) hides it. */
+  onPin?: (repoPath: string) => void;
+  /** Remove every registry entry for this repo path (unpin). Omitted
+   *  (read-only / offline) hides it. */
+  onUnpin?: (group: SidebarGroup) => void;
   offline: boolean;
   dragHandle?: DragHandleProps;
 }) {
@@ -1609,7 +1726,11 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   // action hides once everything is already archived.
   const archivableCount = onArchiveAll ? archivableWorkspaces(group).length : 0;
   const canArchiveAll = archivableCount > 0;
-  const hasMenu = canAppearance || canArchiveAll;
+  // Pin/unpin is repo-axis only and needs a concrete repo path. Pin shows
+  // when the repo is not yet registered; unpin when it is. See #2047.
+  const canPin = !!onPin && group.capabilities.create === "repo" && !!group.repoPath && !group.pinned;
+  const canUnpin = !!onUnpin && group.kind === "repo" && group.pinned;
+  const hasMenu = canAppearance || canArchiveAll || canPin || canUnpin;
   const headerTitle = group.groupPath ?? group.repoPath;
   const [contextMenu, setContextMenu] = useState<{
     x: number;
@@ -1622,6 +1743,30 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
   const dotClass = STATUS_DOT_CLASS[group.status === "active" ? "Running" : "Idle"] ?? "bg-status-idle";
   const headerStyle = repoColorStyle(group.color);
   const headerHoverClass = group.color ? "" : "hover:bg-surface-800/50";
+  const sessionCount = group.workspaces.reduce((n, v) => n + v.workspace.sessions.length, 0);
+
+  // The whole header row is the drag activator now (no grip handle), so a
+  // drag ends with the pointer over one of the row's controls. Suppress the
+  // trailing click for a beat after a drag so reordering a group doesn't also
+  // collapse it or fire the New Session button. The window stays open for the
+  // whole drag (Infinity), so even a multi-second drag can't leak the click,
+  // then closes 250ms after release. Enforced row-wide via onClickCapture so
+  // every control is covered, not just the toggle.
+  const dragSuppressRef = useRef(0);
+  const isDragging = dragHandle?.isDragging ?? false;
+  useEffect(() => {
+    if (isDragging) {
+      dragSuppressRef.current = Number.POSITIVE_INFINITY;
+    } else if (dragSuppressRef.current > Date.now()) {
+      dragSuppressRef.current = Date.now() + 250;
+    }
+  }, [isDragging]);
+  const suppressClickAfterDrag = (e: React.MouseEvent) => {
+    if (dragSuppressRef.current > Date.now()) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  };
 
   const openMenuAt = useCallback((x: number, y: number) => {
     closeOtherContextMenus();
@@ -1699,6 +1844,7 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
       <div
         data-testid="sidebar-group-header"
         data-group-id={group.id}
+        data-draggable={dragHandle ? "true" : undefined}
         tabIndex={hasMenu ? 0 : undefined}
         aria-haspopup={hasMenu ? "menu" : undefined}
         aria-label={
@@ -1713,55 +1859,73 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
             : undefined
         }
         onKeyDown={hasMenu ? handleHeaderKeyDown : undefined}
-        className={`flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${headerHoverClass} ${
+        onClickCapture={suppressClickAfterDrag}
+        className={`group flex items-center gap-2 px-3 py-2 transition-colors duration-75 text-text-secondary focus:outline-none focus:ring-2 focus:ring-brand-600 ${headerHoverClass} ${
           hasActiveChild ? "border-l-2 border-brand-600" : ""
         }`}
         style={headerStyle}
+        // The whole row is the drag activator (no grip). Mirrors SessionRow:
+        // spread only `listeners` (pointer-down), not dnd-kit's `attributes`,
+        // which would inject a role/tabIndex that collide with the context
+        // menu wiring. Keyboard drag isn't supported, matching session rows.
+        ref={dragHandle?.setActivatorNodeRef}
+        {...dragHandle?.listeners}
       >
-        {/* eslint-disable react-hooks/refs -- dnd-kit's DragHandleProps bundles
-            setActivatorNodeRef (a ref-setter callback) alongside plain
-            attributes/listeners objects; the rule incorrectly taints every
-            property access on the whole object as a "ref value read during
-            render". None of these touch .current, so it's a false positive. */}
-        {dragHandle && (
-          <button
-            ref={dragHandle.setActivatorNodeRef}
-            type="button"
-            aria-label={`Reorder project ${group.displayName}`}
-            data-testid="sidebar-group-drag-handle"
-            className="shrink-0 -ml-1 flex h-5 w-4 items-center justify-center text-text-dim hover:text-text-secondary cursor-grab active:cursor-grabbing touch-none"
-            {...dragHandle.attributes}
-            {...dragHandle.listeners}
-          >
-            <GripVertical className="h-3.5 w-3.5" />
-          </button>
-        )}
-        {/* eslint-enable react-hooks/refs */}
         <span className={`w-2 h-2 rounded-full shrink-0 ${dotClass}`} />
         <button
           onClick={onClick}
           aria-expanded={!group.collapsed}
           className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer"
         >
-          <svg
-            width="10"
-            height="10"
-            viewBox="0 0 10 10"
-            fill="currentColor"
-            className={`shrink-0 text-text-dim transition-transform duration-75 ${group.collapsed ? "-rotate-90" : ""}`}
-          >
-            <path
-              d="M2 3 L5 6.5 L8 3"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
-          <OwnerAvatar owner={group.remoteOwner} size={16} />
+          <span className="relative h-4 w-4 shrink-0">
+            <span
+              data-testid="sidebar-group-icon"
+              className="absolute inset-0 flex items-center justify-center transition-opacity duration-75 group-hover:opacity-0 group-focus-within:opacity-0"
+            >
+              {group.remoteOwner ? (
+                <OwnerAvatar owner={group.remoteOwner} size={16} />
+              ) : (
+                <Folder className="h-3.5 w-3.5 text-text-dim" />
+              )}
+            </span>
+            <span
+              data-testid="sidebar-group-fold-chevron"
+              className="absolute inset-0 flex items-center justify-center opacity-0 transition-opacity duration-75 group-hover:opacity-100 group-focus-within:opacity-100"
+            >
+              <svg
+                width="10"
+                height="10"
+                viewBox="0 0 10 10"
+                fill="currentColor"
+                aria-hidden="true"
+                className={`text-text-dim transition-transform duration-75 ${group.collapsed ? "-rotate-90" : ""}`}
+              >
+                <path
+                  d="M2 3 L5 6.5 L8 3"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </span>
+          </span>
+          {group.pinned && (
+            <span
+              className="shrink-0 text-[10px] leading-none text-text-dim"
+              data-testid="sidebar-group-pinned-marker"
+              title="Pinned project (persists without sessions)"
+              aria-label="Pinned project"
+            >
+              ◆
+            </span>
+          )}
           <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={headerTitle}>
             {group.displayName}
+          </span>
+          <span className="shrink-0 text-[12px] tabular-nums text-text-dim" data-testid="sidebar-group-session-count">
+            ({sessionCount})
           </span>
         </button>
         <Tooltip text={offline ? OFFLINE_TITLE : "New session"}>
@@ -1799,6 +1963,33 @@ const SidebarGroupHeader = memo(function SidebarGroupHeader({
               maxHeight: "calc(100vh - 16px)",
             }}
           >
+            {canPin && (
+              <button
+                onClick={() => {
+                  setContextMenu(null);
+                  if (group.repoPath) onPin?.(group.repoPath);
+                }}
+                data-testid="sidebar-group-context-menu-pin"
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+              >
+                Pin project
+              </button>
+            )}
+            {canUnpin && (
+              <button
+                onClick={() => {
+                  setContextMenu(null);
+                  onUnpin?.(group);
+                }}
+                data-testid="sidebar-group-context-menu-unpin"
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+              >
+                Unpin project
+              </button>
+            )}
+            {(canPin || canUnpin) && (canArchiveAll || canAppearance) && (
+              <div className="border-t border-surface-700/20 my-1" />
+            )}
             {canArchiveAll && (
               <button
                 onClick={() => {
@@ -1931,9 +2122,13 @@ export function WorkspaceSidebar({
   onUpdateRepoAppearance,
   onNew,
   onCreateSession,
+  onPinProject,
+  onUnpinProject,
+  savedProjects,
+  onAddProject,
+  onEditProject,
+  onRemoveProject,
   onSettings,
-  onProjects,
-  onProfiles,
   onDeleteSession,
   onStopSession,
   onStartSession,
@@ -2105,7 +2300,13 @@ export function WorkspaceSidebar({
         .filter((ng) => ng.subgroups.length > 0)
     : nestedGroups;
 
-  const hasResults = isNested ? filteredNested.length > 0 : filteredGroups.length > 0;
+  // A filter query that matches only a saved project (no live session) still
+  // populates the Projects section, so it must not trigger the "No matches"
+  // empty state below it. The no-query empty state ("No sessions yet") is left
+  // alone: saved projects are not sessions.
+  const savedProjectsMatchQuery =
+    !!q && savedProjects.some((p) => p.displayName.toLowerCase().includes(q) || p.repoPath.toLowerCase().includes(q));
+  const hasResults = (isNested ? filteredNested.length > 0 : filteredGroups.length > 0) || savedProjectsMatchQuery;
 
   // Sidebar multi-select. Selection is ephemeral sidebar UI state (not routed
   // or persisted); the anchor pivots Shift+click ranges. See #1724.
@@ -2370,12 +2571,12 @@ export function WorkspaceSidebar({
               </svg>
             </button>
           </Tooltip>
-          <Tooltip text={offline ? OFFLINE_TITLE : "New session"}>
+          <Tooltip text={offline ? OFFLINE_TITLE : "New project session"}>
             <button
               onClick={onNew}
               disabled={offline}
               className="w-8 h-8 flex items-center justify-center text-text-muted hover:text-text-secondary hover:bg-surface-800 cursor-pointer rounded-md transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-text-muted disabled:hover:bg-transparent"
-              aria-label="New session"
+              aria-label="New project session"
             >
               <svg
                 width="16"
@@ -2439,7 +2640,7 @@ export function WorkspaceSidebar({
                 onDragEnd={reorderDisabled ? undefined : handleDragEnd}
               >
                 {(() => {
-                  const liveGroups = filteredGroups.filter(sidebarGroupHasLiveWorkspace);
+                  const liveGroups = filteredGroups.filter(sidebarGroupShouldRender);
                   // Every visible group is sortable, synthetic Multi-repo /
                   // Scratch included: they default to the bottom but can be
                   // dragged to any position. Group drag is off while a filter
@@ -2465,6 +2666,8 @@ export function WorkspaceSidebar({
                           onClick={() => !q && onToggleGroup(group.id)}
                           onUpdateAppearance={onUpdateRepoAppearance}
                           onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(fullGroup)}
+                          onPin={readOnly || offline ? undefined : onPinProject}
+                          onUnpin={readOnly || offline ? undefined : onUnpinProject}
                           onNewSession={() =>
                             group.capabilities.create === "repo" && group.repoPath
                               ? onCreateSession(group.repoPath)
@@ -2498,11 +2701,13 @@ export function WorkspaceSidebar({
                                     onDelete={onDeleteSession}
                                     onStop={onStopSession}
                                     onStart={onStartSession}
+                                    onCreateSession={onCreateSession}
                                     readOnly={readOnly}
                                     optimistic={triage.optimisticFor(v.workspace.id)}
                                     onPinToggle={triage.pinToggle}
                                     onArchiveToggle={triage.archiveToggle}
                                     onSnooze={triage.snooze}
+                                    onUnreadToggle={triage.unreadToggle}
                                     // Drag is disabled when the tier
                                     // comparator already controls placement:
                                     // lastActivity mode has no manual
@@ -2540,7 +2745,7 @@ export function WorkspaceSidebar({
             </DragSuppressContext.Provider>
           )}
           {isNested &&
-            filteredNested.filter(nestedSidebarGroupHasLiveWorkspace).map((ng) => {
+            filteredNested.filter(nestedSidebarGroupShouldRender).map((ng) => {
               const repo = ng.repo;
               const repoExpanded = q ? true : !repo.collapsed;
               const repoHasActiveChild = ng.subgroups.some((sg) =>
@@ -2554,6 +2759,8 @@ export function WorkspaceSidebar({
                     onClick={() => !q && onToggleGroup(repo.id)}
                     onUpdateAppearance={onUpdateRepoAppearance}
                     onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(repo)}
+                    onPin={readOnly || offline ? undefined : onPinProject}
+                    onUnpin={readOnly || offline ? undefined : onUnpinProject}
                     onNewSession={() =>
                       repo.capabilities.create === "repo" && repo.repoPath ? onCreateSession(repo.repoPath) : onNew()
                     }
@@ -2606,6 +2813,7 @@ export function WorkspaceSidebar({
                                 onPinToggle={triage.pinToggle}
                                 onArchiveToggle={triage.archiveToggle}
                                 onSnooze={triage.snooze}
+                                onUnreadToggle={triage.unreadToggle}
                                 indented
                               />
                             ))}
@@ -2615,6 +2823,16 @@ export function WorkspaceSidebar({
                 </div>
               );
             })}
+          <ProjectsSection
+            projects={savedProjects}
+            query={q}
+            readOnly={readOnly}
+            offline={offline}
+            onCreateSession={onCreateSession}
+            onAddProject={onAddProject}
+            onEditProject={onEditProject}
+            onRemoveProject={onRemoveProject}
+          />
           {(() => {
             // Single global "Snoozed & archived" section at the very
             // bottom of the sidebar. Aggregates sunk workspaces from
@@ -2674,6 +2892,7 @@ export function WorkspaceSidebar({
                       onPinToggle={triage.pinToggle}
                       onArchiveToggle={triage.archiveToggle}
                       onSnooze={triage.snooze}
+                      onUnreadToggle={triage.unreadToggle}
                       indented
                     />
                   ))}
@@ -2716,47 +2935,6 @@ export function WorkspaceSidebar({
         </div>
 
         <div className="border-t border-surface-700/20 p-2 flex items-center gap-1">
-          <button
-            onClick={onProjects}
-            className="w-8 h-8 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
-            title="Projects"
-            aria-label="Projects"
-          >
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
-            </svg>
-          </button>
-          <button
-            onClick={onProfiles}
-            className="w-8 h-8 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
-            title="Profiles"
-            aria-label="Profiles"
-          >
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            >
-              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
-              <circle cx="9" cy="7" r="4" />
-              <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
-              <path d="M16 3.13a4 4 0 0 1 0 7.75" />
-            </svg>
-          </button>
           <button
             onClick={onSettings}
             {...tourAnchor(TOUR_ANCHORS.sidebarSettings)}

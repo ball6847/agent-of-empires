@@ -444,6 +444,23 @@ pub struct AcpConfig {
     #[serde(default = "default_rate_limit_auto_resume_grace_secs")]
     #[setting(label = "Auto-resume grace (s)", widget = "number", min = 0, advanced)]
     pub rate_limit_auto_resume_grace_secs: u32,
+    /// Allow the web dashboard's "Update & restart" control to run the
+    /// agent's `npm install -g <pkg>` on the host and respawn the worker.
+    /// Off by default: the daemon executing a global package install is a
+    /// host-level capability (it runs arbitrary npm lifecycle scripts as the
+    /// daemon user), so it stays opt-in, is always blocked in read-only mode,
+    /// and is `local_only` so a remote dashboard client cannot flip it on.
+    /// Only npm-installable agents are eligible; others keep the manual
+    /// install hint. See #2109.
+    #[serde(default)]
+    #[setting(
+        label = "Allow agent install from web",
+        widget = "toggle",
+        web = "local_only:runs npm install on the host as the daemon user",
+        global_only,
+        advanced
+    )]
+    pub allow_agent_install: bool,
 }
 
 fn default_rate_limit_auto_resume_grace_secs() -> u32 {
@@ -520,6 +537,7 @@ impl Default for AcpConfig {
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
             rate_limit_auto_resume_grace_secs: default_rate_limit_auto_resume_grace_secs(),
+            allow_agent_install: false,
         }
     }
 }
@@ -649,6 +667,12 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_list_width: Option<u16>,
 
+    /// Whether the home-view session list is collapsed to a narrow,
+    /// click-to-expand strip. Persisted so the choice survives restarts,
+    /// mirroring `home_list_width`. `None`/absent means expanded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_sidebar_collapsed: Option<bool>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_file_list_width: Option<u16>,
 
@@ -667,6 +691,12 @@ pub struct AppStateConfig {
 
     #[serde(default)]
     pub has_seen_custom_instruction_warning: bool,
+
+    /// Latches once the user has been warned (when adding a project in the TUI)
+    /// that the directory is not a git repository, so the one-time notice about
+    /// git features being unavailable does not repeat on every non-git add.
+    #[serde(default)]
+    pub has_seen_non_git_project_warning: bool,
 
     #[serde(default)]
     pub has_acknowledged_agent_hooks: bool,
@@ -698,6 +728,26 @@ pub struct AppStateConfig {
     /// shelved session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_section_collapsed: Option<bool>,
+
+    /// Ids of tips the user has already seen/acknowledged. Drives the unseen
+    /// badge count and stops earned tips from re-popping. Ids come from
+    /// [`crate::tips`] and are stable, so this list stays meaningful across
+    /// upgrades.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tips_seen: Vec<String>,
+
+    /// How many times the new-session dialog has been opened while a project or
+    /// session was selected. Once this passes
+    /// [`crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD`], the "new from
+    /// selection" tip becomes eligible (the earned trigger that closes #2262).
+    #[serde(default)]
+    pub new_session_with_selection_count: u32,
+
+    /// Set once the user has actually used `N` (new-from-selection). They've
+    /// discovered the feature, so the tip that teaches it is suppressed even if
+    /// the count above crosses the threshold.
+    #[serde(default)]
+    pub used_new_from_selection: bool,
 
     /// Server-side mirror of the web dashboard's syncable UI state, keyed by
     /// the frontend's localStorage key (the value is the opaque string the
@@ -759,6 +809,17 @@ pub struct SessionConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Agent Status Hooks", widget = "toggle", category = "Agents")]
     pub agent_status_hooks: bool,
+
+    /// Auto-rename a new structured-view (ACP) session from its first message,
+    /// using the session's own agent in one-shot mode (e.g. `claude -p`). Only
+    /// applies while the session still carries its auto-generated name; a
+    /// manually named session is never touched. Title only: the worktree
+    /// directory is not moved (the running agent holds it). Agents without a
+    /// one-shot mode, sandboxed sessions, and command-overridden agents keep
+    /// the generated name.
+    #[serde(default = "default_true")]
+    #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
+    pub smart_rename: bool,
 
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
@@ -983,6 +1044,41 @@ pub struct SessionConfig {
     #[setting(label = "Confirm Before Quit", widget = "toggle", global_only)]
     pub confirm_before_quit: bool,
 
+    /// Show an unread indicator on sessions. When on (default), a session
+    /// whose turn just finished is painted in the theme's unread color until
+    /// you view it (Tab into live-send or Enter to attach), and you can flag
+    /// a session unread for later with `U`; unread rows also sort just below
+    /// Waiting in the Attention sort. Turn this off to disable the indicator,
+    /// the auto-marking, and the `U` toggle entirely.
+    ///
+    /// `global_only`: the gate is a single process-wide flag
+    /// (`crate::session::unread_enabled`), refreshed from the active profile's
+    /// resolved config, so it can't honor a per-profile override. Exposing it
+    /// as profile-overridable would silently ignore the override; keep the
+    /// schema honest by scoping it global.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Unread Session Indicator",
+        widget = "toggle",
+        category = "Interaction",
+        global_only
+    )]
+    pub unread_indicator: bool,
+
+    /// Show occasional discovery tips: the `💡` badge in the footer, the
+    /// browsable tips overlay, and the one-time earned pop. Turn this off to
+    /// hide the badge and stop tips from popping; seen/earned state still lives
+    /// in `app_state`. A global UX preference, not profile-overridable. See
+    /// [`crate::tips`].
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Show tips",
+        widget = "toggle",
+        category = "Interaction",
+        global_only
+    )]
+    pub show_tips: bool,
+
     /// Keep an aoe-managed worktree session's directory leaf in sync with its
     /// title. When enabled (default), renaming the session also moves its
     /// worktree directory, and new sessions derive the directory leaf from the
@@ -1088,6 +1184,7 @@ impl Default for SessionConfig {
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
             agent_status_hooks: true,
+            smart_rename: true,
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
@@ -1105,6 +1202,8 @@ impl Default for SessionConfig {
             default_attach_mode: NewSessionAttachMode::default(),
             click_action: ClickAction::default(),
             confirm_before_quit: true,
+            unread_indicator: true,
+            show_tips: true,
             tie_workdir_to_name: true,
         }
     }
@@ -2551,6 +2650,40 @@ mod tests {
         let app: AppStateConfig = toml::from_str(toml).unwrap();
         assert!(app.has_seen_web_tour);
         assert!(!app.has_seen_welcome);
+    }
+
+    #[test]
+    fn test_app_state_config_tips_defaults_and_roundtrip() {
+        // Absent from old configs: nothing seen, zero count. (The on/off toggle
+        // lives in `SessionConfig::show_tips`, not here.)
+        let app = AppStateConfig::default();
+        assert!(app.tips_seen.is_empty());
+        assert_eq!(app.new_session_with_selection_count, 0);
+        assert!(!app.used_new_from_selection);
+
+        let toml = r#"
+            tips_seen = ["new-from-selection"]
+            new_session_with_selection_count = 4
+            used_new_from_selection = true
+        "#;
+        let app: AppStateConfig = toml::from_str(toml).unwrap();
+        assert_eq!(app.tips_seen, vec!["new-from-selection"]);
+        assert_eq!(app.new_session_with_selection_count, 4);
+        assert!(app.used_new_from_selection);
+
+        // Round-trips back out.
+        let serialized = toml::to_string(&app).unwrap();
+        let reparsed: AppStateConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.tips_seen, app.tips_seen);
+        assert_eq!(reparsed.new_session_with_selection_count, 4);
+    }
+
+    #[test]
+    fn test_session_config_show_tips_defaults_on() {
+        // Absent from old configs, tips default to on.
+        let toml = "default_tool = \"claude\"\n";
+        let session: SessionConfig = toml::from_str(toml).unwrap();
+        assert!(session.show_tips);
     }
 
     // Full config serialization roundtrip

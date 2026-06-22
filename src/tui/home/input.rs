@@ -17,7 +17,8 @@ use crate::tui::dialogs::{
     DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog, HooksInstallDialog, InfoDialog,
     IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction, PaletteAction, PaletteCommand,
     PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog, RenameMode, RepoTrustAction,
-    RestartDialog, SendMessageDialog, UnifiedDeleteDialog, WorktreeNameDialog,
+    RestartDialog, SendMessageDialog, TipsDialog, TipsOutcome, UnifiedDeleteDialog,
+    WorktreeNameDialog,
 };
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
@@ -368,6 +369,64 @@ impl HomeView {
 
     pub fn hit_list(&self, col: u16, row: u16) -> bool {
         self.list_area.contains(Position::from((col, row)))
+    }
+
+    /// The `KeyEvent` a footer-toolbar button at `(col, row)` synthesizes,
+    /// or `None` when the click misses every button. The caller routes the
+    /// returned key through the normal key handler so a click behaves
+    /// exactly like pressing the shortcut. Returns `None` while a non-live
+    /// overlay (dialog, context menu, help, search) is open: the footer is
+    /// drawn underneath it, but the overlay owns clicks, so a footer button
+    /// must not fire a shortcut behind it.
+    pub fn footer_button_at(&self, col: u16, row: u16) -> Option<KeyEvent> {
+        if self.has_non_live_send_overlay() {
+            return None;
+        }
+        let pos = Position::from((col, row));
+        self.footer_buttons
+            .iter()
+            .find(|(rect, _)| rect.contains(pos))
+            .map(|(_, key)| *key)
+    }
+
+    /// Handle a left-click on the sidebar collapse/expand affordances:
+    /// the collapse button on the expanded list's top-right border, or
+    /// anywhere in the collapsed strip. Returns true when the click landed
+    /// on one (and toggled), so the caller can stop before the row-click
+    /// path. The collapse button sits on the list's top border, which is
+    /// inside `list_area`, so this MUST run before `hit_list` or the click
+    /// falls through to `handle_empty_list_click` and opens a new session.
+    /// No-op while a non-live overlay is open so a click can't toggle the
+    /// sidebar behind a modal (the rects are cleared for the full-screen
+    /// takeover views, so a dialog overlay is the case left to guard).
+    pub fn handle_sidebar_collapse_click(&mut self, col: u16, row: u16) -> bool {
+        if self.has_non_live_send_overlay() {
+            return false;
+        }
+        let pos = Position::from((col, row));
+        if self.collapse_button_area.contains(pos) || self.expand_strip_area.contains(pos) {
+            self.toggle_sidebar_collapsed();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Click on the footer tips badge: open the tips overlay. Returns true when
+    /// the click was on the badge (so the caller stops routing it). Gated on no
+    /// overlay being open, the badge rect is captured behind any modal, so this
+    /// keeps a click in the bottom-right corner from punching through.
+    pub fn handle_tips_badge_click(&mut self, col: u16, row: u16) -> bool {
+        if self.has_non_live_send_overlay() || self.diff_view.is_some() {
+            return false;
+        }
+        let hit = self
+            .tips_badge_rect
+            .is_some_and(|r| r.contains(Position::from((col, row))));
+        if hit {
+            self.open_tips_dialog();
+        }
+        hit
     }
 
     /// True when `(col, row)` lands on the side-by-side list/preview
@@ -888,7 +947,7 @@ impl HomeView {
                         // No pending_intro_theme: the live preview
                         // already applied the chosen theme to
                         // `app.theme`; re-applying would force a
-                        // terminal.clear() (the close-flash). Same
+                        // `clear_terminal` (the close-flash). Same
                         // rationale as the keyboard Submit branch.
                     }
                 }
@@ -922,6 +981,23 @@ impl HomeView {
             // hit rect (e.g. on the title or border): swallow it so
             // the underlying list doesn't shift selection out from
             // under the modal.
+            return true;
+        }
+        if let Some(dialog) = &mut self.tips_dialog {
+            if let Some(result) = dialog.handle_click(col, row) {
+                match result {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel => {
+                        self.tips_dialog = None;
+                    }
+                    DialogResult::Submit(outcome) => {
+                        self.tips_dialog = None;
+                        self.persist_tips_outcome(outcome);
+                    }
+                }
+            }
+            // Swallow every click while the overlay is open so it can't fall
+            // through to the list underneath.
             return true;
         }
         if let Some(dialog) = &mut self.new_dialog {
@@ -1472,7 +1548,7 @@ impl HomeView {
                     // applied the chosen theme to `app.theme` while the
                     // user was on the picker page. Re-dispatching here
                     // would only re-trigger `set_theme → needs_redraw`,
-                    // which forces a `terminal.clear()` on the next loop
+                    // which forces a `clear_terminal` on the next loop
                     // iteration — the close-flash the user sees.
                     return None;
                 }
@@ -1501,6 +1577,20 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.telemetry_consent_dialog = None;
                     persist_telemetry_consent(false);
+                }
+            }
+            return None;
+        }
+
+        if let Some(dialog) = &mut self.tips_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => {
+                    self.tips_dialog = None;
+                }
+                DialogResult::Submit(outcome) => {
+                    self.tips_dialog = None;
+                    self.persist_tips_outcome(outcome);
                 }
             }
             return None;
@@ -1707,6 +1797,12 @@ impl HomeView {
                         self.cancel_creation();
                     } else {
                         self.new_dialog = None;
+                        // Backing out of `n` with a selection is the most
+                        // contextual moment to surface the new-from-selection
+                        // tip; queue it (no-op until it's earned). On submit we
+                        // skip the pop so it doesn't interrupt session creation;
+                        // the badge still carries it. See #2262.
+                        self.queue_earned_tip_pop();
                     }
                 }
                 DialogResult::Submit(data) => {
@@ -2047,6 +2143,14 @@ impl HomeView {
             return None;
         }
 
+        // Drain a queued earned-tip pop now that the home view is idle: every
+        // overlay-routing block above has returned, so nothing is open here.
+        // Skip while searching so it can't interrupt a query. Opening the pop
+        // consumes this keystroke (it's a one-time, dismissable nudge). #2262
+        if !self.search_active && self.pending_tip_pop.is_some() && self.drain_pending_tip_pop() {
+            return None;
+        }
+
         // Search mode. Intentionally takes priority over the Ctrl+K palette
         // binding below: while the search input is focused, every key (including
         // Ctrl+K) feeds the search box. Users can press Esc to exit search and
@@ -2320,12 +2424,18 @@ impl HomeView {
                     tracing::error!("toggle_snooze_at_cursor failed: {}", e);
                 }
             }
+            ActionId::ToggleUnread => {
+                if let Err(e) = self.toggle_unread_at_cursor() {
+                    tracing::error!("toggle_unread_at_cursor failed: {}", e);
+                }
+            }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
             ActionId::SortPicker => self.show_sort_picker(),
             ActionId::GroupBy => self.show_group_picker(),
             ActionId::ToggleProjectPin => self.toggle_project_pin_at_cursor(),
             ActionId::NextWaiting => self.jump_to_next_waiting(),
+            ActionId::Tips => self.open_tips_dialog(),
         }
         None
     }
@@ -2402,6 +2512,9 @@ impl HomeView {
                 dialog.focus_title();
             }
             self.new_dialog = Some(dialog);
+            // The user just used N, so they've discovered it; suppress the tip
+            // that teaches it.
+            self.record_used_new_from_selection();
         }
     }
 
@@ -2500,6 +2613,18 @@ impl HomeView {
             .worktree_info
             .as_ref()
             .and_then(|w| w.base_branch.clone());
+
+        // A session on a non-git project runs in place, so there is no repo to
+        // diff against. Show a clear message instead of letting the git layer
+        // surface a raw "could not open repository" error.
+        if !crate::git::GitWorktree::is_git_repo(&repo_path) {
+            self.info_dialog = Some(InfoDialog::new(
+                "No Git Repository",
+                "This session runs in place in a non-git directory, so there is no diff to show.",
+            ));
+            return;
+        }
+
         match DiffView::new_for_session(
             repo_path,
             Some(session_id_owned),
@@ -2789,7 +2914,8 @@ impl HomeView {
             };
             if let Some(inst) = self.get_instance(&id) {
                 let is_actionable = inst.status == Status::Waiting
-                    || matches!(inst.idle_age(), Some(age) if age < window);
+                    || matches!(inst.idle_age(), Some(age) if age < window)
+                    || (crate::session::unread_enabled() && inst.is_unread());
                 if is_actionable {
                     self.cursor = idx;
                     self.update_selected();
@@ -2915,6 +3041,7 @@ impl HomeView {
                 ) {
                     self.start_live_send()
                 } else {
+                    self.exit_live_send_before_attach();
                     Some(Action::AttachSession(id))
                 }
             }
@@ -2939,9 +3066,14 @@ impl HomeView {
                 } else {
                     TerminalMode::Host
                 };
+                self.exit_live_send_before_attach();
                 Some(Action::AttachTerminal(id, terminal_mode))
             }
-            ViewMode::Tool(ref tool_name) => Some(Action::AttachToolSession(id, tool_name.clone())),
+            ViewMode::Tool(ref tool_name) => {
+                let tool_name = tool_name.clone();
+                self.exit_live_send_before_attach();
+                Some(Action::AttachToolSession(id, tool_name))
+            }
         }
     }
 
@@ -3019,6 +3151,12 @@ impl HomeView {
             }
             if self.selected_session != prev_session {
                 self.preview_scroll_offset = 0;
+                // Moving off a hand-flagged row ends its manual-unread hold, so
+                // returning to it later dwell-clears like any other unread. Done
+                // here at the cursor->selection sync (every navigation path runs
+                // through it) so the release doesn't hinge on a dwell tick
+                // happening to fire during a quick hop to another row.
+                self.manual_unread_hold = None;
             }
         }
     }
@@ -3332,12 +3470,12 @@ impl HomeView {
             } else if is_group {
                 ContextMenuDialog::for_group(anchor)
             } else {
-                let (is_archived, is_snoozed) = match &self.flat_items[idx] {
+                let (is_archived, is_snoozed, is_unread) = match &self.flat_items[idx] {
                     super::Item::Session { id, .. } => self
                         .get_instance(id)
-                        .map(|inst| (inst.is_archived(), inst.is_snoozed()))
-                        .unwrap_or((false, false)),
-                    super::Item::Group { .. } => (false, false),
+                        .map(|inst| (inst.is_archived(), inst.is_snoozed(), inst.is_unread()))
+                        .unwrap_or((false, false, false)),
+                    super::Item::Group { .. } => (false, false, false),
                 };
                 // Snooze is an Attention-sort triage primitive: the `'h'`
                 // keybinding only fires in Attention sort, so the menu omits
@@ -3345,7 +3483,10 @@ impl HomeView {
                 // paths in step.
                 let snooze = (self.sort_order == crate::session::config::SortOrder::Attention)
                     .then_some(is_snoozed);
-                ContextMenuDialog::for_session(anchor, is_archived, snooze)
+                // The unread toggle is always-on (any sort), so it shows
+                // whenever the feature is enabled.
+                let unread = crate::session::unread_enabled().then_some(is_unread);
+                ContextMenuDialog::for_session(anchor, is_archived, snooze, unread)
             });
             return true;
         }
@@ -3422,12 +3563,18 @@ impl HomeView {
                     tracing::error!("toggle_snooze_at_cursor (context menu) failed: {}", e);
                 }
             }
+            ContextMenuAction::ToggleUnread => {
+                // Same cursor-on-the-clicked-row guarantee as ToggleArchive.
+                if let Err(e) = self.toggle_unread_at_cursor() {
+                    tracing::error!("toggle_unread_at_cursor (context menu) failed: {}", e);
+                }
+            }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),
-            // The right-click already moved the cursor onto the group row, so
-            // reuse the "new from selection" path: with a group selected it
-            // prefills the project's repo path (and group) the same way `'N'`
-            // does on a session.
-            ContextMenuAction::NewFromGroup => self.open_new_from_selection(),
+            // The right-click already moved the cursor onto the row, so reuse
+            // the "new from selection" path: a session row prefills its own repo
+            // path and group, a group/project row borrows a member's path, the
+            // same way `'N'` does.
+            ContextMenuAction::NewFromSelection => self.open_new_from_selection(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
             ContextMenuAction::TogglePin => {
@@ -3456,6 +3603,13 @@ impl HomeView {
             self.show_no_agents();
             return;
         }
+        // Earned-tip signal: opening `n` with a row/group selected is exactly
+        // the situation where `N` (new-from-selection) would have helped, so
+        // count it. Once it crosses the threshold the "new from selection" tip
+        // earns its way into the badge/list and a one-time pop (#2262).
+        if self.selected_session.is_some() || self.selected_group.is_some() {
+            self.record_new_session_with_selection();
+        }
         let existing_groups: Vec<String> =
             self.all_groups().iter().map(|g| g.path.clone()).collect();
         let current_profile = self.config_profile();
@@ -3466,6 +3620,126 @@ impl HomeView {
             &current_profile,
             profiles,
         ));
+    }
+
+    /// Open the tips overlay (the browsable list from `crate::tips`). Shared by
+    /// the command palette, the `?` help screen, and the tips badge so they
+    /// can't drift. Always opens, even with no eligible tips, so an explicit
+    /// "Show tips" gives feedback (an empty state) rather than silently doing
+    /// nothing.
+    pub(super) fn open_tips_dialog(&mut self) {
+        let config = load_config().ok().flatten().unwrap_or_default();
+        let signals = crate::tips::TipSignals {
+            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
+            used_new_from_selection: config.app_state.used_new_from_selection,
+        };
+        let eligible = crate::tips::eligible(&signals);
+        self.tips_dialog = Some(TipsDialog::new(
+            eligible,
+            config.app_state.tips_seen.clone(),
+            !config.session.show_tips,
+            self.strict_hotkeys,
+        ));
+    }
+
+    /// Persist what the tips overlay reported on close: merge newly-seen ids
+    /// into `tips_seen` and apply a "don't show tips" toggle if the user
+    /// flipped it. Merging (rather than overwriting) preserves seen ids for
+    /// tips that aren't currently eligible.
+    pub(super) fn persist_tips_outcome(&mut self, outcome: TipsOutcome) {
+        if outcome.newly_seen.is_empty() && outcome.disabled.is_none() {
+            return;
+        }
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            for id in outcome.newly_seen {
+                if !config.app_state.tips_seen.iter().any(|s| s == &id) {
+                    config.app_state.tips_seen.push(id);
+                }
+            }
+            if let Some(disabled) = outcome.disabled {
+                config.session.show_tips = !disabled;
+            }
+            self.tips_unseen = super::tips_unseen_count(&config);
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.input", "Failed to persist tips state: {}", e);
+            }
+        }
+    }
+
+    /// Bump the "opened new-session with a selection" counter that earns the
+    /// new-from-selection tip (#2262), persist it, and refresh the badge.
+    fn record_new_session_with_selection(&mut self) {
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            config.app_state.new_session_with_selection_count = config
+                .app_state
+                .new_session_with_selection_count
+                .saturating_add(1);
+            self.tips_unseen = super::tips_unseen_count(&config);
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.input", "Failed to persist tip signal: {}", e);
+            }
+        }
+    }
+
+    /// Record that the user has used `N` (new-from-selection). They've found the
+    /// feature, so the tip teaching it is suppressed from now on; also cancel a
+    /// queued pop and refresh the badge. Writes once (idempotent).
+    fn record_used_new_from_selection(&mut self) {
+        // They know about N now; don't pop the tip that teaches it.
+        if self.pending_tip_pop.map(|t| t.id) == Some("new-from-selection") {
+            self.pending_tip_pop = None;
+        }
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            if config.app_state.used_new_from_selection {
+                return;
+            }
+            config.app_state.used_new_from_selection = true;
+            self.tips_unseen = super::tips_unseen_count(&config);
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.input", "Failed to persist tip signal: {}", e);
+            }
+        }
+    }
+
+    /// After the new-session dialog closes, queue an earned tip to pop gently
+    /// if one just became eligible and tips aren't disabled. Drained on the
+    /// next keystroke by `drain_pending_tip_pop`, so it never interrupts an
+    /// in-flight action.
+    pub(super) fn queue_earned_tip_pop(&mut self) {
+        if self.pending_tip_pop.is_some() {
+            return;
+        }
+        let config = load_config().ok().flatten().unwrap_or_default();
+        if !config.session.show_tips {
+            return;
+        }
+        let signals = crate::tips::TipSignals {
+            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
+            used_new_from_selection: config.app_state.used_new_from_selection,
+        };
+        self.pending_tip_pop = crate::tips::next_earned_pop(&config.app_state.tips_seen, &signals);
+    }
+
+    /// Open the queued earned tip as a small one-tip overlay, if any. Called
+    /// when the home view is idle (no other overlay) so the pop never
+    /// interrupts an action. Returns true if a pop was opened, so the caller
+    /// can treat the triggering keystroke as consumed.
+    pub(super) fn drain_pending_tip_pop(&mut self) -> bool {
+        let Some(tip) = self.pending_tip_pop.take() else {
+            return false;
+        };
+        let config = load_config().ok().flatten().unwrap_or_default();
+        // Re-check: the user may have disabled tips between queueing and now.
+        if !config.session.show_tips {
+            return false;
+        }
+        self.tips_dialog = Some(TipsDialog::new(
+            vec![tip],
+            config.app_state.tips_seen.clone(),
+            !config.session.show_tips,
+            self.strict_hotkeys,
+        ));
+        true
     }
 
     /// Left-click on the empty area of the sidebar (below the last
@@ -3943,6 +4217,16 @@ impl HomeView {
             overlay_changed |= dialog.handle_hover(col, row);
         }
 
+        // Footer-toolbar hover: the index drives the inverted-chip highlight
+        // on the next render. Recomputed against the current button rects so
+        // it clears the moment the pointer leaves a button.
+        let prev_footer_hover = self.footer_hover;
+        self.footer_hover = self
+            .footer_buttons
+            .iter()
+            .position(|(rect, _)| rect.contains(Position::from((col, row))));
+        let footer_changed = prev_footer_hover != self.footer_hover;
+
         let new_pos = if self.list_inner_area.contains(Position::from((col, row))) {
             Some((col, row))
         } else {
@@ -3951,7 +4235,18 @@ impl HomeView {
         let prev_idx = self.hovered_index();
         self.mouse_pos = new_pos;
         let new_idx = self.hovered_index();
-        overlay_changed || prev_idx != new_idx
+
+        // Footer tips badge: highlight on hover like a session row. Gated to no
+        // overlay being open (the badge isn't clickable then), matching
+        // `handle_tips_badge_click`.
+        let badge_hover = !self.has_non_live_send_overlay()
+            && self
+                .tips_badge_rect
+                .is_some_and(|r| r.contains(Position::from((col, row))));
+        let badge_changed = badge_hover != self.tips_badge_hovered;
+        self.tips_badge_hovered = badge_hover;
+
+        overlay_changed || footer_changed || badge_changed || prev_idx != new_idx
     }
 
     /// Route a mouse-wheel-down at (col, row); see handle_scroll_up.
@@ -4287,6 +4582,23 @@ impl HomeView {
         }
     }
 
+    /// Exit live-send before an activation hands the terminal to a tmux
+    /// attach. The double-click (and Enter) activation path resolves
+    /// through `default_attach_mode`, so when `click_action = LiveSend`
+    /// the *first* click of a double-click already entered live-send for
+    /// the row; the second click then resolves to a tmux attach
+    /// (`default_attach_mode = Tmux`). Without this teardown the
+    /// just-spawned worker keeps dispatching against a pane we're
+    /// leaving, the attach inherits the preview-pinned window size
+    /// instead of growing to the client, and detaching drops the user
+    /// back into live mode rather than the home list (#2290). No-op when
+    /// not live-sending.
+    fn exit_live_send_before_attach(&mut self) {
+        if let Some(state) = self.live_send.clone() {
+            self.exit_live_send_and_restore_sizing(&state);
+        }
+    }
+
     /// Tear down live-send state and restore the tmux window's
     /// automatic sizing policy. live-send's per-keystroke resize loop
     /// forces tmux into manual sizing; if we leave it that way, the
@@ -4303,11 +4615,12 @@ impl HomeView {
         // previewed after exit, just at the idle cadence. The render
         // reconcile retunes it (and retargets if the view later changes).
         self.live_send_last_resize = None;
-        // The leader menu and sidebar collapse are live-mode-only: drop
-        // any half-entered leader chord and re-reveal the session list so
-        // the normal home view is never left in a collapsed or armed state.
+        // The leader menu is live-mode-only: drop any half-entered chord so
+        // the home view is never left armed. The sidebar collapse is now a
+        // general, persisted home-view state (the collapsed strip stays
+        // clickable here), so exiting live mode deliberately leaves it as
+        // the user set it rather than force-revealing the list.
         self.live_send_pending_leader = false;
-        self.sidebar_collapsed = false;
         // Live mode just owned the pane's size; the non-live preview must
         // re-assert its geometry on the next render now that the header is
         // visible again (and so the agent reflows back to the previewed size).

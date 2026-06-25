@@ -17,11 +17,12 @@ use super::environment::{build_docker_env_args, shell_escape};
 use super::poller::SessionPoller;
 
 use crate::session::capture::{
-    capture_codex_session_id, capture_gemini_session_id, capture_hermes_session_id,
-    capture_pi_session_id, capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed,
-    codex_poll_fn, codex_poll_fn_sandboxed, gemini_poll_fn, gemini_poll_fn_sandboxed,
-    generate_claude_session_id, hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id,
-    opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn, pi_poll_fn_sandboxed,
+    capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,
+    capture_gemini_session_id, capture_hermes_session_id, capture_pi_session_id,
+    capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed, codex_poll_fn,
+    codex_poll_fn_sandboxed, gemini_poll_fn, gemini_poll_fn_sandboxed, generate_claude_session_id,
+    hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id, opencode_poll_fn,
+    opencode_poll_fn_sandboxed, pi_poll_fn, pi_poll_fn_sandboxed,
     try_capture_codex_session_id_in_container, try_capture_gemini_session_id_in_container,
     try_capture_hermes_session_id_in_container, try_capture_opencode_session_id,
     try_capture_opencode_session_id_in_container, try_capture_pi_session_id_in_container,
@@ -453,6 +454,15 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_at: Option<DateTime<Utc>>,
 
+    /// Namespaced per-session plugin data, keyed by plugin id. Each plugin
+    /// owns only its own slot (`plugin_meta["<id>"]`), an opaque JSON value it
+    /// reads and writes through the host API that lands with the Tier 1 host
+    /// (#2095). Data for an uninstalled plugin is retained, since it is cheap
+    /// and reinstalling restores the session's state. Additive: absent in
+    /// older `sessions.json` rows, so no migration is needed.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub plugin_meta: std::collections::BTreeMap<String, serde_json::Value>,
+
     /// Scratch-session marker. When true, `project_path` points at an
     /// auto-provisioned directory under `<app_dir>/scratch/<id>/` that the
     /// deletion path removes on `aoe rm` (unless the user opts in to keeping
@@ -557,6 +567,16 @@ pub struct Instance {
     #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,
+
+    /// Set when this session was imported from an existing Claude Code
+    /// session on disk. While true, the next structured spawn seeds the
+    /// event store from the agent's `session/load` history replay (instead
+    /// of suppressing it like a normal reattach does) so the imported
+    /// transcript renders. Cleared once the load completes and the history
+    /// is durably stored. See #2276.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_pending: Option<bool>,
 
     // Runtime state (not serialized)
     #[serde(skip)]
@@ -772,6 +792,16 @@ pub(crate) fn persist_session_to_storage(
     }
 }
 
+/// Emit `fresh` only when it differs from the stored session id, the
+/// "override only when distinct" contract shared by both branches of
+/// `capture_freshest_session_id` (sidecar and mtime fallback).
+fn override_if_distinct(stored: Option<&str>, fresh: String) -> Option<String> {
+    match stored {
+        Some(known) if known == fresh => None,
+        _ => Some(fresh),
+    }
+}
+
 /// Publish a captured session ID to the tmux environment only.
 ///
 /// Background threads (poller on_change) call this so that
@@ -810,6 +840,7 @@ impl Instance {
             unread: false,
             idle_dormant_since: None,
             pinned_at: None,
+            plugin_meta: std::collections::BTreeMap::new(),
             scratch: false,
             worktree_info: None,
             workspace_info: None,
@@ -831,6 +862,8 @@ impl Instance {
             agent_model: None,
             #[cfg(feature = "serve")]
             acp_session_id: None,
+            #[cfg(feature = "serve")]
+            import_pending: None,
             last_error_check: None,
             last_start_time: None,
             last_error: None,
@@ -1399,9 +1432,11 @@ impl Instance {
     /// Returns `(session_id, is_existing)`. Consults `resume_intent` first:
     /// `Use(sid)` returns the user-pinned target; `Cleared` skips both the
     /// observed sid and retroactive capture (forces a fresh start, generating
-    /// a Claude UUID if applicable); `Default` falls back to the observed sid
-    /// (`agent_session_id`), then retroactive capture, then fresh UUID for
-    /// Claude.
+    /// a Claude UUID if applicable); `Default` verifies the observed sid
+    /// against live tool state via `capture_freshest_session_id` (so a
+    /// post-`/clear` session id supersedes a stale stored one), falls back
+    /// to retroactive capture when no sid is observed, then to a fresh
+    /// Claude UUID.
     pub fn acquire_session_id(&mut self) -> (Option<String>, bool) {
         match &self.resume_intent {
             ResumeIntent::Use(sid) => {
@@ -1424,8 +1459,19 @@ impl Instance {
             ResumeIntent::Default => {}
         }
 
-        if self.agent_session_id.is_some() {
-            return (self.agent_session_id.clone(), true);
+        if let Some(stored) = self.agent_session_id.clone() {
+            if let Some(fresh) = self.capture_freshest_session_id() {
+                tracing::info!(
+                    target: "session.store",
+                    stale = %stored,
+                    fresh = %fresh,
+                    tool = %self.tool,
+                    "Replacing stored session id with fresher live observation"
+                );
+                self.agent_session_id = Some(fresh.clone());
+                return (Some(fresh), true);
+            }
+            return (Some(stored), true);
         }
 
         let tmux_exists = self.tmux_session().is_ok_and(|s| s.exists());
@@ -1468,6 +1514,20 @@ impl Instance {
     pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
         let exclusion = self.retroactive_capture_exclusion_set();
         let result: Option<String> = match self.tool.as_str() {
+            "claude" => {
+                if self.is_sandboxed() {
+                    let container_name = self.sandbox_info.as_ref()?.container_name.clone();
+                    capture_claude_session_id_in_container(
+                        &container_name,
+                        &self.container_workdir(),
+                        &exclusion,
+                        None,
+                    )
+                    .ok()
+                } else {
+                    capture_claude_session_id(&self.project_path, None, &exclusion).ok()
+                }
+            }
             "opencode" => {
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
@@ -1550,6 +1610,49 @@ impl Instance {
             _ => None,
         };
         result.and_then(validated_session_id)
+    }
+
+    /// Returns `Some(fresh)` when the live tool state shows a session id
+    /// distinct from `self.agent_session_id`, otherwise `None`. Reuses
+    /// the per-tool dispatch in `try_retroactive_capture` so the freshness
+    /// contract (mtime, SQLite ordering, exclusion set, host/container)
+    /// stays encapsulated in each tool's existing capture function.
+    ///
+    /// For Claude the authoritative per-instance sidecar
+    /// (`/tmp/aoe-hooks-<euid>/<instance_id>/session_id`, written by the
+    /// SessionStart / UserPromptSubmit hooks) is consulted first. It is keyed
+    /// by instance id, so it can never name a peer instance's conversation,
+    /// unlike the mtime disk scan, which picks the most-recent jsonl in the
+    /// shared `~/.claude/projects/<encoded-cwd>/` dir and so can select a
+    /// co-located peer's session when several AoE sessions share one cwd
+    /// (#2344). The mtime scan is only used as a fallback when no fresh
+    /// sidecar exists (e.g. an old session resumed after the 5-minute
+    /// sidecar window), matching the ordering already used by
+    /// `claude_poll_fn`. Sandboxed Claude is included: its `SessionStart`
+    /// hook writes through the `/tmp/aoe-hooks/<id>` bind-mount onto the
+    /// host path, so `read_hook_session_id` reads it the same way, and the
+    /// mtime fallback below still routes through the container-aware branch
+    /// of `try_retroactive_capture`.
+    ///
+    /// Two deliberate divergences from `claude_poll_fn`, both correct for the
+    /// resume context: (1) an excluded sidecar id returns `None` here rather
+    /// than falling through to the mtime scan, since falling through is what
+    /// re-opens #2344; (2) this reader and `claude_poll_fn` read the same
+    /// sidecar without a shared snapshot, so a hook rotation between the two
+    /// reads can briefly surface different UUIDs, benign under the existing
+    /// eventual-consistency capture model.
+    pub(crate) fn capture_freshest_session_id(&self) -> Option<String> {
+        if self.tool == "claude" {
+            if let Some(authoritative) = crate::hooks::read_hook_session_id(&self.id) {
+                if self.retroactive_capture_excludes.contains(&authoritative) {
+                    return None;
+                }
+                return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
+            }
+        }
+
+        let live = self.try_retroactive_capture()?;
+        override_if_distinct(self.agent_session_id.as_deref(), live)
     }
 
     fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> bool {
@@ -2033,51 +2136,57 @@ impl Instance {
                     }
                 }
             }
-        } else if agent.is_some_and(|a| a.name == "codex") && !self.is_sandboxed() {
-            if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
-                match self.codex_config_path_for_launch_env() {
-                    Ok(config_path) => {
-                        if let Err(e) = crate::hooks::install_codex_hooks(
-                            &config_path,
-                            hook_cfg.events,
-                            crate::hooks::HookInstallTarget::Host,
-                        ) {
-                            tracing::warn!("Failed to install codex hooks: {}", e);
-                        }
-                    }
-                    Err(e) => tracing::warn!("Failed to resolve codex config path: {}", e),
-                }
-            }
         } else if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
-            if self.is_sandboxed() {
-                // For sandboxed sessions, hooks are installed via build_container_config
-            } else {
-                // Install hooks in the agent's host settings file, honoring a
-                // config-dir override env var (e.g. CLAUDE_CONFIG_DIR) so hooks
-                // land where the agent actually reads them.
-                match crate::hooks::agent_settings_path_for_host_environment(
-                    hook_cfg,
-                    &self.profile_host_environment(),
-                ) {
-                    Ok(settings_path) => {
-                        if let Err(e) = crate::hooks::install_hooks(
-                            &settings_path,
-                            hook_cfg.events,
-                            crate::hooks::HookInstallTarget::Host,
-                        ) {
-                            tracing::warn!(target: "session.store", "Failed to install agent hooks: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "session.store", "Failed to resolve agent hooks path: {}", e)
+            if !self.is_sandboxed() {
+                match hook_cfg.format {
+                    crate::agents::HookFormat::CodexJson => self.install_codex_host_hooks(hook_cfg),
+                    crate::agents::HookFormat::JsonSettings => {
+                        self.install_json_host_hooks(hook_cfg)
                     }
                 }
             }
+            // Sandboxed sessions install via build_container_config.
         }
     }
 
-    fn codex_config_path_for_launch_env(&self) -> Result<PathBuf> {
-        crate::hooks::codex_config_path_for_host_environment(&self.profile_host_environment())
+    fn install_codex_host_hooks(&self, hook_cfg: &crate::agents::AgentHookConfig) {
+        match crate::hooks::codex_hooks_json_path_for_host_environment(
+            &self.profile_host_environment(),
+        ) {
+            Ok(hooks_path) => {
+                if let Err(e) = crate::hooks::install_hooks(
+                    &hooks_path,
+                    hook_cfg.events,
+                    crate::hooks::HookInstallTarget::Host,
+                ) {
+                    tracing::warn!("Failed to install codex hooks: {}", e);
+                }
+            }
+            Err(e) => tracing::warn!("Failed to resolve codex hooks path: {}", e),
+        }
+    }
+
+    fn install_json_host_hooks(&self, hook_cfg: &crate::agents::AgentHookConfig) {
+        // Install hooks in the agent's host settings file, honoring a
+        // config-dir override env var (e.g. CLAUDE_CONFIG_DIR) so hooks
+        // land where the agent actually reads them.
+        match crate::hooks::agent_settings_path_for_host_environment(
+            hook_cfg,
+            &self.profile_host_environment(),
+        ) {
+            Ok(settings_path) => {
+                if let Err(e) = crate::hooks::install_hooks(
+                    &settings_path,
+                    hook_cfg.events,
+                    crate::hooks::HookInstallTarget::Host,
+                ) {
+                    tracing::warn!(target: "session.store", "Failed to install agent hooks: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "session.store", "Failed to resolve agent hooks path: {}", e)
+            }
+        }
     }
 
     /// Build the tmux command for a host (non-sandboxed) session.
@@ -3853,11 +3962,12 @@ mod tests {
         inst.detect_as = "codex".to_string();
         inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
 
-        let config_path = tmp.path().join(".codex").join("config.toml");
-        let config = std::fs::read_to_string(config_path).unwrap();
-        assert!(config.contains("[[hooks.PreToolUse]]"));
-        assert!(config.contains("aoe-hooks"));
-        assert!(!tmp.path().join(".codex").join("hooks.json").exists());
+        let hooks_path = tmp.path().join(".codex").join("hooks.json");
+        let hooks = std::fs::read_to_string(hooks_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&hooks).unwrap();
+        assert!(parsed["hooks"]["PreToolUse"].is_array());
+        assert!(hooks.contains("aoe-hooks"));
+        assert!(!tmp.path().join(".codex").join("config.toml").exists());
     }
 
     #[test]
@@ -3883,11 +3993,12 @@ mod tests {
         inst.source_profile = "codex-profile".to_string();
         inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
 
-        let config_path = codex_home.join("config.toml");
-        let config = std::fs::read_to_string(config_path).unwrap();
-        assert!(config.contains("[[hooks.PreToolUse]]"));
-        assert!(config.contains("aoe-hooks"));
-        assert!(!tmp.path().join(".codex").join("config.toml").exists());
+        let hooks_path = codex_home.join("hooks.json");
+        let hooks = std::fs::read_to_string(hooks_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&hooks).unwrap();
+        assert!(parsed["hooks"]["PreToolUse"].is_array());
+        assert!(hooks.contains("aoe-hooks"));
+        assert!(!tmp.path().join(".codex").join("hooks.json").exists());
     }
 
     #[test]
@@ -3912,7 +4023,7 @@ mod tests {
         inst.source_profile = "hooks-disabled".to_string();
         inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
 
-        assert!(!tmp.path().join(".codex").join("config.toml").exists());
+        assert!(!tmp.path().join(".codex").join("hooks.json").exists());
     }
 
     #[test]
@@ -3941,10 +4052,11 @@ mod tests {
         inst.source_profile = "hooks-enabled".to_string();
         inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
 
-        let config_path = tmp.path().join(".codex").join("config.toml");
-        let config = std::fs::read_to_string(config_path).unwrap();
-        assert!(config.contains("[[hooks.PreToolUse]]"));
-        assert!(config.contains("aoe-hooks"));
+        let hooks_path = tmp.path().join(".codex").join("hooks.json");
+        let hooks = std::fs::read_to_string(hooks_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&hooks).unwrap();
+        assert!(parsed["hooks"]["PreToolUse"].is_array());
+        assert!(hooks.contains("aoe-hooks"));
     }
 
     #[test]
@@ -4092,6 +4204,37 @@ mod tests {
             json.get("unread").is_none(),
             "false must skip serialization"
         );
+    }
+
+    #[test]
+    fn test_plugin_meta_serde_round_trip() {
+        // Empty map is omitted from disk.
+        let inst = Instance::new("t", "/tmp");
+        let json = serde_json::to_value(&inst).unwrap();
+        assert!(
+            json.get("plugin_meta").is_none(),
+            "empty plugin_meta must skip serialization"
+        );
+
+        // A plugin's namespaced slot round-trips.
+        let mut set = Instance::new("t", "/tmp");
+        set.plugin_meta
+            .insert("aoe.status".to_string(), serde_json::json!({ "score": 3 }));
+        let json = serde_json::to_value(&set).unwrap();
+        let back: Instance = serde_json::from_value(json).unwrap();
+        assert_eq!(back.plugin_meta["aoe.status"]["score"], 3);
+
+        // Rows written before the field existed deserialize to an empty map.
+        let inst: Instance = serde_json::from_value(serde_json::json!({
+            "id": "abc",
+            "title": "t",
+            "project_path": "/tmp",
+            "tool": "claude",
+            "status": "idle",
+            "created_at": "2026-01-01T00:00:00Z",
+        }))
+        .expect("deserialize without plugin_meta");
+        assert!(inst.plugin_meta.is_empty());
     }
 
     #[test]
@@ -4784,6 +4927,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_yolo_envvar_command_is_quoted() {
         // EnvVar values containing JSON must be shell-escaped to prevent
         // the inner bash from expanding special characters ({, *, ").
@@ -6768,6 +6912,322 @@ mod tests {
             assert!(sid.is_some());
             assert!(!is_existing);
             assert_eq!(inst.agent_session_id, sid);
+        }
+
+        mod verify_on_resume {
+            use super::*;
+            use crate::session::capture::encode_claude_project_path;
+            use std::fs;
+            use std::time::{Duration, SystemTime};
+            use tempfile::{tempdir, TempDir};
+
+            struct ClaudeHomeGuard {
+                prev_home: Option<String>,
+                prev_xdg: Option<String>,
+                prev_claude: Option<String>,
+            }
+
+            impl ClaudeHomeGuard {
+                fn set(temp: &TempDir) -> Self {
+                    let prev_home = std::env::var("HOME").ok();
+                    let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+                    let prev_claude = std::env::var("CLAUDE_CONFIG_DIR").ok();
+                    std::env::set_var("HOME", temp.path());
+                    #[cfg(any(target_os = "linux", target_os = "macos"))]
+                    std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+                    std::env::set_var("CLAUDE_CONFIG_DIR", temp.path().join(".claude"));
+                    Self {
+                        prev_home,
+                        prev_xdg,
+                        prev_claude,
+                    }
+                }
+            }
+
+            impl Drop for ClaudeHomeGuard {
+                fn drop(&mut self) {
+                    restore_or_remove("HOME", self.prev_home.take());
+                    restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
+                    restore_or_remove("CLAUDE_CONFIG_DIR", self.prev_claude.take());
+                }
+            }
+
+            fn restore_or_remove(key: &str, prev: Option<String>) {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+
+            fn write_jsonl_with_mtime(path: &std::path::Path, mtime: SystemTime) {
+                fs::write(path, "").unwrap();
+                let f = fs::File::options().write(true).open(path).unwrap();
+                f.set_times(fs::FileTimes::new().set_modified(mtime))
+                    .unwrap();
+            }
+
+            #[test]
+            #[serial]
+            fn supersedes_stale_claude_sid_after_clear() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2291-claude-bascule";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let stale = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+                let fresh = "11111111-2222-3333-4444-555555555555";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{stale}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{fresh}.jsonl")),
+                    now - Duration::from_secs(10),
+                );
+
+                let mut inst = Instance::new("verify-claude-bascule", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            #[test]
+            #[serial]
+            fn no_bascule_when_claude_stored_matches_freshest() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2291-claude-steady";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let live = "ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{live}.jsonl")),
+                    now - Duration::from_secs(10),
+                );
+
+                let mut inst = Instance::new("verify-claude-steady", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(live.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(live));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(live));
+            }
+
+            #[test]
+            #[serial]
+            fn stored_sid_returned_when_no_jsonl_on_disk() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2291-no-jsonl";
+                let stored = "12121212-3434-5656-7878-9a9a9a9a9a9a";
+
+                let mut inst = Instance::new("verify-claude-no-jsonl", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(stored.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(stored));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(stored));
+            }
+
+            #[test]
+            #[serial]
+            fn unaffected_for_unsupported_tool() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let mut inst = Instance::new("verify-cursor", "/tmp/aoe-test-2291-cursor");
+                inst.tool = "cursor".to_string();
+                inst.agent_session_id = Some("stored-cursor-sid".to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some("stored-cursor-sid"));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some("stored-cursor-sid"));
+            }
+
+            // #2344: when several AoE Claude sessions share one cwd, the
+            // most-recent jsonl in the shared `~/.claude/projects/<encoded-cwd>/`
+            // dir is often a *peer* session's conversation. The mtime scan would
+            // pick it and clobber this instance's stored sid on resume. The
+            // per-instance hook sidecar is authoritative and must win over the
+            // mtime guess: here the sidecar names the instance's own conversation
+            // while a peer's jsonl is strictly fresher on disk.
+            #[test]
+            #[serial]
+            fn sidecar_wins_over_fresher_peer_jsonl() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2344-shared-cwd";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                // `mine` is this instance's real conversation (named by its
+                // sidecar). `peer` is a co-located peer's conversation that is
+                // strictly freshest on disk. `stored` is a stale id distinct
+                // from `mine`, so asserting `sid == mine` proves the sidecar
+                // actively overrode the stored value rather than the stored
+                // value passing through unchanged.
+                let mine = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+                let peer = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+                let stored = "cccccccc-3333-4333-8333-cccccccccccc";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{mine}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{peer}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let mut inst = Instance::new("verify-2344-shared-cwd", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(stored.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let dir = super::write_sidecar(&inst.id, mine);
+                let (sid, is_existing) = inst.acquire_session_id();
+                std::fs::remove_dir_all(&dir).ok();
+
+                // The authoritative sidecar overrides the stale stored sid;
+                // the peer's fresher jsonl never wins.
+                assert_eq!(sid.as_deref(), Some(mine));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
+            }
+
+            // #2344 follow-up: a sandboxed Claude session must also consult the
+            // sidecar. Its SessionStart hook writes through the
+            // `/tmp/aoe-hooks/<id>` bind-mount onto the host path, so
+            // `read_hook_session_id` reads it the same way a host session's is
+            // read. Without the sidecar short-circuit the sandbox-aware mtime
+            // branch would pick a peer's fresher jsonl in the shared cwd.
+            #[test]
+            #[serial]
+            fn sidecar_consulted_for_sandboxed_claude() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2344-sandbox";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                // `stored` is distinct from the sidecar `mine`, so the assertion
+                // proves the sidecar actively overrode the stale stored value.
+                let mine = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee";
+                let peer = "ffffffff-6666-4666-8666-ffffffffffff";
+                let stored = "dddddddd-7777-4777-8777-dddddddddddd";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{mine}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{peer}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let mut inst = Instance::new("verify-2344-sandbox", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(stored.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+                inst.sandbox_info = Some(crate::session::SandboxInfo {
+                    enabled: true,
+                    container_id: None,
+                    image: "test-image".to_string(),
+                    container_name: "verify-2344-sandbox".to_string(),
+                    extra_env: None,
+                    custom_instruction: None,
+                    before_start_env: Vec::new(),
+                });
+                assert!(inst.is_sandboxed());
+
+                let dir = super::write_sidecar(&inst.id, mine);
+                let (sid, is_existing) = inst.acquire_session_id();
+                std::fs::remove_dir_all(&dir).ok();
+
+                // Sidecar (host-readable) names this instance's conversation, so
+                // the peer's fresher jsonl does not win even though sandbox would
+                // otherwise route through the container-aware mtime branch.
+                assert_eq!(sid.as_deref(), Some(mine));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
+            }
+
+            // Companion to the above: without a sidecar (e.g. a session resumed
+            // after the 5-minute sidecar window) the mtime fallback still
+            // applies, preserving the #2291 daemon-mode fix.
+            #[test]
+            #[serial]
+            fn mtime_fallback_applies_without_sidecar() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2344-no-sidecar";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let stale = "cccccccc-3333-4333-8333-cccccccccccc";
+                let fresh = "dddddddd-4444-4444-8444-dddddddddddd";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{stale}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{fresh}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let mut inst = Instance::new("verify-2344-no-sidecar", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(stale.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(fresh));
+                assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
         }
 
         #[test]

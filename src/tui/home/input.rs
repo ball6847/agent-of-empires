@@ -1207,9 +1207,7 @@ impl HomeView {
                 }
                 DialogResult::Submit(order) => {
                     self.sort_picker_dialog = None;
-                    if order != self.sort_order {
-                        self.apply_sort_order(order);
-                    }
+                    self.apply_sort_order(order);
                 }
             }
             return true;
@@ -1996,6 +1994,16 @@ impl HomeView {
             return None;
         }
 
+        if let Some(dialog) = &mut self.plugin_manager_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel | DialogResult::Submit(()) => {
+                    self.plugin_manager_dialog = None;
+                }
+            }
+            return None;
+        }
+
         if let Some(dialog) = &mut self.group_picker_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
@@ -2037,9 +2045,7 @@ impl HomeView {
                 }
                 DialogResult::Submit(order) => {
                     self.sort_picker_dialog = None;
-                    if order != self.sort_order {
-                        self.apply_sort_order(order);
-                    }
+                    self.apply_sort_order(order);
                 }
             }
             return None;
@@ -2405,6 +2411,9 @@ impl HomeView {
                 let profile = self.config_profile();
                 self.projects_dialog = Some(ProjectsDialog::new(&profile));
             }
+            ActionId::Plugins => {
+                self.plugin_manager_dialog = Some(crate::tui::dialogs::PluginManagerDialog::new());
+            }
             ActionId::Restart => self.open_restart_dialog(),
             ActionId::Update => return self.run_update(update_info),
             ActionId::ToggleArchive => {
@@ -2647,19 +2656,32 @@ impl HomeView {
     fn open_serve(&mut self) {
         #[cfg(feature = "serve")]
         {
+            let web_disabled = crate::plugin::registry()
+                .get("aoe.web")
+                .is_some_and(|p| !p.enabled);
+            if web_disabled {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Web dashboard disabled",
+                    "The aoe.web plugin is disabled, so the web dashboard cannot \
+                     be served.\n\n\
+                     Re-enable it in Settings > Plugins (or run \
+                     `aoe plugin enable aoe.web`), then press R again.",
+                ));
+                return;
+            }
             self.serve_view = Some(crate::tui::dialogs::ServeView::new());
         }
         #[cfg(not(feature = "serve"))]
         {
             self.info_dialog = Some(InfoDialog::new(
                 "Serve unavailable",
-                "This `aoe` binary was built without the `serve` feature, \
-                 so the web dashboard, local network serving, and \
-                 Cloudflare Tunnel integration are not included.\n\n\
+                "This `aoe` binary was built without the web dashboard \
+                 (a `--no-default-features` source build), so local network \
+                 serving and Cloudflare Tunnel integration are not included.\n\n\
                  To serve to your phone (LAN / Tailscale / tunnel):\n\
                    \u{2022} Install a release build from GitHub Releases, or\n\
-                   \u{2022} Build from source with:\n\
-                     cargo build --release --features serve\n\n\
+                   \u{2022} Build from source with default features:\n\
+                     cargo build --release\n\n\
                  Once you have a `serve`-enabled binary, press R again to \
                  open the serve dialog.",
             ));
@@ -3011,7 +3033,7 @@ impl HomeView {
                 #[cfg(not(feature = "serve"))]
                 {
                     return Some(Action::SetTransientStatus(
-                        "Acp session: rebuild with --features serve to attach".to_string(),
+                        "Acp session: rebuild with default features to attach".to_string(),
                     ));
                 }
             }
@@ -3097,7 +3119,7 @@ impl HomeView {
                 #[cfg(not(feature = "serve"))]
                 {
                     return Some(Action::SetTransientStatus(
-                        "Acp session: rebuild with --features serve to attach".to_string(),
+                        "Acp session: rebuild with default features to attach".to_string(),
                     ));
                 }
             }
@@ -3236,6 +3258,7 @@ impl HomeView {
             self.project_group_collapsed
                 .insert(path.to_string(), !collapsed);
             self.flat_items = self.build_flat_items();
+            self.save_project_group_collapsed();
             return;
         }
         // Route to the correct profile's GroupTree
@@ -3633,7 +3656,7 @@ impl HomeView {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
         };
-        let eligible = crate::tips::eligible(&signals);
+        let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);
         self.tips_dialog = Some(TipsDialog::new(
             eligible,
             config.app_state.tips_seen.clone(),
@@ -3717,7 +3740,11 @@ impl HomeView {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
         };
-        self.pending_tip_pop = crate::tips::next_earned_pop(&config.app_state.tips_seen, &signals);
+        self.pending_tip_pop = crate::tips::next_earned_pop(
+            crate::tips::TipSurface::Tui,
+            &config.app_state.tips_seen,
+            &signals,
+        );
     }
 
     /// Open the queued earned tip as a small one-tip overlay, if any. Called
@@ -3841,8 +3868,16 @@ impl HomeView {
                 .clone()
                 .unwrap_or_else(|| self.config_profile());
             let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
-            let existing_groups: Vec<String> =
-                self.all_groups().iter().map(|g| g.path.clone()).collect();
+            // Duplicate-name validation is per-profile (rename_selected_group
+            // checks only the target profile's tree), so the dialog's existing
+            // names must be scoped to this group's profile too. Spanning all
+            // profiles would falsely block renaming to a name that only
+            // collides with a same-named group in a different profile.
+            let existing_groups: Vec<String> = self
+                .group_trees
+                .get(&current_profile)
+                .map(|t| t.get_all_groups().iter().map(|g| g.path.clone()).collect())
+                .unwrap_or_default();
             self.group_rename_context = Some(super::GroupRenameContext {
                 old_path: group_path.clone(),
                 old_profile: current_profile.clone(),
@@ -3986,16 +4021,31 @@ impl HomeView {
                 self.info_dialog = Some(InfoDialog::new("Cannot Modify Project Groups", hint));
                 return;
             }
+            // Scope the count to the selected group's profile: two groups in
+            // different profiles can share a path, and counting by path alone
+            // would pop the "delete N sessions" options dialog for an empty
+            // group whose same-named twin in another profile still has rows.
+            let owning_profile = self.selected_group_profile.clone();
             let prefix = format!("{}/", group_path);
             let session_count = self
                 .instances
                 .iter()
-                .filter(|i| i.group_path == *group_path || i.group_path.starts_with(&prefix))
+                .filter(|i| {
+                    (i.group_path == *group_path || i.group_path.starts_with(&prefix))
+                        && owning_profile
+                            .as_ref()
+                            .is_none_or(|p| &i.source_profile == p)
+                })
                 .count();
 
             if session_count > 0 {
-                let has_managed_worktrees = self.group_has_managed_worktrees(group_path, &prefix);
-                let has_containers = self.group_has_containers(group_path, &prefix);
+                let has_managed_worktrees = self.group_has_managed_worktrees(
+                    group_path,
+                    &prefix,
+                    owning_profile.as_deref(),
+                );
+                let has_containers =
+                    self.group_has_containers(group_path, &prefix, owning_profile.as_deref());
                 self.group_delete_options_dialog = Some(GroupDeleteOptionsDialog::new(
                     group_path.clone(),
                     session_count,
@@ -4217,14 +4267,16 @@ impl HomeView {
             overlay_changed |= dialog.handle_hover(col, row);
         }
 
-        // Footer-toolbar hover: the index drives the inverted-chip highlight
-        // on the next render. Recomputed against the current button rects so
-        // it clears the moment the pointer leaves a button.
+        // Footer-toolbar hover: the hovered button's shortcut drives the
+        // inverted-chip highlight on the next render. Recomputed against the
+        // current button rects so it clears the moment the pointer leaves a
+        // button.
         let prev_footer_hover = self.footer_hover;
         self.footer_hover = self
             .footer_buttons
             .iter()
-            .position(|(rect, _)| rect.contains(Position::from((col, row))));
+            .find(|(rect, _)| rect.contains(Position::from((col, row))))
+            .map(|(_, key)| *key);
         let footer_changed = prev_footer_hover != self.footer_hover;
 
         let new_pos = if self.list_inner_area.contains(Position::from((col, row))) {
@@ -4788,6 +4840,10 @@ impl HomeView {
     }
 
     /// Re-score matches after a reload without moving the cursor.
+    fn search_haystack_for(inst: &crate::session::Instance) -> String {
+        format!("{} {}", inst.title, inst.project_path)
+    }
+
     pub(super) fn refresh_search_matches(&mut self) {
         let query = self.search_query.value();
         if query.is_empty() {
@@ -4815,7 +4871,7 @@ impl HomeView {
             let haystack = match item {
                 Item::Session { id, .. } => {
                     if let Some(inst) = self.get_instance(id) {
-                        format!("{} {}", inst.title, inst.project_path)
+                        Self::search_haystack_for(inst)
                     } else {
                         continue;
                     }
@@ -4869,7 +4925,7 @@ impl HomeView {
             let haystack = match item {
                 Item::Session { id, .. } => {
                     if let Some(inst) = self.get_instance(id) {
-                        format!("{} {}", inst.title, inst.project_path)
+                        Self::search_haystack_for(inst)
                     } else {
                         continue;
                     }

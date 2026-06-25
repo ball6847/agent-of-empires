@@ -88,6 +88,44 @@ pub struct Config {
     /// palette (Ctrl+K).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tools: HashMap<String, ToolSessionConfig>,
+
+    /// Per-plugin configuration keyed by plugin id (`[plugins."aoe.web"]`).
+    /// An explicit typed map rather than a root-level flatten so unknown core
+    /// keys still fail loudly while plugin enable-state survives every save.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub plugins: std::collections::BTreeMap<String, PluginConfig>,
+}
+
+/// Configuration for one bundled plugin: whether it is enabled, plus its
+/// schema-free persisted settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginConfig {
+    /// Whether the plugin is active. A disabled plugin contributes nothing to
+    /// any surface.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+
+    /// The plugin's persisted settings (`[plugins."<id>".settings]`). Kept as
+    /// an opaque `toml::Table` so values survive on disk even while the plugin
+    /// is disabled; the typed schema that validates and renders them lands
+    /// with Tier 0 registries (#2094). Declared after `enabled` so the scalar
+    /// reads above the nested table; the toml serializer emits scalars before
+    /// subtables regardless, so the order is for readability. Empty is omitted.
+    #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
+    pub settings: toml::Table,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+            settings: toml::Table::new(),
+        }
+    }
 }
 
 /// Configuration for a user-defined tool session (lazygit, yazi, tig, etc.)
@@ -729,6 +767,14 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_section_collapsed: Option<bool>,
 
+    /// Paths of project-mode sidebar folders the user has collapsed. Stored as
+    /// the set of collapsed paths (absent/expanded folders are not listed), so
+    /// the choice survives restarts. Group-mode collapse lives on the per-profile
+    /// GroupTrees in session storage; project-mode folders are auto-derived and
+    /// have no group record, so their collapse state is persisted here instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_group_collapsed: Vec<String>,
+
     /// Ids of tips the user has already seen/acknowledged. Drives the unseen
     /// badge count and stops earned tips from re-popping. Ids come from
     /// [`crate::tips`] and are stable, so this list stays meaningful across
@@ -820,6 +866,20 @@ pub struct SessionConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
     pub smart_rename: bool,
+
+    /// Agent used for the one-shot smart-rename title call. Empty means use the
+    /// session's own agent. Set this to point smart rename at a cheaper or more
+    /// obedient title model (e.g. codex or opencode) without changing the
+    /// session's working agent. Only agents with a one-shot mode qualify; an
+    /// unknown or one-shot-incapable value falls back to leaving the generated
+    /// name. The picker lists installed one-shot-capable agents.
+    #[serde(default)]
+    #[setting(
+        label = "Smart-rename agent",
+        widget = "custom:smart-rename-agent",
+        category = "Agents"
+    )]
+    pub smart_rename_agent: String,
 
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
@@ -1185,6 +1245,7 @@ impl Default for SessionConfig {
             agent_command_override: HashMap::new(),
             agent_status_hooks: true,
             smart_rename: true,
+            smart_rename_agent: String::new(),
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
@@ -2139,12 +2200,12 @@ pub(crate) fn config_path() -> Result<PathBuf> {
 impl Config {
     pub fn load() -> Result<Self> {
         let path = config_path()?;
-        if !path.exists() {
-            return Ok(Config::default());
-        }
-
-        let content = fs::read_to_string(&path)?;
-        let mut config: Config = toml::from_str(&content)?;
+        let table: toml::Table = if path.exists() {
+            toml::from_str(&fs::read_to_string(&path)?)?
+        } else {
+            toml::Table::new()
+        };
+        let mut config: Config = table.try_into()?;
         config.normalize();
         Ok(config)
     }
@@ -2198,7 +2259,8 @@ pub fn load_config() -> Result<Option<Config>> {
 
 pub fn save_config(config: &Config) -> Result<()> {
     let path = config_path()?;
-    let content = toml::to_string_pretty(config)?;
+    let table = toml::Table::try_from(config)?;
+    let content = toml::to_string_pretty(&table)?;
     super::atomic_write(&path, content.as_bytes())?;
     Ok(())
 }
@@ -2378,6 +2440,72 @@ mod tests {
         assert_eq!(config.default_profile, "custom");
         // Other fields should have defaults
         assert!(!config.worktree.enabled);
+    }
+
+    #[test]
+    fn test_plugins_table_round_trips_through_save() {
+        // A plugin's enable-state must survive serialize/deserialize.
+        let toml_in = r#"
+            [plugins."aoe.web"]
+            enabled = false
+        "#;
+        let config: Config = toml::from_str(toml_in).unwrap();
+        assert!(!config.plugins["aoe.web"].enabled);
+
+        let serialized = toml::to_string(&config).unwrap();
+        let reloaded: Config = toml::from_str(&serialized).unwrap();
+        assert!(!reloaded.plugins["aoe.web"].enabled);
+    }
+
+    #[test]
+    fn test_plugins_default_empty_and_omitted_from_toml() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.plugins.is_empty());
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(
+            !serialized.contains("[plugins"),
+            "empty plugins map must not serialize a stray section"
+        );
+    }
+
+    #[test]
+    fn test_plugin_settings_persist_even_while_disabled() {
+        // Disabling a plugin hides its settings from every surface but must
+        // never destroy them: the values survive a save/load round-trip.
+        let toml_in = r#"
+            [plugins."aoe.status"]
+            enabled = false
+
+            [plugins."aoe.status".settings]
+            poll_interval_ms = 1000
+            verbose = true
+        "#;
+        let config: Config = toml::from_str(toml_in).unwrap();
+        let plugin = &config.plugins["aoe.status"];
+        assert!(!plugin.enabled);
+        assert_eq!(plugin.settings["poll_interval_ms"].as_integer(), Some(1000));
+
+        let serialized = toml::to_string(&config).unwrap();
+        let reloaded: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            reloaded.plugins["aoe.status"].settings["verbose"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_plugin_empty_settings_omitted_from_toml() {
+        let toml_in = r#"
+            [plugins."aoe.web"]
+            enabled = true
+        "#;
+        let config: Config = toml::from_str(toml_in).unwrap();
+        assert!(config.plugins["aoe.web"].settings.is_empty());
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(
+            !serialized.contains("settings"),
+            "empty plugin settings must not serialize a stray section"
+        );
     }
 
     // Tests for ThemeConfig

@@ -1795,7 +1795,8 @@ fn using_n_suppresses_the_earned_tip() {
     env.view.selected_session = Some(id);
     // Earn the tip (badge showing) without queueing a pop.
     earn_tip(&mut env);
-    assert!(env.view.tips_unseen > 0, "tip is earned and badged");
+    let earned = env.view.tips_unseen;
+    assert!(earned > 0, "tip is earned and badged");
 
     // The user discovers N for themselves: open new-from-selection.
     env.view.handle_key(key(KeyCode::Char('N')), None);
@@ -1803,8 +1804,10 @@ fn using_n_suppresses_the_earned_tip() {
         env.view.new_dialog.is_some(),
         "N opens the new-from-selection dialog"
     );
+    // The earned tip drops from the badge (rotation tips, if any, remain).
     assert_eq!(
-        env.view.tips_unseen, 0,
+        env.view.tips_unseen,
+        earned - 1,
         "using N suppresses the tip that teaches it"
     );
 
@@ -2341,8 +2344,8 @@ fn test_group_has_managed_worktrees() {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    assert!(view.group_has_managed_worktrees("work", "work/"));
-    assert!(!view.group_has_managed_worktrees("other", "other/"));
+    assert!(view.group_has_managed_worktrees("work", "work/", None));
+    assert!(!view.group_has_managed_worktrees("other", "other/", None));
 }
 
 #[test]
@@ -2391,8 +2394,8 @@ fn test_group_has_containers() {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    assert!(view.group_has_containers("work", "work/"));
-    assert!(!view.group_has_containers("other", "other/"));
+    assert!(view.group_has_containers("work", "work/", None));
+    assert!(!view.group_has_containers("other", "other/", None));
 }
 
 #[test]
@@ -2995,6 +2998,115 @@ fn test_group_collapsed_state_saved_to_storage() {
     assert!(
         saved_group.collapsed,
         "collapsed state should be persisted to storage"
+    );
+}
+
+/// Project-mode folder collapse must survive a restart. Unlike group mode
+/// (persisted on the per-profile GroupTree), project folders are auto-derived
+/// and have no group record, so their collapse state is written to
+/// `app_state.project_group_collapsed`. Regression for collapsed project
+/// folders re-expanding on relaunch.
+#[test]
+#[serial]
+fn test_project_group_collapsed_state_persists_to_config() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Find a project folder header and confirm it starts expanded.
+    let (group_idx, group_path) = env
+        .view
+        .flat_items
+        .iter()
+        .enumerate()
+        .find_map(|(idx, item)| match item {
+            Item::Group {
+                path, collapsed, ..
+            } => {
+                assert!(!collapsed, "project folder should start expanded");
+                Some((idx, path.clone()))
+            }
+            _ => None,
+        })
+        .expect("project mode should have a folder header");
+
+    // Collapse it via Enter, which routes through toggle_group_collapsed.
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+    env.view.handle_key(key(KeyCode::Enter), None);
+
+    // The collapsed path must be persisted to the on-disk config.
+    let config = crate::session::config::load_config()
+        .unwrap()
+        .expect("config should exist after collapse");
+    assert!(
+        config
+            .app_state
+            .project_group_collapsed
+            .contains(&group_path),
+        "collapsed project folder path should be persisted to app_state"
+    );
+
+    // A freshly constructed HomeView (simulating relaunch) must restore it.
+    let fresh = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert_eq!(
+        fresh.project_group_collapsed.get(&group_path).copied(),
+        Some(true),
+        "relaunched HomeView should restore the collapsed project folder"
+    );
+}
+
+/// A collapse entry for a project that no longer exists must be pruned on save
+/// so the persisted set can't grow without bound as projects come and go. A
+/// still-live folder collapsed in the same session must survive.
+#[test]
+#[serial]
+fn test_project_group_collapsed_prunes_stale_paths() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // A real folder the user collapsed this session.
+    let live_path = env
+        .view
+        .flat_items
+        .iter()
+        .find_map(|item| match item {
+            Item::Group { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .expect("project mode should have a folder header");
+
+    env.view
+        .project_group_collapsed
+        .insert(live_path.clone(), true);
+    // A stale entry for a project that isn't part of this session at all.
+    env.view
+        .project_group_collapsed
+        .insert("/repos/deleted-ghost".to_string(), true);
+
+    env.view.save_project_group_collapsed();
+
+    let config = crate::session::config::load_config()
+        .unwrap()
+        .expect("config should exist after save");
+    let saved = &config.app_state.project_group_collapsed;
+    assert!(
+        saved.contains(&live_path),
+        "a live collapsed folder must be persisted"
+    );
+    assert!(
+        !saved.iter().any(|p| p == "/repos/deleted-ghost"),
+        "a collapse entry for a nonexistent project must be pruned"
     );
 }
 
@@ -4589,6 +4701,136 @@ fn test_delete_group_scoped_to_owning_profile() {
     assert_eq!(
         beta_inst.group_path, "work",
         "beta's instance should still be in 'work'"
+    );
+}
+
+/// Opening the group-delete dialog must scope its session count to the
+/// selected group's profile. Two profiles can own a same-named group; an
+/// empty group in one profile should open the simple confirm, not the
+/// "delete N sessions" options dialog driven by its populated twin in
+/// another profile. Regression for the group-key conflict where the empty
+/// group was not the one the delete modal acted on.
+#[test]
+#[serial]
+fn test_group_delete_dialog_scoped_to_owning_profile() {
+    use crate::session::GroupTree;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    // alpha owns an EMPTY "work" group (group exists, no sessions).
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
+    let mut tree_a = GroupTree::new_with_groups(&[], &[]);
+    tree_a.create_group("work");
+    storage_a
+        .update(|i, g| {
+            *i = vec![];
+            *g = tree_a.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    // beta owns a same-named "work" group that still has a session.
+    let storage_b = Storage::new_unwatched("beta").unwrap();
+    let mut inst_b = Instance::new("B1", "/tmp/b");
+    inst_b.group_path = "work".to_string();
+    let tree_b = GroupTree::new_with_groups(&[inst_b.clone()], &[]);
+    storage_b
+        .update(|i, g| {
+            *i = [inst_b].to_vec();
+            *g = tree_b.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+
+    // Select alpha's (empty) "work" group.
+    let work_indices: Vec<usize> = view
+        .flat_items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, item)| match item {
+            Item::Group { path, .. } if path == "work" => Some(idx),
+            _ => None,
+        })
+        .collect();
+    for idx in work_indices {
+        view.cursor = idx;
+        view.update_selected();
+        if view.selected_group_profile.as_deref() == Some("alpha") {
+            break;
+        }
+    }
+    assert_eq!(view.selected_group_profile.as_deref(), Some("alpha"));
+
+    view.open_delete_for_selected();
+
+    assert!(
+        view.group_delete_options_dialog.is_none(),
+        "empty group must not trigger the with-sessions options dialog from a same-named group in another profile"
+    );
+    assert!(
+        view.confirm_dialog.is_some(),
+        "empty group should open the simple delete-group confirm"
+    );
+}
+
+/// Changing a session's profile via the rename dialog must prune the
+/// source profile's now-empty group, just like the restart-with-edits
+/// path does. Without the prune the source keeps an empty group with the
+/// same name as the target's copy, which renders as a duplicate header and
+/// collides on the shared group key.
+#[test]
+#[serial]
+fn test_rename_profile_change_prunes_source_group() {
+    use crate::session::GroupTree;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    // alpha has one session in "work"; beta exists but is empty.
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
+    let mut inst_a = Instance::new("A1", "/tmp/a");
+    inst_a.group_path = "work".to_string();
+    let id = inst_a.id.clone();
+    let tree_a = GroupTree::new_with_groups(&[inst_a.clone()], &[]);
+    storage_a
+        .update(|i, g| {
+            *i = [inst_a].to_vec();
+            *g = tree_a.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+    let _storage_b = Storage::new_unwatched("beta").unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.selected_session = Some(id.clone());
+
+    // Move the session alpha -> beta, keeping the same group name.
+    view.rename_selected("", None, Some("beta"), false).unwrap();
+
+    let moved = view.instances().iter().find(|i| i.id == id).unwrap();
+    assert_eq!(moved.source_profile, "beta");
+    assert_eq!(moved.group_path, "work");
+    assert!(
+        view.group_trees.get("beta").unwrap().group_exists("work"),
+        "beta should own the 'work' group after the move"
+    );
+    assert!(
+        !view
+            .group_trees
+            .get("alpha")
+            .map(|t| t.group_exists("work"))
+            .unwrap_or(false),
+        "alpha's now-empty 'work' group should be pruned after the profile move"
     );
 }
 
@@ -9314,12 +9556,12 @@ mod footer_toolbar {
     fn hover_tracks_button_under_pointer() {
         let mut env = create_test_env_with_sessions(3);
         render_at(&mut env, 120, 12);
-        let (rect, _) = env.view.footer_buttons[1];
+        let (rect, key) = env.view.footer_buttons[1];
 
         assert!(env.view.footer_hover.is_none());
         let changed = env.view.handle_hover(rect.x + 1, rect.y);
         assert!(changed, "moving onto a button is a hover change");
-        assert_eq!(env.view.footer_hover, Some(1));
+        assert_eq!(env.view.footer_hover, Some(key));
 
         // Same button, no change reported.
         assert!(!env.view.handle_hover(rect.x, rect.y));

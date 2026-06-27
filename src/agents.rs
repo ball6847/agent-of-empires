@@ -785,6 +785,7 @@ pub const AGENTS: &[AgentDef] = &[
     AgentDef {
         name: "kimi",
         binary: "kimi",
+        launch_subcommand: None,
         aliases: &["kimi-cli", "kimi-code"],
         detection: DetectionMethod::Which("kimi"),
         yolo: Some(YoloMode::CliFlag("--yolo")),

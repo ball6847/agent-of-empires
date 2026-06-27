@@ -534,6 +534,13 @@ pub enum Event {
     TodoListUpdated {
         todos: Vec<Todo>,
     },
+    /// Legacy event for agent-pushed ACP `session_info_update` titles. Kept so
+    /// persisted event logs from versions that emitted it still deserialize.
+    /// New Claude ACP title pushes are ignored; AoE owns automatic renaming via
+    /// `session::smart_rename`.
+    SessionTitleSuggested {
+        title: String,
+    },
     ToolCallStarted {
         tool_call: ToolCall,
     },
@@ -726,6 +733,13 @@ pub enum Event {
     RawAgentUpdate {
         payload: serde_json::Value,
     },
+    /// A prompt reached the adapter, but the adapter-side runtime failed
+    /// before any assistant transcript or tool event was emitted. Used
+    /// for recoverable turn failures, distinct from startup/handshake
+    /// errors that block the whole structured-view session. See #2426.
+    PromptRuntimeError {
+        message: String,
+    },
     /// An assistant message chunk (text). In ACP this comes as an
     /// `agent_message_chunk` session update.
     AgentMessageChunk {
@@ -914,6 +928,9 @@ impl AcpState {
         match event {
             Event::PlanUpdated { plan } => self.current_plan = Some(plan),
             Event::TodoListUpdated { todos } => self.todos = todos,
+            // Session title lives on `Instance`, not `AcpState`; the daemon's
+            // `acp_event_listener` applies it. No transcript state to mutate.
+            Event::SessionTitleSuggested { .. } => {}
             Event::ToolCallStarted { tool_call } => self.in_flight_tool = Some(tool_call),
             Event::ToolCallCompleted { tool_call_id, .. } => {
                 if self
@@ -1035,6 +1052,7 @@ impl AcpState {
             // clients see them in the replay buffer and know the session
             // made progress.
             Event::RawAgentUpdate { .. } => {}
+            Event::PromptRuntimeError { .. } => {}
             Event::AgentMessageChunk { .. } => {}
             // No in-memory mutation: the turn is still active (turnActive
             // stays true until a real `Stopped`). The reducer/UI derive the

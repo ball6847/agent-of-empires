@@ -99,6 +99,7 @@ import { OwnerAvatar } from "./OwnerAvatar";
 import { SessionGroupModal } from "./SessionGroupModal";
 import { SidebarSortPicker } from "./SidebarSortPicker";
 import { Tooltip } from "./Tooltip";
+import { PluginRowBadges, PluginRowColumn } from "./plugin/PluginSlots";
 
 const SIDEBAR_WIDTH_KEY = "aoe-sidebar-width";
 const SUNK_EXPANDED_KEY = "aoe-sidebar-sunk-expanded";
@@ -1195,6 +1196,8 @@ export const SessionRow = memo(function SessionRow({
                 <WakeupCountdown wakeAt={firstSession.next_wakeup_at} reason={firstSession.next_wakeup_reason} />
               )}
               {firstSession?.monitor_active && <MonitorBadge description={firstSession.monitor_description} />}
+              {firstSession && <PluginRowBadges sessionId={firstSession.id} />}
+              {firstSession && <PluginRowColumn sessionId={firstSession.id} />}
             </span>
             {subtitle && (
               <span className="block text-[11px] font-mono text-text-dim truncate" title={subtitleTitle ?? subtitle}>
@@ -1906,7 +1909,11 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
   const dotClass = STATUS_DOT_CLASS[group.status === "active" ? "Running" : "Idle"] ?? "bg-status-idle";
   const headerStyle = repoColorStyle(group.color);
   const headerHoverClass = group.color ? "" : "hover:bg-surface-800/50";
-  const sessionCount = group.workspaces.reduce((n, v) => n + v.workspace.sessions.length, 0);
+  // Count live rows only, matching the list rendered below (which drops
+  // workspaces where every session is archived or snoozed via
+  // workspaceIsSunk). Summing raw sessions inflated the badge above the
+  // visible row count. See #2372.
+  const sessionCount = group.workspaces.filter((v) => !workspaceIsSunk(v.workspace)).length;
 
   // The whole header row is the drag activator now (no grip handle), so a
   // drag ends with the pointer over one of the row's controls. Suppress the

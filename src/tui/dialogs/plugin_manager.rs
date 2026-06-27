@@ -1,7 +1,8 @@
-//! Plugin manager: list builtin plugins and enable/disable them from the TUI.
-//! The TUI twin of `aoe plugin list` and the web Plugins tab. This is the
-//! minimal core: a browse list with an enable/disable toggle. Install, update,
-//! uninstall, discovery, and capability approval return in follow-up PRs.
+//! Plugin manager: list plugins (builtin and external) with their trust and
+//! enabled/approval state, and enable/disable them from the TUI. The TUI twin
+//! of `aoe plugin list` and the web Plugins tab. Installing, updating, and
+//! capability approval are CLI-driven (`aoe plugin install`); the TUI shows the
+//! resulting state but does not perform installs.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -174,18 +175,41 @@ impl PluginManagerDialog {
             .rows
             .iter()
             .map(|row| {
-                let state = if row.enabled {
-                    ("enabled", theme.running)
-                } else {
+                let state = if !row.enabled {
                     ("disabled", theme.dimmed)
+                } else if row.needs_reapproval {
+                    // Waiting on the user to re-approve, not failed: use the
+                    // attention-needed color, not the error color.
+                    ("needs approval", theme.waiting)
+                } else {
+                    ("enabled", theme.running)
                 };
-                let spans = vec![
+                let mut spans = vec![
                     Span::styled(
                         format!("{:<28}", format!("{} v{}", row.name, row.version)),
                         Style::default().fg(theme.text),
                     ),
-                    Span::styled(format!("{:<12}", state.0), Style::default().fg(state.1)),
+                    Span::styled(
+                        format!("{:<10}", row.validation),
+                        Style::default().fg(theme.dimmed),
+                    ),
+                    Span::styled(format!("{:<14}", state.0), Style::default().fg(state.1)),
                 ];
+                // Disclose the dashboard UI slots the plugin renders into, so the
+                // manager shows that a plugin modifies the UI (#2366). Distinct
+                // slot names only; ids are in `aoe plugin info`.
+                if !row.ui_contributions.is_empty() {
+                    let mut slots: Vec<&str> = Vec::new();
+                    for u in &row.ui_contributions {
+                        if !slots.contains(&u.slot.as_str()) {
+                            slots.push(u.slot.as_str());
+                        }
+                    }
+                    spans.push(Span::styled(
+                        format!("ui: {}", slots.join(", ")),
+                        Style::default().fg(theme.dimmed),
+                    ));
+                }
                 ListItem::new(Line::from(spans))
             })
             .collect();

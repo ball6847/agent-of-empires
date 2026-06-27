@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::cli::truncate_id;
 use crate::containers::{self, DockerContainer};
 use crate::tmux;
 
@@ -302,6 +303,15 @@ pub struct SandboxInfo {
     /// Custom instruction text to inject into agent launch command
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_instruction: Option<String>,
+    /// The container's working directory, captured from
+    /// `ContainerConfig::working_dir` when the container is created (and
+    /// backfilled from a live container for sessions created before this field
+    /// existed). [`Instance::container_workdir`] returns this verbatim so every
+    /// `docker exec -w` targets the path the container was actually built with,
+    /// instead of a live recomputation that can drift once the host worktree's
+    /// git linkage breaks (#2414).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_workdir: Option<String>,
     /// `KEY=VALUE` pairs minted on the host by `host_hooks.before_start` when
     /// the container last came up. Injected into the container environment as
     /// inherited (leak-safe) entries by [`super::environment::collect_environment`].
@@ -354,6 +364,14 @@ impl ResumeIntent {
 pub struct Instance {
     pub id: String,
     pub title: String,
+    /// The last title written by the `smart_rename` automatic renamer.
+    /// An auto-rename overwrites `title` only while `title` is still a
+    /// default civ name or still equals this value, so a forced retry can
+    /// replace an automatic title while a manual rename (which changes `title`
+    /// but not this) is left untouched.
+    /// `None` on legacy records and freshly created sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_auto_title: Option<String>,
     pub project_path: String,
     #[serde(default)]
     pub group_path: String,
@@ -802,18 +820,53 @@ fn override_if_distinct(stored: Option<&str>, fresh: String) -> Option<String> {
     }
 }
 
+fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
+    let suffix = format!("_{}", truncate_id(instance_id, 8));
+    let output = std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let mut agent = None;
+    let mut terminal = None;
+    let mut container = None;
+    for name in String::from_utf8_lossy(&output.stdout).lines() {
+        if !name.ends_with(&suffix)
+            || name.starts_with(tmux::TOOL_PREFIX)
+            || crate::tmux::utils::is_pane_dead(name)
+        {
+            continue;
+        }
+
+        if name.starts_with(tmux::TERMINAL_PREFIX) {
+            terminal.get_or_insert_with(|| name.to_string());
+        } else if name.starts_with(tmux::CONTAINER_TERMINAL_PREFIX) {
+            container.get_or_insert_with(|| name.to_string());
+        } else if name.starts_with(tmux::SESSION_PREFIX) {
+            agent.get_or_insert_with(|| name.to_string());
+        }
+    }
+
+    agent.or(terminal).or(container)
+}
+
 /// Publish a captured session ID to the tmux environment only.
 ///
 /// Background threads (poller on_change) call this so that
 /// `build_exclusion_set()` on other instances can see the captured ID
 /// without racing with the TUI thread's `save()`.
-fn publish_session_to_tmux_env(tmux_session_name: &str, session_id: &str) {
-    if let Err(e) = crate::tmux::env::set_hidden_env(
-        tmux_session_name,
-        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-        session_id,
-    ) {
-        tracing::warn!(target: "session.store", "Failed to write captured session ID to tmux env: {}", e);
+fn publish_session_to_tmux_env(tmux_session_name: &str, instance_id: &str, session_id: &str) {
+    for (key, value) in [
+        (crate::tmux::env::AOE_INSTANCE_ID_KEY, instance_id),
+        (crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY, session_id),
+    ] {
+        if let Err(e) = crate::tmux::env::set_hidden_env(tmux_session_name, key, value) {
+            tracing::warn!(target: "session.store", "Failed to write {} to tmux env: {}", key, e);
+            return;
+        }
     }
 }
 
@@ -822,6 +875,7 @@ impl Instance {
         Self {
             id: generate_id(),
             title: title.to_string(),
+            last_auto_title: None,
             project_path: project_path.to_string(),
             group_path: String::new(),
             parent_session_id: None,
@@ -906,6 +960,24 @@ impl Instance {
                 .worktree_info
                 .as_ref()
                 .is_some_and(|w| w.managed_by_aoe)
+    }
+
+    /// Whether deleting this session has aoe-managed worktree state to clean
+    /// up, covering BOTH single-repo and multi-repo (workspace) sessions.
+    /// Single-repo sessions carry an aoe-managed `worktree_info`; workspace
+    /// sessions carry `workspace_info` instead (with `worktree_info = None`),
+    /// and opt into cleanup via `cleanup_on_delete`. Entry points use this to
+    /// decide whether to set `delete_worktree`; gating on `worktree_info`
+    /// alone silently leaks the workspace directory (#2363). Mirrors the TUI
+    /// group-delete predicate so every surface agrees.
+    pub fn has_managed_worktree_or_workspace(&self) -> bool {
+        self.worktree_info
+            .as_ref()
+            .is_some_and(|w| w.managed_by_aoe)
+            || self
+                .workspace_info
+                .as_ref()
+                .is_some_and(|ws| ws.cleanup_on_delete)
     }
 
     /// Stamp `last_accessed_at` to the current time AND wake the session
@@ -1695,12 +1767,51 @@ impl Instance {
         }
     }
 
+    /// The text searched for a user-selected `--agent NAME` flag: both the
+    /// command override (where a custom command like `kiro-cli chat --agent x`
+    /// may live) and the extra-args field (the usual place). Joined so a flag
+    /// in either is found.
+    fn selected_agent_args(&self) -> String {
+        if self.command.is_empty() {
+            self.extra_args.clone()
+        } else if self.extra_args.is_empty() {
+            self.command.clone()
+        } else {
+            format!("{} {}", self.command, self.extra_args)
+        }
+    }
+
+    /// Launch command including any agent `launch_subcommand` (e.g.
+    /// `kiro-cli chat`). A user command override takes precedence verbatim and
+    /// the subcommand is not applied to it. Used when assembling the launch
+    /// command so subcommand-scoped flags (yolo, resume) parse correctly.
+    fn get_launch_command(&self) -> String {
+        if self.command.is_empty() {
+            crate::agents::get_agent(&self.tool)
+                .map(|a| a.launch_base_command())
+                .unwrap_or_else(|| "bash".to_string())
+        } else {
+            self.command.clone()
+        }
+    }
+
     pub fn tmux_session(&self) -> Result<tmux::Session> {
         tmux::Session::new(&self.id, &self.title)
     }
 
+    pub(crate) fn tmux_env_session_name(&self) -> Option<String> {
+        tmux_env_session_name_for_instance_id(&self.id)
+    }
+
     pub fn terminal_tmux_session(&self) -> Result<tmux::TerminalSession> {
-        tmux::TerminalSession::new(&self.id, &self.title)
+        self.terminal_tmux_session_indexed(0)
+    }
+
+    /// Paired host terminal at `index`. Index 0 is the historical single
+    /// terminal (the only one the TUI uses); index >= 1 are the additional
+    /// web dashboard terminal tabs (#2437).
+    pub fn terminal_tmux_session_indexed(&self, index: u32) -> Result<tmux::TerminalSession> {
+        tmux::TerminalSession::new_indexed(&self.id, &self.title, index)
     }
 
     pub fn has_terminal(&self) -> bool {
@@ -1715,25 +1826,39 @@ impl Instance {
     }
 
     pub fn start_terminal_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
-        let session = self.terminal_tmux_session()?;
+        self.start_terminal_with_size_indexed(0, size)
+    }
+
+    pub fn start_terminal_with_size_indexed(
+        &mut self,
+        index: u32,
+        size: Option<(u16, u16)>,
+    ) -> Result<()> {
+        let session = self.terminal_tmux_session_indexed(index)?;
 
         let is_new = !session.exists();
         if is_new {
             session.create_with_size(&self.project_path, None, size)?;
+            // Apply all configured tmux options to terminal sessions too
+            self.apply_terminal_tmux_options(index);
         }
 
-        // Apply all configured tmux options to terminal sessions too
-        if is_new {
-            self.apply_terminal_tmux_options();
+        // The persisted `terminal_info` cache is the index-0 fast path the TUI
+        // reads; additional terminals (index >= 1) are tracked by the web
+        // dashboard and queried straight from tmux, like container terminals.
+        if index == 0 {
+            self.terminal_info = Some(TerminalInfo { created: true });
         }
-
-        self.terminal_info = Some(TerminalInfo { created: true });
 
         Ok(())
     }
 
     pub fn kill_terminal(&self) -> Result<()> {
-        let session = self.terminal_tmux_session()?;
+        self.kill_terminal_indexed(0)
+    }
+
+    pub fn kill_terminal_indexed(&self, index: u32) -> Result<()> {
+        let session = self.terminal_tmux_session_indexed(index)?;
         if session.exists() {
             session.kill()?;
         }
@@ -1745,7 +1870,11 @@ impl Instance {
     /// Returns true if a kill happened so the caller knows to re-spawn.
     /// A missing session or a live pane both return Ok(false).
     pub fn kill_terminal_if_dead(&self) -> Result<bool> {
-        let session = self.terminal_tmux_session()?;
+        self.kill_terminal_if_dead_indexed(0)
+    }
+
+    pub fn kill_terminal_if_dead_indexed(&self, index: u32) -> Result<bool> {
+        let session = self.terminal_tmux_session_indexed(index)?;
         if session.exists() && session.is_pane_dead() {
             let _ = session.kill();
             return Ok(true);
@@ -1754,7 +1883,14 @@ impl Instance {
     }
 
     pub fn container_terminal_tmux_session(&self) -> Result<tmux::ContainerTerminalSession> {
-        tmux::ContainerTerminalSession::new(&self.id, &self.title)
+        self.container_terminal_tmux_session_indexed(0)
+    }
+
+    pub fn container_terminal_tmux_session_indexed(
+        &self,
+        index: u32,
+    ) -> Result<tmux::ContainerTerminalSession> {
+        tmux::ContainerTerminalSession::new_indexed(&self.id, &self.title, index)
     }
 
     pub fn has_container_terminal(&self) -> bool {
@@ -1766,12 +1902,18 @@ impl Instance {
     /// `exists()` alone is insufficient: a pane can exist while its agent
     /// has died. Used by recovery, status polling, and TUI reload.
     pub fn has_live_tmux_pane(&self) -> bool {
-        self.tmux_session()
-            .map(|s| s.exists() && !s.is_pane_dead())
-            .unwrap_or(false)
+        self.tmux_env_session_name().is_some()
     }
 
     pub fn start_container_terminal_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
+        self.start_container_terminal_with_size_indexed(0, size)
+    }
+
+    pub fn start_container_terminal_with_size_indexed(
+        &mut self,
+        index: u32,
+        size: Option<(u16, u16)>,
+    ) -> Result<()> {
         if !self.is_sandboxed() {
             anyhow::bail!("Cannot create container terminal for non-sandboxed session");
         }
@@ -1811,18 +1953,22 @@ impl Instance {
             format!("{}; exec {}", exports, cmd)
         };
 
-        let session = self.container_terminal_tmux_session()?;
+        let session = self.container_terminal_tmux_session_indexed(index)?;
         let is_new = !session.exists();
         if is_new {
             session.create_with_size(&self.project_path, Some(&session_cmd), size)?;
-            self.apply_container_terminal_tmux_options();
+            self.apply_container_terminal_tmux_options(index);
         }
 
         Ok(())
     }
 
     pub fn kill_container_terminal(&self) -> Result<()> {
-        let session = self.container_terminal_tmux_session()?;
+        self.kill_container_terminal_indexed(0)
+    }
+
+    pub fn kill_container_terminal_indexed(&self, index: u32) -> Result<()> {
+        let session = self.container_terminal_tmux_session_indexed(index)?;
         if session.exists() {
             session.kill()?;
         }
@@ -1831,7 +1977,11 @@ impl Instance {
 
     /// Container counterpart of [`Self::kill_terminal_if_dead`].
     pub fn kill_container_terminal_if_dead(&self) -> Result<bool> {
-        let session = self.container_terminal_tmux_session()?;
+        self.kill_container_terminal_if_dead_indexed(0)
+    }
+
+    pub fn kill_container_terminal_if_dead_indexed(&self, index: u32) -> Result<bool> {
+        let session = self.container_terminal_tmux_session_indexed(index)?;
         if session.exists() && session.is_pane_dead() {
             let _ = session.kill();
             return Ok(true);
@@ -1867,8 +2017,9 @@ impl Instance {
         );
     }
 
-    fn apply_container_terminal_tmux_options(&self) {
-        let name = tmux::ContainerTerminalSession::generate_name(&self.id, &self.title);
+    fn apply_container_terminal_tmux_options(&self, index: u32) {
+        let name =
+            tmux::ContainerTerminalSession::generate_name_indexed(&self.id, &self.title, index);
         self.apply_session_tmux_options(&name, &format!("{} (container)", self.title));
     }
 
@@ -2009,10 +2160,11 @@ impl Instance {
                 }
             }
 
+            let launch_cmd = self.get_launch_command();
             let base_cmd = if self.extra_args.is_empty() {
-                self.get_tool_command().to_string()
+                launch_cmd
             } else {
-                format!("{} {}", self.get_tool_command(), self.extra_args)
+                format!("{} {}", launch_cmd, self.extra_args)
             };
             let mut tool_cmd = if self.is_yolo_mode() {
                 if let Some(ref yolo) = agent.and_then(|a| a.yolo.as_ref()) {
@@ -2111,10 +2263,8 @@ impl Instance {
     /// Respects the `agent_status_hooks` config setting.
     fn install_agent_status_hooks(&self, agent: Option<&'static crate::agents::AgentDef>) {
         let profile = self.effective_profile();
-        let hooks_enabled = super::profile_config::resolve_config_or_warn(&profile)
-            .session
-            .agent_status_hooks;
-        if !hooks_enabled {
+        let session_cfg = super::profile_config::resolve_config_or_warn(&profile).session;
+        if !session_cfg.agent_status_hooks {
             return;
         }
         if let Some(sidecar) = agent.and_then(|a| a.sidecar_hooks.as_ref()) {
@@ -2124,16 +2274,7 @@ impl Instance {
             // sandboxed, so the gate is a no-op for them.
             if !self.is_sandboxed() {
                 if let Some(home) = dirs::home_dir() {
-                    let config_path = home.join(sidecar.host_config_subpath);
-                    match (sidecar.install)(&config_path, crate::hooks::HookInstallTarget::Host) {
-                        Ok(()) => {
-                            if let Some(post_install) = sidecar.post_install_host {
-                                post_install();
-                            }
-                        }
-                        Err(e) => tracing::warn!(target: "session.store",
-                            "Failed to install {} hooks: {}", self.tool, e),
-                    }
+                    self.install_sidecar_host_hooks(sidecar, &home, &session_cfg);
                 }
             }
         } else if let Some(hook_cfg) = agent.and_then(|a| a.hook_config.as_ref()) {
@@ -2146,6 +2287,59 @@ impl Instance {
                 }
             }
             // Sandboxed sessions install via build_container_config.
+        }
+    }
+
+    /// Install a sidecar agent's host hooks. For agents whose hooks are scoped
+    /// to a user-selected named agent (`selected_agent_hooks`, e.g. Kiro), and
+    /// when the user actually selected one and the merge setting is on, install
+    /// into that agent's own config file and stop. Otherwise install into the
+    /// agent's standalone config and run any `post_install_host` follow-up.
+    fn install_sidecar_host_hooks(
+        &self,
+        sidecar: &'static crate::agents::SidecarHooks,
+        home: &Path,
+        session_cfg: &super::config::SessionConfig,
+    ) {
+        if session_cfg.merge_hooks_into_selected_agent {
+            if let Some(sel) = sidecar.selected_agent_hooks.as_ref() {
+                if let Some(name) =
+                    crate::agents::parse_selected_agent(&self.selected_agent_args(), sel.flag)
+                {
+                    // The selected agent is what the CLI loads; install AoE's
+                    // hooks into its config (these CLIs have no global hooks) and
+                    // skip the standalone-agent install + post_install_host. The
+                    // agents directory is the parent of the standalone hooks
+                    // agent's config (e.g. `.kiro/agents`); the resolver picks the
+                    // right file within it by `name`.
+                    let agents_dir = home.join(
+                        Path::new(sidecar.host_config_subpath)
+                            .parent()
+                            .unwrap_or(Path::new(".")),
+                    );
+                    let path = (sel.resolve_config_file)(&agents_dir, &name);
+                    match (sidecar.install)(&path, crate::hooks::HookInstallTarget::Host) {
+                        Ok(()) => tracing::info!(target: "session.store",
+                            "Installed AoE status hooks into {} agent '{}' at {}", self.tool, name, path.display()),
+                        Err(e) => tracing::warn!(target: "session.store",
+                            "Failed to install AoE hooks into {} agent '{}' at {}: {}", self.tool, name, path.display(), e),
+                    }
+                    return;
+                }
+            }
+        }
+
+        let config_path = home.join(sidecar.host_config_subpath);
+        match (sidecar.install)(&config_path, crate::hooks::HookInstallTarget::Host) {
+            Ok(()) => {
+                tracing::info!(target: "session.store",
+                    "Installed AoE status hooks for {} via standalone hooks agent", self.tool);
+                if let Some(post_install) = sidecar.post_install_host {
+                    post_install();
+                }
+            }
+            Err(e) => tracing::warn!(target: "session.store",
+                "Failed to install {} hooks: {}", self.tool, e),
         }
     }
 
@@ -2241,7 +2435,7 @@ impl Instance {
         if self.command.is_empty() {
             match crate::agents::get_agent(&self.tool) {
                 Some(a) => {
-                    let mut cmd = a.binary.to_string();
+                    let mut cmd = a.launch_base_command();
                     if !self.extra_args.is_empty() {
                         cmd = format!("{} {}", cmd, self.extra_args);
                     }
@@ -2574,8 +2768,8 @@ impl Instance {
 }
 
 impl Instance {
-    fn apply_terminal_tmux_options(&self) {
-        let name = tmux::TerminalSession::generate_name(&self.id, &self.title);
+    fn apply_terminal_tmux_options(&self, index: u32) {
+        let name = tmux::TerminalSession::generate_name_indexed(&self.id, &self.title, index);
         self.apply_session_tmux_options(&name, &format!("{} (terminal)", self.title));
     }
 
@@ -2593,6 +2787,7 @@ impl Instance {
             // fresh process attached to a running container with no values yet.
             self.ensure_before_start_env(false)?;
             container_config::refresh_agent_configs();
+            self.backfill_container_workdir(&container);
             return Ok(container);
         }
 
@@ -2602,6 +2797,7 @@ impl Instance {
             self.ensure_before_start_env(true)?;
             container_config::refresh_agent_configs();
             container.start()?;
+            self.backfill_container_workdir(&container);
             return Ok(container);
         }
 
@@ -2617,13 +2813,62 @@ impl Instance {
 
         if let Some(ref mut sandbox) = self.sandbox_info {
             sandbox.container_id = Some(container_id);
+            // Pin the workdir to exactly what the container was built with, so
+            // later `docker exec -w` can never drift from it (#2414).
+            sandbox.container_workdir = Some(config.working_dir.clone());
         }
 
         Ok(container)
     }
 
+    /// Backfill [`SandboxInfo::container_workdir`] from a live container for a
+    /// session created before that field existed (or one whose value was
+    /// cleared). Authoritative: the value is the container's own
+    /// `Config.WorkingDir`, so a later host-side git-linkage break can't make
+    /// [`Self::container_workdir`] drift from the path the container was built
+    /// with (#2414). No-op once the value is set, when the session is not
+    /// sandboxed, or when the runtime can't report it (the live fallback
+    /// stands). Not persisted here; the next start re-backfills if needed.
+    fn backfill_container_workdir(&mut self, container: &containers::DockerContainer) {
+        let needs_backfill = self
+            .sandbox_info
+            .as_ref()
+            .is_some_and(|s| s.container_workdir.is_none());
+        if !needs_backfill {
+            return;
+        }
+        if let Some(workdir) = container.working_dir() {
+            if let Some(sandbox) = self.sandbox_info.as_mut() {
+                sandbox.container_workdir = Some(workdir);
+            }
+        }
+    }
+
     /// Get the container working directory for this instance.
+    /// The working directory a `docker exec` into this session's sandbox must
+    /// chdir to. Pinned to what the container was actually created with
+    /// ([`SandboxInfo::container_workdir`]): set at create time from
+    /// `ContainerConfig::working_dir` and backfilled from a live container for
+    /// sessions that predate the field.
+    ///
+    /// Recomputing it live from `compute_volume_paths` is unsafe, which is what
+    /// #2414 hit: that helper resolves the worktree's git linkage, and once the
+    /// container is up that linkage can break on the host (e.g. the worktree's
+    /// admin entry under `<main>/.git/worktrees/<name>` is pruned). When it
+    /// can't resolve, `compute_volume_paths` silently collapses to
+    /// `/workspace/<basename>` -- a path the container never mounted -- and the
+    /// exec dies with `chdir to cwd ("/workspace/<name>") ... no such file or
+    /// directory`. The live computation survives only as a fallback for a
+    /// session whose container has not been created yet, where there is nothing
+    /// to pin to.
     pub fn container_workdir(&self) -> String {
+        if let Some(pinned) = self
+            .sandbox_info
+            .as_ref()
+            .and_then(|s| s.container_workdir.clone())
+        {
+            return pinned;
+        }
         container_config::compute_volume_paths(Path::new(&self.project_path), &self.project_path)
             .map(|(_, wd)| wd)
             .unwrap_or_else(|_| "/workspace".to_string())
@@ -2634,10 +2879,33 @@ impl Instance {
             .sandbox_info
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed session"))?;
+        // Resolve the user-selected agent (e.g. Kiro `--agent NAME`) so the
+        // sandbox installs status hooks into that agent's config, matching the
+        // host path. Gated by the same setting; only applies to agents that
+        // declare selected_agent_hooks.
+        let merge_selected =
+            super::profile_config::resolve_config_or_warn(&self.effective_profile())
+                .session
+                .merge_hooks_into_selected_agent;
+        let selected_agent = if merge_selected {
+            // Mirror the host path's agent resolution (a custom wrapper detected
+            // as kiro carries kiro's sidecar via detect_as), and the sandbox's
+            // own `resolve_active_agent`, which also falls back to detect_as.
+            crate::agents::get_agent(&self.tool)
+                .or_else(|| crate::agents::get_agent(&self.detect_as))
+                .and_then(|a| a.sidecar_hooks.as_ref())
+                .and_then(|s| s.selected_agent_hooks.as_ref())
+                .and_then(|sel| {
+                    crate::agents::parse_selected_agent(&self.selected_agent_args(), sel.flag)
+                })
+        } else {
+            None
+        };
         container_config::build_container_config(
             &self.project_path,
             sandbox,
-            container_config::ContainerAgentSelection::new(&self.tool, Some(&self.detect_as)),
+            container_config::ContainerAgentSelection::new(&self.tool, Some(&self.detect_as))
+                .with_selected_agent(selected_agent.as_deref()),
             self.is_yolo_mode(),
             &self.id,
             self.workspace_info.as_ref(),
@@ -2708,8 +2976,8 @@ impl Instance {
         let tool = self.tool.as_str();
 
         let tmux_session_name = self
-            .tmux_session()
-            .map(|s| s.name().to_string())
+            .tmux_env_session_name()
+            .or_else(|| self.tmux_session().ok().map(|s| s.name().to_string()))
             .unwrap_or_default();
         let mut poller = SessionPoller::new(tmux_session_name.clone());
         let instance_id = self.id.clone();
@@ -2873,15 +3141,11 @@ impl Instance {
         };
 
         let cb_instance_id = self.id.clone();
-        let cb_tmux_name = self
-            .tmux_session()
-            .map(|s| s.name().to_string())
-            .unwrap_or_default();
 
         let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id: &str| {
             tracing::info!(target: "session.store", "Session ID changed for {}: {}", cb_instance_id, new_id);
-            if !cb_tmux_name.is_empty() {
-                publish_session_to_tmux_env(&cb_tmux_name, new_id);
+            if let Some(tmux_name) = tmux_env_session_name_for_instance_id(&cb_instance_id) {
+                publish_session_to_tmux_env(&tmux_name, &cb_instance_id, new_id);
             }
         });
 
@@ -3357,24 +3621,10 @@ impl Instance {
     /// with caller-specific tracing while still letting all other
     /// kinds be cleaned up consistently.
     pub fn kill_ancillary_tmux_sessions(&self) {
-        if let Err(e) = self.kill_terminal() {
-            tracing::debug!(
-                target: "session.tmux_cleanup",
-                session_id = %self.id,
-                kind = "terminal",
-                error = %e,
-                "kill_ancillary_tmux_sessions: kill failed"
-            );
-        }
-        if let Err(e) = self.kill_container_terminal() {
-            tracing::debug!(
-                target: "session.tmux_cleanup",
-                session_id = %self.id,
-                kind = "container_terminal",
-                error = %e,
-                "kill_ancillary_tmux_sessions: kill failed"
-            );
-        }
+        // Reaps every paired terminal (host + container, index 0 and the
+        // additional web terminal tabs) in one tmux scan, so multi-terminal
+        // sessions (#2437) do not leak panes on teardown.
+        crate::tmux::kill_all_terminals_for_id(&self.id);
         crate::tmux::kill_all_tool_sessions_for_id(&self.id);
     }
 
@@ -3928,6 +4178,55 @@ mod tests {
                 None => std::env::remove_var("CODEX_HOME"),
             }
         }
+    }
+
+    /// Regression for issue #2414: a sandboxed worktree session's
+    /// `container_workdir()` must stay pinned to what the container was created
+    /// with, even after the host worktree's git linkage breaks.
+    ///
+    /// When the worktree's admin entry under `<main>/.git/worktrees/<name>` is
+    /// pruned, the `.git` file's gitdir no longer resolves, `compute_volume_paths`
+    /// can't find the main repo, and it silently collapses to
+    /// `/workspace/<basename>` -- a path the container never mounted -- so a
+    /// `docker exec -w` dies with `chdir to cwd ... no such file or directory`.
+    /// The create-time-pinned `SandboxInfo::container_workdir` defends against
+    /// that drift.
+    #[test]
+    fn container_workdir_stays_pinned_when_worktree_linkage_breaks() {
+        use tempfile::TempDir;
+        let root = TempDir::new().unwrap();
+        // An orphaned worktree: a `.git` file whose gitdir points nowhere,
+        // exactly the state a pruned admin entry leaves behind.
+        let worktree = root.path().join("myrepo-worktrees").join("contexec");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../does-not-exist/.git/worktrees/contexec\n",
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("contexec", worktree.to_str().unwrap());
+        inst.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "img".to_string(),
+            container_name: "aoe-sandbox-test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+
+        // Bug reproduction: with nothing pinned, the live recompute can't resolve
+        // the orphaned worktree and falls back to the basename. This is the path
+        // that produced the `chdir to cwd ("/workspace/contexec")` failure.
+        assert_eq!(inst.container_workdir(), "/workspace/contexec");
+
+        // Fix: the value the container was actually built with is returned
+        // verbatim, so the exec targets a path that exists in the container.
+        let pinned = "/workspace/myrepo-worktrees/contexec".to_string();
+        inst.sandbox_info.as_mut().unwrap().container_workdir = Some(pinned.clone());
+        assert_eq!(inst.container_workdir(), pinned);
     }
 
     #[test]
@@ -5089,6 +5388,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         });
         assert!(!inst.is_sandboxed());
     }
@@ -5104,6 +5404,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         });
         assert!(inst.is_sandboxed());
     }
@@ -5210,6 +5511,7 @@ mod tests {
             extra_env: Some(vec!["MY_VAR".to_string(), "OTHER_VAR".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -5308,6 +5610,48 @@ mod tests {
         let wt = deserialized.worktree_info.unwrap();
         assert_eq!(wt.branch, "feature/abc");
         assert!(wt.managed_by_aoe);
+    }
+
+    #[test]
+    fn has_managed_worktree_or_workspace_covers_both_shapes() {
+        // Single-repo aoe-managed worktree.
+        let mut wt = Instance::new("WT", "/tmp/wt");
+        wt.worktree_info = Some(WorktreeInfo {
+            branch: "feature/abc".to_string(),
+            main_repo_path: "/tmp/main".to_string(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: None,
+        });
+        assert!(wt.has_managed_worktree_or_workspace());
+
+        // Multi-repo workspace opting into cleanup (worktree_info is None).
+        let mut ws = Instance::new("WS", "/tmp/ws/repo-a");
+        ws.workspace_info = Some(WorkspaceInfo {
+            branch: "feature/abc".to_string(),
+            workspace_dir: "/tmp/ws".to_string(),
+            repos: vec![WorkspaceRepo {
+                name: "repo-a".to_string(),
+                source_path: "/tmp/src/repo-a".to_string(),
+                branch: "feature/abc".to_string(),
+                worktree_path: "/tmp/ws/repo-a".to_string(),
+                main_repo_path: "/tmp/src/repo-a".to_string(),
+                managed_by_aoe: true,
+            }],
+            created_at: Utc::now(),
+            cleanup_on_delete: true,
+        });
+        assert!(ws.has_managed_worktree_or_workspace());
+
+        // Workspace that opted out of cleanup: nothing to clean.
+        if let Some(info) = ws.workspace_info.as_mut() {
+            info.cleanup_on_delete = false;
+        }
+        assert!(!ws.has_managed_worktree_or_workspace());
+
+        // Plain session: neither worktree nor workspace.
+        let plain = Instance::new("Plain", "/tmp/plain");
+        assert!(!plain.has_managed_worktree_or_workspace());
     }
 
     #[test]
@@ -5773,6 +6117,90 @@ mod tests {
         assert!(cmd_str.contains("TERM=xterm-256color"));
         assert!(cmd_str.contains("COLORTERM=truecolor"));
         assert!(cmd_str.contains("agy"));
+    }
+
+    #[test]
+    fn test_build_host_command_kiro_uses_chat_subcommand() {
+        // Regression: Kiro must launch via `kiro-cli chat` so the binary
+        // accepts chat-scoped flags. Bare `kiro-cli` rejects --trust-all-tools.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "kiro".to_string();
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("kiro"), &None)
+            .unwrap();
+        assert!(cmd.unwrap().contains("kiro-cli chat"));
+    }
+
+    #[test]
+    fn test_build_host_command_kiro_yolo_after_chat() {
+        // YOLO flag must follow the `chat` subcommand, not precede it.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "kiro".to_string();
+        inst.yolo_mode = true;
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("kiro"), &None)
+            .unwrap();
+        let cmd_str = cmd.unwrap();
+        let chat_pos = cmd_str
+            .find("kiro-cli chat")
+            .expect("chat subcommand present");
+        let yolo_pos = cmd_str
+            .find("--trust-all-tools")
+            .expect("yolo flag present");
+        assert!(
+            yolo_pos > chat_pos,
+            "--trust-all-tools must come after `kiro-cli chat`: {cmd_str}"
+        );
+    }
+
+    #[test]
+    fn test_build_host_command_custom_override_skips_subcommand() {
+        // A user command override is passed through verbatim; AoE must not
+        // inject a launch subcommand into it (the user is in full control).
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "kiro".to_string();
+        inst.command = "kiro-cli chat --trust-all-tools".to_string();
+        let (cmd, _) = inst
+            .build_host_command(crate::agents::get_agent("kiro"), &None)
+            .unwrap();
+        let cmd_str = cmd.unwrap();
+        // Exactly one "chat" token (no doubled `chat chat`).
+        assert_eq!(
+            cmd_str.matches("chat").count(),
+            1,
+            "no duplicate subcommand: {cmd_str}"
+        );
+    }
+
+    #[test]
+    fn test_selected_agent_args_combines_command_and_extra() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "kiro".to_string();
+        inst.extra_args = "--agent custom-agent".to_string();
+        assert_eq!(
+            crate::agents::parse_selected_agent(&inst.selected_agent_args(), "--agent"),
+            Some("custom-agent".to_string())
+        );
+
+        // Agent named inside a command override is also found.
+        let mut inst2 = Instance::new("test", "/tmp/test");
+        inst2.tool = "kiro".to_string();
+        inst2.command = "kiro-cli chat --agent custom-agent".to_string();
+        assert_eq!(
+            crate::agents::parse_selected_agent(&inst2.selected_agent_args(), "--agent"),
+            Some("custom-agent".to_string())
+        );
+
+        // extra_args is appended after the command override, so a per-session
+        // --agent there wins over one baked into the override (last wins).
+        let mut inst3 = Instance::new("test", "/tmp/test");
+        inst3.tool = "kiro".to_string();
+        inst3.command = "kiro-cli chat --agent from-command".to_string();
+        inst3.extra_args = "--agent from-extra".to_string();
+        assert_eq!(
+            crate::agents::parse_selected_agent(&inst3.selected_agent_args(), "--agent"),
+            Some("from-extra".to_string())
+        );
     }
 
     #[test]
@@ -6411,6 +6839,7 @@ mod tests {
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                container_workdir: None,
             });
             let on_disk = inst.clone();
             storage
@@ -7175,6 +7604,7 @@ mod tests {
                     extra_env: None,
                     custom_instruction: None,
                     before_start_env: Vec::new(),
+                    container_workdir: None,
                 });
                 assert!(inst.is_sandboxed());
 
@@ -7731,8 +8161,9 @@ mod tests {
     }
 
     mod publish_captured_sid {
-        use super::super::{Instance, ResumeIntent};
+        use super::super::{publish_session_to_tmux_env, Instance, ResumeIntent};
         use serial_test::serial;
+        use std::collections::HashSet;
         use std::process::Command;
         use tempfile::{tempdir, TempDir};
 
@@ -7743,7 +8174,14 @@ mod tests {
 
         impl TmuxSession {
             fn create(id: &str, title: &str) -> Self {
-                let name = crate::tmux::Session::generate_name(id, title);
+                Self::create_named(crate::tmux::Session::generate_name(id, title))
+            }
+
+            fn create_terminal(id: &str, title: &str) -> Self {
+                Self::create_named(crate::tmux::TerminalSession::generate_name(id, title))
+            }
+
+            fn create_named(name: String) -> Self {
                 let _ = Command::new("tmux")
                     .args(["kill-session", "-t", &name])
                     .output();
@@ -7754,6 +8192,7 @@ mod tests {
                 assert!(status.success(), "tmux new-session failed for {}", name);
                 Self(name)
             }
+
             fn name(&self) -> &str {
                 &self.0
             }
@@ -7785,6 +8224,10 @@ mod tests {
             crate::tmux::env::get_hidden_env(name, crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
         }
 
+        fn instance_env(name: &str) -> Option<String> {
+            crate::tmux::env::get_hidden_env(name, crate::tmux::env::AOE_INSTANCE_ID_KEY)
+        }
+
         fn make_inst(profile: &str, title: &str) -> Instance {
             let mut inst = Instance::new(title, "/tmp/x");
             inst.tool = "claude".to_string();
@@ -7806,6 +8249,52 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
+        }
+
+        #[test]
+        #[serial]
+        fn poller_publish_writes_terminal_session_env() {
+            if skip_if_no_tmux() {
+                return;
+            }
+
+            let mut inst = make_inst("publish-terminal", "tailscale-operator-followup");
+            inst.terminal_info = Some(crate::session::TerminalInfo { created: true });
+            let tmux = TmuxSession::create_terminal(&inst.id, &inst.title);
+            inst.title = "renamed-after-terminal-create".to_string();
+
+            assert_eq!(inst.tmux_env_session_name().as_deref(), Some(tmux.name()));
+            assert!(tmux.name().starts_with(crate::tmux::TERMINAL_PREFIX));
+            assert!(tmux.name().contains("tailscale-operator-f"));
+
+            let agent_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            publish_session_to_tmux_env(tmux.name(), &inst.id, VALID_SID);
+
+            assert!(captured_env(&agent_name).is_none());
+            assert_eq!(instance_env(tmux.name()).as_deref(), Some(inst.id.as_str()));
+            assert_eq!(captured_env(tmux.name()).as_deref(), Some(VALID_SID));
+        }
+
+        #[test]
+        #[serial]
+        fn terminal_publish_feeds_exclusion_set_for_other_instances() {
+            if skip_if_no_tmux() {
+                return;
+            }
+
+            let mut peer = make_inst("publish-terminal-exclusion", "peer-terminal");
+            peer.terminal_info = Some(crate::session::TerminalInfo { created: true });
+            let tmux = TmuxSession::create_terminal(&peer.id, &peer.title);
+
+            publish_session_to_tmux_env(tmux.name(), &peer.id, PEER_SID);
+
+            let extra = HashSet::new();
+            let other_exclusion =
+                crate::session::capture::compose_exclusion("other-instance", &extra);
+            assert!(other_exclusion.contains(PEER_SID));
+
+            let own_exclusion = crate::session::capture::compose_exclusion(&peer.id, &extra);
+            assert!(!own_exclusion.contains(PEER_SID));
         }
 
         #[test]

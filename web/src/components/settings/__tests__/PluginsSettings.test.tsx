@@ -37,6 +37,12 @@ function listResponse(overrides: Partial<PluginListResponse> = {}): PluginListRe
         description: "Detects agent session status.",
         enabled: true,
         builtin: true,
+        validation: "builtin",
+        source: null,
+        capabilities: [],
+        ui_contributions: [],
+        granted: true,
+        needs_reapproval: false,
       },
       {
         id: "example.plugin",
@@ -45,6 +51,15 @@ function listResponse(overrides: Partial<PluginListResponse> = {}): PluginListRe
         description: "A community plugin.",
         enabled: false,
         builtin: false,
+        validation: "community",
+        source: "gh:example/plugin",
+        capabilities: ["net"],
+        ui_contributions: [
+          { slot: "status-bar", id: "s" },
+          { slot: "row-badge", id: "b" },
+        ],
+        granted: true,
+        needs_reapproval: false,
       },
     ],
     load_errors: [],
@@ -65,6 +80,65 @@ describe("PluginsSettings", () => {
     await findByText("Agent Status Detection");
     await findByText("v1.1.0");
     await findByText("A community plugin.");
+  });
+
+  it("discloses the UI slots a plugin renders into, deduped", async () => {
+    const { findByText } = render(<PluginsSettings />);
+    // example.plugin declares status-bar + row-badge (#2366).
+    await findByText("UI: status-bar, row-badge");
+  });
+
+  it("shows validation badges and a needs-approval state for an ungranted community plugin", async () => {
+    fetchPlugins.mockResolvedValue(
+      listResponse({
+        plugins: [
+          {
+            id: "example.plugin",
+            name: "Example",
+            version: "0.2.0",
+            description: "A community plugin.",
+            enabled: true,
+            builtin: false,
+            validation: "community",
+            source: "gh:example/plugin",
+            capabilities: ["net", "fs.read"],
+            granted: false,
+            needs_reapproval: true,
+          },
+        ],
+      }),
+    );
+    const { findByTestId, getByText } = render(<PluginsSettings />);
+    const validation = await findByTestId("plugin-validation-example.plugin");
+    expect(validation.textContent).toBe("community");
+    await findByTestId("plugin-needs-approval-example.plugin");
+    expect(getByText(/net, fs\.read/)).toBeTruthy();
+    expect(getByText(/not granted/)).toBeTruthy();
+  });
+
+  it("shows the featured validation badge for a featured plugin", async () => {
+    fetchPlugins.mockResolvedValue(
+      listResponse({
+        plugins: [
+          {
+            id: "agent-of-empires.example",
+            name: "Official Example",
+            version: "1.0.0",
+            description: "A featured plugin.",
+            enabled: true,
+            builtin: false,
+            validation: "featured",
+            source: "gh:agent-of-empires/example",
+            capabilities: [],
+            granted: true,
+            needs_reapproval: false,
+          },
+        ],
+      }),
+    );
+    const { findByTestId } = render(<PluginsSettings />);
+    const validation = await findByTestId("plugin-validation-agent-of-empires.example");
+    expect(validation.textContent).toBe("featured");
   });
 
   it("disable toggle POSTs setPluginEnabled(id, false) and adopts the refreshed list", async () => {
@@ -94,6 +168,11 @@ describe("PluginsSettings", () => {
       description: "The web dashboard.",
       enabled: true,
       builtin: true,
+      validation: "builtin",
+      source: null,
+      capabilities: [],
+      granted: true,
+      needs_reapproval: false,
     };
     fetchPlugins.mockResolvedValue(listResponse({ plugins: [web] }));
     setPluginEnabled.mockResolvedValue({

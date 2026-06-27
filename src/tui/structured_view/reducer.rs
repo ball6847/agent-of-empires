@@ -247,6 +247,9 @@ impl AcpTranscript {
 
     fn apply_event(&mut self, event: &Event) {
         match event {
+            // Session title is shown in the session list/header, not the
+            // activity transcript; the daemon applies it to Instance.title.
+            Event::SessionTitleSuggested { .. } => {}
             Event::AgentMessageChunk { text } => {
                 if let Some(idx) = self.pending_message_idx {
                     if let Some(ActivityRow::AgentMessage(buf)) = self.rows.get_mut(idx) {
@@ -473,6 +476,15 @@ impl AcpTranscript {
                 self.rows.push(ActivityRow::Note {
                     kind: NoteKind::Error,
                     text: format!("agent startup failed: {message}"),
+                });
+                self.turn_active = false;
+            }
+            Event::PromptRuntimeError { message } => {
+                self.flush_pending_chunk();
+                self.status_text = Some("prompt error".to_string());
+                self.rows.push(ActivityRow::Note {
+                    kind: NoteKind::Error,
+                    text: format!("prompt failed: {message}"),
                 });
                 self.turn_active = false;
             }

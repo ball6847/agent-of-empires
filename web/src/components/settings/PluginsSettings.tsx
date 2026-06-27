@@ -4,7 +4,9 @@ import { fetchPlugins, setPluginEnabled, type PluginListResponse, type PluginVie
 import { reportInfo } from "../../lib/toastBus";
 
 /// Plugin management: list every known plugin (name, version, description,
-/// enabled state) and toggle it on or off. The toggle POSTs to
+/// validation provenance, capabilities, and enabled / approval state) and
+/// toggle it on or off. Installing and capability approval are CLI-driven (`aoe plugin
+/// install`); this panel shows the resulting state. The toggle POSTs to
 /// `/api/plugins/{id}/enabled`; it is a host mutation, so it needs read-write
 /// mode and (when login is enabled) an elevated session. A `403
 /// elevation_required` response pops the global passphrase prompt via the
@@ -93,13 +95,38 @@ export function PluginsSettings() {
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="font-medium">{plugin.name}</span>
                   <span className="text-xs text-text-dim">v{plugin.version}</span>
-                  {plugin.builtin && (
-                    <span className="rounded bg-accent-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-500">
-                      builtin
+                  <span
+                    className="rounded bg-accent-500/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-accent-500"
+                    data-testid={`plugin-validation-${plugin.id}`}
+                  >
+                    {plugin.validation}
+                  </span>
+                  {plugin.needs_reapproval && (
+                    <span
+                      className="rounded bg-status-warning/20 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-status-warning"
+                      data-testid={`plugin-needs-approval-${plugin.id}`}
+                    >
+                      needs approval
                     </span>
                   )}
                 </div>
                 <p className="mt-1 text-xs text-text-dim">{plugin.description}</p>
+                {plugin.capabilities.length > 0 && (
+                  <p className="mt-1 text-[11px] text-text-dim">
+                    Capabilities: {plugin.capabilities.join(", ")}
+                    {plugin.granted ? "" : " (not granted)"}
+                  </p>
+                )}
+                {(plugin.ui_contributions ?? []).length > 0 && (
+                  <p className="mt-1 text-[11px] text-text-dim">
+                    UI: {[...new Set((plugin.ui_contributions ?? []).map((u) => u.slot))].join(", ")}
+                  </p>
+                )}
+                {plugin.needs_reapproval && (
+                  <p className="mt-1 text-[11px] text-status-warning">
+                    Installed but inactive. Re-approve with <code>aoe plugin update {plugin.id}</code>.
+                  </p>
+                )}
               </div>
               <label className="flex shrink-0 items-center gap-1 text-xs">
                 <input

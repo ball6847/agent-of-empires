@@ -36,13 +36,13 @@ pub use client_log::post_client_log;
 pub use git::{clone_repo, list_branches};
 pub use log_level::{get_log_level, patch_log_level};
 pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_conflict};
-pub use plugins::{list_plugins, set_plugin_enabled};
+pub use plugins::{invoke_plugin_action, list_plugins, plugin_ui_state, set_plugin_enabled};
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
     create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
-    force_smart_rename, get_recent_projects, list_sessions, preview_volume_ignores_globs,
-    read_output, rename_session, send_message, session_diff_file, session_diff_files,
-    set_worktree_name, start_session, stop_session, update_session_archive,
+    force_smart_rename, get_recent_projects, kill_terminal, list_sessions,
+    preview_volume_ignores_globs, read_output, rename_session, send_message, session_diff_file,
+    session_diff_files, set_worktree_name, start_session, stop_session, update_session_archive,
     update_session_diff_base, update_session_group, update_session_notifications,
     update_session_pin, update_session_snooze, update_session_unread, update_workspace_ordering,
     CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
@@ -52,11 +52,11 @@ pub(crate) use sessions::persist_session_update;
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, dismiss_update,
     docker_status, filesystem_home, get_about, get_current_theme, get_profile_settings,
-    get_resolved_theme, get_settings, get_settings_schema, get_tips, get_update_status,
-    get_web_ui_state, list_agents, list_groups, list_profiles, list_sounds, list_themes,
-    mark_tip_seen, mark_volume_ignores_globs_acknowledged, mark_web_tour_seen, patch_web_ui_state,
-    rename_profile, serve_sound_file, set_show_tips, update_profile_settings, update_settings,
-    update_theme,
+    get_resolved_theme, get_settings, get_settings_resolved, get_settings_schema, get_tips,
+    get_update_status, get_web_ui_state, list_agents, list_groups, list_profiles, list_sounds,
+    list_themes, mark_tip_seen, mark_volume_ignores_globs_acknowledged, mark_web_tour_seen,
+    patch_web_ui_state, rename_profile, serve_sound_file, set_show_tips, update_profile_settings,
+    update_settings, update_theme,
 };
 pub use telemetry::{
     get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
@@ -239,6 +239,11 @@ mod tests {
                     "post_telemetry_structured_interaction",
                 ],
             ),
+            (
+                "api/plugins.rs",
+                include_str!("plugins.rs"),
+                &["invoke_plugin_action"],
+            ),
         ];
 
         let guard_patterns: &[&str] = &[
@@ -286,6 +291,39 @@ mod tests {
             "Read-only audit failed:\n{}",
             missing.join("\n")
         );
+    }
+
+    /// A plugin pane action is forwarded to the worker (the trust boundary)
+    /// and mutates no host-managed state, so it is gated on read-write mode
+    /// only, never on passphrase elevation (#2454). This static check guards
+    /// against a refactor re-introducing the elevation gate on the action
+    /// path and re-breaking the refresh button under login. Same body-boundary
+    /// walk as `every_mutating_handler_has_read_only_guard`.
+    #[test]
+    fn plugin_action_does_not_require_elevation() {
+        let source = include_str!("plugins.rs");
+        let needle = "fn invoke_plugin_action(";
+        let start = source
+            .find(needle)
+            .expect("handler `invoke_plugin_action` not found (rename/refactor?)");
+        let rest = &source[start + needle.len()..];
+        let body_terminators: &[&str] = &["\npub async fn ", "\npub fn ", "\nasync fn ", "\nfn "];
+        let end = body_terminators
+            .iter()
+            .filter_map(|t| rest.find(t))
+            .min()
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        // `mutation_gate` bundles the elevation check; `is_elevated` /
+        // `elevation_required` would mean elevation was reintroduced inline.
+        for marker in ["mutation_gate", "is_elevated", "elevation_required"] {
+            assert!(
+                !body.contains(marker),
+                "invoke_plugin_action must not elevation-gate (found `{marker}`). \
+                 A pane action mutates no host state; keep the read-only gate only. \
+                 If an action ever needs elevation, make it opt-in per action (#2454)."
+            );
+        }
     }
 
     /// Companion to `every_mutating_handler_has_read_only_guard`: enforce

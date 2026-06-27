@@ -107,11 +107,25 @@ export async function ensureSession(id: string, signal?: AbortSignal): Promise<E
   }
 }
 
-export async function ensureTerminal(id: string, container = false): Promise<boolean> {
+export async function ensureTerminal(id: string, index = 0, container = false): Promise<boolean> {
   const path = container ? "container-terminal" : "terminal";
   try {
-    const res = await fetch(`/api/sessions/${id}/${path}`, {
+    const res = await fetch(`/api/sessions/${id}/${path}?index=${index}`, {
       method: "POST",
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Kill an extra terminal tab's host + container shells (index >= 1). Index 0
+ *  is the primary terminal shared with the native TUI and cannot be killed
+ *  from the web UI (the server rejects it); closing that tab only hides it. */
+export async function killTerminal(id: string, index: number): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/terminal?index=${index}`, {
+      method: "DELETE",
     });
     return res.ok;
   } catch {
@@ -188,6 +202,16 @@ export interface PluginView {
   description: string;
   enabled: boolean;
   builtin: boolean;
+  /** Validation provenance: "builtin" | "featured" | "community" | "local". */
+  validation: string;
+  source: string | null;
+  capabilities: string[];
+  /** UI slots the plugin declares it will render into (#2366), disclosed so the
+   *  user sees the plugin modifies the dashboard. Not a capability (needs no
+   *  grant). `slot` is the kebab-case slot name. */
+  ui_contributions: { slot: string; id: string }[];
+  granted: boolean;
+  needs_reapproval: boolean;
 }
 
 export interface PluginListResponse {
@@ -215,6 +239,56 @@ function isValidPluginListResponse(payload: unknown): payload is PluginListRespo
   );
 }
 
+// Plugin UI extension points (#2366).
+
+/** Display tone a plugin attaches to a slot entry or notification. The host
+ *  validates it to this closed set; each surface maps it to a color. */
+export type PluginUiTone = "neutral" | "info" | "success" | "warn" | "danger";
+
+/** The nine host-rendered slots, kebab-case as the host serializes them. */
+export type PluginUiSlot =
+  | "status-bar"
+  | "row-badge"
+  | "row-column"
+  | "sort-key"
+  | "filter-facet"
+  | "card"
+  | "pane"
+  | "detail-badge"
+  | "notification";
+
+/** One piece of UI state a worker pushed. `payload` shape is determined by
+ *  `slot`; the dashboard renders it (no plugin code runs here). */
+export interface PluginUiEntry {
+  plugin_id: string;
+  slot: PluginUiSlot;
+  id: string;
+  session_id?: string;
+  payload: Record<string, unknown>;
+}
+
+/** A notification pushed via `ui.notify`. `seq` is monotonic so the client
+ *  toasts each one exactly once. */
+export interface PluginUiNotification {
+  seq: number;
+  plugin_id: string;
+  tone: PluginUiTone;
+  title: string;
+  body?: string;
+  session_id?: string;
+}
+
+export interface PluginUiState {
+  entries: PluginUiEntry[];
+  notifications: PluginUiNotification[];
+}
+
+/** The host's aggregated UI-state snapshot. Returns an empty state (not null)
+ *  shape on the server when no plugin host is running. */
+export function fetchPluginUiState(): Promise<PluginUiState | null> {
+  return fetchJson<PluginUiState>("/api/plugins/ui-state");
+}
+
 export async function setPluginEnabled(id: string, enabled: boolean): Promise<PluginToggleResult> {
   try {
     const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/enabled`, {
@@ -233,6 +307,29 @@ export async function setPluginEnabled(id: string, enabled: boolean): Promise<Pl
     return { kind: "error", message };
   } catch {
     return { kind: "error", message: "Network error." };
+  }
+}
+
+/**
+ * Forward a plugin pane's UI action (e.g. a "Refresh" button) to the plugin's
+ * worker. Fire-and-forget: the worker runs the named method and re-pushes its
+ * UI state, which the next ui-state poll renders. Returns false on read-only
+ * (403), no running worker (404), or network failure.
+ */
+export async function invokePluginAction(
+  pluginId: string,
+  method: string,
+  params: Record<string, unknown> = {},
+): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ method, params }),
+    });
+    return res.ok;
+  } catch {
+    return false;
   }
 }
 

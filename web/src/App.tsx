@@ -1,4 +1,5 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Puzzle } from "lucide-react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
@@ -6,13 +7,14 @@ import { useSessions } from "./hooks/useSessions";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
-import { safeGetItem, safeRemoveItem, safeSetItem } from "./lib/safeStorage";
+import { safeGetItem, safeRemoveItem } from "./lib/safeStorage";
 import { isAutomatedSession } from "./lib/onboarding";
 import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
+import { PluginUiProvider } from "./lib/pluginUiContext";
 import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
 import { useSidebarAxis } from "./hooks/useSidebarAxis";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
@@ -30,6 +32,10 @@ import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
+import { usePaneLayout, dockTabs, dockActive, dockOf } from "./lib/paneLayout";
+import { isPluginPaneId, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
+import { PluginPaneBody } from "./components/plugin/PluginSlots";
+import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   loginStatus,
   logout,
@@ -48,6 +54,7 @@ import {
   setProjectPinned,
   deleteProject,
   setSessionUnread,
+  killTerminal,
 } from "./lib/api";
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
@@ -74,7 +81,13 @@ const StructuredView = lazy(() =>
     default: m.StructuredView,
   })),
 );
-import { RightPanel } from "./components/RightPanel";
+import { Dock, type PaneDisplay } from "./components/Dock";
+import { BottomDock } from "./components/BottomDock";
+import { PaneDndController } from "./components/PaneDndController";
+import { visibleToFullIndex } from "./components/paneDnd";
+import { DiffPane } from "./components/DiffPane";
+import { PairedShellPane } from "./components/PairedTerminal";
+import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
 import { DiffFileViewer } from "./components/diff/DiffFileViewer";
@@ -102,7 +115,6 @@ import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
 
-const RIGHT_PANEL_COLLAPSED_KEY = "aoe-right-collapsed";
 // Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
 // already dismissed the tour to the backend; no longer written.
 const LEGACY_TOUR_SEEN_KEY = "aoe-tour-seen";
@@ -191,7 +203,12 @@ export default function App() {
   return (
     <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
       <UnreadIndicatorContext.Provider value={unreadIndicatorEnabled}>
-        <AppContent loginRequired={loginRequired} onLogout={handleLogout} />
+        {/* PluginUiProvider must sit above AppContent: AppContent itself reads
+            the plugin UI snapshot (usePluginPanes), so the provider can't live
+            inside its own return. */}
+        <PluginUiProvider>
+          <AppContent loginRequired={loginRequired} onLogout={handleLogout} />
+        </PluginUiProvider>
         <ElevationPrompt />
       </UnreadIndicatorContext.Provider>
     </IdleDecayWindowContext.Provider>
@@ -344,15 +361,127 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const selectedFilePath = selectedFile?.path ?? null;
   const selectedRepoName = selectedFile?.repoName;
   const selectedFileLine = selectedFile?.line;
-  const [diffCollapsed, setDiffCollapsed] = useState(() => {
-    const stored = safeGetItem(RIGHT_PANEL_COLLAPSED_KEY);
-    if (stored === "1") return true;
-    if (stored === "0") return false;
-    return window.innerWidth < 768;
-  });
+  // Dock panes render as tabbed groups (#2437): each dock holds an ordered set
+  // of tabs (diff, one-or-more terminals, plugin panes) with one active body.
+  // The tab membership + active tab + terminal count are persisted per session;
+  // dock sizes stay global (Dock/BottomDock own those localStorage keys).
+  const {
+    layout: paneLayout,
+    openTab,
+    addTerminal,
+    closeTab,
+    activateTab,
+    moveTab,
+    placeTab,
+    toggleKind,
+    togglePlugin,
+    syncPlugins,
+  } = usePaneLayout(activeSessionId);
+  const pluginPanes = usePluginPanes(activeSessionId);
+  const pluginPaneById = useMemo(() => {
+    const m = new Map<string, PluginPane>();
+    for (const p of pluginPanes) m.set(p.id, p);
+    return m;
+  }, [pluginPanes]);
+
+  // Auto-add newly available plugin panes as tabs in their default dock; the
+  // layout suppresses any the user explicitly closed.
   useEffect(() => {
-    safeSetItem(RIGHT_PANEL_COLLAPSED_KEY, diffCollapsed ? "1" : "0");
-  }, [diffCollapsed]);
+    syncPlugins(pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })));
+  }, [pluginPanes, syncPlugins]);
+
+  const paneDescriptor = useCallback(
+    (id: string): PaneDisplay => {
+      const plugin = pluginPaneById.get(id);
+      if (plugin) return { title: plugin.title, icon: plugin.icon ?? Puzzle };
+      if (isTerminalTabId(id)) {
+        const idx = terminalIndexOf(id);
+        const term = BUILTIN_PANES.find((p) => p.id === "terminal")!;
+        return { title: idx === 0 ? term.title : `${term.title} ${idx + 1}`, icon: term.icon };
+      }
+      const d = BUILTIN_PANES.find((p) => p.id === id)!;
+      return { title: d.title, icon: d.icon };
+    },
+    [pluginPaneById],
+  );
+
+  // A persisted tab is visible only if its backing pane currently exists: diff
+  // and terminals always do; a plugin tab does only while its plugin is loaded.
+  const tabAvailable = useCallback(
+    (id: string) => !id.startsWith("plugin:") || pluginPaneById.has(id),
+    [pluginPaneById],
+  );
+  const visibleTabs = useCallback(
+    (dock: DockLocation) => dockTabs(paneLayout, dock).filter(tabAvailable),
+    [paneLayout, tabAvailable],
+  );
+  const visibleActive = useCallback(
+    (dock: DockLocation): string | null => {
+      const vis = visibleTabs(dock);
+      const a = dockActive(paneLayout, dock);
+      return a && vis.includes(a) ? a : (vis[0] ?? null);
+    },
+    [paneLayout, visibleTabs],
+  );
+
+  const rightTabs = visibleTabs("right");
+  const bottomTabs = visibleTabs("bottom");
+  const tabsByDock = useMemo(() => ({ right: rightTabs, bottom: bottomTabs }), [rightTabs, bottomTabs]);
+  const rightDockCollapsed = rightTabs.length === 0;
+  const terminalOpen = (["right", "bottom"] as DockLocation[]).some((d) =>
+    dockTabs(paneLayout, d).some(isTerminalTabId),
+  );
+
+  // Activity-bar entries are pane KINDS (diff, terminal, each plugin), not
+  // individual tabs; the strip's +/x manage terminal instances.
+  const allPaneIds: string[] = ["diff", "terminal", ...pluginPanes.map((p) => p.id)];
+  const isPaneOpen = (kind: string): boolean => {
+    if (kind === "terminal") return terminalOpen;
+    return dockOf(paneLayout, kind) !== null;
+  };
+  const togglePaneAny = useCallback(
+    (kind: string) => {
+      const defaultDock: DockLocation =
+        pluginPaneById.get(kind)?.defaultDock ?? BUILTIN_PANES.find((p) => p.id === kind)?.defaultDock ?? "right";
+      if (isPluginPaneId(kind)) togglePlugin(kind, defaultDock);
+      else toggleKind(kind as "diff" | "terminal", defaultDock);
+    },
+    [toggleKind, togglePlugin, pluginPaneById],
+  );
+  const closePaneAny = useCallback(
+    (id: string) => {
+      // Closing an extra terminal tab kills its tmux shell so it does not leak;
+      // terminal 0 (shared with the native TUI) only hides. Diff/plugin tabs
+      // have no backend shell to reap.
+      if (isTerminalTabId(id)) {
+        const idx = terminalIndexOf(id);
+        if (idx >= 1) {
+          // Remove the tab only once the shell is actually killed; if the
+          // DELETE fails, keep the tab so the user can retry instead of
+          // silently leaking the shell with no way to close it.
+          if (activeSessionId) {
+            void killTerminal(activeSessionId, idx).then((ok) => {
+              if (ok) closeTab(id);
+            });
+          }
+          return;
+        }
+      }
+      closeTab(id);
+    },
+    [closeTab, activeSessionId],
+  );
+  const movePaneAny = useCallback((id: string, dock: DockLocation) => moveTab(id, dock), [moveTab]);
+  // The dnd controller works in visible-tab space; map its drop index back to
+  // the full persisted dock list, since a hidden (unloaded) plugin tab still
+  // holds a slot the visible index does not count.
+  const placeVisibleTab = useCallback(
+    (id: string, toDock: DockLocation, visibleIndex: number) => {
+      const fullBase = dockTabs(paneLayout, toDock).filter((tab) => tab !== id);
+      placeTab(id, toDock, visibleToFullIndex(fullBase, visibleIndex, tabAvailable));
+    },
+    [paneLayout, placeTab, tabAvailable],
+  );
   // Layout topology is width-driven so it stays aligned with the `md:`
   // Tailwind classes the rest of the layout uses. At md and up the
   // side-by-side ContentSplit renders; below md a single full-viewport
@@ -396,7 +525,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   // Fetch the diff when the panel is actually showing: on desktop when the
   // split is expanded, on mobile when the diff view is the active pane.
-  const diffPanelActive = isMdUp ? !diffCollapsed : rightPanelView === "diff";
+  const diffPanelActive = isMdUp ? dockOf(paneLayout, "diff") !== null : rightPanelView === "diff";
   const {
     files: diffFiles,
     perRepoBases,
@@ -407,7 +536,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   } = useDiffFiles(activeSessionId, diffPanelActive);
 
   // Diff-viewer comments (#928). Acp-only and session-scoped. The
-  // banner lives in RightPanel while the inline UI lives inside
+  // banner lives in the diff pane while the inline UI lives inside
   // DiffFileViewer, so the store is lifted here and threaded to both.
   const diffComments = useDiffComments(activeSessionId);
   const commentsEnabled = activeSession?.view === "structured";
@@ -805,11 +934,31 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // is no split to collapse: it opens the view picker instead (#1452).
   const toggleDiff = useCallback(() => {
     if (isMdUp) {
-      setDiffCollapsed((c) => !c);
+      toggleKind("diff", "right");
     } else {
       setPickerOpen((o) => !o);
     }
-  }, [isMdUp]);
+  }, [isMdUp, toggleKind]);
+
+  // Collapse or restore the whole right dock (the "toggle right panel"
+  // shortcut). Collapse closes every pane docked right; restore reopens the
+  // built-in diff + terminal that live there. ponytail: restore reopens the
+  // defaults rather than remembering the exact pre-collapse set, which is a
+  // fine approximation for a collapse/expand toggle.
+  const toggleRightDock = useCallback(() => {
+    if (!isMdUp) {
+      setPickerOpen((o) => !o);
+      return;
+    }
+    if (rightDockCollapsed) {
+      // Restore the built-in defaults into the right dock.
+      openTab("diff", "right");
+      openTab(terminalTabId(0), "right");
+    } else {
+      // Collapse: close every tab currently in the right dock.
+      for (const id of dockTabs(paneLayout, "right")) closeTab(id);
+    }
+  }, [isMdUp, rightDockCollapsed, paneLayout, openTab, closeTab]);
 
   const handlePickView = useCallback((view: RightPanelView) => {
     setRightPanelView(view);
@@ -888,11 +1037,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const openSidebar = useCallback(() => setSidebarOpen(true), []);
   const openDiff = useCallback(() => {
     if (isMdUp) {
-      setDiffCollapsed(false);
+      openTab("diff", "right");
     } else {
       setPickerOpen(true);
     }
-  }, [isMdUp]);
+  }, [isMdUp, openTab]);
   useEdgeSwipe({
     edge: "left",
     enabled: !sidebarOpen,
@@ -904,7 +1053,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   });
   useEdgeSwipe({
     edge: "right",
-    enabled: diffCollapsed && !!activeSessionId,
+    enabled: rightDockCollapsed && !!activeSessionId,
     onSwipe: openDiff,
   });
 
@@ -963,12 +1112,24 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return;
     }
 
-    if (target === "paired" && diffCollapsed) {
-      // Right panel is collapsed; paired terminal is unmounted. Set the
-      // pending intent so PairedTerminal grabs focus once it mounts and
-      // its PTY is ready, then expand the panel.
+    if (target === "paired") {
+      // The paired shell only mounts when a terminal tab is the active tab of
+      // its dock.
+      const termTab =
+        (["right", "bottom"] as DockLocation[]).flatMap((d) => dockTabs(paneLayout, d)).find(isTerminalTabId) ??
+        terminalTabId(0);
+      const termDock = dockOf(paneLayout, termTab);
+      if (termDock && dockActive(paneLayout, termDock) === termTab) {
+        // Already the active tab (mounted): move focus synchronously so rapid
+        // agent<->paired toggles stay deterministic.
+        dispatchFocusTerminal("paired");
+        return;
+      }
+      // Not mounted yet: latch the intent and activate/open its tab; the paired
+      // panel grabs focus once its PTY is ready.
       setPendingTerminalFocus("paired");
-      setDiffCollapsed(false);
+      if (termDock) activateTab(termDock, termTab);
+      else openTab(termTab, "right");
       return;
     }
     if (target === "agent" && selectedFilePath) {
@@ -980,7 +1141,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return;
     }
     dispatchFocusTerminal(target);
-  }, [activeSessionId, singlePane, diffCollapsed, selectedFilePath]);
+  }, [activeSessionId, singlePane, paneLayout, openTab, activateTab, selectedFilePath]);
 
   useKeyboardShortcuts(
     useCallback(
@@ -1017,11 +1178,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         onSettings: () => (showSettings ? handleCloseSettings() : navigate("/settings")),
         onPalette: () => setShowPalette((p) => !p),
         onToggleSidebar: () => setSidebarOpen((o) => !o),
-        onToggleRightPanel: () => toggleDiff(),
+        onToggleRightPanel: () => toggleRightDock(),
         onToggleTerminalFocus: handleToggleTerminalFocus,
       }),
       [
         toggleDiff,
+        toggleRightDock,
         showPalette,
         deletingWorkspaceId,
         stoppingWorkspaceId,
@@ -1148,72 +1310,117 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       );
     }
 
+    // Render a pane body by id. Passed to the docks as a callback (rather than
+    // building an array of {icon, body} objects here) so the per-session JSX is
+    // constructed inside the dock, not threaded through a prop object.
+    const renderPaneBody = (id: string): ReactNode => {
+      const plugin = pluginPaneById.get(id);
+      if (plugin) return <PluginPaneBody entry={plugin.entry} />;
+      if (id === "diff") {
+        return (
+          <DiffPane
+            session={activeSession ?? null}
+            sessionId={activeSessionId}
+            files={diffFiles}
+            perRepoBases={perRepoBases}
+            warning={warning}
+            filesLoading={diffFilesLoading}
+            selectedFilePath={selectedFilePath}
+            selectedRepoName={selectedRepoName}
+            onSelectFile={handleSelectFile}
+            onDiffRefresh={refreshDiffFiles}
+            commentsEnabled={commentsEnabled}
+            commentsCount={diffComments.count}
+            commentsSendEnabled={commentSendEnabled}
+            commentsSendDisabledReason={commentSendDisabledReason}
+            onOpenSendDialog={() => setSendDialogOpen(true)}
+            onDiscardAllComments={diffComments.clearComments}
+          />
+        );
+      }
+      return (
+        <PairedShellPane
+          session={activeSession ?? null}
+          sessionId={activeSessionId}
+          terminalIndex={isTerminalTabId(id) ? terminalIndexOf(id) : 0}
+        />
+      );
+    };
     return (
       <div className="flex-1 flex flex-col min-h-0">
-        <ContentSplit
-          collapsed={diffCollapsed}
-          onToggleCollapse={toggleDiff}
-          left={
-            <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
-              <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
-                {activeSession?.view === "structured" ? (
-                  <Suspense fallback={<AcpLoadingFallback />}>
-                    <StructuredView
-                      key={activeSessionId}
-                      sessionId={activeSessionId!}
-                      acpWorkerState={activeSession.acp_worker_state ?? "absent"}
-                      tool={activeSession.tool}
-                      archivedAt={activeSession.archived_at ?? null}
-                      snoozedUntil={activeSession.snoozed_until ?? null}
-                      onOpenFileRef={handleOpenFileRef}
-                      fileRefSession={activeSession}
+        <PaneDndController tabsByDock={tabsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
+          <ContentSplit
+            collapsed={rightDockCollapsed}
+            onToggleCollapse={toggleDiff}
+            left={
+              <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
+                <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
+                  {activeSession?.view === "structured" ? (
+                    <Suspense fallback={<AcpLoadingFallback />}>
+                      <StructuredView
+                        key={activeSessionId}
+                        sessionId={activeSessionId!}
+                        acpWorkerState={activeSession.acp_worker_state ?? "absent"}
+                        tool={activeSession.tool}
+                        archivedAt={activeSession.archived_at ?? null}
+                        snoozedUntil={activeSession.snoozed_until ?? null}
+                        onOpenFileRef={handleOpenFileRef}
+                        fileRefSession={activeSession}
+                      />
+                    </Suspense>
+                  ) : (
+                    <TerminalSessionStack
+                      activeSessionId={activeSessionId!}
+                      sessions={sessions.filter((session) => session.view !== "structured")}
+                      persistent={webSettings.persistentTerminals}
+                      maxPersistentTerminals={webSettings.maxPersistentTerminals}
                     />
-                  </Suspense>
-                ) : (
-                  <TerminalSessionStack
-                    activeSessionId={activeSessionId!}
-                    sessions={sessions.filter((session) => session.view !== "structured")}
-                    persistent={webSettings.persistentTerminals}
-                    maxPersistentTerminals={webSettings.maxPersistentTerminals}
+                  )}
+                </div>
+
+                {selectedFilePath && activeSessionId && (
+                  <DiffFileViewer
+                    sessionId={activeSessionId}
+                    filePath={selectedFilePath}
+                    repoName={selectedRepoName}
+                    targetLine={selectedFileLine}
+                    revision={revision}
+                    onClose={handleCloseFile}
+                    commentsEnabled={commentsEnabled}
+                    commentsStore={diffComments}
                   />
                 )}
               </div>
-
-              {selectedFilePath && activeSessionId && (
-                <DiffFileViewer
-                  sessionId={activeSessionId}
-                  filePath={selectedFilePath}
-                  repoName={selectedRepoName}
-                  targetLine={selectedFileLine}
-                  revision={revision}
-                  onClose={handleCloseFile}
-                  commentsEnabled={commentsEnabled}
-                  commentsStore={diffComments}
+            }
+            right={
+              <div {...tourAnchor(TOUR_ANCHORS.rightPanel)} className="flex min-h-0 min-w-0 flex-1">
+                <Dock
+                  location="right"
+                  tabs={rightTabs}
+                  active={visibleActive("right")}
+                  descriptorFor={paneDescriptor}
+                  renderBody={renderPaneBody}
+                  onActivate={(id) => activateTab("right", id)}
+                  onMove={movePaneAny}
+                  onClose={closePaneAny}
+                  onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("right")}
                 />
-              )}
-            </div>
-          }
-          right={
-            <RightPanel
-              session={activeSession ?? null}
-              sessionId={activeSessionId}
-              files={diffFiles}
-              perRepoBases={perRepoBases}
-              warning={warning}
-              filesLoading={diffFilesLoading}
-              selectedFilePath={selectedFilePath}
-              selectedRepoName={selectedRepoName}
-              onSelectFile={handleSelectFile}
-              onDiffRefresh={refreshDiffFiles}
-              commentsEnabled={commentsEnabled}
-              commentsCount={diffComments.count}
-              commentsSendEnabled={commentSendEnabled}
-              commentsSendDisabledReason={commentSendDisabledReason}
-              onOpenSendDialog={() => setSendDialogOpen(true)}
-              onDiscardAllComments={diffComments.clearComments}
+              </div>
+            }
+          />
+          {bottomTabs.length > 0 && (
+            <BottomDock
+              tabs={bottomTabs}
+              active={visibleActive("bottom")}
+              descriptorFor={paneDescriptor}
+              renderBody={renderPaneBody}
+              onActivate={(id) => activateTab("bottom", id)}
+              onMove={movePaneAny}
+              onClose={closePaneAny}
+              onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("bottom")}
             />
-          }
-        />
+          )}
+        </PaneDndController>
         {sendDialogOpen && commentsEnabled && activeSessionId && (
           <SendCommentsDialog
             sessionId={activeSessionId}
@@ -1393,7 +1600,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           onToggleSidebar={handleToggleSidebar}
           onOpenPalette={() => setShowPalette(true)}
           onToggleDiff={toggleDiff}
-          diffCollapsed={diffCollapsed}
+          paneIds={allPaneIds}
+          paneDescriptor={paneDescriptor}
+          isPaneOpen={isPaneOpen}
+          onTogglePane={togglePaneAny}
           onOpenHelp={handleOpenHelp}
           onOpenAbout={handleOpenAbout}
           onStartTutorial={tour.startTour}
@@ -1404,7 +1614,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           onOpenTips={tips.open}
           onGoDashboard={handleGoDashboard}
           sidebarColumnVisible={!showSettings && sidebarOpen}
-          rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !diffCollapsed}
+          rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
         />
 
         <DisconnectBanner />
@@ -1502,7 +1712,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           <DeleteSessionDialog
             sessionTitle={deletingSession.title}
             branchName={deletingSession.branch}
-            hasManagedWorktree={deletingSession.has_managed_worktree}
+            hasManagedWorktree={deletingSession.has_cleanable_worktree ?? false}
             isSandboxed={deletingSession.is_sandboxed}
             isScratch={deletingSession.scratch}
             cleanupDefaults={deletingSession.cleanup_defaults}

@@ -631,24 +631,10 @@ impl HomeView {
 
             for session_id in &sessions_to_delete {
                 if let Some(inst) = self.get_instance(session_id) {
-                    let delete_worktree = options.delete_worktrees
-                        && (inst
-                            .worktree_info
-                            .as_ref()
-                            .is_some_and(|wt| wt.managed_by_aoe)
-                            || inst
-                                .workspace_info
-                                .as_ref()
-                                .is_some_and(|ws| ws.cleanup_on_delete));
-                    let delete_branch = options.delete_branches
-                        && (inst
-                            .worktree_info
-                            .as_ref()
-                            .is_some_and(|wt| wt.managed_by_aoe)
-                            || inst
-                                .workspace_info
-                                .as_ref()
-                                .is_some_and(|ws| ws.cleanup_on_delete));
+                    let delete_worktree =
+                        options.delete_worktrees && inst.has_managed_worktree_or_workspace();
+                    let delete_branch =
+                        options.delete_branches && inst.has_managed_worktree_or_workspace();
                     let delete_sandbox = options.delete_containers
                         && inst.sandbox_info.as_ref().is_some_and(|s| s.enabled);
                     let request = DeletionRequest {
@@ -720,10 +706,7 @@ impl HomeView {
         self.instances().iter().any(|i| {
             (i.group_path == group_path || i.group_path.starts_with(prefix))
                 && owning_profile.is_none_or(|p| i.source_profile == p)
-                && (i.worktree_info.as_ref().is_some_and(|wt| wt.managed_by_aoe)
-                    || i.workspace_info
-                        .as_ref()
-                        .is_some_and(|ws| ws.cleanup_on_delete))
+                && i.has_managed_worktree_or_workspace()
         })
     }
 
@@ -889,10 +872,15 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
-        let snapshot = self
-            .get_instance(&id)
-            .map(|i| (i.worktree_info.clone(), i.status, i.project_path.clone()));
-        let Some((worktree_info, status, project_path)) = snapshot else {
+        let snapshot = self.get_instance(&id).map(|i| {
+            (
+                i.worktree_info.clone(),
+                i.status,
+                i.project_path.clone(),
+                i.is_sandboxed(),
+            )
+        });
+        let Some((worktree_info, status, project_path, is_sandboxed)) = snapshot else {
             anyhow::bail!("Session not found");
         };
         let Some(worktree_info) = worktree_info else {
@@ -900,6 +888,19 @@ impl HomeView {
         };
         if status.blocks_worktree_edit() {
             anyhow::bail!("Stop the session before editing its workdir name");
+        }
+        // A sandbox session keeps its container alive (running `sleep infinity`)
+        // even while Idle, and that container bind-mounts the worktree dir, so
+        // the `git worktree move` below would hit EBUSY, and a reused container
+        // would keep mounting (and `cd`-ing into) the old path. Refuse until the
+        // session is stopped, mirroring the tied-rename path. `status` alone is
+        // insufficient: `blocks_worktree_edit` is false for an Idle session
+        // whose container is still up. See #2117, #2414.
+        if crate::session::worktree_edit::sandbox_container_holds_worktree(&id, is_sandboxed) {
+            anyhow::bail!(
+                "Stop the session before editing its workdir name: its sandbox container is \
+                 mounting the worktree directory"
+            );
         }
 
         let outcome = crate::session::worktree_edit::edit_worktree_workdir(
@@ -912,6 +913,17 @@ impl HomeView {
         )?;
         let new_path = outcome.new_path.to_string_lossy().to_string();
         let new_branch = outcome.new_branch.clone();
+
+        // A container created against the old path is now stale: its mounts and
+        // working dir are baked in at create time and do NOT follow a host-side
+        // `git worktree move`, so a reused container would `docker exec -w` into
+        // a path that no longer exists. Drop it to force a fresh create on next
+        // start. Only when the dir actually moved; a branch-only rename leaves
+        // the path valid. Mirrors `rename_selected` (#2117).
+        let dir_moved = outcome.new_path != std::path::Path::new(&project_path);
+        if dir_moved {
+            crate::session::worktree_edit::discard_sandbox_container_after_move(&id, is_sandboxed);
+        }
 
         self.apply_user_action(&id, |inst| {
             inst.project_path = new_path.clone();

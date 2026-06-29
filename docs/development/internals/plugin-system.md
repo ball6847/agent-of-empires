@@ -23,6 +23,29 @@ contribution section from a future schema is a hard error today) and validates
 (`api_version` in range, non-empty `name`/`version`). `API_VERSION` is the
 schema/host version this crate understands.
 
+### Screenshots
+
+A plugin may declare up to eight `[[screenshots]]` to illustrate itself in the
+dashboard marketplace and detail modal (requires `api_version >= 5`):
+
+```toml
+[[screenshots]]
+path = "docs/screenshots/dashboard.png"  # repository-relative; not a URL
+alt = "Dashboard card the plugin contributes"  # required, for accessibility
+caption = "Live status card."  # optional, shown beneath the image
+```
+
+`path` must be a repository-relative image (`png`/`jpg`/`jpeg`/`gif`/`webp`):
+absolute URLs, absolute or `..`-traversing paths, and other extensions are
+rejected. The plugin detail endpoint resolves each path against the source
+repo's `raw.githubusercontent.com` (honoring the installed ref, else `HEAD`),
+so the browser fetches the asset directly; AoE never proxies image bytes. The
+endpoint silently drops any screenshot whose path or alt text fails validation
+rather than failing the whole detail response, so one bad entry omits only that
+image. The assets must be committed and pushed to the source repo before they
+render; local plugins do not support screenshots yet (future work beyond
+#2484).
+
 ## Registry
 
 `src/plugin/registry.rs` owns the in-process registry.
@@ -31,7 +54,12 @@ schema/host version this crate understands.
   TOML via `include_str!`. The `aoe.web` marker is gated on the `serve` cargo
   feature, so it is present in every dashboard/release build and absent from a
   TUI-only build. `default-plugins` (on by default) reserves the on-by-default
-  slot for bundled plugins that do not require the dashboard.
+  slot for bundled plugins that do not require the dashboard. CI runs a
+  `--no-default-features` leg (`.github/workflows/tests.yml`) that builds with
+  every default plugin compiled out and runs the e2e suite, so a default plugin
+  cannot silently grow an undeclared core dependency: core must still create,
+  attach to, and destroy a tmux + worktree session from CLI and TUI with all
+  default plugins disabled (invariant 1 of #268).
 - `PluginRegistry::load(config)` parses every builtin manifest, resolves each
   plugin's enabled flag from `[plugins."<id>"]` in `config.toml` (default
   enabled), and collects any parse errors as non-fatal `load_errors`.
@@ -114,15 +142,29 @@ declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`, and a
 declares; they are defined in `aoe-plugin-api` and parsed/validated by the
 host, but consumed by later issues (the settings registry in #2094, the runtime
 host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is now
-3 (bumped to 2 for the contribution sections, then 3 when the `detail-panel`
-slot became the dockable `pane` slot); an older `api_version` manifest still
-loads as long as it targets no newer slot. Unknown top-level keys remain a hard
-parse error (`deny_unknown_fields`).
+4 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
+became the dockable `pane` slot, then 4 for the `status` section and the
+`aoe_version` field); an older `api_version` manifest still loads as long as it
+targets no newer field. Unknown top-level keys remain a hard parse error
+(`deny_unknown_fields`).
 
-The `themes`, `status`, and `panes` sections are deferred until a consumer
-exists, so no schema lands in core ahead of one (#2386). With
-`deny_unknown_fields`, a manifest declaring `[[themes]]`, `[[status]]`, or
-`[[panes]]` is a hard parse error today.
+The `themes` section ships and is consumed by the theme registry (#2094); the
+`status` section (`id`, `label`) is parsed and validated here, its consumer is
+the status reference plugin (#2096). `panes` is not a manifest section: panes
+ship as a `ui` slot of kind `pane` (#2432), so `[[panes]]` stays a hard parse
+error. `status` and `aoe_version` (below) require `api_version >= 4`: under
+`deny_unknown_fields` a pre-4 host would otherwise report a bare "unknown
+field" instead of the "upgrade aoe" message, so the host gates them behind the
+bump.
+
+`aoe_version` is an optional semver requirement (`">=0.10, <0.12"`) naming
+which aoe (host app) versions this plugin version supports. It is distinct from
+`api_version`: `api_version` gates the manifest schema shape, `aoe_version`
+gates the host's app behaviour. The host refuses to install or update a plugin
+whose range excludes the running aoe, and skips loading one (into the
+registry's load errors) rather than bailing, so an aoe upgrade cannot brick
+startup. Builtins are exempt (they ship with aoe). An absent range means no
+constraint.
 
 The `runtime` section is one of two kinds: `command` (an argv launched from the
 plugin directory) or `release-binary` (a compiled worker shipped as a GitHub
@@ -138,24 +180,33 @@ registered. This is how an interpreted worker sets itself up (create a venv,
 ```toml
 [runtime]
 kind = "command"
-command = [".venv/bin/aoe-github-worker"]   # plugin-relative: PATH-independent
+command = [".aoe-build/venv/bin/aoe-github-worker"]   # plugin-relative
 
 [[runtime.build]]
-command = ["python3", "-m", "venv", ".venv"]
+command = ["python3", "-m", "venv", ".aoe-build/venv"]
 
 [[runtime.build]]
-command = [".venv/bin/pip", "install", "."]
+command = [".aoe-build/venv/bin/pip", "install", "."]
 platforms = ["linux", "macos"]              # optional; omitted runs everywhere
 ```
 
+Build output must go under the reserved `.aoe-build/` directory, never directly
+into the source tree. That directory is excluded from `tree_hash` (see below), so
+a build that mutates the install tree (a venv, `node_modules`, compiled
+artifacts) does not change the source hash and a featured plugin still
+re-derives `Featured` at load. A source tree that ships `.aoe-build` is refused
+at install.
+
 Each step's argv resolves through the host's argv resolver (bare name on PATH,
 separator path relative to the plugin dir, absolute rejected), evaluated just
-before the step runs so `.venv/bin/pip` resolves once the prior step created it.
+before the step runs so `.aoe-build/venv/bin/pip` resolves once the prior step
+created it.
 Build steps are free to name bare PATH programs (`python3`, `node`, `uv`): they
 run in the user's interactive shell where PATH is reliable, which is exactly why
 the worker entrypoint, launched later by the daemon, is not. A step's optional `platforms` (`linux` / `macos` / `windows`)
 restricts it to matching hosts. Builds run with cwd set to the plugin dir, with
-stdin closed and stdout/stderr inherited so the user sees progress.
+stdin closed and stdout/stderr going to the operation log: the user's terminal
+for a CLI install, or a per-job log file for a dashboard install (see below).
 
 Why install time and the final dir, not launch or staging: `aoe plugin
 install` runs in the user's interactive shell, where `python3` / `node` / `uv`
@@ -165,6 +216,19 @@ absolute paths), so the build runs in the final `<plugins_dir>/<id>`, never in
 a staging tree that is then renamed. A failed build aborts the install with no
 trace; a failed update restores the prior version from a backup, and a leftover
 backup from an interrupted update is recovered on the next install/update.
+
+Web lifecycle jobs: the dashboard (Settings -> Plugins) installs, updates, and
+uninstalls a `gh:` plugin without a terminal. The same disclosure the CLI
+prompts for (capabilities, build commands, UI slots, unverified-source warning)
+is returned as structured data and approved in a modal; the host then runs the
+operation as a job whose progress and build output stream to a per-job log file
+under `<plugins_dir>/jobs/<job_id>.log`, which the dashboard tails. One
+lifecycle mutation runs at a time (config and lockfile writes are not
+concurrency-safe; a second start is rejected). One PATH caveat: a dashboard
+build runs with the daemon's environment, not the user's interactive shell, so a
+build step that names a bare PATH program present only in the interactive shell
+can succeed from `aoe plugin install` yet fail from a dashboard install. Local
+(non-`gh:`) installs stay CLI-only.
 
 The worker entrypoint (`command`'s `argv[0]`) must be plugin-relative: a path
 containing a separator (`.venv/bin/worker`), resolved inside the install
@@ -263,8 +327,16 @@ reads (the field defaults) and is repopulated on the next install/update.
 `plugin::integrity::tree_hash` is a deterministic `sha256:<hex>` over a plugin's
 source tree. Files are sorted by their forward-slash relative path and hashed
 under a versioned header (`aoe-plugin-tree-hash-v1`) as `file\0<path>\0<len>
-<content>`. `.git` is skipped (it is stripped from an installed tree); a symlink
-or non-UTF-8 path is a hard error so nothing installed escapes the hash. File
+<content>`. `.git` and the reserved `.aoe-build/` build-output directory are skipped
+(the first is stripped from an installed tree, the second is generated into it by
+build steps and is not part of the source); a symlink or non-UTF-8 path outside
+those is a hard error so nothing installed escapes the hash. Skipping
+`.aoe-build` is what lets a build-mutating plugin (a venv holds ~thousands of
+files and a `python3` symlink) re-derive the same hash at load that the author's
+`aoe plugin hash` of a clean checkout produced; a fixed reserved name keeps the
+exclusion out of attacker control, where a manifest-declared list a tampered
+manifest could widen would not. A source that ships `.aoe-build` is refused at
+fetch, so the excluded subtree can never hide vetted source. File
 mode is excluded for cross-platform determinism, and `git clone` runs with
 `core.autocrlf=false` so line endings never differ by platform. The hash is
 computed over the staged source **before** any release-binary worker is
@@ -273,16 +345,25 @@ install-time value; the downloaded worker stays pinned separately by the lock's
 `asset_sha256`.
 
 `plugins/featured.toml` is the curated index, compiled into the binary. Each
-entry pins one vetted release per plugin id to its `{source, tree_hash}`: a
-maintainer's attestation that this exact tree was reviewed. When a plugin id
-appears in the index, install and update **refuse** unless the fetched source
-slug (case-insensitive) and tree hash both match the pin, and a release-binary
-manifest is refused outright (its worker bytes are not covered by the tree hash
-yet). A featured-verified install is the one case allowed to claim a reserved
-(`aoe.*` / `agent-of-empires.*`) namespace; a builtin-id collision is always
-rejected. In debug builds `AOE_FEATURED_INDEX_PATH` overrides the embedded index
-for tests; a release binary always uses the compiled-in index, since the curated
-set is a root of trust and must not be redefinable by the environment.
+entry holds a plugin's `source` slug and a `version -> tree_hash` map of vetted
+releases: a maintainer's attestation that each listed tree was reviewed. When a
+plugin id appears in the index, install and update **refuse** if the fetched
+source slug (case-insensitive) does not match, or if the manifest ships a
+release-binary worker (its bytes are not covered by the tree hash yet). The tree
+hash is then checked against the entry's set of vetted hashes: a match is
+featured-verified. An id-in-index install at a hash that is **not** in the set is
+an unvetted version, not a tamper-refuse: it installs as a non-featured plugin
+(community for a GitHub install), so a maintainer can vet a new release by
+appending its hash without un-verifying older ones. The reserved-namespace gate
+is unchanged, so an unvetted version of a reserved-namespace plugin is still
+refused (only a vetted release lifts that gate). A featured-verified install is
+the one case allowed to claim a reserved (`aoe.*` / `agent-of-empires.*`)
+namespace; a builtin-id collision is always rejected. To ship a new release, run
+`aoe plugin hash` against the new tag and add a `"<version>" = "sha256:..."`
+entry inside the entry's `versions` map alongside the existing ones. In debug
+builds `AOE_FEATURED_INDEX_PATH` overrides the embedded
+index for tests; a release binary always uses the compiled-in index, since the
+curated set is a root of trust and must not be redefinable by the environment.
 
 Every surface (CLI `aoe plugin list` / `info`, the TUI plugin manager, the web
 Plugins panel) shows a `ValidationState`: `builtin`, `featured`, `community` (an
@@ -293,9 +374,14 @@ gates the reserved-namespace lift and the lockfile is user-writable; `community`
 vs `local` is derived from the install source. The lockfile records the tree
 hash and the install-time `trust` as a resolved record, but the load path does
 not depend on them for validation. The recompute is cheap (only ids the index
-names, and a featured plugin ships no release-binary, so its installed tree
-equals its source tree). The manifest-hash grant check still catches a community
-plugin tampered after install.
+names, and a featured plugin ships no release-binary, so its installed source
+equals its pinned source; build output under `.aoe-build` is excluded, so a
+build-mutating plugin re-derives the same hash) and is done live on every load
+from the on-disk tree,
+never from a cache: a metadata-keyed cache could be forged to return a stale
+vetted hash for a tampered tree, so the verified decision always re-hashes
+content. The manifest-hash grant check still catches a community plugin tampered
+after install.
 
 `aoe plugin hash <dir>` prints the tree hash for a plugin directory so an author
 can produce the value a maintainer pins. Run it on a clean checkout.
@@ -441,6 +527,13 @@ that loses returns the current value rather than clobbering it. Writes go
 through `Storage`'s cross-process lock, so the daemon picks them up on its next
 session reload (eventual consistency, not a live push).
 
+`sessions.list` returns one entry per session with `id`, `title`,
+`project_path`, `tool`, `status` (the run-state), and two inactivity flags:
+`archived` (the session is archived) and `snoozed` (it has a snooze deadline
+still in the future; a past deadline reports `false`). The call never filters
+server-side, so a worker that should ignore dormant sessions, for example to
+avoid spending API quota on them, checks these flags itself.
+
 `config.get { key }` returns the value at `plugins.<plugin-id>.settings.<key>`
 for the calling plugin's own id, so a worker reads back the settings the user
 edited on the TUI/web surfaces, falling back to its own default when the key is
@@ -464,9 +557,11 @@ change to the resolver or the supervisor.
 ## UI extension points (#2366)
 
 A plugin worker pushes typed UI state to the host over capability-gated RPCs;
-the **host** renders every slot, on the web dashboard. No plugin code runs in
-the dashboard and the render path never awaits a worker: the host keeps an
-in-memory snapshot the dashboard reads synchronously.
+the **host** renders every slot, on the web dashboard and (the
+terminal-applicable subset) in the daemon-connected TUI. No plugin code runs in
+either surface and the render path never awaits a worker: the host keeps an
+in-memory snapshot each surface reads synchronously (see Delivery below for what
+the TUI renders).
 
 The nine slots are a closed `UiSlot` set (`aoe-plugin-api`), kebab-case on the
 wire: `status-bar`, `row-badge`, `row-column`, `sort-key`, `filter-facet`,
@@ -509,18 +604,35 @@ Two slots carry more than a single value, so one entry (one declared
   safe URL. The single `{ text, tone, tooltip, icon, href }` form still works.
   An empty `items: []` clears the row.
 - `pane` also accepts `blocks: Block[]`, an ordered list of typed
-  blocks. The host knows these kinds: `heading { text }`,
-  `row { label, value?, sublabel?, icon?, tone?, href? }`, `note { text, tone? }`,
-  `divider {}`, `section { title?, children: Block[] }` (nested blocks), and
+  blocks. The web renderer knows these kinds: `heading { text }`,
+  `row { label, value?, sublabel?, icon?, tone?, color?, href? }`,
+  `note { text, tone? }`, `divider {}`,
+  `section { title?, children: Block[], collapsible?, collapsed? }` (nested
+  blocks; `collapsible` wraps the section in a native `<details>` the user can
+  fold, and `collapsed` starts it folded, default open),
+  `comment { author, body, path?, line?, resolved?, href? }` (a read-only PR
+  review comment: author, optional file:line, a wrapped body excerpt, and an
+  unresolved/resolved marker), and
   `action { label, method, icon? }` (a button that forwards `method` to the
-  plugin's worker, see below). The simple `{ title, body }` form still works
+  plugin's worker, see below). A block's optional `color` is a validated hex
+  literal (`#rgb`/`#rrggbb`, normalized; no CSS names, `rgb()`, `var()`, or
+  `url()`, so it can never carry arbitrary CSS) that tints the block's
+  icon/value where a semantic `tone` cannot name the hue, e.g. a merged PR's
+  purple. The simple `{ title, body }` form still works
   when `blocks` is absent. A `pane`
   also takes an optional `default_location` (`right` | `bottom`) choosing the
   dock it first opens in; the user can move it between docks afterward, and an
   optional `icon` (any lucide icon name, kebab-case) for its activity-bar
   button, falling back to a generic plugin icon. The host renders each `pane` as
   a dockable tool-window (activity-bar toggle, move, close) alongside the
-  built-in diff and terminal panes.
+  built-in diff and terminal panes. Each pane's body scrolls, and a long
+  `comment` body is clamped with a "more"/"less" toggle, so a full PR comment
+  list stays browsable.
+
+  A pane entry gets a larger payload budget than the other slots: its normalized
+  JSON may be up to 64KB, against 8KB for every other slot (`status-bar`,
+  `row-badge`, `row-column`, `card`, `detail-badge`), so a plugin can push a full
+  comment list in one pane entry without truncating to fit.
 
 **Block parsing is forward-compatible by design.** The host stores `blocks` as
 opaque JSON (`Vec<Value>`); it validates only that the payload envelope is
@@ -562,20 +674,108 @@ incremental cursor. The dashboard polls it on the same cadence as
 `/api/sessions` and renders per-session entries only for sessions present in
 the live list. Notifications surface as toasts, deduped by `seq`.
 
-`sort-key` and `filter-facet` are accepted and stored by the host but their
-dashboard rendering (which needs changes to the sidebar's sort/filter core),
-and TUI rendering of any slot (the standalone TUI has no daemon link), are
-deferred to follow-ups.
+`sort-key` and `filter-facet` render in the dashboard sidebar (#2401): each
+global `sort-key` is an extra option in the sort picker that orders rows by the
+referenced `row-column`'s `sort_value` (best value per direction at the
+workspace and group level, unvalued rows sink), and each `filter-facet` is a
+facet control that filters rows by the referenced `row-column`'s
+`filter_values` (AND across facets, OR within one). Both selections are
+client-side and ephemeral: they read the already-fetched scalars, run no plugin
+code, and are not persisted, so a daemon restart falls back to the built-in
+sort.
+
+The native **structured-view** TUI (`aoe acp attach`, the remote-home picker)
+polls the same endpoint on a 3-second cadence and renders the slots a terminal
+can show: global `status-bar` segments and the open session's `detail-badge`
+entries, tone-colored, in its status line, plus `notification`s as toasts
+(deduped by `seq`, queued so a burst shows one at a time). It renders text and
+tone only; `icon`, `tooltip`, and `href` are dropped, and `card`, `pane`,
+`row-badge`, `row-column`, `sort-key`, and `filter-facet` have no structured-view
+surface. The standalone home screen reads local session storage and has no
+daemon link, so it renders no plugin slots; rendering there is a follow-up
+(#2402).
+
+## Discovery and update checks (#2365)
+
+Discovery and update checks are **explicit actions, never background work** (the
+one exception is the opt-in auto-update sweep below). Both are repo/source level
+and reuse the existing install trust model rather than weakening it.
+
+### Discovery
+
+`plugin::discover::discover(query)` runs one GitHub search over the `aoe-plugin`
+topic (`topic:aoe-plugin fork:false archived:false`, plus an optional free-text
+term) and badges each result by matching the repo slug against the featured
+index source slugs and the installed plugins' sources (case-insensitive). It does
+**not** fetch each repo's `aoe-plugin.toml`: cloning N search results to read a
+manifest would be an N+1 blowup against the unauthenticated search rate limit. So
+a result is "a GitHub repository tagged `aoe-plugin`", and a `featured` badge
+means "a curated source slug", not "the current tree matches the pin". Results
+rank featured-first then by stars (#2105 will add popularity ranking). Install
+stays the trust boundary: `aoe plugin install` fetches the manifest, prompts for
+capabilities, and enforces the featured pin.
+
+Surfaces: `aoe plugin discover [query]`, the TUI plugin manager `d` key, and the
+dashboard "Search GitHub" button (`GET /api/plugins/discover?q=`). The dashboard
+has no install path (capability approval needs a terminal), so each result shows
+a copyable `aoe plugin install gh:owner/repo` command instead of an install
+button.
+
+Unauthenticated GitHub search is rate limited (about 10 requests/minute/IP); the
+client maps a 403/429 to a `RateLimited` error so each surface reports it plainly
+rather than as a generic failure.
+
+`GET /api/plugins/details?source=gh:owner/repo` backs the dashboard's detail
+modal (opened from a discovery result or an installed-plugin row). It reads the
+plugin's `aoe-plugin.toml` via the GitHub contents API (no clone) and lists the
+repo's release tags as the available versions. The manifest is parsed leniently
+(unknown and future keys ignored, `api_version` not range-checked), so a plugin
+targeting a newer host than the one installed still renders; a missing or
+unparseable manifest is reported in `manifest_error` while the release tags still
+load.
+
+### Update checks
+
+`plugin::update_check::outdated()` checks every installed external plugin against
+its `plugins.lock` entry. A GitHub source compares the locked `resolved_commit`
+to `git ls-remote <clone_url> <ref|HEAD>` (no clone, no REST rate limit; honors
+`AOE_GITHUB_CLONE_BASE`, and an annotated tag's peeled `^{}` target wins). A local
+source re-hashes its source directory with `integrity::tree_hash` and compares to
+the locked `tree_hash`. Builtins are skipped; a missing lock entry, absent `git`,
+or dead remote is reported per-plugin, never silently treated as up to date. A
+commit-pinned install is never "outdated". Limitation: a `release-binary` plugin
+whose release asset is replaced without a source-commit change is not detected
+(ls-remote only sees the source tree).
+
+Surfaces: `aoe plugin outdated`, the TUI plugin manager `c` key, and
+`GET /api/plugins/updates`. The web endpoint is separate from the always-on
+`GET /api/plugins` list so a settings render never blocks on git or the network;
+the dashboard paints update-available badges only after the user clicks "Check
+for updates".
+
+### Auto-update sweep
+
+The opt-in `updates.auto_update_plugins` setting (off by default) runs a sweep at
+TUI and `aoe serve` startup (`plugin::auto_update::spawn_if_enabled`), spawned
+non-blocking so a slow remote never delays startup. It applies only **clean**
+updates, those that need no new consent; any version that changes the capability
+set, build steps, or UI slots is skipped and left for a manual `aoe plugin
+update` so the new grant is reviewed (`install::ConsentMode::CleanOnlyNonInteractive`).
+A background sweep therefore never grants new capabilities, runs a changed build
+step unattended, or deactivates a working plugin. Applied updates take effect on
+the next launch / daemon restart.
 
 ## What comes next
 
 Each deferred piece returns as its own PR once the core is proven: the Tier 0
 contribution registries (issue 2094), the UI extension points (issue 2366,
 above), the builtin worker self-exec path and worker SDK (with the first
-builtin worker that needs them), and the discovery / featured supply-chain
-layer with integrity hashing (issues 2364 and 2365). Within #2366, dashboard
-rendering of the `sort-key` and `filter-facet` slots and TUI rendering of any
-slot are themselves follow-ups. Pinning a featured plugin's
+builtin worker that needs them); the integrity-hashing / featured supply-chain
+layer landed in #2364 and the discovery / update-check layer in #2365 (both
+above). Rendering plugin slots in the standalone (non-daemon) home screen is
+still a follow-up (the structured-view TUI already renders the
+terminal-applicable subset, #2402). Pinning a featured plugin's
 release-binary asset hash in `featured.toml` (so a featured worker is attested,
 not just its source) is a follow-up; today a release-binary plugin cannot be
-featured.
+featured. Popularity-based discovery ranking and a `release-binary` asset-drift
+update check are tracked in #2105 and remain out of scope here.

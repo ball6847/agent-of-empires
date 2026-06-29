@@ -2,14 +2,22 @@
 // typed display state; these components draw it. No plugin code runs here.
 // Each reads the shared snapshot via context and the pure selectors in
 // `pluginUi.ts`. Slots shipped here: status-bar, row-badge, row-column, card,
-// pane, detail-badge. Notifications surface as toasts via the hook;
-// sort-key and filter-facet are deferred (see #2366 follow-ups).
+// pane, detail-badge. Notifications surface as toasts via the hook; the
+// sort-key and filter-facet slots render as sidebar sort options and a facet
+// filter (the sidebar owns those; see SidebarSortPicker / WorkspaceSidebar, #2401).
 
-import { createElement, useState } from "react";
+import { createElement, useEffect, useId, useRef, useState } from "react";
+import { ChevronRight } from "lucide-react";
 
 import { invokePluginAction } from "../../lib/api";
-import { usePluginUiEntries } from "../../lib/pluginUiContext";
 import {
+  usePluginUiEntries,
+  usePluginUiPoke,
+  usePluginUiRefreshing,
+  usePluginUiRevision,
+} from "../../lib/pluginUiContext";
+import {
+  accentStyle,
   entryText,
   entryTone,
   globalEntries,
@@ -155,14 +163,16 @@ export function PluginRowBadges({ sessionId }: { sessionId: string }) {
   );
 }
 
-/** row-column: per-session text column, right-aligned on a session row. The
- *  payload may also carry sort/filter scalars; rendering those as interactive
- *  controls is the deferred sort-key/filter-facet work. */
+/** row-column: per-session text column, anchored to the right of the plugin
+ *  row line (#2514) so it gives up no width to the badges beside it. The
+ *  payload may also carry `sort_value` / `filter_values` scalars, which the
+ *  sidebar's sort-key and filter-facet controls consume (#2401); this renders
+ *  only the visible text. */
 export function PluginRowColumn({ sessionId }: { sessionId: string }) {
   const entries = sessionEntries(usePluginUiEntries(), "row-column", sessionId);
   if (entries.length === 0) return null;
   return (
-    <span className="flex min-w-0 items-center gap-1.5">
+    <span className="ml-auto flex shrink-0 items-center gap-1.5">
       {entries.map((e) => {
         const text = entryText(e);
         if (!text) return null;
@@ -182,6 +192,27 @@ export function PluginRowColumn({ sessionId }: { sessionId: string }) {
           </span>
         );
       })}
+    </span>
+  );
+}
+
+/** The plugin row line: badges (wrapping, left) plus the right-anchored
+ *  status column, on their own line under the session name (#2514). Keeping
+ *  these off the name line stops the narrow mobile sidebar from squeezing the
+ *  column text to zero and pushing the badge icons past the drawer edge.
+ *  Renders nothing when the session has neither, so plugin-free rows keep their
+ *  original height. */
+export function PluginRowLine({ sessionId }: { sessionId: string }) {
+  const entries = usePluginUiEntries();
+  const hasBadges = sessionEntries(entries, "row-badge", sessionId).length > 0;
+  const hasColumn = sessionEntries(entries, "row-column", sessionId).length > 0;
+  if (!hasBadges && !hasColumn) return null;
+  return (
+    <span className="mt-0.5 flex items-center gap-1.5">
+      <span className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <PluginRowBadges sessionId={sessionId} />
+      </span>
+      <PluginRowColumn sessionId={sessionId} />
     </span>
   );
 }
@@ -234,6 +265,9 @@ function BlockRow({ block }: { block: Record<string, unknown> }) {
   const sublabel = str(block, "sublabel");
   const iconComp = lucideIcon(str(block, "icon"));
   const tone = validTone(block.tone);
+  // A validated hex `color` overrides the tone color for the icon and value
+  // (e.g. a merged PR's purple, which no semantic tone names).
+  const accent = accentStyle(block.color);
   const safe = safeHref(str(block, "href"));
   if (!label && !value && !iconComp) return null;
   // Name the link from its text so an icon-only row is not announced unlabeled.
@@ -241,10 +275,18 @@ function BlockRow({ block }: { block: Record<string, unknown> }) {
   const inner = (
     <span className="flex min-w-0 items-center gap-2">
       {iconComp &&
-        createElement(iconComp, { className: `size-4 shrink-0 ${toneTextClass(tone)}`, "aria-hidden": true })}
+        createElement(iconComp, {
+          className: `size-4 shrink-0 ${accent ? "" : toneTextClass(tone)}`,
+          style: accent,
+          "aria-hidden": true,
+        })}
       <span className="min-w-0 truncate">
         {label && <span className="font-medium text-text-primary">{label}</span>}
-        {value && <span className="ml-1.5 text-text-secondary">{value}</span>}
+        {value && (
+          <span className="ml-1.5 text-text-secondary" style={accent}>
+            {value}
+          </span>
+        )}
         {sublabel && <span className="ml-1.5 text-[11px] text-text-dim">{sublabel}</span>}
       </span>
     </span>
@@ -264,23 +306,91 @@ function BlockRow({ block }: { block: Record<string, unknown> }) {
   );
 }
 
+/** The repo's inline spinner glyph (same shape as the dialog buttons), sized to
+ *  fit alongside slot text. `currentColor` so it inherits the surrounding tone. */
+function Spinner({ className }: { className: string }) {
+  return (
+    <svg className={`animate-spin ${className}`} viewBox="0 0 24 24" aria-hidden>
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+    </svg>
+  );
+}
+
+// A pane action's spinner clears after this even if no fresh state arrives, so
+// a worker that processes the action without re-pushing (no sessions, ignored
+// method, mid-refresh crash) can never leave the button spinning forever.
+const ACTION_TIMEOUT_MS = 15000;
+
 /** An `action` pane block: a button that forwards a worker method (named by the
- *  plugin) to that plugin's worker. Fire-and-forget; the worker re-pushes its
- *  UI state, which the next poll renders. Disabled briefly so a double-click
- *  does not double-fire. An icon is optional. */
-function BlockAction({ block, pluginId }: { block: Record<string, unknown>; pluginId: string }) {
+ *  plugin) to that plugin's worker. The worker runs the method and re-pushes its
+ *  UI state, which a later poll renders. The button spins from the click until
+ *  the plugin's UI revision moves off the baseline the action POST returned (the
+ *  worker's re-pushed state has landed), not merely until the POST is accepted,
+ *  with a hard timeout fallback so it can never hang. A failed POST clears the
+ *  spinner at once. An icon is optional. */
+function BlockAction({
+  block,
+  pluginId,
+  sessionId,
+}: {
+  block: Record<string, unknown>;
+  pluginId: string;
+  sessionId?: string;
+}) {
   const label = str(block, "label");
   const method = str(block, "method");
   const iconComp = lucideIcon(str(block, "icon"));
-  const [busy, setBusy] = useState(false);
+  const revision = usePluginUiRevision(pluginId, sessionId);
+  const poke = usePluginUiPoke();
+  // `posting`: the POST is in flight. `waitBaseline`: the revision the host had
+  // when it accepted the action; the button keeps spinning until the polled
+  // revision moves off it (the worker's re-pushed state landed) or the timeout
+  // fires. Stored as state so a polled revision change re-renders the button.
+  const [posting, setPosting] = useState(false);
+  const [waitBaseline, setWaitBaseline] = useState<number | null>(null);
+  // Guards a same-tick double-fire of the POST, before `posting` commits and
+  // `disabled` takes effect; the wait phase is guarded by `busy`/`disabled`.
+  const postingRef = useRef(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Derived in render, so nothing has to chase the revision in an effect: still
+  // waiting only while the polled revision has not moved off the baseline. `!==`
+  // so a daemon restart that resets the counter to a lower value also clears.
+  const waiting = waitBaseline !== null && revision === waitBaseline;
+  const busy = posting || waiting;
+
+  // Only an unmount guard: stop the fallback timer so it cannot fire setState on
+  // an unmounted block. No state writes here, so no effect-chases-event lint.
+  useEffect(
+    () => () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    },
+    [],
+  );
+
   if (!label || !method) return null;
   const onClick = async () => {
-    if (busy) return;
-    setBusy(true);
+    if (postingRef.current || busy) return;
+    postingRef.current = true;
+    setPosting(true);
     try {
-      await invokePluginAction(pluginId, method);
+      const accepted = await invokePluginAction(pluginId, method, sessionId);
+      if (!accepted) return; // 403/404/network: nothing re-pushes, stop spinning
+      poke();
+      // No baseline (older daemon): can't track completion, so degrade to
+      // clearing when the POST settles rather than spinning to the timeout.
+      if (accepted.baselineRevision === null) return;
+      // Hold the spinner until the revision moves off this baseline (see above).
+      setWaitBaseline(accepted.baselineRevision);
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => {
+        setWaitBaseline(null);
+        timerRef.current = null;
+      }, ACTION_TIMEOUT_MS);
     } finally {
-      setBusy(false);
+      postingRef.current = false;
+      setPosting(false);
     }
   };
   return (
@@ -288,12 +398,88 @@ function BlockAction({ block, pluginId }: { block: Record<string, unknown>; plug
       type="button"
       onClick={onClick}
       disabled={busy}
+      aria-busy={busy || undefined}
       data-testid="plugin-pane-action"
       className="self-start inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs cursor-pointer bg-surface-700/50 text-text-secondary hover:text-text-primary hover:bg-surface-700 disabled:opacity-50 disabled:cursor-default transition-colors"
     >
-      {iconComp && createElement(iconComp, { className: "size-3.5", "aria-hidden": true })}
+      {busy ? (
+        <Spinner className="size-3.5" />
+      ) : (
+        iconComp && createElement(iconComp, { className: "size-3.5", "aria-hidden": true })
+      )}
       {label}
     </button>
+  );
+}
+
+/** A read-only PR review comment: author, optional file:line, a wrapped body,
+ *  and an unresolved/resolved marker. Wrapped in a link when `href` is a safe
+ *  http(s) URL. A long body is clamped to 3 lines with a "more"/"less" toggle so
+ *  the full text is reachable without leaving the pane. There are no
+ *  reply/resolve controls; this only surfaces what is already on the PR. */
+function BlockComment({ block }: { block: Record<string, unknown> }) {
+  const author = str(block, "author");
+  const body = str(block, "body");
+  const path = str(block, "path");
+  const line = typeof block.line === "number" ? block.line : undefined;
+  const resolved = block.resolved === true;
+  const safe = safeHref(str(block, "href"));
+  const [expanded, setExpanded] = useState(false);
+  const bodyId = useId();
+  if (!author && !body) return null;
+  const where = path ? `${path}${line ? `:${line}` : ""}` : undefined;
+  // ponytail: cheap length/newline heuristic instead of measuring layout, so the
+  // toggle works in jsdom and needs no ref/effect. Ceiling: a short-but-wide body
+  // that wraps past 3 lines under 200 chars misses the toggle; raise the bound if
+  // that bites.
+  const longBody = !!body && (body.length > 200 || (body.match(/\n/g)?.length ?? 0) >= 3);
+  // The linkable content (header + body); the toggle stays a sibling so it is
+  // never an interactive child of the <a> (invalid nesting, odd keyboard focus).
+  const linkContent = (
+    <>
+      <div className="flex items-center justify-between gap-2 text-text-secondary">
+        <span className="min-w-0 truncate font-medium">{author}</span>
+        <span className="flex shrink-0 items-center gap-1.5">
+          {where && <span className="font-mono text-[10px] text-text-dim truncate max-w-40">{where}</span>}
+          <span className={`text-[10px] ${resolved ? "text-status-running" : "text-status-waiting"}`}>
+            {resolved ? "resolved" : "unresolved"}
+          </span>
+        </span>
+      </div>
+      {body && (
+        // Clamp only when there is a toggle to undo it, so a short body that
+        // still wraps past three lines is not truncated with no way to expand.
+        <div
+          id={bodyId}
+          className={`mt-0.5 whitespace-pre-wrap text-text-primary ${longBody && !expanded ? "line-clamp-3" : ""}`}
+        >
+          {body}
+        </div>
+      )}
+    </>
+  );
+  return (
+    <div className="rounded-md bg-surface-700/30 p-2 text-xs">
+      {safe ? (
+        <a className="block rounded-md hover:bg-surface-700/50" href={safe} target="_blank" rel="noopener noreferrer">
+          {linkContent}
+        </a>
+      ) : (
+        linkContent
+      )}
+      {longBody && (
+        <button
+          type="button"
+          data-testid="plugin-comment-toggle"
+          aria-expanded={expanded}
+          aria-controls={bodyId}
+          onClick={() => setExpanded((v) => !v)}
+          className="mt-0.5 text-[10px] text-text-dim hover:text-text-primary cursor-pointer"
+        >
+          {expanded ? "less" : "more"}
+        </button>
+      )}
+    </div>
   );
 }
 
@@ -301,7 +487,15 @@ function BlockAction({ block, pluginId }: { block: Record<string, unknown>; plug
  *  an unknown `kind` (or a known kind missing its required field) renders
  *  nothing rather than throwing, so a newer plugin can push kinds an older host
  *  has never heard of. */
-function DetailBlock({ block, pluginId }: { block: Record<string, unknown>; pluginId: string }) {
+function DetailBlock({
+  block,
+  pluginId,
+  sessionId,
+}: {
+  block: Record<string, unknown>;
+  pluginId: string;
+  sessionId?: string;
+}) {
   switch (str(block, "kind")) {
     case "heading": {
       const text = str(block, "text");
@@ -309,6 +503,8 @@ function DetailBlock({ block, pluginId }: { block: Record<string, unknown>; plug
     }
     case "row":
       return <BlockRow block={block} />;
+    case "comment":
+      return <BlockComment block={block} />;
     case "note": {
       const text = str(block, "text");
       return text ? <p className={`text-xs ${toneTextClass(validTone(block.tone))}`}>{text}</p> : null;
@@ -316,16 +512,41 @@ function DetailBlock({ block, pluginId }: { block: Record<string, unknown>; plug
     case "divider":
       return <hr className="border-surface-700/60" />;
     case "action":
-      return <BlockAction block={block} pluginId={pluginId} />;
+      return <BlockAction block={block} pluginId={pluginId} sessionId={sessionId} />;
     case "section": {
       const title = str(block, "title");
       const children = Array.isArray(block.children) ? block.children.filter(isObject) : [];
+      const body = children.map((c, i) => <DetailBlock key={i} block={c} pluginId={pluginId} sessionId={sessionId} />);
+      // An optional tone-tinted icon on the title gives an at-a-glance status
+      // even when the section is folded (e.g. a green check vs a red x).
+      const tone = validTone(block.tone);
+      const iconComp = lucideIcon(str(block, "icon"));
+      const titleColor = iconComp || tone ? toneTextClass(tone) : "text-text-dim";
+      const titleClass = `text-[11px] font-semibold uppercase tracking-wide ${titleColor}`;
+      const titleInner = (
+        <>
+          {iconComp && createElement(iconComp, { className: "size-3 shrink-0", "aria-hidden": true })}
+          {title}
+        </>
+      );
+      // A `collapsible` section folds via a native <details>: keyboard-accessible
+      // and stateless, no JS toggle to track. `collapsed` sets the initial state;
+      // it stays open by default so existing panes look unchanged.
+      if (block.collapsible === true) {
+        return (
+          <details className="group flex flex-col gap-1" open={block.collapsed !== true}>
+            <summary className={`flex cursor-pointer list-none items-center gap-1 select-none ${titleClass}`}>
+              <ChevronRight className="size-3 shrink-0 transition-transform group-open:rotate-90" aria-hidden />
+              {titleInner}
+            </summary>
+            <div className="flex flex-col gap-1">{body}</div>
+          </details>
+        );
+      }
       return (
         <section className="flex flex-col gap-1">
-          {title && <div className="text-[11px] font-semibold uppercase tracking-wide text-text-dim">{title}</div>}
-          {children.map((c, i) => (
-            <DetailBlock key={i} block={c} pluginId={pluginId} />
-          ))}
+          {title && <div className={`flex items-center gap-1 ${titleClass}`}>{titleInner}</div>}
+          {body}
         </section>
       );
     }
@@ -343,12 +564,24 @@ export function PluginPaneBody({ entry }: { entry: PluginUiEntry }) {
   const blocks = objectList(entry.payload, "blocks");
   const title = payloadStr(entry, "title");
   const body = payloadStr(entry, "body");
+  // A background poll only flips this once it outlasts the indicator delay, so
+  // this surfaces a slow auto-refresh without strobing on every 3s cadence.
+  const refreshing = usePluginUiRefreshing();
   return (
     <div className="flex-1 min-h-0 overflow-auto p-3" data-testid="plugin-pane-body" data-plugin-id={entry.plugin_id}>
+      {refreshing && (
+        <div
+          className="sticky top-0 z-10 mb-1.5 flex items-center justify-end gap-1 text-[10px] text-text-dim"
+          data-testid="plugin-pane-refreshing"
+        >
+          <Spinner className="size-3" />
+          Refreshing…
+        </div>
+      )}
       {blocks ? (
         <div className="flex flex-col gap-1.5">
           {blocks.map((b, i) => (
-            <DetailBlock key={i} block={b} pluginId={entry.plugin_id} />
+            <DetailBlock key={i} block={b} pluginId={entry.plugin_id} sessionId={entry.session_id} />
           ))}
         </div>
       ) : (

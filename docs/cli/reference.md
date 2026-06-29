@@ -33,6 +33,9 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session unfavorite`↴](#aoe-session-unfavorite)
 * [`aoe session archive`↴](#aoe-session-archive)
 * [`aoe session unarchive`↴](#aoe-session-unarchive)
+* [`aoe session restore`↴](#aoe-session-restore)
+* [`aoe session list-trash`↴](#aoe-session-list-trash)
+* [`aoe session empty-trash`↴](#aoe-session-empty-trash)
 * [`aoe group`↴](#aoe-group)
 * [`aoe group list`↴](#aoe-group-list)
 * [`aoe group create`↴](#aoe-group-create)
@@ -47,6 +50,8 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe plugin update`↴](#aoe-plugin-update)
 * [`aoe plugin uninstall`↴](#aoe-plugin-uninstall)
 * [`aoe plugin hash`↴](#aoe-plugin-hash)
+* [`aoe plugin discover`↴](#aoe-plugin-discover)
+* [`aoe plugin outdated`↴](#aoe-plugin-outdated)
 * [`aoe profile`↴](#aoe-profile)
 * [`aoe profile list`↴](#aoe-profile-list)
 * [`aoe profile create`↴](#aoe-profile-create)
@@ -270,6 +275,7 @@ Remove a session
 * `--force` — Force worktree removal even with untracked/modified files
 * `--keep-container` — Keep container instead of deleting it (default: delete per config)
 * `--keep-scratch` — For scratch sessions, keep the scratch directory on disk instead of removing it. The session record is still deleted; the kept path is logged so you can find the files later. No effect on non-scratch sessions
+* `--purge` — Permanently delete instead of moving to trash. By default `rm` moves the session to the trash (when `session.delete_to_trash` is enabled, the default) so it can be restored; `--purge` forces the irreversible teardown (worktree/branch/container cleanup per the other flags, plus transcript removal)
 
 
 
@@ -344,6 +350,9 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `unfavorite` — Clear the favorite flag on a session
 * `archive` — Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 * `unarchive` — Unarchive a session (restores it to its tier in the Attention sort)
+* `restore` — Restore a trashed session, returning it to its prior bucket with its transcript and metadata intact. See #2489
+* `list-trash` — List the sessions currently in the trash
+* `empty-trash` — Permanently purge every trashed session in the profile (irreversible)
 
 
 
@@ -596,6 +605,34 @@ Unarchive a session (restores it to its tier in the Attention sort)
 
 
 
+## `aoe session restore`
+
+Restore a trashed session, returning it to its prior bucket with its transcript and metadata intact. See #2489
+
+**Usage:** `aoe session restore <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+
+
+
+## `aoe session list-trash`
+
+List the sessions currently in the trash
+
+**Usage:** `aoe session list-trash`
+
+
+
+## `aoe session empty-trash`
+
+Permanently purge every trashed session in the profile (irreversible)
+
+**Usage:** `aoe session empty-trash`
+
+
+
 ## `aoe group`
 
 Manage groups for organizing sessions
@@ -680,10 +717,12 @@ Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `info` — Show one plugin's manifest details
 * `enable` — Enable a plugin's contributions
 * `disable` — Disable a plugin; its settings stay on disk for re-enabling
-* `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. Community plugins run at your own risk
+* `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. With no `@ref`, installs the repo's latest release; an explicit `@ref` installs unverified, un-audited code. Community plugins run at your own risk
 * `update` — Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
 * `uninstall` — Uninstall an external plugin, removing its files and capability grant
 * `hash` — Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
+* `discover` — Search GitHub's `aoe-plugin` topic for installable plugins
+* `outdated` — List installed external plugins that have an update available
 
 
 
@@ -733,13 +772,13 @@ Disable a plugin; its settings stay on disk for re-enabling
 
 ## `aoe plugin install`
 
-Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. Community plugins run at your own risk
+Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. With no `@ref`, installs the repo's latest release; an explicit `@ref` installs unverified, un-audited code. Community plugins run at your own risk
 
 **Usage:** `aoe plugin install [OPTIONS] <SOURCE>`
 
 ###### **Arguments:**
 
-* `<SOURCE>` — `gh:owner/repo[@ref]` or a local directory path
+* `<SOURCE>` — `gh:owner/repo` (latest release) or `gh:owner/repo@ref` (unverified) or a local directory path
 
 ###### **Options:**
 
@@ -780,6 +819,26 @@ Print the deterministic source tree hash for a plugin directory, the value a mai
 ###### **Arguments:**
 
 * `<PATH>` — Path to the plugin directory
+
+
+
+## `aoe plugin discover`
+
+Search GitHub's `aoe-plugin` topic for installable plugins
+
+**Usage:** `aoe plugin discover [QUERY]`
+
+###### **Arguments:**
+
+* `<QUERY>` — Optional free-text term to narrow the search
+
+
+
+## `aoe plugin outdated`
+
+List installed external plugins that have an update available
+
+**Usage:** `aoe plugin outdated`
 
 
 

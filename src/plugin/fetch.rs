@@ -20,7 +20,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use aoe_plugin_api::{PluginManifest, RuntimeSpec};
 
-use crate::github::{GitHubClient, GitHubClientConfig, DEFAULT_USER_AGENT};
+use crate::github::{GitHubClient, GitHubClientConfig, GitHubError, DEFAULT_USER_AGENT};
 
 use super::source::PluginSource;
 
@@ -80,6 +80,16 @@ pub async fn fetch(source: &PluginSource) -> Result<FetchedPlugin> {
     };
 
     let (manifest, manifest_bytes) = read_manifest(&tree)?;
+
+    // The reserved build-output dir is excluded from the tree hash, so a source
+    // that ships it could hide files from the pin. It must only ever be created
+    // by build steps, never committed; refuse a source tree that contains it.
+    if tree.join(super::integrity::BUILD_OUTPUT_DIR).exists() {
+        bail!(
+            "plugin source ships the reserved build-output directory {:?}; it must only be produced by build steps, not committed",
+            super::integrity::BUILD_OUTPUT_DIR
+        );
+    }
 
     // Hash the source tree before any release-binary is injected below, so the
     // value matches `aoe plugin hash` run on the author's checkout (which has
@@ -159,6 +169,63 @@ fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Resolve the commit a GitHub source's ref currently points at, without
+/// cloning, via `git ls-remote`. `reference` of `None` means the remote `HEAD`.
+/// Used by the update check to tell whether a newer commit exists.
+///
+/// A `reference` that is already a full commit sha is returned as-is: `ls-remote`
+/// cannot resolve a bare sha, and a commit-pinned install can never be outdated.
+/// For a branch or tag, an annotated tag's peeled (`^{}`) target is preferred so
+/// the result is the commit the install would actually check out.
+pub fn ls_remote(url: &str, reference: Option<&str>) -> Result<String> {
+    if let Some(r) = reference {
+        if is_full_commit_sha(r) {
+            return Ok(r.to_ascii_lowercase());
+        }
+    }
+    let target = reference.unwrap_or("HEAD");
+    let out = run_git(&["ls-remote", url, target], None)?;
+    parse_ls_remote(&out, target)
+}
+
+/// The tag of the repo's latest stable GitHub release, or `None` when the repo
+/// has published no release. `GET /releases/latest` already excludes prereleases
+/// and drafts, so this is the stable channel; a 404 (no releases) maps to `None`
+/// while any other API error propagates. Used by the default install path
+/// (no `@ref`) and the rolling update check.
+pub async fn latest_release_tag(owner: &str, repo: &str) -> Result<Option<String>> {
+    let client = GitHubClient::unauthenticated(GitHubClientConfig {
+        api_base: github_api_base(),
+        user_agent: DEFAULT_USER_AGENT.to_string(),
+        timeout: Duration::from_secs(60),
+    })?;
+    match client.latest_release(owner, repo).await {
+        Ok(release) => Ok(Some(release.tag_name)),
+        Err(GitHubError::NotFound { .. }) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn is_full_commit_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Pick the resolved commit from `git ls-remote` output (`<sha>\t<ref>` lines),
+/// preferring an annotated tag's peeled `^{}` target over the tag object itself.
+fn parse_ls_remote(out: &str, target: &str) -> Result<String> {
+    let mut first = None;
+    for line in out.lines() {
+        let Some((sha, name)) = line.split_once('\t') else {
+            continue;
+        };
+        if name.ends_with("^{}") {
+            return Ok(sha.trim().to_string());
+        }
+        first.get_or_insert_with(|| sha.trim().to_string());
+    }
+    first.ok_or_else(|| anyhow!("ref {target:?} not found on the remote"))
 }
 
 fn path_arg(path: &Path) -> Result<&str> {
@@ -435,6 +502,36 @@ fn ensure_executable(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_ls_remote_prefers_peeled_tag() {
+        let out = "1111111111111111111111111111111111111111\trefs/tags/v1\n\
+                   2222222222222222222222222222222222222222\trefs/tags/v1^{}";
+        assert_eq!(
+            parse_ls_remote(out, "v1").unwrap(),
+            "2222222222222222222222222222222222222222"
+        );
+    }
+
+    #[test]
+    fn parse_ls_remote_takes_first_when_unpeeled() {
+        let out = "3333333333333333333333333333333333333333\tHEAD";
+        assert_eq!(
+            parse_ls_remote(out, "HEAD").unwrap(),
+            "3333333333333333333333333333333333333333"
+        );
+    }
+
+    #[test]
+    fn parse_ls_remote_errors_when_empty() {
+        assert!(parse_ls_remote("", "nope").is_err());
+    }
+
+    #[test]
+    fn ls_remote_returns_pinned_sha_as_is() {
+        let sha = "abcdef0123456789abcdef0123456789abcdef01";
+        assert_eq!(ls_remote("unused://", Some(sha)).unwrap(), sha);
+    }
 
     #[test]
     fn renders_platform_tokens() {

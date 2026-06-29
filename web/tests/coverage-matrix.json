@@ -31,6 +31,7 @@
       "components": [
         "web/src/components/ActivityBar.tsx",
         "web/src/components/Dock.tsx",
+        "web/src/components/DockGroups.tsx",
         "web/src/components/BottomDock.tsx",
         "web/src/components/PaneDndController.tsx",
         "web/src/components/paneDnd.ts",
@@ -444,6 +445,13 @@
       "components": ["web/src/components/NotificationSettings.tsx"]
     },
     {
+      "id": "notifications.service-worker-clear",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/__tests__/sw.test.ts"],
+      "components": ["web/public/sw.js"]
+    },
+    {
       "id": "settings.security-readonly",
       "kind": "vitest",
       "risk": "low",
@@ -809,6 +817,19 @@
       ]
     },
     {
+      "id": "palette.content-search",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/palette-content-search.spec.ts",
+        "src/components/command-palette/__tests__/CommandPalette.test.tsx",
+        "src/hooks/useConversationSearch.test.ts",
+        "src/hooks/__tests__/useCommandActions.test.tsx",
+        "src/lib/__tests__/searchConversationsApi.test.ts"
+      ],
+      "components": ["web/src/App.tsx", "web/src/components/command-palette/CommandPalette.tsx"]
+    },
+    {
       "id": "sidebar.scratch-group",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -1020,6 +1041,24 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/SidebarSortPicker.tsx"]
     },
     {
+      "id": "sidebar.plugin-sort-filter",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/plugin-sort-filter.spec.ts"],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/SidebarSortPicker.tsx",
+        "web/src/components/plugin/PluginSlots.tsx"
+      ]
+    },
+    {
+      "id": "sidebar.plugin-row-slots",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/plugin-row-slots-mobile.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/plugin/PluginSlots.tsx"]
+    },
+    {
       "id": "sidebar.group-axis-pure",
       "kind": "vitest",
       "risk": "high",
@@ -1068,6 +1107,36 @@
       "risk": "high",
       "specs": ["tests/live/session-rename.spec.ts", "tests/live/session-delete.spec.ts"],
       "components": ["web/src/components/DeleteSessionDialog.tsx", "web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "session.trash",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/session-trash.spec.ts"],
+      "components": [
+        "web/src/components/DeleteSessionDialog.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/lib/sidebarSort.ts"
+      ]
+    },
+    {
+      "id": "session.trash.flow",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/session-trash-flow.spec.ts"],
+      "components": [
+        "web/src/App.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/components/DeleteSessionDialog.tsx",
+        "web/src/hooks/useSessions.ts"
+      ]
+    },
+    {
+      "id": "session.trash.read-only-composer",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/acp-trashed-composer.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "session.group-edit",
@@ -1219,6 +1288,18 @@
       ]
     },
     {
+      "id": "right-panel.mobile-plugin-pane",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/mobile-plugin-pane.spec.ts"],
+      "components": [
+        "web/src/components/MobileRightPanelPicker.tsx",
+        "web/src/components/MobileMainPane.tsx",
+        "web/src/components/plugin/PluginSlots.tsx",
+        "web/src/lib/rightPanelView.ts"
+      ]
+    },
+    {
       "id": "right-panel.mobile-picker-units",
       "kind": "vitest",
       "risk": "high",
@@ -1318,6 +1399,23 @@
       ]
     },
     {
+      "id": "acp.background-agents",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/__tests__/BackgroundAgentsPanel.test.tsx",
+        "src/components/acp/__tests__/ToolCards.test.tsx",
+        "src/lib/acpTypes.reducer.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/BackgroundAgentsPanel.tsx",
+        "web/src/components/acp/backgroundAgentsContext.ts",
+        "web/src/components/acp/ToolCards.tsx",
+        "web/src/lib/acpTypes.ts",
+        "web/src/hooks/useAcpSession.ts"
+      ]
+    },
+    {
       "id": "acp.memory-recall",
       "kind": "live-playwright",
       "risk": "medium",
@@ -1339,6 +1437,17 @@
         "web/src/components/acp/Composer.tsx",
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/components/acp/StructuredView.tsx"
+      ]
+    },
+    {
+      "id": "acp.attachment-drafts",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-attachment-draft.spec.ts"],
+      "components": [
+        "web/src/components/acp/AcpRuntime.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/lib/acpDrafts.ts"
       ]
     },
     {
@@ -1522,8 +1631,21 @@
       "id": "acp.rate-limit-recovery",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/lib/acpTypes.test.ts", "src/components/acp/SwitchAgentModal.test.tsx"],
-      "components": ["web/src/components/acp/SwitchAgentModal.tsx"]
+      "specs": [
+        "src/lib/acpTypes.test.ts",
+        "src/hooks/useAcpSession.queue.test.ts",
+        "src/hooks/useRespawnSession.test.tsx",
+        "src/components/acp/SystemNotices.test.tsx",
+        "src/components/acp/RateLimitRecoverySection.test.tsx",
+        "src/components/acp/SwitchAgentModal.test.tsx"
+      ],
+      "components": [
+        "src/server/api/acp.rs",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/SwitchAgentModal.tsx",
+        "web/src/hooks/useRespawnSession.ts",
+        "web/src/lib/acpTypes.ts"
+      ]
     },
     {
       "id": "acp.switch-agent-manual",
@@ -1841,6 +1963,16 @@
       "risk": "medium",
       "specs": ["src/hooks/__tests__/useSettingsCommands.test.tsx"],
       "components": ["web/src/hooks/useSettingsCommands.ts", "web/src/App.tsx"]
+    },
+    {
+      "id": "story.cmdk-cheat-codes",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": ["tests/command-palette.spec.ts"],
+      "components": [
+        "web/src/components/command-palette/CommandPalette.tsx",
+        "web/src/components/command-palette/CheatOverlay.tsx"
+      ]
     },
     {
       "id": "story.shortcut-toggle-sidebar",
@@ -2736,7 +2868,13 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/settings/__tests__/PluginsSettings.test.tsx"],
-      "components": ["web/src/components/settings/PluginsSettings.tsx"]
+      "components": [
+        "web/src/components/settings/PluginsSettings.tsx",
+        "web/src/components/settings/PluginDetailModal.tsx",
+        "web/src/components/settings/PluginUpdateConsentModal.tsx",
+        "web/src/components/settings/PluginInstallConsentModal.tsx",
+        "web/src/components/settings/PluginJobProgressModal.tsx"
+      ]
     },
     {
       "id": "settings.plugins-live-toggle",

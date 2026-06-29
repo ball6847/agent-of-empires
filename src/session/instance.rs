@@ -360,6 +360,18 @@ impl ResumeIntent {
     }
 }
 
+/// Mutually-exclusive lifecycle bucket a session belongs to, computed by
+/// `Instance::effective_bucket()`. Precedence is `Trashed > Archived >
+/// Active`. Used to route a session into the right list (active sidebar,
+/// archived fold, or trash view) and to filter the `GET /api/sessions`
+/// response by `?state=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionBucket {
+    Active,
+    Archived,
+    Trashed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
     pub id: String,
@@ -471,6 +483,35 @@ pub struct Instance {
     /// state that "user is engaging" implicitly contradicts. See #1581.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_at: Option<DateTime<Utc>>,
+
+    /// Trash marker: the session is soft-deleted. A trashed row is hidden
+    /// from every normal and archived view (trash is its own bucket, see
+    /// `effective_bucket()`), its live processes are stopped, but its
+    /// durable state (structured-view transcript, event rows, worktree,
+    /// branch, container) is kept on disk so `restore` is faithful.
+    /// Permanent teardown happens only at purge (the historical delete
+    /// path) or when the configured retention window
+    /// (`session.trash_retention_days`) elapses from `trashed_at`.
+    ///
+    /// Unlike `archive()`, `trash()` does NOT clear the sibling triage
+    /// timestamps (`archived_at`, `favorited_at`, `snoozed_until`,
+    /// `pinned_at`): trash takes precedence in bucketing while those are
+    /// preserved, so a restored favorite comes back a favorite. Additive:
+    /// absent in older `sessions.json` rows, so no migration is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trashed_at: Option<DateTime<Utc>>,
+
+    /// The `project_path` a managed-worktree session had before it was
+    /// trashed, captured when the trash flow relocates the worktree into the
+    /// `.aoe-trash` holding area (see `src/session/trash.rs`). `project_path`
+    /// is repointed to the trash location while trashed so the structured-view
+    /// preview, diff, and purge keep reading the worktree at its real spot;
+    /// restore moves the worktree back here and clears this field. `None` for
+    /// sessions that were never relocated (plain / non-managed worktrees, or
+    /// rows trashed before relocation existed). Additive: absent in older
+    /// `sessions.json` rows, so no migration is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_trash_project_path: Option<String>,
 
     /// Namespaced per-session plugin data, keyed by plugin id. Each plugin
     /// owns only its own slot (`plugin_meta["<id>"]`), an opaque JSON value it
@@ -894,6 +935,8 @@ impl Instance {
             unread: false,
             idle_dormant_since: None,
             pinned_at: None,
+            trashed_at: None,
+            pre_trash_project_path: None,
             plugin_meta: std::collections::BTreeMap::new(),
             scratch: false,
             worktree_info: None,
@@ -1197,6 +1240,12 @@ impl Instance {
         if pre.pinned_at != post.pinned_at {
             self.pinned_at = post.pinned_at;
         }
+        if pre.trashed_at != post.trashed_at {
+            self.trashed_at = post.trashed_at;
+        }
+        if pre.pre_trash_project_path != post.pre_trash_project_path {
+            self.pre_trash_project_path = post.pre_trash_project_path.clone();
+        }
         if pre.unread != post.unread {
             self.unread = post.unread;
         }
@@ -1290,6 +1339,46 @@ impl Instance {
 
     pub fn is_archived(&self) -> bool {
         self.archived_at.is_some()
+    }
+
+    /// Soft-delete the session into the trash bucket. Stops the live
+    /// session (handled by the caller: ACP `shutdown`, optional tmux kill)
+    /// but keeps every durable artifact so `untrash` can bring it back
+    /// intact. Intentionally additive: only `trashed_at` is set, the
+    /// sibling triage flags (`archived_at`, `favorited_at`, `snoozed_until`,
+    /// `pinned_at`) are left untouched so restore is faithful.
+    /// `effective_bucket()` makes trash win regardless. Idempotent.
+    pub fn trash(&mut self) {
+        if self.trashed_at.is_none() {
+            self.trashed_at = Some(Utc::now());
+        }
+    }
+
+    /// Restore a trashed session back to its prior bucket (active or
+    /// archived, depending on the preserved sibling flags). Idempotent.
+    pub fn untrash(&mut self) {
+        self.trashed_at = None;
+    }
+
+    pub fn is_trashed(&self) -> bool {
+        self.trashed_at.is_some()
+    }
+
+    /// The mutually-exclusive lifecycle bucket a session renders in.
+    /// Precedence is `Trashed > Archived > Active`: a trashed row never
+    /// shows in active or archived views, and an archived row never shows
+    /// in active views. Snooze/favorite/pin are orthogonal decorations
+    /// within a bucket, not buckets of their own, so they are not consulted
+    /// here. Use this instead of bare `!is_archived()` filters so trashed
+    /// rows cannot leak into the active list.
+    pub fn effective_bucket(&self) -> SessionBucket {
+        if self.is_trashed() {
+            SessionBucket::Trashed
+        } else if self.is_archived() {
+            SessionBucket::Archived
+        } else {
+            SessionBucket::Active
+        }
     }
 
     /// Mark the session favorite. Sibling of `archive`, with opposite semantics.
@@ -1584,9 +1673,20 @@ impl Instance {
     }
 
     pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
-        let exclusion = self.retroactive_capture_exclusion_set();
         let result: Option<String> = match self.tool.as_str() {
             "claude" => {
+                // Claude-only: extend the live-tmux exclusion with stopped,
+                // archived, or pane-less peer sids read from sessions.json so
+                // the mtime fallback skips peers whose jsonl outlived their
+                // tmux session (#2355). Other tool arms call
+                // `retroactive_capture_exclusion_set()` directly for the
+                // live-only set.
+                let exclusion = super::capture::compose_exclusion_with_stopped_peers(
+                    &self.id,
+                    &self.project_path,
+                    &self.effective_profile(),
+                    &self.retroactive_capture_excludes,
+                );
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     capture_claude_session_id_in_container(
@@ -1601,6 +1701,7 @@ impl Instance {
                 }
             }
             "opencode" => {
+                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_opencode_session_id_in_container(
@@ -1615,6 +1716,7 @@ impl Instance {
                 }
             }
             "vibe" => {
+                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_vibe_session_id_in_container(
@@ -1628,6 +1730,7 @@ impl Instance {
                 }
             }
             "pi" => {
+                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_pi_session_id_in_container(
@@ -1641,6 +1744,7 @@ impl Instance {
                 }
             }
             "codex" => {
+                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_codex_session_id_in_container(
@@ -1654,6 +1758,7 @@ impl Instance {
                 }
             }
             "gemini" => {
+                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_gemini_session_id_in_container(
@@ -1667,6 +1772,7 @@ impl Instance {
                 }
             }
             "hermes" => {
+                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_hermes_session_id_in_container(
@@ -4555,6 +4661,27 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_user_action_diff_propagates_trash_marker() {
+        let pre = Instance::new("t", "/tmp");
+        let mut post = pre.clone();
+        post.trash();
+        let mut disk = pre.clone();
+
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(disk.is_trashed());
+
+        let pre2 = post.clone();
+        let mut post2 = pre2.clone();
+        post2.untrash();
+        let mut disk2 = pre2.clone();
+
+        disk2.merge_user_action_diff(&pre2, &post2);
+
+        assert!(!disk2.is_trashed());
+    }
+
+    #[test]
     fn test_mark_idle_dormant_sets_marker() {
         let mut inst = Instance::new("test", "/tmp/test");
         assert!(!inst.is_idle_dormant());
@@ -4840,6 +4967,80 @@ mod tests {
         inst.archive();
         assert!(inst.is_archived());
         assert!(!inst.is_pinned());
+    }
+
+    #[test]
+    fn test_trash_untrash_roundtrip() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        assert!(!inst.is_trashed());
+        assert_eq!(inst.effective_bucket(), SessionBucket::Active);
+
+        inst.trash();
+        assert!(inst.is_trashed());
+        assert_eq!(inst.effective_bucket(), SessionBucket::Trashed);
+
+        inst.untrash();
+        assert!(!inst.is_trashed());
+        assert_eq!(inst.effective_bucket(), SessionBucket::Active);
+    }
+
+    #[test]
+    fn test_trash_preserves_sibling_triage_flags() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.favorite();
+        inst.pin();
+        assert!(inst.is_favorited());
+        assert!(inst.is_pinned());
+
+        inst.trash();
+        // Trash wins the bucket but leaves the decorations intact so
+        // restore is faithful (a trashed favorite comes back a favorite).
+        assert_eq!(inst.effective_bucket(), SessionBucket::Trashed);
+        assert!(inst.is_favorited(), "favorite preserved across trash");
+        assert!(inst.is_pinned(), "pin preserved across trash");
+
+        inst.untrash();
+        assert!(inst.is_favorited());
+        assert!(inst.is_pinned());
+    }
+
+    #[test]
+    fn test_effective_bucket_trash_beats_archive() {
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.archive();
+        assert_eq!(inst.effective_bucket(), SessionBucket::Archived);
+        inst.trash();
+        assert_eq!(
+            inst.effective_bucket(),
+            SessionBucket::Trashed,
+            "trash takes precedence over archive in bucketing"
+        );
+        // archived_at is preserved, so restore returns to the archived bucket.
+        assert!(inst.is_archived());
+        inst.untrash();
+        assert_eq!(inst.effective_bucket(), SessionBucket::Archived);
+    }
+
+    #[test]
+    fn test_trashed_at_serde_roundtrip_and_default() {
+        // A non-trashed instance omits trashed_at on the wire
+        // (skip_serializing_if), so deserializing it exercises the
+        // missing-field path that legacy rows hit: it must default to None,
+        // which is why no migration is needed.
+        let fresh = Instance::new("s", "/tmp/x");
+        let fresh_json = serde_json::to_string(&fresh).expect("serialize fresh");
+        assert!(
+            !fresh_json.contains("trashed_at"),
+            "None trashed_at must not be serialized"
+        );
+        let parsed: Instance = serde_json::from_str(&fresh_json).expect("parse fresh");
+        assert!(!parsed.is_trashed(), "missing trashed_at => None");
+
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.trash();
+        let json = serde_json::to_string(&inst).expect("serialize");
+        let back: Instance = serde_json::from_str(&json).expect("round-trip");
+        assert!(back.is_trashed());
     }
 
     #[test]
@@ -7657,6 +7858,159 @@ mod tests {
                 let (sid, _is_existing) = inst.acquire_session_id();
                 assert_eq!(sid.as_deref(), Some(fresh));
                 assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            // #2355: when a co-located stopped peer leaves a fresher jsonl in
+            // the shared `~/.claude/projects/<encoded-cwd>/` dir, the mtime
+            // fallback must skip the peer's sid. `build_exclusion_set` only
+            // sees live tmux peers; `compose_exclusion_with_stopped_peers`
+            // adds the stopped peer's sid from `sessions.json` so this
+            // instance's own (older) jsonl wins.
+            #[test]
+            #[serial]
+            fn mtime_fallback_skips_stopped_peer_sid() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2355-stopped-peer";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let mine = "11111111-1111-4111-8111-111111111111";
+                let peer = "22222222-2222-4222-8222-222222222222";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{mine}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{peer}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let profile = "verify-2355-stopped-peer";
+                let mut peer_inst = Instance::new("stopped-peer-id", project_path);
+                peer_inst.source_profile = profile.to_string();
+                peer_inst.tool = "claude".to_string();
+                peer_inst.agent_session_id = Some(peer.to_string());
+                peer_inst.status = Status::Stopped;
+                super::seed_disk_for_sidecar_test(profile, &peer_inst);
+
+                let mut inst = Instance::new("verify-2355", project_path);
+                inst.source_profile = profile.to_string();
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(mine.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(mine));
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
+            }
+
+            // Companion to the above: same setup but the peer is archived
+            // instead of stopped, exercising the `is_archived()` branch of
+            // `compose_exclusion_with_stopped_peers`.
+            #[test]
+            #[serial]
+            fn mtime_fallback_skips_archived_peer_sid() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2355-archived-peer";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let mine = "33333333-3333-4333-8333-333333333333";
+                let peer = "44444444-4444-4444-8444-444444444444";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{mine}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{peer}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let profile = "verify-2355-archived-peer";
+                let mut peer_inst = Instance::new("archived-peer-id", project_path);
+                peer_inst.source_profile = profile.to_string();
+                peer_inst.tool = "claude".to_string();
+                peer_inst.agent_session_id = Some(peer.to_string());
+                peer_inst.archive();
+
+                super::seed_disk_for_sidecar_test(profile, &peer_inst);
+
+                let mut inst = Instance::new("verify-2355-archived", project_path);
+                inst.source_profile = profile.to_string();
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(mine.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(mine));
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
+            }
+
+            // Companion to the above: same setup but the peer carries the
+            // default `Status::Idle` and is not archived, exercising the
+            // `!inst.has_live_tmux_pane()` branch on its own. The peer has
+            // never spawned a tmux pane in the test, so it counts as
+            // pane-less even though its Status field does not flag it.
+            #[test]
+            #[serial]
+            fn mtime_fallback_skips_pane_less_peer_sid() {
+                let temp = tempdir().unwrap();
+                let _guard = ClaudeHomeGuard::set(&temp);
+
+                let project_path = "/tmp/aoe-test-2355-paneless-peer";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let mine = "55555555-5555-4555-8555-555555555555";
+                let peer = "66666666-6666-4666-8666-666666666666";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{mine}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{peer}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let profile = "verify-2355-paneless-peer";
+                let mut peer_inst = Instance::new("paneless-peer-id", project_path);
+                peer_inst.source_profile = profile.to_string();
+                peer_inst.tool = "claude".to_string();
+                peer_inst.agent_session_id = Some(peer.to_string());
+                assert!(!peer_inst.is_archived());
+                assert!(matches!(peer_inst.status, Status::Idle));
+                assert!(!peer_inst.has_live_tmux_pane());
+
+                super::seed_disk_for_sidecar_test(profile, &peer_inst);
+
+                let mut inst = Instance::new("verify-2355-paneless", project_path);
+                inst.source_profile = profile.to_string();
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(mine.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(mine));
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
             }
         }
 

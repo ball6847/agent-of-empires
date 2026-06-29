@@ -93,16 +93,19 @@ fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
     let current = vec!["test".to_string()];
 
     assert!(
-        view.disk_watch_handles.is_empty(),
+        view.disk_watch.handles.is_empty(),
         "construction outside a tokio runtime must not prewire subscriptions"
     );
     view.rewire_disk_subscriptions(&current);
     assert!(
-        view.disk_watch_handles.is_empty(),
+        view.disk_watch.handles.is_empty(),
         "rewire outside a tokio runtime must stay a no-op for lib tests"
     );
     assert!(
-        !view.disk_dirty.load(std::sync::atomic::Ordering::Acquire),
+        !view
+            .disk_watch
+            .dirty
+            .load(std::sync::atomic::Ordering::Acquire),
         "the noop branch must leave disk_dirty clear outside a runtime"
     );
 }
@@ -122,12 +125,14 @@ async fn config_watch_keys_distinguish_global_from_profile_named_global() {
     )
     .unwrap();
 
-    assert_eq!(view.config_watch_handles.len(), 2);
+    assert_eq!(view.config_watch.handles.len(), 2);
     assert!(view
-        .config_watch_handles
+        .config_watch
+        .handles
         .contains_key(&ConfigWatchKey::Global));
     assert!(view
-        .config_watch_handles
+        .config_watch
+        .handles
         .contains_key(&ConfigWatchKey::profile(profile_name)));
 }
 
@@ -366,6 +371,20 @@ fn create_test_env_with_sessions(count: usize) -> TestEnv {
     view.flat_items = view.build_flat_items();
     view.update_selected();
     TestEnv { _temp: temp, view }
+}
+
+/// Disable trash-first delete for tests that assert the permanent-delete
+/// dialog opens on `d` / `Shift+D` / context-menu Delete. With the default
+/// (`delete_to_trash = true`) those keys move the session to the trash
+/// instead of opening the dialog; the trash-first path has its own coverage
+/// (`trash_then_restore_round_trip`). Must run after `setup_test_home` so it
+/// writes into the test HOME. See #2489.
+fn disable_delete_to_trash() {
+    let mut config = crate::session::config::load_config()
+        .unwrap()
+        .unwrap_or_default();
+    config.session.delete_to_trash = false;
+    crate::session::config::save_config(&config).unwrap();
 }
 
 fn create_test_env_with_groups() -> TestEnv {
@@ -1296,6 +1315,7 @@ fn test_search_mode_enter_exits_and_clears_state() {
 #[serial]
 fn test_d_on_session_opens_delete_dialog() {
     let mut env = create_test_env_with_sessions(3);
+    disable_delete_to_trash();
     env.view.update_selected();
     assert!(env.view.unified_delete_dialog.is_none());
     env.view.handle_key(key(KeyCode::Char('d')), None);
@@ -3581,6 +3601,7 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
     // fire rename (not serve), and orphaned the diff/serve/projects arms. All
     // three Ctrl chords must keep CTRL so their secondary arms fire.
     let mut env = create_test_env_with_sessions(1);
+    disable_delete_to_trash();
     env.view.strict_hotkeys = true;
     env.view.cursor = 0;
     env.view.update_selected();
@@ -6613,6 +6634,73 @@ fn toggle_archive_at_cursor_round_trip() {
     env.view.select_session_by_id(&id);
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(!env.view.instances[0].is_archived());
+}
+
+/// Trashing a session hides it from the active list and surfaces it under
+/// the synthetic Trash section; the shelve/unshelve key (`z`) restores it.
+#[test]
+#[serial]
+fn trash_then_restore_round_trip() {
+    let mut env = create_test_env_with_sessions(2);
+    // Keep the Trash section expanded so the trashed row stays reachable.
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    assert!(!env.view.instances[0].is_trashed());
+
+    env.view.trash_session_by_id(&id);
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "session must be trashed"
+    );
+
+    // The Trash section header is present, and the trashed row is not in the
+    // active flow (it renders under that header).
+    let items = env.view.build_flat_items();
+    assert!(
+        items.iter().any(|it| matches!(
+            it,
+            Item::Group { path, .. } if crate::session::is_trash_section_path(path)
+        )),
+        "Trash section header must be present after trashing"
+    );
+
+    // Restore via the shelve/unshelve key.
+    env.view.select_session_by_id(&id);
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(
+        !env.view.get_instance(&id).unwrap().is_trashed(),
+        "session must be restored out of trash"
+    );
+}
+
+#[test]
+#[serial]
+fn d_on_session_with_default_trash_persists_trash_marker() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "pressing d with default trash-first config must mark the row trashed in memory"
+    );
+    assert!(
+        env.view.unified_delete_dialog.is_none(),
+        "trash-first d must not open the permanent-delete dialog"
+    );
+    let disk_row = Storage::new_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|inst| inst.id == id)
+        .expect("disk row present");
+    assert!(
+        disk_row.is_trashed(),
+        "pressing d must persist trashed_at so a storage refresh cannot resurrect a killed session"
+    );
 }
 
 /// When no session is selected, the toggle is a silent no-op.
@@ -13514,6 +13602,7 @@ mod right_click_context_menu {
     #[serial]
     fn down_then_enter_in_menu_opens_delete_dialog() {
         let mut env = create_test_env_with_sessions(2);
+        disable_delete_to_trash();
         setup_inner(&mut env);
         // Attention sort surfaces the full session menu (New Session / Rename
         // / Archive / Snooze / Mark unread / Delete), so Delete is five Downs

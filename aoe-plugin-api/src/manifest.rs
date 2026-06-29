@@ -25,6 +25,12 @@ pub struct PluginManifest {
     #[serde(default)]
     pub description: String,
 
+    /// Screenshots / animated GIFs the plugin ships to illustrate itself in the
+    /// marketplace and detail views. Each `path` is repository-relative;
+    /// presentation only, granting nothing. Requires `api_version >= 5`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub screenshots: Vec<Screenshot>,
+
     /// Resource/effect capabilities the plugin requests. Static contributions
     /// below are NOT listed here; only runtime resource access is. The user
     /// grants these once at install (community plugins); builtins are
@@ -60,6 +66,12 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub themes: Vec<ThemeContribution>,
 
+    /// Status segments the plugin contributes. Each is a labelled id the host
+    /// renders in a status surface; consumed by the status reference plugin
+    /// (#2096). Requires `api_version >= 4`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status: Vec<StatusContribution>,
+
     /// UI slots the plugin renders into. Consumed by #2366.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ui: Vec<UiContribution>,
@@ -68,6 +80,16 @@ pub struct PluginManifest {
     /// release-binary worker; actually launching it is #2095.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeSpec>,
+
+    /// Optional range of aoe (host app) versions this plugin version supports,
+    /// as a semver requirement like `">=0.10, <0.12"`. Distinct from
+    /// `api_version` (the manifest schema version): `api_version` gates the
+    /// manifest shape, `aoe_version` gates the host's app behaviour. The host
+    /// refuses to install and skips loading a plugin when its running version
+    /// is outside this range. Absent means no constraint. Requires
+    /// `api_version >= 4`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aoe_version: Option<String>,
 }
 
 /// A command the plugin contributes. The host namespaces it as
@@ -79,6 +101,26 @@ pub struct CommandContribution {
     pub title: String,
     #[serde(default)]
     pub description: String,
+    /// How invoking the command behaves. Absent means a fire-and-forget worker
+    /// notification (deferred). When present, the host surface executes the
+    /// action directly, synchronously inside the user's gesture, so it works on
+    /// a remote web dashboard where an async round-trip would be popup-blocked.
+    /// Requires `api_version >= 6` and the `browser_open` capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ClientAction>,
+}
+
+/// A client-executed command action: the host surface (web dashboard, TUI) runs
+/// it directly rather than forwarding to the worker. Tagged by `kind` so future
+/// action shapes extend the set without breaking existing manifests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ClientAction {
+    /// Open the `href` carried by this plugin's own `(slot, id)` UI-state entry
+    /// for the active session, in the user's browser. The href is read from the
+    /// snapshot the surface already holds, so no worker call is made; the slot
+    /// must be per-session.
+    OpenUiLink { slot: UiSlot, id: String },
 }
 
 /// A keybind the plugin contributes, binding a key chord to a command.
@@ -129,7 +171,9 @@ pub enum SettingType {
     /// Free text, rendered as a text input.
     #[default]
     String,
-    /// On/off, rendered as a toggle.
+    /// On/off, rendered as a toggle. Accepts `boolean` too: it is the natural
+    /// spelling next to `integer`, and shipped plugins use it.
+    #[serde(alias = "boolean")]
     Bool,
     /// Integer, rendered as a number input (bounded by `min`/`max`).
     Integer,
@@ -145,6 +189,77 @@ pub struct ThemeContribution {
     pub name: String,
     /// Theme TOML path, relative to the plugin directory.
     pub path: String,
+}
+
+/// A status segment the plugin contributes. The host namespaces it by plugin
+/// id and renders `label` in a status surface; consumed by #2096.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusContribution {
+    /// Stable identifier the host addresses this segment by.
+    pub id: String,
+    /// Human-readable text shown in the status surface.
+    #[serde(default)]
+    pub label: String,
+}
+
+/// Maximum screenshots a manifest may declare. A cap keeps the detail modal
+/// usable and the manifest from ballooning; the lenient detail parser truncates
+/// to the same bound.
+pub const MAX_SCREENSHOTS: usize = 8;
+
+/// Image extensions a screenshot `path` may use. The host renders each in an
+/// `<img>`, so this is the raster/animated set a browser shows inline; SVG is
+/// deliberately excluded (it can embed external references).
+const SCREENSHOT_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+
+/// A screenshot or animated GIF a plugin ships to illustrate itself. `path` is
+/// repository-relative (resolved against the plugin's source repo by the detail
+/// endpoint); absolute URLs are rejected so opening a detail modal cannot issue
+/// author-chosen third-party requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Screenshot {
+    /// Repository-relative path to a PNG/JPEG/GIF/WebP asset in the plugin's
+    /// source repo. Not a URL: no scheme, no leading separator, no `..`.
+    pub path: String,
+    /// Accessible description of the image. Required; screenshots are content,
+    /// not decoration.
+    pub alt: String,
+    /// Optional human-visible caption shown beneath the image.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caption: String,
+}
+
+/// Whether `path` is a clean repository-relative image path usable as a
+/// screenshot: relative (no URL scheme, no drive letter, no leading separator),
+/// no `..` traversal, no empty components, no control characters, bounded
+/// length, and an allowed image extension. Shared by the strict validator and
+/// the lenient detail parser so both agree on what resolves.
+pub fn screenshot_path_ok(path: &str) -> bool {
+    if path.is_empty() || path.len() > 512 {
+        return false;
+    }
+    // A colon rejects both URL schemes (`https:`) and Windows drive letters
+    // (`C:`); a leading slash rejects absolute paths. Screenshot paths are
+    // repository paths, so they must use `/`, never `\`: a backslash would
+    // survive into the resolved raw URL percent-encoded and 404, so reject it
+    // here to fail fast for the author rather than render a broken image.
+    if path.starts_with('/') || path.contains(':') || path.contains('\\') {
+        return false;
+    }
+    if path.chars().any(char::is_control) {
+        return false;
+    }
+    if path.split('/').any(|seg| seg == ".." || seg.is_empty()) {
+        return false;
+    }
+    match path.rsplit('.').next() {
+        Some(ext) if ext != path => {
+            SCREENSHOT_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+        }
+        // No extension (or a leading-dot dotfile with no extension).
+        _ => false,
+    }
 }
 
 /// A host-rendered UI slot a plugin may push state into (#2366). A closed set,
@@ -355,6 +470,30 @@ impl PluginManifest {
         out
     }
 
+    /// Check the running host (aoe app) version against the manifest's declared
+    /// `aoe_version` range. `host` is a semver version string (the host's
+    /// `CARGO_PKG_VERSION`). No declared range means no constraint. Returns an
+    /// actionable message when the host is outside the range, so install can
+    /// refuse and load can skip with a reason. The range is re-parsed here
+    /// rather than cached because [`validate`] already gated its syntax, so a
+    /// loaded manifest's range is known-valid.
+    pub fn host_compat(&self, host: &str) -> Result<(), String> {
+        let Some(req) = &self.aoe_version else {
+            return Ok(());
+        };
+        let req = semver::VersionReq::parse(req)
+            .map_err(|e| format!("aoe_version {req:?} is not a valid semver requirement: {e}"))?;
+        let host_version = semver::Version::parse(host)
+            .map_err(|e| format!("host aoe version {host:?} is not valid semver: {e}"))?;
+        if req.matches(&host_version) {
+            Ok(())
+        } else {
+            Err(format!(
+                "plugin requires aoe {req}; this host is {host_version}"
+            ))
+        }
+    }
+
     /// Structural validation; collects every problem instead of stopping at
     /// the first so a plugin author sees the full list in one pass.
     ///
@@ -453,11 +592,40 @@ impl PluginManifest {
         // Contribution sections declare required identifiers; an empty one would
         // install and persist a malformed manifest, so reject it here rather
         // than push the cleanup onto the later consumers (#2094 / #2095 / #2366).
+        let has_browser_open = self
+            .capabilities
+            .iter()
+            .any(|c| c.as_str() == "browser_open");
         for (i, c) in self.commands.iter().enumerate() {
             check(
                 !c.id.is_empty(),
                 format!("commands[{i}].id must not be empty"),
             );
+            if let Some(ClientAction::OpenUiLink { slot, id }) = &c.action {
+                check(
+                    self.api_version >= 6,
+                    format!("commands[{i}].action requires api_version >= 6"),
+                );
+                check(
+                    has_browser_open,
+                    format!("commands[{i}].action needs the `browser_open` capability"),
+                );
+                check(
+                    slot.is_per_session(),
+                    format!("commands[{i}].action open-ui-link slot must be per-session"),
+                );
+                check(
+                    self.ui
+                        .iter()
+                        .filter(|u| u.slot == *slot && &u.id == id)
+                        .count()
+                        == 1,
+                    format!(
+                        "commands[{i}].action must reference exactly one ui slot ({}, {id})",
+                        slot.as_str()
+                    ),
+                );
+            }
         }
         for (i, k) in self.keybinds.iter().enumerate() {
             check(
@@ -539,6 +707,66 @@ impl PluginManifest {
                 format!("themes[{i}].path must not be empty"),
             );
         }
+        for (i, s) in self.status.iter().enumerate() {
+            check(
+                !s.id.is_empty(),
+                format!("status[{i}].id must not be empty"),
+            );
+        }
+        check(
+            self.screenshots.len() <= MAX_SCREENSHOTS,
+            format!(
+                "at most {MAX_SCREENSHOTS} screenshots are allowed (got {})",
+                self.screenshots.len()
+            ),
+        );
+        for (i, s) in self.screenshots.iter().enumerate() {
+            check(
+                screenshot_path_ok(&s.path),
+                format!(
+                    "screenshots[{i}].path {:?} must be a repository-relative image path \
+                     (png/jpg/jpeg/gif/webp), not a URL or an absolute/traversing path",
+                    s.path
+                ),
+            );
+            check(
+                !s.alt.trim().is_empty(),
+                format!("screenshots[{i}].alt must not be empty"),
+            );
+        }
+        // `aoe_version` is the host-app compatibility range, gated by the host
+        // at install and load; reject a malformed requirement at parse so the
+        // author learns of it before publishing rather than at a user's install.
+        if let Some(req) = &self.aoe_version {
+            check(
+                semver::VersionReq::parse(req).is_ok(),
+                format!("aoe_version {req:?} is not a valid semver requirement"),
+            );
+        }
+        // `status` and `aoe_version` are api_version 4 fields. A manifest using
+        // them while declaring an older api_version would parse fine on this
+        // host but fail with a confusing "unknown field" on a pre-4 host (which
+        // never reaches the "upgrade aoe" path because the declared version is
+        // not newer). Force the bump so older hosts emit the right message.
+        if self.api_version < 4 {
+            check(
+                self.status.is_empty(),
+                "status contributions require api_version >= 4".into(),
+            );
+            check(
+                self.aoe_version.is_none(),
+                "aoe_version requires api_version >= 4".into(),
+            );
+        }
+        // `screenshots` is an api_version 5 field; force the bump for the same
+        // reason as the api_version 4 fields above, so a pre-5 host emits the
+        // "upgrade aoe" path rather than a confusing "unknown field" error.
+        if self.api_version < 5 {
+            check(
+                self.screenshots.is_empty(),
+                "screenshots require api_version >= 5".into(),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
@@ -557,6 +785,114 @@ impl PluginManifest {
             Ok(())
         } else {
             Err(ManifestError::Invalid(errors))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_ui_link_toml(api_version: u32, caps: &str, ui_slot: &str, action_slot: &str) -> String {
+        format!(
+            "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = {api_version}\ncapabilities = [{caps}]\n\n\
+             [[ui]]\nslot = \"{ui_slot}\"\nid = \"link\"\n\n\
+             [[commands]]\nid = \"open\"\ntitle = \"Open\"\n[commands.action]\nkind = \"open-ui-link\"\nslot = \"{action_slot}\"\nid = \"link\"\n"
+        )
+    }
+
+    #[test]
+    fn open_ui_link_action_valid() {
+        let m = PluginManifest::from_toml_str(&open_ui_link_toml(
+            6,
+            "\"browser_open\"",
+            "row-column",
+            "row-column",
+        ))
+        .expect("manifest parses");
+        assert!(matches!(
+            m.commands[0].action,
+            Some(ClientAction::OpenUiLink { .. })
+        ));
+    }
+
+    #[test]
+    fn open_ui_link_requires_capability() {
+        let err =
+            PluginManifest::from_toml_str(&open_ui_link_toml(6, "", "row-column", "row-column"))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("browser_open"), "{err}");
+    }
+
+    #[test]
+    fn open_ui_link_requires_api_version_6() {
+        let err = PluginManifest::from_toml_str(&open_ui_link_toml(
+            5,
+            "\"browser_open\"",
+            "row-column",
+            "row-column",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("api_version"), "{err}");
+    }
+
+    #[test]
+    fn open_ui_link_rejects_global_slot() {
+        let err = PluginManifest::from_toml_str(&open_ui_link_toml(
+            6,
+            "\"browser_open\"",
+            "status-bar",
+            "status-bar",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("per-session"), "{err}");
+    }
+
+    #[test]
+    fn open_ui_link_requires_declared_slot() {
+        // Declares a row-badge ui slot but the action points at row-column.
+        let err = PluginManifest::from_toml_str(&open_ui_link_toml(
+            6,
+            "\"browser_open\"",
+            "row-badge",
+            "row-column",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("exactly one ui slot"), "{err}");
+    }
+
+    #[test]
+    fn open_ui_link_rejects_duplicate_slot() {
+        // Two ui contributions declare the same per-session (slot, id), so the
+        // action's target is ambiguous and must be rejected.
+        let err = PluginManifest::from_toml_str(
+            "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 6\ncapabilities = [\"browser_open\"]\n\n\
+             [[ui]]\nslot = \"row-column\"\nid = \"link\"\n\n[[ui]]\nslot = \"row-column\"\nid = \"link\"\n\n\
+             [[commands]]\nid = \"open\"\n[commands.action]\nkind = \"open-ui-link\"\nslot = \"row-column\"\nid = \"link\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("exactly one ui slot"), "{err}");
+    }
+
+    #[test]
+    fn setting_type_accepts_boolean_and_bool() {
+        // `boolean` is the natural spelling next to `integer`, and shipped
+        // plugins (plugin-github) use it; both must parse to Bool.
+        for spelling in ["boolean", "bool"] {
+            let manifest = PluginManifest::from_toml_str(&format!(
+                "id = \"acme.thing\"\nname = \"Thing\"\nversion = \"1.0.0\"\napi_version = 4\n\n[[settings]]\nkey = \"flag\"\ntype = \"{spelling}\"\n"
+            ))
+            .expect("manifest parses");
+            assert_eq!(
+                manifest.settings[0].value_type,
+                SettingType::Bool,
+                "{spelling}"
+            );
         }
     }
 }

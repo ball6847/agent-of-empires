@@ -32,7 +32,7 @@ use crate::tui::styles::available_themes;
 use super::SettingsScope;
 
 /// Categories of settings. Each maps to a tab in the left-hand panel. The
-/// string returned by [`SettingsCategory::schema_name`] is matched against the
+/// string returned by `SettingsCategory::schema_name` is matched against the
 /// per-field `category` emitted by the schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsCategory {
@@ -104,7 +104,7 @@ impl SettingsCategory {
     }
 }
 
-/// Which lifecycle hook list a [`FieldKind::Hook`] row edits.
+/// Which lifecycle hook list a `FieldKind::Hook` row edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookField {
     OnCreate,

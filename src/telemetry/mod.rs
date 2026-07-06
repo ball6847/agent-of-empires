@@ -6,9 +6,9 @@
 //! - **`DO_NOT_TRACK` is absolute.** When set (`1` / `true` / `yes`), it
 //!   suppresses both sending and install-id generation regardless of config.
 //! - **Endpoint.** Opted-in sends go to the collection gateway at
-//!   [`DEFAULT_ENDPOINT`] (which validates and re-sanitizes as a backstop);
+//!   `DEFAULT_ENDPOINT` (which validates and re-sanitizes as a backstop);
 //!   `AOE_TELEMETRY_ENDPOINT` overrides it, e.g. to point at a local sink. A
-//!   compiled-in [`TELEMETRY_KEY`] is sent as `X-Telemetry-Key` so the gateway
+//!   compiled-in `TELEMETRY_KEY` is sent as `X-Telemetry-Key` so the gateway
 //!   can shed drive-by noise (it is visible in source, so not real auth).
 //! - **Fire-and-forget.** Sends run detached with a hard timeout (plus a short
 //!   connect timeout so a down endpoint fails fast) and swallow every error
@@ -116,7 +116,7 @@ pub fn do_not_track() -> bool {
 }
 
 /// The send endpoint. `AOE_TELEMETRY_ENDPOINT` overrides when set to a
-/// non-empty value; otherwise the compiled-in [`DEFAULT_ENDPOINT`] is used.
+/// non-empty value; otherwise the compiled-in `DEFAULT_ENDPOINT` is used.
 /// Always returns a target, so the opt-in gate (not a missing endpoint) is
 /// what decides whether anything is sent.
 pub fn endpoint() -> String {
@@ -597,7 +597,7 @@ pub fn build_cli_usage() -> Option<CliUsage> {
 /// `aoe init`, ...) on a not-opted-in install never materialize the app dir and
 /// keep working in read-only / sandboxed environments. The daily slot is claimed
 /// only after a *confirmed* send, so a failed send leaves the counts and the slot
-/// intact for the next invocation to retry (bounded by [`CLI_USAGE_RETRY_GAP`]).
+/// intact for the next invocation to retry (bounded by `CLI_USAGE_RETRY_GAP`).
 /// Awaited with a hard timeout so a dead endpoint can never hang the CLI's exit.
 pub async fn track_cli_command(name: &str) {
     // Cheap non-creating gate first: opt-in creates the app dir, so its absence

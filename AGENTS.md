@@ -39,6 +39,7 @@
 - Debug logging: `AGENT_OF_EMPIRES_DEBUG=1 cargo run` (writes `debug.log` in app data dir).
 - Running from source needs `tmux` installed.
 - Debug builds use an isolated namespace so they don't collide with an installed release `aoe`: app data dir is `~/.agent-of-empires-dev` (macOS/Windows) or `~/.config/agent-of-empires-dev` (Linux), tmux session prefix is `aoe_dev_`, and `aoe serve` defaults to port `8081`. Release builds keep the original `agent-of-empires` paths, `aoe_` prefix, and port `8080`.
+- Debug builds also run tmux on their own socket (`<app_dir>/tmux.sock`) rather than tmux's shared default, so a `cargo run` / e2e build can never poison an installed release build's tmux server (default-shell, base env); release builds keep the default socket. Set `AOE_TMUX_SOCKET=<path>` to force a specific socket (the e2e harness uses this to isolate each test).
 
 ### Web Dashboard
 
@@ -120,13 +121,13 @@ would need a breaking config-layout migration; the web does not surface it.
 
 ### E2E Tests
 
-Full-binary e2e tests live in `tests/e2e/`, exercising `aoe` through tmux (TUI) and as a subprocess (CLI). Run with `cargo test --test e2e` (add `-- --nocapture` for screen dumps on failure).
+Full-binary e2e tests live in `tests/e2e/`, exercising `aoe` through tmux (TUI) and as a subprocess (CLI). Run with `cargo test --features e2e-tests --test e2e` (add `-- --nocapture` for screen dumps on failure). The e2e target is gated behind the `e2e-tests` feature so CI can run the serve suite as parallel shards (one runs everything except e2e, one runs e2e only); `cargo test --features serve` skips e2e, and naming the target without the feature errors loudly instead of skipping. Run the full serve suite locally with `cargo test --features serve,e2e-tests`.
 
 The harness (`tests/e2e/harness.rs`) exposes `TuiTestHarness` with `spawn_tui()`/`spawn(args)`, `send_keys(keys)`/`type_text(text)`, `wait_for(text)` (10s timeout), `capture_screen()`/`assert_screen_contains(text)`, and `run_cli(args)`. TUI tests auto-skip without tmux; Docker tests use `#[ignore]`; all use `#[serial]` for tmux isolation.
 
 Agent-view live-daemon e2e (`tests/e2e/acp_focus_isolation_e2e.rs`) stands up a real `aoe serve --daemon` and attaches the native TUI structured view against it. It reuses the shared Node fake-ACP agent (`web/tests/helpers/fakeAcpAgent.mjs`) to drive a deterministic pending approval, so it needs `--features serve` and Node on `PATH` (it auto-skips via `require_node!` otherwise). The harness installs the fake as the `claude` / `claude-agent-acp` / `aoe-agent` shims (`install_acp_shim`), roots `$HOME` under `/tmp` (`new_in_tmp`, keeping the worker unix socket under the macOS `sun_path` limit), and stops the worker plus daemon on `Drop` (`stop_daemon_on_drop`).
 
-Recording (for PR reviews): `RECORD_E2E=1 cargo test --test e2e -- --nocapture` locally (needs `asciinema` + `agg`, outputs to `target/e2e-recordings/`), or add the `needs-recording` label in CI.
+Recording (for PR reviews): `RECORD_E2E=1 cargo test --features e2e-tests --test e2e -- --nocapture` locally (needs `asciinema` + `agg`, outputs to `target/e2e-recordings/`), or add the `needs-recording` label in CI.
 
 ### Web Dashboard Playwright Tests
 

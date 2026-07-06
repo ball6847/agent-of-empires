@@ -1030,7 +1030,7 @@ pub fn append_trash_section(items: &mut Vec<Item>, instances: &[Instance], colla
 ///
 /// Layout:
 /// - Archived (depth 0)
-///   - <project name> (depth 1)
+///   - `<project name>` (depth 1)
 ///     - session row (depth 2)
 ///
 /// `section_collapsed` hides everything below the top header; per-project

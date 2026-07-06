@@ -616,6 +616,8 @@ pub struct HomeView {
     pub(super) pending_image_pull: Option<String>,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
+    /// Session to trash after the `session.confirm_delete` dialog is accepted
+    pub(super) pending_trash_session: Option<String>,
     /// Action emitted by a mouse-click on a modal dialog (e.g. clicking
     /// `[Yes]` on a stop-session confirm). The keyboard path returns
     /// these via `handle_key -> Option<Action>`, but the mouse path
@@ -1198,10 +1200,10 @@ impl DiskWatchState {
             return;
         }
 
-        // Clear the latch ahead of the install loop. `record_disk_watcher_init_failure`
-        // re-latches it on any `subscribe_channel` Err below, so the latch
-        // reflects the outcome of this rewire pass.
-        reload_failure.clear_disk_watcher_init_failure();
+        // Buffer the install-loop outcome and apply it as one transition
+        // at the end of the pass: an identical failure recurring across
+        // rewires must not re-arm the ack latch (issue #2112).
+        let mut new_init_error: Option<WatcherInitError> = None;
 
         let to_remove: Vec<String> = prior
             .iter()
@@ -1291,10 +1293,15 @@ impl DiskWatchState {
                         error = %e,
                         "subscribe_channel failed; falling back to 5s heartbeat for this profile"
                     );
-                    reload_failure.record_disk_watcher_init_failure(name, e.to_string());
+                    new_init_error = Some(WatcherInitError {
+                        profile: Some(name.clone()),
+                        kind: WatcherInitErrorKind::Watch(e.kind()),
+                        message: e.to_string(),
+                    });
                 }
             }
         }
+        reload_failure.apply_disk_watcher_init_pass(new_init_error);
         tracing::debug!(
             target: "tui.file_watch",
             added = ?to_add,
@@ -1447,10 +1454,10 @@ impl ConfigWatchState {
             return;
         }
 
-        // Clear the latch ahead of the install loop. `record_config_watcher_init_failure`
-        // re-latches it on any `subscribe_channel` Err below, so the latch
-        // reflects the outcome of this rewire pass.
-        reload_failure.clear_config_watcher_init_failure();
+        // Buffer the install-loop outcome and apply it as one transition
+        // at the end of the pass: an identical failure recurring across
+        // rewires must not re-arm the ack latch (issue #2112).
+        let mut new_init_error: Option<WatcherInitError> = None;
 
         if global_needs_install {
             match crate::session::get_app_dir() {
@@ -1502,7 +1509,11 @@ impl ConfigWatchState {
                                 "global config subscribe_channel failed; \
                                  falling back to settings-close + profile-switch reload"
                             );
-                            reload_failure.record_config_watcher_init_failure(None, e.to_string());
+                            new_init_error = Some(WatcherInitError {
+                                profile: None,
+                                kind: WatcherInitErrorKind::Watch(e.kind()),
+                                message: e.to_string(),
+                            });
                         }
                     }
                 }
@@ -1512,10 +1523,11 @@ impl ConfigWatchState {
                         error = %e,
                         "skipping global config subscribe; app dir resolution failed"
                     );
-                    reload_failure.record_config_watcher_init_failure(
-                        None,
-                        format!("app dir resolution failed: {e}"),
-                    );
+                    new_init_error = Some(WatcherInitError {
+                        profile: None,
+                        kind: WatcherInitErrorKind::Resolution,
+                        message: format!("app dir resolution failed: {e}"),
+                    });
                 }
             }
         }
@@ -1598,10 +1610,15 @@ impl ConfigWatchState {
                         "config subscribe_channel failed; \
                          falling back to settings-close + profile-switch reload for this profile"
                     );
-                    reload_failure.record_config_watcher_init_failure(Some(name), e.to_string());
+                    new_init_error = Some(WatcherInitError {
+                        profile: Some(name.clone()),
+                        kind: WatcherInitErrorKind::Watch(e.kind()),
+                        message: e.to_string(),
+                    });
                 }
             }
         }
+        reload_failure.apply_config_watcher_init_pass(new_init_error);
         if !to_add.is_empty() || !to_remove.is_empty() {
             tracing::debug!(
                 target: "tui.file_watch",
@@ -1623,13 +1640,38 @@ impl ConfigWatchState {
     }
 }
 
-/// Latched record of a watcher init failure. The disk slot always carries
-/// `Some(profile)`; the config slot carries `None` for the global config
-/// watch and `Some(profile)` per-profile.
-pub(super) struct WatcherInitError {
-    profile: Option<String>,
-    message: String,
+/// Stable identity for a watcher-init failure across rewire passes.
+/// The `notify` crate's Display string is not part of its stability
+/// guarantee; ack-equality is keyed on the structured kind so a
+/// future Display drift does not silently re-arm the dialog on the
+/// same persistent failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WatcherInitErrorKind {
+    Watch(crate::file_watch::WatchErrorKind),
+    /// The app-dir resolution path errored before a subscribe attempt
+    /// could be made. Distinct from any `Watch(_)` variant so a
+    /// resolution failure followed by a backend failure surfaces as a
+    /// content change.
+    Resolution,
 }
+
+/// Latched record of a watcher-init failure. The disk slot always carries
+/// `Some(profile)`; the config slot carries `None` for the global config
+/// watch and `Some(profile)` per-profile. Equality is keyed on
+/// `(profile, kind)`; `message` is display-only.
+pub(super) struct WatcherInitError {
+    pub(super) profile: Option<String>,
+    pub(super) kind: WatcherInitErrorKind,
+    pub(super) message: String,
+}
+
+impl PartialEq for WatcherInitError {
+    fn eq(&self, other: &Self) -> bool {
+        self.profile == other.profile && self.kind == other.kind
+    }
+}
+
+impl Eq for WatcherInitError {}
 
 /// Per-tick reload failure tracking. Tick-driven reload paths in
 /// `App::run` (heartbeat `reload()`, watcher-driven `reload_storage_only()`,
@@ -1716,49 +1758,45 @@ impl ReloadFailureState {
         }
     }
 
-    pub(super) fn record_disk_watcher_init_failure(
-        &mut self,
-        profile: &str,
-        message: impl Into<String>,
-    ) {
-        let was_clear = self.disk_watcher_init_error.is_none();
-        self.disk_watcher_init_error = Some(WatcherInitError {
-            profile: Some(profile.to_owned()),
-            message: message.into(),
-        });
-        if was_clear {
-            self.dialog_acknowledged = false;
-        }
-    }
-
-    pub(super) fn clear_disk_watcher_init_failure(&mut self) {
-        if self.disk_watcher_init_error.is_some() {
-            self.disk_watcher_init_error = None;
-            if !self.has_any_failure() {
+    /// Apply the outcome of a disk-watch rewire pass as one transition.
+    /// `new` is the per-pass install-loop result (`Some` if any profile's
+    /// `subscribe_channel` returned `Err`, `None` otherwise). The latch
+    /// is re-armed only on a content change: a same-as-before failure
+    /// inside an acknowledged burst is treated as a no-op so the user
+    /// is not re-notified every rewire pass while the underlying
+    /// failure persists. A clean transition to `None` resets the ack
+    /// latch when no other source remains failing, so a later identical
+    /// failure surfaces a fresh dialog.
+    pub(super) fn apply_disk_watcher_init_pass(&mut self, new: Option<WatcherInitError>) {
+        let was = std::mem::replace(&mut self.disk_watcher_init_error, new);
+        match (&was, &self.disk_watcher_init_error) {
+            (Some(prev), Some(curr)) if prev == curr => {}
+            (None, None) => {}
+            (Some(_), None) => {
+                if !self.has_any_failure() {
+                    self.dialog_acknowledged = false;
+                }
+            }
+            (_, Some(_)) => {
                 self.dialog_acknowledged = false;
             }
         }
     }
 
-    pub(super) fn record_config_watcher_init_failure(
-        &mut self,
-        profile: Option<&str>,
-        message: impl Into<String>,
-    ) {
-        let was_clear = self.config_watcher_init_error.is_none();
-        self.config_watcher_init_error = Some(WatcherInitError {
-            profile: profile.map(str::to_owned),
-            message: message.into(),
-        });
-        if was_clear {
-            self.dialog_acknowledged = false;
-        }
-    }
-
-    pub(super) fn clear_config_watcher_init_failure(&mut self) {
-        if self.config_watcher_init_error.is_some() {
-            self.config_watcher_init_error = None;
-            if !self.has_any_failure() {
+    /// Apply the outcome of a config-watch rewire pass as one transition.
+    /// See [`Self::apply_disk_watcher_init_pass`] for the latch semantics;
+    /// the two slots are independent.
+    pub(super) fn apply_config_watcher_init_pass(&mut self, new: Option<WatcherInitError>) {
+        let was = std::mem::replace(&mut self.config_watcher_init_error, new);
+        match (&was, &self.config_watcher_init_error) {
+            (Some(prev), Some(curr)) if prev == curr => {}
+            (None, None) => {}
+            (Some(_), None) => {
+                if !self.has_any_failure() {
+                    self.dialog_acknowledged = false;
+                }
+            }
+            (_, Some(_)) => {
                 self.dialog_acknowledged = false;
             }
         }
@@ -2035,6 +2073,7 @@ impl HomeView {
             pending_stop_session: None,
             pending_image_pull: None,
             pending_force_remove_session: None,
+            pending_trash_session: None,
             pending_dialog_click_action: None,
             search_active: false,
             search_query: Input::default(),
@@ -2231,8 +2270,11 @@ impl HomeView {
         // Disk subscriptions stay scoped to the loaded storages: in
         // single-profile mode (`aoe --profile X`) the user opted into
         // exactly that profile's instance state, so we don't watch
-        // sessions.json/groups.json for unrelated profiles.
-        let initial_disk_profiles: Vec<String> = view.storages.keys().cloned().collect();
+        // sessions.json/groups.json for unrelated profiles. Sorted so
+        // the install-loop's last-write-wins target stays stable across
+        // HashMap rehash between rewire ticks (see #2584).
+        let mut initial_disk_profiles: Vec<String> = view.storages.keys().cloned().collect();
+        initial_disk_profiles.sort();
         view.rewire_disk_subscriptions(&initial_disk_profiles);
         // Config subscriptions are intentionally asymmetric: even in
         // single-profile mode, peer edits to ANY profile's config.toml
@@ -2285,7 +2327,9 @@ impl HomeView {
                     error = %error,
                     "list_profiles failed during reload_storage_only; reusing loaded storages for watcher rewires"
                 );
-                self.storages.keys().cloned().collect()
+                let mut keys: Vec<String> = self.storages.keys().cloned().collect();
+                keys.sort();
+                keys
             }
         };
 
@@ -2300,7 +2344,8 @@ impl HomeView {
         // so the unconditional call is a no-op on a stable profile set.
         self.rewire_config_subscriptions(&current_profiles);
         if self.active_profile.is_some() {
-            let active_only: Vec<String> = self.storages.keys().cloned().collect();
+            let mut active_only: Vec<String> = self.storages.keys().cloned().collect();
+            active_only.sort();
             self.rewire_disk_subscriptions(&active_only);
         } else {
             self.rewire_disk_subscriptions(&current_profiles);
@@ -2451,7 +2496,9 @@ impl HomeView {
         match crate::session::list_profiles() {
             Ok(profiles) => {
                 let disk_targets: Vec<String> = if self.active_profile.is_some() {
-                    self.storages.keys().cloned().collect()
+                    let mut keys: Vec<String> = self.storages.keys().cloned().collect();
+                    keys.sort();
+                    keys
                 } else {
                     profiles.clone()
                 };
@@ -2871,6 +2918,18 @@ impl HomeView {
                             );
                         }
                         Ok(crate::session::StartOutcome::Fresh) => {}
+                        Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
+                            // Defensive: `is_recovery_candidate` already excludes
+                            // sids equal to `resume_probe_failed_sid`, so this
+                            // should not normally fire here. See #2609.
+                            tracing::info!(
+                                target: "session.startup_recovery",
+                                id = %instance_id,
+                                %title,
+                                %sid,
+                                "started fresh; sid previously failed a resume probe",
+                            );
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 target: "session.startup_recovery",
@@ -3001,6 +3060,22 @@ impl HomeView {
                                 "Restart Failed",
                                 &format!(
                                     "Resume failed for sid {sid}; preserved for explicit retry"
+                                ),
+                            ));
+                        }
+                        Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
+                            tracing::info!(
+                                target: "session.restart",
+                                id = %session_id,
+                                %sid,
+                                "started fresh; sid previously failed a resume probe",
+                            );
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Restarted",
+                                &format!(
+                                    "Started fresh; a prior resume attempt failed for sid {sid}. \
+                                     The old conversation is still reachable via the agent's \
+                                     own resume/history picker."
                                 ),
                             ));
                         }
@@ -4251,7 +4326,9 @@ impl HomeView {
                     error = %e,
                     "list_profiles failed during switch_profile; reusing loaded storages for config rewire"
                 );
-                self.storages.keys().cloned().collect()
+                let mut keys: Vec<String> = self.storages.keys().cloned().collect();
+                keys.sort();
+                keys
             }
         };
         self.rewire_config_subscriptions(&config_targets);
@@ -4773,7 +4850,7 @@ impl HomeView {
         if pane.width == 0 || pane.height == 0 {
             return;
         }
-        let resize_status = std::process::Command::new("tmux")
+        let resize_status = crate::tmux::tmux_command()
             .args([
                 "resize-window",
                 "-t",

@@ -777,7 +777,7 @@ impl GitWorktree {
     }
 
     /// Lock `path`'s linked-worktree admin entry so `git worktree prune` skips
-    /// it (see [`WORKTREE_LOCK_REASON`]). Called once at the end of
+    /// it (see `WORKTREE_LOCK_REASON`). Called once at the end of
     /// `create_worktree`. Returns an error the caller can surface as a
     /// non-fatal warning; a missing lock only forfeits prune protection, it
     /// does not make the worktree unusable.

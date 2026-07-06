@@ -19,6 +19,7 @@ import {
   CircleDot,
   CircleStop,
   Folder,
+  GitFork,
   Hourglass,
   Layers,
   ListFilter,
@@ -73,6 +74,7 @@ import { exceedsTouchSlop } from "../lib/longPress";
 import { useUnreadIndicatorEnabled } from "../lib/unreadIndicator";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import {
+  createSession,
   renameSession,
   setSessionNotifications,
   setWorktreeName,
@@ -92,6 +94,7 @@ import {
   workspaceIsPinned,
   workspaceIsSunk,
   workspaceIsTrashed,
+  workspaceTrashedAtMs,
   type SidebarSortMode,
 } from "../lib/sidebarSort";
 import {
@@ -503,11 +506,11 @@ export function formatSnoozeRemainingShort(snoozedUntilIso: string): string {
   return `${Math.floor(hours / 24)}d`;
 }
 
-/** Trash control in the sidebar footer, next to Settings (#2512). Trash is a
- *  terminal, rarely-touched state, so it lives as an icon with an upward
- *  popover rather than a full scrolling section. Outside click and Escape
- *  close it, mirroring SidebarSortPicker. Only rendered when something is
- *  trashed. */
+/** Trash control in the sidebar footer, next to Settings (#2512). Trash stays
+ *  outside the filtered session list so recovery remains reachable when search
+ *  hides every live row, but opens into a wider panel instead of a cramped
+ *  icon-only popover. Outside click and Escape close it, mirroring
+ *  SidebarSortPicker. Only rendered when something is trashed. */
 function TrashMenu({
   trashedWorkspaces,
   readOnly,
@@ -522,12 +525,25 @@ function TrashMenu({
   onDelete: (workspaceId: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [panelPosition, setPanelPosition] = useState<{ left: number; bottom: number; width: number } | null>(null);
   const ref = useRef<HTMLDivElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  const positionPanel = useCallback(() => {
+    const rect = ref.current?.getBoundingClientRect();
+    if (!rect) return;
+    const gutter = 8;
+    const width = Math.min(420, window.innerWidth - gutter * 2);
+    const left = Math.min(Math.max(gutter, rect.left), Math.max(gutter, window.innerWidth - width - gutter));
+    setPanelPosition({ left, bottom: Math.max(gutter, window.innerHeight - rect.top + gutter), width });
+  }, []);
 
   useEffect(() => {
     if (!open) return;
     const onDocClick = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+      const target = e.target as Node;
+      if (ref.current?.contains(target) || panelRef.current?.contains(target)) return;
+      setOpen(false);
     };
     const onKeydown = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
@@ -540,74 +556,157 @@ function TrashMenu({
     };
   }, [open]);
 
+  useLayoutEffect(() => {
+    if (!open) return;
+    positionPanel();
+    window.addEventListener("resize", positionPanel);
+    window.addEventListener("scroll", positionPanel, true);
+    return () => {
+      window.removeEventListener("resize", positionPanel);
+      window.removeEventListener("scroll", positionPanel, true);
+    };
+  }, [open, positionPanel]);
+
   const count = trashedWorkspaces.length;
 
   return (
-    <div ref={ref} className="relative">
+    <div ref={ref} className="relative min-w-0 flex-1">
       <button
-        onClick={() => setOpen((o) => !o)}
-        aria-haspopup="menu"
+        onClick={() => {
+          if (!open) positionPanel();
+          setOpen((o) => !o);
+        }}
         aria-expanded={open}
+        aria-controls={open ? "sidebar-trash-panel" : undefined}
         data-testid="sidebar-trash-toggle"
-        className="w-8 h-8 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
+        className="h-8 w-full min-w-0 flex items-center gap-2 rounded-md px-2.5 text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer transition-colors"
         title={`Trash (${count})`}
         aria-label={`Trash (${count})`}
       >
-        <Trash2 className="h-4 w-4" />
-      </button>
-      {open && (
-        <div
-          role="menu"
-          data-testid="sidebar-trash-menu"
-          className="absolute bottom-full mb-1 left-0 min-w-[220px] max-h-[50vh] overflow-y-auto bg-surface-800 border border-surface-700/50 rounded-md shadow-xl py-1 z-50 animate-fade-in"
+        <Trash2 className="h-4 w-4 shrink-0" />
+        <span
+          data-testid="sidebar-trash-count"
+          className="shrink-0 rounded-full bg-surface-900 px-1.5 py-0.5 text-[10px] font-mono tabular-nums text-text-dim leading-none"
         >
-          <div className="px-3 py-1.5 text-[11px] font-mono uppercase tracking-widest text-text-muted">
-            Trash ({count})
-          </div>
-          {trashedWorkspaces.map((ws) => (
-            <div
-              key={ws.id}
-              data-testid="sidebar-trash-row"
-              className="flex items-center gap-2 px-3 py-1.5 text-[13px] text-text-secondary"
-            >
+          {count}
+        </span>
+        <span className="min-w-0 flex-1 truncate text-left text-[13px] font-medium">Trash</span>
+      </button>
+      {open &&
+        panelPosition &&
+        createPortal(
+          <div
+            ref={panelRef}
+            id="sidebar-trash-panel"
+            role="region"
+            aria-label="Trash"
+            data-testid="sidebar-trash-menu"
+            className="fixed z-40 flex max-h-[min(520px,calc(100vh-5rem))] flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-800 shadow-2xl animate-fade-in"
+            style={{ left: panelPosition.left, bottom: panelPosition.bottom, width: panelPosition.width }}
+          >
+            <div className="flex items-start justify-between gap-3 border-b border-surface-700/60 px-4 py-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <Trash2 className="h-4 w-4 shrink-0 text-text-muted" />
+                  <h2 className="text-sm font-semibold text-text-primary">Trash</h2>
+                  <span className="rounded-full bg-surface-900 px-2 py-0.5 text-[11px] font-mono tabular-nums text-text-dim leading-none">
+                    {count}
+                  </span>
+                </div>
+                <p className="mt-1 text-[12px] text-text-dim">Restore sessions, or delete them permanently.</p>
+              </div>
               <button
                 type="button"
-                onClick={(e) => onOpen(ws.id, e)}
-                title={ws.displayName}
-                data-testid="sidebar-trash-open"
-                className="flex-1 truncate text-left hover:text-text-primary cursor-pointer"
+                onClick={() => setOpen(false)}
+                aria-label="Close Trash"
+                className="-mr-1 rounded-md p-1 text-text-muted hover:bg-surface-700/50 hover:text-text-primary cursor-pointer transition-colors"
               >
-                {ws.displayName}
+                <X className="h-4 w-4" />
               </button>
-              {!readOnly && (
-                <>
-                  <button
-                    onClick={() => {
-                      const ids = ws.sessions.map((s) => s.id);
-                      if (ids.length > 0) onRestore(ids);
-                    }}
-                    data-testid="sidebar-trash-restore"
-                    title="Restore"
-                    aria-label="Restore"
-                    className="text-accent-500 hover:text-accent-600 cursor-pointer"
-                  >
-                    <RotateCcw className="h-3.5 w-3.5" />
-                  </button>
-                  <button
-                    onClick={() => onDelete(ws.id)}
-                    data-testid="sidebar-trash-purge"
-                    title="Delete permanently"
-                    aria-label="Delete permanently"
-                    className="text-status-error/80 hover:text-status-error cursor-pointer"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                </>
-              )}
             </div>
-          ))}
-        </div>
-      )}
+
+            <div className="min-h-0 flex-1 overflow-y-auto p-2">
+              <div className="space-y-1">
+                {[...trashedWorkspaces]
+                  .sort((a, b) => workspaceTrashedAtMs(b) - workspaceTrashedAtMs(a))
+                  .map((ws) => {
+                    const sessionCount = ws.sessions.length;
+                    const sessionLabel = sessionCount === 1 ? "1 session" : `${sessionCount} sessions`;
+                    return (
+                      <div
+                        key={ws.id}
+                        data-testid="sidebar-trash-row"
+                        className="rounded-md border border-surface-700/30 bg-surface-900/20 px-3 py-2.5 text-[13px] text-text-secondary"
+                      >
+                        <div className="min-w-0">
+                          <div className="truncate font-medium text-text-primary" title={ws.displayName}>
+                            {ws.displayName}
+                          </div>
+                          <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-text-dim">
+                            <span className="max-w-full truncate font-mono" title={ws.projectPath}>
+                              {ws.projectPath}
+                            </span>
+                            {ws.branch && (
+                              <span className="max-w-full truncate font-mono text-accent-500" title={ws.branch}>
+                                {ws.branch}
+                              </span>
+                            )}
+                            <span>{sessionLabel}</span>
+                          </div>
+                        </div>
+                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setOpen(false);
+                              onOpen(ws.id, { metaKey: false, ctrlKey: false, shiftKey: false });
+                            }}
+                            data-testid="sidebar-trash-open"
+                            className="inline-flex h-7 items-center rounded-md border border-surface-700/50 px-2.5 text-[12px] font-medium text-text-secondary hover:border-surface-600 hover:bg-surface-700/40 hover:text-text-primary cursor-pointer transition-colors"
+                          >
+                            Open
+                          </button>
+                          {!readOnly && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const ids = ws.sessions.map((s) => s.id);
+                                  if (ids.length > 0) onRestore(ids);
+                                }}
+                                data-testid="sidebar-trash-restore"
+                                title="Restore"
+                                aria-label="Restore"
+                                className="inline-flex h-7 items-center gap-1.5 rounded-md border border-accent-500/30 bg-accent-500/10 px-2.5 text-[12px] font-medium text-accent-500 hover:border-accent-500/50 hover:bg-accent-500/15 hover:text-accent-600 cursor-pointer transition-colors"
+                              >
+                                <RotateCcw className="h-3.5 w-3.5 shrink-0" />
+                                Restore
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setOpen(false);
+                                  onDelete(ws.id);
+                                }}
+                                data-testid="sidebar-trash-purge"
+                                title="Delete permanently"
+                                aria-label="Delete permanently"
+                                className="inline-flex h-7 items-center gap-1.5 rounded-md border border-status-error/30 bg-status-error/10 px-2.5 text-[12px] font-medium text-status-error/85 hover:border-status-error/50 hover:bg-status-error/15 hover:text-status-error cursor-pointer transition-colors"
+                              >
+                                <X className="h-3.5 w-3.5 shrink-0" />
+                                Delete
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
     </div>
   );
 }
@@ -863,12 +962,21 @@ export const SessionRow = memo(function SessionRow({
   const isPinned = workspace.sessions.some((s) => s.pinned_at != null);
   const isArchived = workspace.sessions.some((s) => s.archived_at != null);
   const snoozedUntil = workspace.sessions.find((s) => s.snoozed_until)?.snoozed_until ?? null;
+  // Effective state for rendering: optimistic overrides win until the
+  // sidebar's overlay reconciler drops them once the prop catches up.
+  const effectivePinned = effectivePinnedOf(optimistic, isPinned);
+  const effectiveArchived = effectiveArchivedOf(optimistic, isArchived);
+  const effectiveSnoozedUntil = effectiveSnoozedUntilOf(optimistic, snoozedUntil);
+  const effectiveSnoozed = effectiveSnoozedUntil != null;
   // Unread marker for the row, server value plus optimistic overlay. The
   // active (open) row is always suppressed: opening reads it and the App
   // clears it a beat later, so hiding it avoids a flash in the poll window.
+  // Sunk rows (archived/snoozed) suppress it too: the user dismissed the
+  // row, so lighting it up as unread contradicts that. The `unread` flag
+  // stays on disk, so unarchiving or unsnoozing restores the marker (#2571).
   const serverUnread = workspace.sessions.some((s) => s.unread === true);
   const effectiveUnread = effectiveUnreadOf(optimistic, serverUnread);
-  const isUnread = unreadIndicatorEnabled && effectiveUnread && !isActive;
+  const isUnread = unreadIndicatorEnabled && effectiveUnread && !isActive && !effectiveArchived && !effectiveSnoozed;
   // Like the TUI, the unread marker *replaces* the resting status glyph with a
   // solid dot (rather than sitting beside the title). Only for resting states:
   // a live spinner (Running/Waiting/...) stays, since live status outranks it
@@ -972,6 +1080,29 @@ export const SessionRow = memo(function SessionRow({
     requestSwitchAgent(acpSession.id);
   };
 
+  // Fork a structured session: create a new structured session that resumes the
+  // source's ACP conversation and diverges from it. Gated on a captured
+  // `acp_session_id` (the value the server forks from) AND `acp_can_fork`, so a
+  // resume-only agent that minted an id but cannot do `session/fork` never
+  // reaches the handshake; the original is left untouched. On success the new
+  // session opens; on failure the message surfaces as a toast.
+  const handleFork = async () => {
+    setContextMenu(null);
+    if (!acpSession?.acp_session_id || !acpSession.acp_can_fork) return;
+    const result = await createSession({
+      path: acpSession.project_path,
+      tool: acpSession.tool,
+      view: "structured",
+      profile: acpSession.profile || undefined,
+      fork_from: acpSession.acp_session_id,
+    });
+    if (result.ok && result.session) {
+      requestOpenSession(result.session.id);
+    } else {
+      reportError(result.error ?? "Could not fork this session. Please try again.");
+    }
+  };
+
   // Re-run smart rename ("Auto-name now") for a structured session whose
   // automatic rename never landed. Best-effort and async: a success just means
   // the one-shot was re-triggered; the title updates over the live session
@@ -985,13 +1116,6 @@ export const SessionRow = memo(function SessionRow({
       reportError(result.message ?? "Could not start auto-name. Please try again.");
     }
   };
-
-  // Effective state for rendering: optimistic overrides win until the
-  // sidebar's overlay reconciler drops them once the prop catches up.
-  const effectivePinned = effectivePinnedOf(optimistic, isPinned);
-  const effectiveArchived = effectiveArchivedOf(optimistic, isArchived);
-  const effectiveSnoozedUntil = effectiveSnoozedUntilOf(optimistic, snoozedUntil);
-  const effectiveSnoozed = effectiveSnoozedUntil != null;
 
   const [contextMenu, setContextMenu] = useState<{
     x: number;
@@ -1439,6 +1563,16 @@ export const SessionRow = memo(function SessionRow({
                   >
                     <ArrowLeftRight className="h-3.5 w-3.5 shrink-0" />
                     Switch agent
+                  </button>
+                )}
+                {!readOnly && acpSession?.acp_session_id && acpSession.acp_can_fork && (
+                  <button
+                    onClick={() => void handleFork()}
+                    data-testid="sidebar-context-menu-fork"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <GitFork className="h-3.5 w-3.5 shrink-0" />
+                    Fork session
                   </button>
                 )}
                 {!readOnly && acpSession?.default_name && (
@@ -3428,7 +3562,7 @@ export function WorkspaceSidebar({
           <button
             onClick={onSettings}
             {...tourAnchor(TOUR_ANCHORS.sidebarSettings)}
-            className="w-8 h-8 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
+            className="w-8 h-8 shrink-0 flex items-center justify-center text-text-secondary hover:text-text-primary hover:bg-surface-800/50 cursor-pointer rounded-md transition-colors"
             title="Settings"
             aria-label="Settings"
           >

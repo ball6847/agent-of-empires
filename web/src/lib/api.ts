@@ -14,6 +14,7 @@ import type {
   ClaudeSessionSummary,
   SettingsFieldDescriptor,
 } from "./types";
+import type { ConfigOptionDescriptor } from "./acpTypes";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
 
 // GET a JSON endpoint; returns null on non-2xx or network/parse errors.
@@ -222,6 +223,11 @@ export interface PluginView {
   name: string;
   version: string;
   description: string;
+  /** Lucide kebab-case identity icon name, straight from the manifest. */
+  icon: string | null;
+  /** Resolved URL for the manifest's `icon_asset` (served from the plugin's
+   *  install directory), null for a builtin or a plugin with no icon_asset. */
+  icon_asset_url: string | null;
   enabled: boolean;
   builtin: boolean;
   /** Validation provenance: "builtin" | "featured" | "community" | "local". */
@@ -327,6 +333,10 @@ export interface PluginDiscoveryResult {
   stars: number;
   badge: "installed" | "featured" | "unvetted";
   install_command: string;
+  /** The repo owner's GitHub avatar; a source-identity affordance, NOT the
+   *  plugin's own icon (unknown until a manifest fetch, which discovery
+   *  results never do). */
+  source_avatar_url: string;
 }
 
 export type DiscoverResult = { kind: "ok"; results: PluginDiscoveryResult[] } | { kind: "error"; message: string };
@@ -364,6 +374,10 @@ export interface PluginDetailManifest {
   ui_contributions: { slot: string; id: string }[];
   /** Screenshot/GIF previews, each resolved server-side to a raw.githubusercontent.com URL. */
   screenshots: { src: string; alt: string; caption: string }[];
+  /** Lucide kebab-case identity icon name. */
+  icon: string | null;
+  /** The manifest's `icon_asset`, resolved server-side to a raw.githubusercontent.com URL. */
+  icon_asset_url: string | null;
 }
 
 /** On-demand detail for one plugin source (`GET /api/plugins/details`): manifest
@@ -402,6 +416,25 @@ export interface PluginUpdateUiView {
   id: string;
 }
 
+/** One changelog item between the installed and target version: a release's
+ *  notes, or a single commit subject. Mirrors Rust `ChangelogEntry`. */
+export type PluginChangelogEntry =
+  | { kind: "release"; tag: string; body: string | null; published_at: string | null }
+  | { kind: "commit"; sha: string; subject: string; url: string | null };
+
+/** What changed between the installed version and the update target, mirroring
+ *  Rust `UpdateChangelog`. `unavailable_reason` distinguishes "could not load"
+ *  from "no entries" (both leave `entries` empty); `truncated` flags that more
+ *  existed than are shown. */
+export interface PluginUpdateChangelog {
+  entries: PluginChangelogEntry[];
+  truncated: boolean;
+  unavailable_reason: string | null;
+  /** GitHub URL for the full history (releases page or compare view), shown when
+   *  the changelog is truncated. */
+  more_url: string | null;
+}
+
 /** Structured disclosure for a capability-expanding plugin update, mirroring the
  *  Rust `UpdateConsent`. Drives the consent modal. */
 export interface PluginUpdateConsent {
@@ -418,13 +451,14 @@ export interface PluginUpdateConsent {
   trust_downgrade: boolean;
   fingerprint: string;
   stays_active_if_declined: boolean;
+  changelog: PluginUpdateChangelog;
 }
 
 /** Result of `GET /api/plugins/{id}/update/preview`: a tagged union mirroring the
  *  Rust `UpdatePreview`. */
 export type PluginUpdatePreview =
   | { kind: "no_update" }
-  | { kind: "safe_update"; to_version: string; fingerprint: string }
+  | { kind: "safe_update"; to_version: string; fingerprint: string; changelog: PluginUpdateChangelog }
   | { kind: "consent_required"; consent: PluginUpdateConsent; dismissed: boolean };
 
 export type PluginUpdatePreviewResult =
@@ -1269,6 +1303,25 @@ export interface AcpAgentInfo {
  *  modal to populate the handoff target list. See #1282. */
 export async function fetchAcpAgents(): Promise<AcpAgentInfo[]> {
   return (await fetchJson<AcpAgentInfo[]>("/api/acp/agents")) ?? [];
+}
+
+/** One agent's last-observed config options, from the recall cache. */
+export interface AgentOptionEntry {
+  /** RFC 3339 timestamp of the last observation, for freshness display. */
+  updated_at: string;
+  options: ConfigOptionDescriptor[];
+}
+
+/** Recall cache of the config options each agent last advertised, keyed by
+ *  agent name. Feeds the per-agent defaults settings page dropdowns without a
+ *  live session; empty until an agent has run at least once. See #2631. */
+export interface AcpOptionCatalog {
+  version: number;
+  agents: Record<string, AgentOptionEntry>;
+}
+
+export async function fetchAcpOptionCatalog(): Promise<AcpOptionCatalog> {
+  return (await fetchJson<AcpOptionCatalog>("/api/acp/option-catalog")) ?? { version: 1, agents: {} };
 }
 
 // --- Acp switch agent ---

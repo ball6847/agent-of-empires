@@ -18,9 +18,29 @@ import type {
   PluginJobStartResult,
   PluginListResponse,
   PluginToggleResult,
+  PluginUpdateChangelog,
   PluginUpdatePreviewResult,
   PluginUpdatesResult,
 } from "../../../lib/api";
+
+const emptyChangelog: PluginUpdateChangelog = {
+  entries: [],
+  truncated: false,
+  unavailable_reason: null,
+  more_url: null,
+};
+const releaseChangelog: PluginUpdateChangelog = {
+  entries: [{ kind: "release", tag: "v0.2.0", body: "Added a thing.", published_at: null }],
+  truncated: false,
+  unavailable_reason: null,
+  more_url: null,
+};
+const commitChangelog: PluginUpdateChangelog = {
+  entries: [{ kind: "commit", sha: "abcdef1234", subject: "fix: a bug", url: null }],
+  truncated: true,
+  unavailable_reason: null,
+  more_url: "https://github.com/example/plugin/compare/aaa...bbb",
+};
 
 const fetchPlugins = vi.fn<[], Promise<PluginListResponse | null>>();
 const setPluginEnabled = vi.fn<[string, boolean], Promise<PluginToggleResult>>();
@@ -508,6 +528,93 @@ describe("PluginsSettings", () => {
     await waitFor(() => expect(queryByTestId("plugin-detail-modal")).toBeNull());
   });
 
+  it("renders an installed plugin's icon_asset as an image", async () => {
+    fetchPlugins.mockResolvedValue(
+      listResponse({
+        plugins: [
+          {
+            id: "agent-of-empires.github",
+            name: "GitHub",
+            version: "1.0.0",
+            description: "GitHub integration.",
+            enabled: true,
+            builtin: false,
+            validation: "featured",
+            source: "gh:agent-of-empires/plugin-github",
+            capabilities: [],
+            ui_contributions: [],
+            granted: true,
+            needs_reapproval: false,
+            icon: "github",
+            icon_asset_url: "/api/plugins/agent-of-empires.github/icon",
+          },
+        ],
+      }),
+    );
+    const { findByTestId } = render(<PluginsSettings />);
+    const icon = await findByTestId("plugin-icon-agent-of-empires.github");
+    expect(icon.tagName).toBe("IMG");
+    expect(icon.getAttribute("src")).toBe("/api/plugins/agent-of-empires.github/icon");
+  });
+
+  it("falls back to the lucide icon when a plugin has no icon_asset_url", async () => {
+    fetchPlugins.mockResolvedValue(
+      listResponse({
+        plugins: [
+          {
+            id: "acme.widget",
+            name: "Widget",
+            version: "1.0.0",
+            description: "A widget.",
+            enabled: true,
+            builtin: false,
+            validation: "community",
+            source: "gh:acme/widget",
+            capabilities: [],
+            ui_contributions: [],
+            granted: true,
+            needs_reapproval: false,
+            icon: "git-branch",
+            icon_asset_url: null,
+          },
+        ],
+      }),
+    );
+    const { findByTestId } = render(<PluginsSettings />);
+    const icon = await findByTestId("plugin-icon-acme.widget");
+    expect(icon.tagName).toBe("svg");
+  });
+
+  it("shows the plugin's icon in the detail modal header", async () => {
+    fetchPlugins.mockResolvedValue(
+      listResponse({
+        plugins: [
+          {
+            id: "agent-of-empires.github",
+            name: "GitHub",
+            version: "1.0.0",
+            description: "GitHub integration.",
+            enabled: true,
+            builtin: false,
+            validation: "featured",
+            source: "gh:agent-of-empires/plugin-github",
+            capabilities: [],
+            ui_contributions: [],
+            granted: true,
+            needs_reapproval: false,
+            icon: "github",
+            icon_asset_url: "/api/plugins/agent-of-empires.github/icon",
+          },
+        ],
+      }),
+    );
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugin-open-agent-of-empires.github"));
+    const icon = await findByTestId("plugin-detail-icon");
+    expect(icon.tagName).toBe("IMG");
+    expect(icon.getAttribute("src")).toBe("/api/plugins/agent-of-empires.github/icon");
+  });
+
   it("Escape closes the detail modal when no lightbox is open", async () => {
     const { findByTestId, queryByTestId } = render(<PluginsSettings />);
     fireEvent.click(await findByTestId("plugin-open-example.plugin"));
@@ -552,6 +659,7 @@ describe("PluginsSettings", () => {
         trust_downgrade: false,
         fingerprint: "treeB||community",
         stays_active_if_declined: true,
+        changelog: releaseChangelog,
       },
     },
   };
@@ -566,6 +674,8 @@ describe("PluginsSettings", () => {
     await findByTestId("plugin-update-consent-modal");
     expect((await findByTestId("plugin-update-added-caps")).textContent).toContain("fs.read");
     expect((await findByTestId("plugin-update-build-steps")).textContent).toContain("sh build.sh");
+    // The changelog is shown alongside the access disclosure.
+    expect((await findByTestId("plugin-update-changelog")).textContent).toContain("v0.2.0");
   });
 
   it("Approving applies the update pinned to the previewed fingerprint and opens the job modal", async () => {
@@ -611,19 +721,60 @@ describe("PluginsSettings", () => {
     await findByTestId("plugin-update-available-example.plugin");
   });
 
-  it("a safe update applies directly without a consent modal and follows the job", async () => {
+  it("a safe update shows the changelog in a review modal, then applies on Update", async () => {
     markOutdated();
     previewPluginUpdate.mockResolvedValue({
       kind: "ok",
-      preview: { kind: "safe_update", to_version: "0.2.0", fingerprint: "treeC||community" },
+      preview: {
+        kind: "safe_update",
+        to_version: "0.2.0",
+        fingerprint: "treeC||community",
+        changelog: commitChangelog,
+      },
     });
     applyPluginUpdate.mockResolvedValue({ kind: "ok", jobId: "job1" });
     const { findByTestId, queryByTestId } = render(<PluginsSettings />);
     fireEvent.click(await findByTestId("plugins-check-updates"));
     fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    // Safe updates no longer auto-apply: the review modal opens first, shows the
+    // changelog, and has no access disclosure.
+    await findByTestId("plugin-update-consent-modal");
+    expect((await findByTestId("plugin-update-changelog")).textContent).toContain("fix: a bug");
+    // A truncated changelog links out to the full history on GitHub.
+    const more = await findByTestId("plugin-update-changelog-more");
+    expect(more.getAttribute("href")).toBe("https://github.com/example/plugin/compare/aaa...bbb");
+    expect(queryByTestId("plugin-update-added-caps")).toBeNull();
+    expect(applyPluginUpdate).not.toHaveBeenCalled();
+    fireEvent.click(await findByTestId("plugin-update-approve"));
     await waitFor(() => expect(applyPluginUpdate).toHaveBeenCalledWith("example.plugin", "treeC||community"));
-    expect(queryByTestId("plugin-update-consent-modal")).toBeNull();
     await findByTestId("plugin-job-modal");
+  });
+
+  it("an unavailable changelog says so and still lets the update proceed", async () => {
+    markOutdated();
+    previewPluginUpdate.mockResolvedValue({
+      kind: "ok",
+      preview: {
+        kind: "safe_update",
+        to_version: "0.2.0",
+        fingerprint: "treeC||community",
+        changelog: {
+          entries: [],
+          truncated: false,
+          unavailable_reason: "GitHub rate limit reached; changelog unavailable.",
+          more_url: null,
+        },
+      },
+    });
+    applyPluginUpdate.mockResolvedValue({ kind: "ok", jobId: "job1" });
+    const { findByTestId } = render(<PluginsSettings />);
+    fireEvent.click(await findByTestId("plugins-check-updates"));
+    fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    const note = await findByTestId("plugin-update-changelog-unavailable");
+    expect(note.textContent).toContain("rate limit");
+    // The update is still offered: approving applies it.
+    fireEvent.click(await findByTestId("plugin-update-approve"));
+    await waitFor(() => expect(applyPluginUpdate).toHaveBeenCalledWith("example.plugin", "treeC||community"));
   });
 
   it("surfaces an apply error in the consent modal and keeps it open", async () => {
@@ -662,6 +813,7 @@ describe("PluginsSettings", () => {
           trust_downgrade: true,
           fingerprint: "treeD||community",
           stays_active_if_declined: true,
+          changelog: emptyChangelog,
         },
       },
     });
@@ -671,6 +823,8 @@ describe("PluginsSettings", () => {
     await findByTestId("plugin-update-consent-modal");
     expect((await findByTestId("plugin-update-runtime-change")).textContent).toContain("release binary");
     await findByTestId("plugin-update-trust-downgrade");
+    // An empty (but available) changelog reads as "No changelog available".
+    await findByTestId("plugin-update-changelog-empty");
   });
 
   it("Update reports up-to-date and clears the badge when preview finds no update", async () => {
@@ -696,12 +850,13 @@ describe("PluginsSettings", () => {
     markOutdated();
     previewPluginUpdate.mockResolvedValue({
       kind: "ok",
-      preview: { kind: "safe_update", to_version: "0.2.0", fingerprint: "treeC||community" },
+      preview: { kind: "safe_update", to_version: "0.2.0", fingerprint: "treeC||community", changelog: emptyChangelog },
     });
     applyPluginUpdate.mockResolvedValue({ kind: "error", message: "apply boom" });
     const { findByTestId, findByText } = render(<PluginsSettings />);
     fireEvent.click(await findByTestId("plugins-check-updates"));
     fireEvent.click(await findByTestId("plugin-update-example.plugin"));
+    fireEvent.click(await findByTestId("plugin-update-approve"));
     await findByText("apply boom");
   });
 

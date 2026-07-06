@@ -145,7 +145,7 @@ pub struct WatchSpec {
 
 /// Coarse classification for a watch failure; useful for callers that want
 /// to surface different remediation hints.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchErrorKind {
     /// The notify backend reported a generic error.
     Backend,
@@ -155,6 +155,12 @@ pub enum WatchErrorKind {
     NotFound,
     /// Permission denied at the backend.
     Permission,
+    /// The in-process file-watch dispatcher task has terminated.
+    /// Distinct from `Backend` because the failure is process-internal
+    /// (panic / abort in the dispatcher), not a kernel-reported error,
+    /// and the remediation is an aoe restart rather than freeing kernel
+    /// resources.
+    DispatcherDead,
     /// Anything else.
     Other,
 }
@@ -197,6 +203,18 @@ pub enum WatchError {
     /// rather than registering an entry that pretends to be live.
     #[error("file watcher dispatcher has terminated")]
     DispatcherDead,
+}
+
+impl WatchError {
+    /// Coarse classification of the failure. Stable across `notify` Display
+    /// drift, so callers that key on error identity can compare on this
+    /// rather than the formatted message.
+    pub fn kind(&self) -> WatchErrorKind {
+        match self {
+            WatchError::Init { kind, .. } | WatchError::Watch { kind, .. } => *kind,
+            WatchError::DispatcherDead => WatchErrorKind::DispatcherDead,
+        }
+    }
 }
 
 /// Internal subscription identifier. `0` is reserved for the noop sentinel.
@@ -409,7 +427,7 @@ impl FileWatchService {
     /// Construct a noop service: no kernel watcher, no drain thread, no
     /// dispatcher. [`Self::subscribe_channel`] returns Ok with an
     /// immediately-closed receiver (its paired sender is dropped before
-    /// return). [`Self::notify_local_change`] is silently a no-op: the
+    /// return). `Self::notify_local_change` is silently a no-op: the
     /// dispatcher channel's receiver is dropped at construction so any
     /// `send` Errs, and `dispatcher_dead` is pre-set so the error log path
     /// short-circuits. Used by `Storage::new_unwatched` and as the

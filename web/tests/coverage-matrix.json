@@ -349,6 +349,19 @@
       "components": ["web/src/components/settings/customWidgets.tsx"]
     },
     {
+      "id": "settings.acp-defaults",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/settings/__tests__/AcpDefaultsWidget.test.tsx",
+        "src/components/__tests__/SettingsView.session.test.tsx"
+      ],
+      "components": [
+        "web/src/components/settings/AcpDefaultsWidget.tsx",
+        "web/src/components/settings/customWidgetRegistry.ts"
+      ]
+    },
+    {
       "id": "settings.schema-persistence",
       "kind": "live-playwright",
       "risk": "medium",
@@ -462,8 +475,12 @@
       "id": "settings.terminal-localstorage",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/__tests__/TerminalSettings.test.tsx"],
-      "components": ["web/src/components/TerminalSettings.tsx", "web/src/components/TerminalSessionStack.tsx"]
+      "specs": ["src/components/__tests__/TerminalSettings.test.tsx", "src/lib/__tests__/fontDetect.test.ts"],
+      "components": [
+        "web/src/components/TerminalSettings.tsx",
+        "web/src/components/TerminalSessionStack.tsx",
+        "web/src/lib/fontDetect.ts"
+      ]
     },
     {
       "id": "app-shell.topbar-dev-badge",
@@ -476,8 +493,8 @@
       "id": "app-shell.activity-bar",
       "kind": "vitest",
       "risk": "low",
-      "specs": ["src/components/__tests__/ActivityBar.test.tsx"],
-      "components": ["web/src/components/ActivityBar.tsx"]
+      "specs": ["src/components/__tests__/ActivityBar.test.tsx", "src/components/__tests__/PaneIcon.test.tsx"],
+      "components": ["web/src/components/ActivityBar.tsx", "web/src/components/PaneIcon.tsx"]
     },
     {
       "id": "app-shell.tips-badge",
@@ -830,6 +847,23 @@
       "components": ["web/src/App.tsx", "web/src/components/command-palette/CommandPalette.tsx"]
     },
     {
+      "id": "palette.category-tabs",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/command-palette/__tests__/CommandPalette.test.tsx"],
+      "components": [
+        "web/src/components/command-palette/CommandPalette.tsx",
+        "web/src/components/command-palette/groups.ts"
+      ]
+    },
+    {
+      "id": "palette.session-triage",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/__tests__/useCommandActions.test.tsx"],
+      "components": ["web/src/hooks/useCommandActions.ts", "web/src/App.tsx"]
+    },
+    {
       "id": "sidebar.scratch-group",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -848,6 +882,20 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/sidebar-grouping.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sessions.fork",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/components/__tests__/ForkSessionAction.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sessions.fork.round-trip",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/session-fork.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
@@ -891,6 +939,20 @@
       "risk": "low",
       "specs": ["tests/sidebar-empty-state.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.trash-control",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.trash-order",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/lib/__tests__/sidebarTrash.test.ts", "src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
+      "components": ["web/src/lib/sidebarSort.ts", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.new-session-tooltips",
@@ -1139,6 +1201,13 @@
       "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
+      "id": "session.trash.restore-banner",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/__tests__/TrashedWorkerStoppedBanner.test.tsx"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
       "id": "session.group-edit",
       "kind": "live-playwright",
       "risk": "high",
@@ -1376,6 +1445,13 @@
       "risk": "medium",
       "specs": ["tests/live/disconnect-banner.spec.ts"],
       "components": ["web/src/components/DisconnectBanner.tsx"]
+    },
+    {
+      "id": "connectivity.lifecycle-fetch-toasts",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/fetchInterceptor.more.test.ts"],
+      "components": ["web/src/lib/fetchInterceptor.ts"]
     },
     {
       "id": "git-clone",
@@ -1755,8 +1831,12 @@
       "id": "acp.markdown",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/acp/Markdown.test.tsx", "src/components/acp/Markdown.breaks.test.tsx"],
-      "components": ["web/src/components/acp/Markdown.tsx"]
+      "specs": [
+        "src/components/acp/Markdown.test.tsx",
+        "src/components/acp/Markdown.breaks.test.tsx",
+        "src/components/acp/__tests__/artifactMedia.test.tsx"
+      ],
+      "components": ["web/src/components/acp/Markdown.tsx", "web/src/components/acp/artifactMedia.tsx"]
     },
     {
       "id": "acp.file-links",
@@ -2803,7 +2883,8 @@
         "web/src/components/Dashboard.tsx",
         "web/src/components/WorkspaceSidebar.tsx",
         "web/src/components/Dock.tsx",
-        "web/src/components/acp/Composer.tsx"
+        "web/src/components/acp/Composer.tsx",
+        "web/src/components/SettingsView.tsx"
       ]
     },
     {
@@ -2814,7 +2895,8 @@
         "src/lib/__tests__/tourSteps.test.ts",
         "src/hooks/__tests__/useTour.test.ts",
         "src/components/__tests__/Dashboard.tour.test.tsx",
-        "src/components/tour/TourRunner.theme.test.tsx"
+        "src/components/tour/TourRunner.theme.test.tsx",
+        "src/components/tour/TourRunner.transition.test.tsx"
       ],
       "components": [
         "web/src/components/Dashboard.tsx",
@@ -2867,13 +2949,17 @@
       "id": "settings.plugins",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/settings/__tests__/PluginsSettings.test.tsx"],
+      "specs": [
+        "src/components/settings/__tests__/PluginsSettings.test.tsx",
+        "src/components/settings/__tests__/PluginIdentityIcon.test.tsx"
+      ],
       "components": [
         "web/src/components/settings/PluginsSettings.tsx",
         "web/src/components/settings/PluginDetailModal.tsx",
         "web/src/components/settings/PluginUpdateConsentModal.tsx",
         "web/src/components/settings/PluginInstallConsentModal.tsx",
-        "web/src/components/settings/PluginJobProgressModal.tsx"
+        "web/src/components/settings/PluginJobProgressModal.tsx",
+        "web/src/components/settings/PluginIdentityIcon.tsx"
       ]
     },
     {
@@ -2882,6 +2968,17 @@
       "risk": "high",
       "specs": ["tests/live/plugins-enable-toggle.spec.ts"],
       "components": ["web/src/components/settings/PluginsSettings.tsx"]
+    },
+    {
+      "id": "settings.plugins-passphrase-loopback",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/plugins-passphrase-loopback.spec.ts"],
+      "components": [
+        "web/src/components/settings/PluginsSettings.tsx",
+        "web/src/components/ElevationPrompt.tsx",
+        "web/src/lib/fetchInterceptor.ts"
+      ]
     },
     {
       "id": "terminal.desktop-live-input",

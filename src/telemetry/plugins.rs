@@ -1,6 +1,6 @@
 //! Plugin-adoption census for `usage_snapshot` (#2367).
 //!
-//! Two maps, both fed straight from the loaded [`PluginRegistry`]:
+//! Two maps, both fed straight from the loaded [`crate::plugin::PluginRegistry`]:
 //! - `plugins_by_source`: installed count per source bucket
 //!   (`builtin` / `featured` / `community` / `local`). A count by category,
 //!   never an identity, so it is safe for every source.

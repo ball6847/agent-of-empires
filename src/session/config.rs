@@ -537,6 +537,18 @@ pub struct AcpConfig {
         advanced
     )]
     pub allow_agent_install: bool,
+
+    /// Per-agent structured-view startup defaults, keyed by agent name
+    /// (`{"<agent>": {"model": "...", "effort": "...", "mode": "...",
+    /// "effort_by_model": {"<model>": "..."}}}`). `model` is forwarded at spawn;
+    /// `effort` and `mode` are applied through ACP config options when
+    /// advertised. `effort_by_model` overrides `effort` for a matching model.
+    ///
+    /// Edited per agent through the `acp-defaults` custom widget (composer-style
+    /// dropdowns on the web, an inline JSON field in the TUI).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[setting(label = "Structured View Defaults", widget = "custom:acp-defaults")]
+    pub acp_defaults: HashMap<String, AcpAgentDefaults>,
 }
 
 fn default_rate_limit_auto_resume_grace_secs() -> u32 {
@@ -614,6 +626,7 @@ impl Default for AcpConfig {
             rate_limit_auto_resume: false,
             rate_limit_auto_resume_grace_secs: default_rate_limit_auto_resume_grace_secs(),
             allow_agent_install: false,
+            acp_defaults: HashMap::new(),
         }
     }
 }
@@ -934,6 +947,20 @@ pub struct SessionConfig {
     )]
     pub smart_rename_agent: String,
 
+    /// Pass `--resume <sid>` (or the agent's equivalent) when restarting (`e`)
+    /// or reattaching (`Enter`) a terminal-mode session with a stored session
+    /// id. Disable to always start these sessions fresh instead, e.g. to
+    /// resume manually via the agent's own `/resume` picker. Does not affect
+    /// Send Message or Live Send, which always try to preserve context when
+    /// respawning a dead pane. See #2609.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Auto-resume on restart/reattach",
+        widget = "toggle",
+        category = "Agents"
+    )]
+    pub auto_resume_on_restart: bool,
+
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
     /// wheel and text selection back to the terminal, e.g. iOS Mosh +
@@ -986,17 +1013,6 @@ pub struct SessionConfig {
     )]
     pub agent_acp_cmd: HashMap<String, String>,
 
-    /// Per-agent acp startup defaults as a JSON object
-    /// (`{"<agent>": {"model": "...", "effort": "..."}}`). `model` is forwarded
-    /// at spawn; `effort` is applied through ACP config options when advertised.
-    ///
-    /// Map-of-struct, so it has no flat widget: it is edited as raw JSON through
-    /// the `acp-defaults` custom widget (a JSON textarea on the web, an inline
-    /// JSON field in the TUI) and saved like any other schema field.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[setting(label = "Structured View Defaults", widget = "custom:acp-defaults")]
-    pub acp_defaults: HashMap<String, AcpAgentDefaults>,
-
     /// Require SHIFT on letter-based TUI hotkeys (e.g. SHIFT+N for New, SHIFT+D for Delete).
     /// Guards against accidental destructive actions from dictation software, a forgotten
     /// focus, or stray keystrokes. Navigation keys (h/j/k/l, arrows, Enter, Esc), punctuation
@@ -1034,6 +1050,17 @@ pub struct SessionConfig {
     #[serde(default = "default_true")]
     #[setting(label = "Delete to Trash", widget = "toggle")]
     pub delete_to_trash: bool,
+
+    /// Ask for confirmation before deleting a session with the TUI `d` key.
+    /// Off by default so the trash-first flow stays low-friction: `d` moves
+    /// the session straight to the trash. When on, `d` opens a confirmation
+    /// dialog first, guarding against a fumbled keystroke trashing the wrong
+    /// (possibly running) session. Only affects the TUI trash path; the web
+    /// delete dialog already confirms, and the permanent-delete/force-remove
+    /// paths are gated by their own dialogs regardless. See #2583.
+    #[serde(default)]
+    #[setting(label = "Confirm Before Delete", widget = "toggle")]
+    pub confirm_delete: bool,
 
     /// Days a session stays in the trash before it is automatically purged,
     /// measured from when it was trashed. `0` keeps trashed sessions
@@ -1242,16 +1269,53 @@ pub struct AcpAgentDefaults {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+
+    /// Default structured view mode (ACP `category:"mode"` config option
+    /// value). Applied after `session/new` only when the agent advertises a
+    /// live mode option; a stale value no-ops with a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+
+    /// Per-model effort overrides, keyed by the exact ACP model option value.
+    /// Takes precedence over the flat `effort` when the resolved model matches
+    /// a key; falls back to `effort` otherwise.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub effort_by_model: HashMap<String, String>,
 }
 
 impl AcpAgentDefaults {
     pub fn is_empty(&self) -> bool {
         self.model.as_deref().is_none_or(str::is_empty)
             && self.effort.as_deref().is_none_or(str::is_empty)
+            && self.mode.as_deref().is_none_or(str::is_empty)
+            && self.effort_by_model.is_empty()
+    }
+
+    /// Default mode, with empty strings treated as unset (mirrors
+    /// `effort_for_model`) so a blank value never triggers a pointless ACP
+    /// config update on spawn.
+    pub fn mode(&self) -> Option<String> {
+        self.mode.clone().filter(|value| !value.is_empty())
+    }
+
+    /// Effort for a resolved model: the per-model override wins when the model
+    /// matches a key, otherwise the flat `effort`. Empty strings are treated as
+    /// unset.
+    pub fn effort_for_model(&self, model: Option<&str>) -> Option<String> {
+        if let Some(model) = model {
+            if let Some(effort) = self
+                .effort_by_model
+                .get(model)
+                .filter(|value| !value.is_empty())
+            {
+                return Some(effort.clone());
+            }
+        }
+        self.effort.clone().filter(|value| !value.is_empty())
     }
 }
 
-impl SessionConfig {
+impl AcpConfig {
     pub fn acp_defaults_for(&self, agent: &str) -> Option<&AcpAgentDefaults> {
         self.acp_defaults
             .get(agent)
@@ -1328,14 +1392,15 @@ impl Default for SessionConfig {
             merge_hooks_into_selected_agent: true,
             smart_rename: true,
             smart_rename_agent: String::new(),
+            auto_resume_on_restart: true,
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
             agent_acp_cmd: HashMap::new(),
-            acp_defaults: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
             delete_to_trash: true,
+            confirm_delete: false,
             trash_retention_days: default_trash_retention_days(),
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             restart_wake_message: default_restart_wake_message(),
@@ -1619,7 +1684,7 @@ pub enum ColorMode {
     /// modern terminals and SSH sessions that pass RGB correctly.
     #[default]
     Truecolor,
-    /// Emit 256-palette escapes (\e[38;5;<idx>m) by converting every theme
+    /// Emit 256-palette escapes (`\e[38;5;<idx>m`) by converting every theme
     /// Rgb(r,g,b) to the nearest xterm-256 index. Use this when the transport
     /// (notably some mosh clients) mishandles 24-bit RGB; preview panes in
     /// aoe already use 256-palette via ansi-to-tui, so palette mode renders
@@ -3193,11 +3258,12 @@ mod tests {
             .session
             .agent_extra_args
             .insert("opencode".to_string(), "--port 8080".to_string());
-        config.session.acp_defaults.insert(
+        config.acp.acp_defaults.insert(
             "opencode".to_string(),
             AcpAgentDefaults {
                 model: Some("openai/gpt-5.5".to_string()),
                 effort: Some("high".to_string()),
+                ..Default::default()
             },
         );
 
@@ -3214,13 +3280,69 @@ mod tests {
             "agent_extra_args should survive roundtrip"
         );
         assert_eq!(
-            deserialized.session.acp_defaults.get("opencode"),
+            deserialized.acp.acp_defaults.get("opencode"),
             Some(&AcpAgentDefaults {
                 model: Some("openai/gpt-5.5".to_string()),
                 effort: Some("high".to_string()),
+                ..Default::default()
             }),
             "acp_defaults should survive roundtrip"
         );
+    }
+
+    #[test]
+    fn acp_defaults_effort_for_model_prefers_per_model_then_flat() {
+        let mut defaults = AcpAgentDefaults {
+            effort: Some("low".to_string()),
+            ..Default::default()
+        };
+        defaults
+            .effort_by_model
+            .insert("gpt-5".to_string(), "high".to_string());
+
+        // Matching model uses the per-model override.
+        assert_eq!(
+            defaults.effort_for_model(Some("gpt-5")).as_deref(),
+            Some("high")
+        );
+        // Non-matching model and the no-model case fall back to the flat effort.
+        assert_eq!(
+            defaults.effort_for_model(Some("other")).as_deref(),
+            Some("low")
+        );
+        assert_eq!(defaults.effort_for_model(None).as_deref(), Some("low"));
+        // An empty per-model value is treated as unset and falls back.
+        defaults
+            .effort_by_model
+            .insert("gpt-5".to_string(), String::new());
+        assert_eq!(
+            defaults.effort_for_model(Some("gpt-5")).as_deref(),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn acp_defaults_is_empty_covers_new_fields() {
+        let mut defaults = AcpAgentDefaults::default();
+        assert!(defaults.is_empty());
+        defaults.mode = Some("plan".to_string());
+        assert!(!defaults.is_empty());
+
+        let mut with_map = AcpAgentDefaults::default();
+        with_map
+            .effort_by_model
+            .insert("gpt-5".to_string(), "high".to_string());
+        assert!(!with_map.is_empty());
+    }
+
+    #[test]
+    fn acp_defaults_mode_treats_empty_as_unset() {
+        let mut defaults = AcpAgentDefaults::default();
+        assert_eq!(defaults.mode(), None);
+        defaults.mode = Some(String::new());
+        assert_eq!(defaults.mode(), None);
+        defaults.mode = Some("plan".to_string());
+        assert_eq!(defaults.mode().as_deref(), Some("plan"));
     }
 
     #[test]

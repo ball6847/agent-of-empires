@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::git::error::GitError;
 use crate::session::{EnsureReadyError, EnsureReadyOutcome, Instance, Status, Storage};
 
+use super::validate_display_label;
 use super::validate_no_shell_injection;
 use super::AppState;
 
@@ -21,6 +22,10 @@ pub struct SessionResponse {
     pub id: String,
     pub title: String,
     pub project_path: String,
+    /// Absolute host path of the session's managed artifact directory. The
+    /// web transcript maps agent-emitted artifact paths under this root (or
+    /// the fixed sandbox mount) to the authenticated artifact route. See #2587.
+    pub artifact_dir: String,
     pub group_path: String,
     pub tool: String,
     pub status: String,
@@ -168,6 +173,28 @@ pub struct SessionResponse {
     /// available, replacing the hardcoded client-side tool list.
     #[cfg(feature = "serve")]
     pub acp_capable: bool,
+    /// The session's captured ACP session id, present only once the
+    /// structured-view worker has minted one. The web dashboard passes this
+    /// as `fork_from` on a structured fork create, so the sidebar only offers
+    /// "Fork" on a structured row that has a captured id to diverge from.
+    /// Omitted when absent (terminal sessions, or structured ones whose worker
+    /// has not minted an id yet).
+    #[cfg(feature = "serve")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_session_id: Option<String>,
+    /// True when this session's agent can run a structured ACP `session/fork`:
+    /// it is ACP-capable AND declares a real fork strategy. Resume-only ACP
+    /// agents (e.g. the bundled `aoe-agent`, which advertises `loadSession` but
+    /// not `session/fork`) are ACP-capable yet not forkable, so gating the web
+    /// "Fork" action on `acp_session_id` alone would offer a dead-end button
+    /// that fails at the `session/fork` handshake. The true capability is only
+    /// advertised transiently during the handshake, so this projects the static
+    /// agent fork strategy instead, which is the set AoE treats as forkable.
+    /// Omitted (read as not-forkable) for terminal sessions and non-forkable
+    /// agents.
+    #[cfg(feature = "serve")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub acp_can_fork: bool,
     /// True when the session is a Claude Code session AND the user has
     /// enabled Claude's fullscreen renderer (`tui: "fullscreen"` in
     /// `~/.claude/settings.json`). The web client uses this to skip
@@ -289,6 +316,9 @@ impl SessionResponse {
             id: inst.id.clone(),
             title: inst.title.clone(),
             project_path: inst.project_path.clone(),
+            artifact_dir: crate::session::artifacts::artifact_dir_path(&inst.id)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
             group_path: inst.group_path.clone(),
             tool: inst.tool.clone(),
             status: format!("{:?}", inst.status),
@@ -369,6 +399,13 @@ impl SessionResponse {
                     .unwrap_or(inst.tool.as_str());
                 builtin_acp_registry().get(resolved).is_some()
             },
+            #[cfg(feature = "serve")]
+            acp_session_id: inst.acp_session_id.clone(),
+            // Shares `agent_is_structured_fork_capable` with the create-time
+            // guard so the web "Fork" affordance and server-side acceptance
+            // cannot drift: forkable = ACP-capable AND a real fork strategy.
+            #[cfg(feature = "serve")]
+            acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
             workspace_repos: inst
                 .workspace_info
@@ -611,12 +648,17 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
         }
     }
 
-    // Overlay the smart-rename indicator. `running` comes from the live
-    // in-flight set; `pending` from the shared eligibility predicate, so the
-    // chip cannot drift from the runtime gate. Config resolved once per profile.
+    // Overlay the smart-rename indicator. `Running` comes from the live
+    // in-flight set; `Pending` from the shared eligibility predicate, so the
+    // indicator cannot drift from the runtime gate. Config resolved once per
+    // (profile, project_path) so repo-local overrides are honored.
     {
-        use crate::session::smart_rename::{check_eligible_resolved, SmartRenameState};
+        use crate::session::smart_rename::{
+            check_eligible_resolved, resolve_smart_rename_config, SmartRenameConfig,
+            SmartRenameState,
+        };
         use std::collections::{HashMap, HashSet};
+        use std::path::Path;
         let inflight: HashSet<String> = state
             .smart_rename_inflight
             .lock()
@@ -627,8 +669,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        let mut cfg_cache: HashMap<String, (bool, String, HashMap<String, String>)> =
-            HashMap::new();
+        let mut cfg_cache: HashMap<(String, String), SmartRenameConfig> = HashMap::new();
         for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
             resp.default_name = crate::session::civilizations::is_default_civ_name(&inst.title);
             if inflight.contains(&inst.id) {
@@ -640,28 +681,19 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             if attempted.contains(&inst.id) {
                 continue;
             }
-            let (setting_on, rename_agent, overrides) = cfg_cache
-                .entry(inst.source_profile.clone())
-                .or_insert_with(|| {
-                    let cfg = crate::session::profile_config::resolve_config_or_warn(
-                        &inst.source_profile,
-                    )
-                    .session;
-                    (
-                        cfg.smart_rename,
-                        cfg.smart_rename_agent,
-                        cfg.agent_command_override,
-                    )
-                });
+            let key = (inst.source_profile.clone(), inst.project_path.clone());
+            let cfg = cfg_cache.entry(key).or_insert_with(|| {
+                resolve_smart_rename_config(&inst.source_profile, Path::new(&inst.project_path))
+            });
             let eligible = check_eligible_resolved(
                 inst.is_structured(),
-                *setting_on,
+                cfg.setting_on,
                 &inst.title,
                 &inst.tool,
-                rename_agent,
+                &cfg.rename_agent,
                 inst.is_sandboxed(),
                 &inst.command,
-                overrides,
+                &cfg.overrides,
             )
             .is_ok();
             if eligible {
@@ -940,6 +972,45 @@ async fn quiesce_structured_worker_for_worktree_move(
     }
 }
 
+/// Probe whether a sandboxed session's container is still holding its
+/// worktree mount, on the blocking pool.
+///
+/// A sandbox container runs `sleep infinity` for the life of the session
+/// and keeps the worktree dir bind-mounted even while the agent is Idle,
+/// so a `git worktree move` would fail with `EBUSY`. Callers gate the
+/// rename/workdir-edit endpoints on this probe.
+///
+/// Fails closed at the async boundary: a `spawn_blocking` panic or
+/// cancellation reports the worktree as held (with a `warn!` log), so
+/// the caller rejects the mutating request with `409 CONFLICT` rather
+/// than risk `EBUSY` against a possibly-live container mount. Sharing
+/// this helper between `rename_session` and `set_worktree_name` keeps
+/// the fail-closed policy synchronized across the two endpoints (#2596).
+async fn probe_container_holds_worktree(id: &str, is_sandboxed: bool) -> bool {
+    let probe_id = id.to_string();
+    let log_id = id.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::session::worktree_edit::sandbox_container_holds_worktree(&probe_id, is_sandboxed)
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(
+            target: "server.api.sessions",
+            session = %log_id,
+            error = %e,
+            "sandbox container probe task failed at the async boundary; failing closed and reporting the worktree as held to prevent EBUSY against a possibly-live container"
+        );
+        true
+    })
+}
+
+/// Rename a session's title (and, when tied, its worktree directory).
+///
+/// The sandbox container probe runs on the blocking pool via
+/// [`probe_container_holds_worktree`], which fails closed on a
+/// `spawn_blocking` panic or cancellation so the rename is rejected
+/// with `409 CONFLICT` rather than proceeding against a possibly-live
+/// container mount and hitting `EBUSY`.
 pub async fn rename_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -966,7 +1037,7 @@ pub async fn rename_session(
         )
             .into_response();
     }
-    if let Err(msg) = validate_no_shell_injection(&title, "title") {
+    if let Err(msg) = validate_display_label(&title, "title") {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "message": msg })),
@@ -1015,17 +1086,8 @@ pub async fn rename_session(
         // first; the setting is the escape hatch for free-form relabeling.
         // A sandbox session's container keeps the worktree dir mounted even
         // while the agent is Idle, so the move would fail with EBUSY; stopping
-        // the session tears the container down and releases the mount. The
-        // container probe is a subprocess, so it runs on the blocking pool
-        // like the other process-spawning work in this file.
-        let container_holds = {
-            let id = id.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::session::worktree_edit::sandbox_container_holds_worktree(&id, is_sandboxed)
-            })
-            .await
-            .unwrap_or(false)
-        };
+        // the session tears the container down and releases the mount.
+        let container_holds = probe_container_holds_worktree(&id, is_sandboxed).await;
         if status.blocks_worktree_edit() || container_holds {
             return (
                 StatusCode::CONFLICT,
@@ -1232,6 +1294,14 @@ fn worktree_edit_error_response(
     }
 }
 
+/// Edit a managed worktree session's workdir directory name (and optionally
+/// its git branch).
+///
+/// The sandbox container probe runs on the blocking pool via
+/// [`probe_container_holds_worktree`], which fails closed on a
+/// `spawn_blocking` panic or cancellation so the edit is rejected with
+/// `409 CONFLICT` rather than proceeding against a possibly-live container
+/// mount and hitting `EBUSY`.
 pub async fn set_worktree_name(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1258,13 +1328,10 @@ pub async fn set_worktree_name(
         )
             .into_response();
     }
-    if let Err(msg) = validate_no_shell_injection(&name, "name") {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "message": msg })),
-        )
-            .into_response();
-    }
+    // #2624: no shell-injection check here. `name` becomes a git branch and
+    // filesystem leaf via `edit_worktree_workdir`, which already runs it
+    // through `git_sanitize_branch_name` + `sanitize_branch_name` before
+    // either ever sees a raw byte (src/session/worktree_edit.rs).
 
     // Serialize against other mutations on this session (start, delete,
     // another rename) so the git ops and the metadata write don't race.
@@ -1316,17 +1383,8 @@ pub async fn set_worktree_name(
     }
     // A sandbox container keeps the worktree dir mounted even while the agent
     // is Idle, so the move would fail with EBUSY; stopping the session releases
-    // the mount, same as the active-status case. The container probe is a
-    // subprocess, so it runs on the blocking pool like the other
-    // process-spawning work in this file.
-    let container_holds = {
-        let id = id.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::session::worktree_edit::sandbox_container_holds_worktree(&id, is_sandboxed)
-        })
-        .await
-        .unwrap_or(false)
-    };
+    // the mount, same as the active-status case.
+    let container_holds = probe_container_holds_worktree(&id, is_sandboxed).await;
     if status.blocks_worktree_edit() || container_holds {
         return (
             StatusCode::CONFLICT,
@@ -1512,11 +1570,11 @@ pub async fn update_session_group(
         Err(rej) => return rej.into_response(),
     };
     let group = body.group;
-    // Match `create_session`'s group handling exactly: shell-injection
+    // Match `create_session`'s group handling exactly: display-label
     // check on a non-empty path, no trimming or slash normalization. The
     // empty string is the ungroup sentinel and skips validation.
     if !group.is_empty() {
-        if let Err(msg) = validate_no_shell_injection(&group, "group") {
+        if let Err(msg) = validate_display_label(&group, "group") {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({ "message": msg })),
@@ -2852,7 +2910,13 @@ pub async fn start_session(
             if let Err(e) = inst.kill_clean() {
                 return Err(Box::new((inst, e)));
             }
-            match inst.start_with_resume_fallback(None, false) {
+            // Explicit restart endpoint (web dashboard Restart button):
+            // honor auto_resume_on_restart, same as TUI `e`/`Enter`. See #2609.
+            match inst.start_with_resume_fallback(
+                None,
+                false,
+                crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
+            ) {
                 Ok(outcome) => Ok((inst, outcome)),
                 Err(e) => Err(Box::new((inst, e))),
             }
@@ -3642,6 +3706,61 @@ pub struct CreateSessionBody {
     #[cfg(feature = "serve")]
     #[serde(default)]
     pub import_acp_session_id: Option<String>,
+    /// Fork an existing session: the source session's captured session id to
+    /// resume and diverge from. The new session resumes that conversation as an
+    /// independent session (the original is left untouched). The kind of fork
+    /// follows `view`/the tool: when `view == Structured` and the tool is
+    /// ACP-capable, this drives a structured ACP `session/fork` against the
+    /// parent's `acp_session_id`; otherwise it drives a terminal fork that
+    /// resumes the parent `agent_session_id` with the agent's fork flag. A
+    /// structured fork requested for a non-ACP agent is rejected rather than
+    /// silently downgraded.
+    #[cfg(feature = "serve")]
+    #[serde(default)]
+    pub fork_from: Option<String>,
+}
+
+/// Resolve the one-shot fork seed for a `fork_from` create request. A
+/// structured request (`structured == true`) forks through ACP `session/fork`
+/// against the parent's `acp_session_id`; a terminal request resumes the
+/// parent agent id with the agent's fork flag, generating a fresh child id.
+/// `Err` reports an unforkable terminal agent or missing parent id; structured
+/// forks defer that check to the live `session/fork` handshake.
+#[cfg(feature = "serve")]
+fn resolve_create_fork_seed(
+    tool: &str,
+    parent_id: &str,
+    structured: bool,
+) -> Result<crate::session::ForkSeed, crate::session::ForkDenied> {
+    if structured {
+        return Ok(crate::session::ForkSeed::Structured {
+            parent_acp_session_id: parent_id.to_string(),
+        });
+    }
+    crate::session::fork::terminal_fork_seed(
+        tool,
+        Some(parent_id),
+        crate::session::capture::generate_claude_session_id(),
+    )
+}
+
+/// True when a create request asks to both import an existing session and fork
+/// a parent. The two seed the new session from different sources, so allowing
+/// both would produce a contradictory half-imported, half-forked session.
+/// Trailing whitespace is treated as unset, matching the per-field guards.
+#[cfg(feature = "serve")]
+fn both_import_and_fork_set(body: &CreateSessionBody) -> bool {
+    let set = |v: &Option<String>| v.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
+    set(&body.import_acp_session_id) && set(&body.fork_from)
+}
+
+/// Thin server-side alias for [`crate::session::fork::structured_fork_capable`],
+/// the single source of truth for "can this agent run the ACP `session/fork`
+/// handshake?". Shared by the `SessionResponse.acp_can_fork` projection (the web
+/// "Fork" affordance) and the create-time guard so they cannot drift.
+#[cfg(feature = "serve")]
+fn agent_is_structured_fork_capable(tool: &str, agent_name: Option<&str>) -> bool {
+    crate::session::fork::structured_fork_capable(tool, agent_name)
 }
 
 fn validate_session_tool_identity(
@@ -3947,11 +4066,7 @@ pub async fn create_session(
     // Validate user inputs for shell injection. For scratch sessions the
     // `path` field is server-provisioned (and clients typically send an
     // empty string), so skip the path entry in that case.
-    let mut shell_checks: Vec<(&str, &str)> = vec![
-        (body.extra_args.as_str(), "extra_args"),
-        (body.tool.as_str(), "tool"),
-        (body.group.as_str(), "group"),
-    ];
+    let mut shell_checks: Vec<(&str, &str)> = vec![(body.extra_args.as_str(), "extra_args")];
     if !body.scratch {
         shell_checks.push((body.path.as_str(), "path"));
     }
@@ -3964,17 +4079,22 @@ pub async fn create_session(
                 .into_response();
         }
     }
-    if let Some(ref title) = body.title {
-        if let Err(msg) = validate_no_shell_injection(title, "title") {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
-            )
-                .into_response();
-        }
+    // #2624: `title`/`group` are display labels, not shell input, so they
+    // go through `validate_display_label` (control characters only)
+    // instead. `tool` is checked against the agent registry below
+    // (`validate_session_tool_identity`); `worktree_branch` is re-sanitized
+    // for git-ref safety in the builder; `profile` is checked against
+    // `list_profiles()` right below. None of the four ever reach a shell,
+    // so `validate_no_shell_injection` no longer runs on them.
+    if let Err(msg) = validate_display_label(&body.group, "group") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "validation_failed", "message": msg})),
+        )
+            .into_response();
     }
-    if let Some(ref branch) = body.worktree_branch {
-        if let Err(msg) = validate_no_shell_injection(branch, "worktree_branch") {
+    if let Some(ref title) = body.title {
+        if let Err(msg) = validate_display_label(title, "title") {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "validation_failed", "message": msg})),
@@ -3983,13 +4103,6 @@ pub async fn create_session(
         }
     }
     if let Some(ref profile_name) = body.profile {
-        if let Err(msg) = validate_no_shell_injection(profile_name, "profile") {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
-            )
-                .into_response();
-        }
         // Verify the profile exists. Every profile is a real directory under
         // profiles/; there is no implicitly-valid profile name. Distinguish
         // an enumeration failure (I/O, permissions) from a missing profile
@@ -4034,6 +4147,22 @@ pub async fn create_session(
             Json(serde_json::json!({
                 "error": "validation_failed",
                 "message": format!("Unknown agent '{}'", body.tool),
+            })),
+        )
+            .into_response();
+    }
+
+    // Import and fork are mutually exclusive: each seeds the new session from a
+    // different source (import adopts an on-disk session id; fork resumes a
+    // parent's captured id), and honoring both would leave the session in a
+    // contradictory half-imported, half-forked state. Reject up front.
+    #[cfg(feature = "serve")]
+    if both_import_and_fork_set(&body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_request",
+                "message": "Cannot set both import_acp_session_id and fork_from",
             })),
         )
             .into_response();
@@ -4086,6 +4215,70 @@ pub async fn create_session(
             return bad("Unknown Claude session for this directory");
         }
     }
+
+    // Forking an existing session: `fork_from` carries the source session's
+    // captured session id. A structured request (`view == Structured`) forks
+    // through ACP `session/fork` against the parent's `acp_session_id`; a
+    // terminal request resumes the parent agent id with the agent's fork flag.
+    // The seed is resolved here, ahead of the build, so an unforkable terminal
+    // agent or a missing parent id returns a clean 400 rather than failing
+    // later. The builder applies the seed: a structured seed forces the
+    // structured view and sets the one-shot `fork_pending`/`import_pending`
+    // markers; a terminal seed pre-pins the child id and the Fork intent.
+    #[cfg(feature = "serve")]
+    let fork_seed = match body
+        .fork_from
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(parent_id) => {
+            // Reject a malformed parent id up front. `build_fork_flags` fails
+            // closed on an invalid id (no fork flags), which would otherwise
+            // start a fresh, non-forked session with no error to the caller.
+            if !crate::session::capture::is_valid_session_id(parent_id) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "fork_invalid",
+                        "message": "fork_from is not a valid session id",
+                    })),
+                )
+                    .into_response();
+            }
+            let structured = body.view == crate::session::View::Structured;
+            // A structured fork only runs over a live ACP connection. Reject it
+            // here for a non-ACP agent rather than letting the post-build
+            // capability check silently downgrade it to a non-forked terminal
+            // session (the fork markers would be cleared, dropping the fork).
+            if structured
+                && !agent_is_structured_fork_capable(&body.tool, body.agent_name.as_deref())
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "fork_unsupported",
+                        "message": "A structured fork requires an ACP agent that supports forking",
+                    })),
+                )
+                    .into_response();
+            }
+            match resolve_create_fork_seed(&body.tool, parent_id, structured) {
+                Ok(seed) => Some(seed),
+                Err(_) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "fork_unsupported",
+                            "message": "This agent or session cannot be forked",
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        None => None,
+    };
 
     let profile = body.profile.unwrap_or_else(|| state.profile.clone());
     let instances = state.instances.read().await;
@@ -4165,6 +4358,10 @@ pub async fn create_session(
             command_override: body.command_override,
             extra_repo_paths,
             scratch: body.scratch,
+            #[cfg(feature = "serve")]
+            fork_seed,
+            #[cfg(not(feature = "serve"))]
+            fork_seed: None,
         };
 
         let build_result = builder::build_instance(params, &title_refs, &branch_refs, &profile)?;
@@ -4212,15 +4409,19 @@ pub async fn create_session(
                 &instance.source_profile,
                 std::path::Path::new(&instance.project_path),
             );
-            let defaults = resolved_config.session.acp_defaults_for(&agent_key);
+            let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
             instance.agent_model = body
                 .agent_model
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| defaults.and_then(|d| d.model.clone()));
-            let mut agent_effort = body
-                .agent_effort
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| defaults.and_then(|d| d.effort.clone()));
+            // Per-model effort override wins when a model is resolved, else the
+            // flat default effort. The explicit request effort always wins.
+            let mut agent_effort =
+                body.agent_effort
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| {
+                        defaults.and_then(|d| d.effort_for_model(instance.agent_model.as_deref()))
+                    });
             // Don't trust the client's capability decision. Re-resolve
             // whether this agent can actually run in structured view; a custom
             // agent without an `agent_acp_cmd` (or any non-ACP tool)
@@ -4243,11 +4444,18 @@ pub async fn create_session(
                     .is_some_and(|cmd| {
                         crate::acp::AgentSpec::from_acp_cmd(&instance.tool, cmd).is_ok()
                     });
-                instance.view = if capable {
-                    crate::session::View::Structured
+                if capable {
+                    instance.view = crate::session::View::Structured;
                 } else {
-                    crate::session::View::Terminal
-                };
+                    instance.view = crate::session::View::Terminal;
+                    // A non-ACP tool cannot run the structured session/fork
+                    // handshake. If a malformed request seeded a structured
+                    // fork (fork_pending/import_pending set by the builder),
+                    // drop those markers so a later switch-to-structured does
+                    // not fire an unexpected session/fork against the parent.
+                    instance.fork_pending = None;
+                    instance.import_pending = None;
+                }
             }
 
             if !instance.is_structured() {
@@ -4377,6 +4585,7 @@ pub async fn create_session(
                     instance.yolo_mode,
                     instance.command.clone(),
                     instance.import_pending == Some(true),
+                    instance.fork_pending.clone(),
                 ))
             } else {
                 None
@@ -4404,6 +4613,7 @@ pub async fn create_session(
                 yolo_mode,
                 command,
                 seed_history_replay,
+                fork_from,
             )) = acp_spawn_target
             {
                 let agent = state
@@ -4453,6 +4663,7 @@ pub async fn create_session(
                             model,
                             effort,
                             stored_acp_session_id,
+                            fork_from,
                             sandbox_info,
                             source_profile: source_profile_for_spawn,
                             yolo_mode,
@@ -4763,7 +4974,16 @@ pub async fn ensure_session(
             // live entry can retain stale marker/sid state until the next
             // `status_poll_loop` reload window (~2s). See
             // `apply_post_restart_sync`.
-            match inst.start_with_resume_fallback(None, false) {
+            //
+            // `ensure_session` respawns on-demand before a WS attach/send,
+            // the server-side analog of `ensure_pane_ready`: always `Allow`,
+            // ignoring `auto_resume_on_restart`, so attaching doesn't
+            // silently drop the agent's context. See #2609.
+            match inst.start_with_resume_fallback(
+                None,
+                false,
+                crate::session::ResumeAttemptPolicy::Allow,
+            ) {
                 Ok(outcome) => Ok((inst, outcome)),
                 Err(e) => Err(Box::new((inst, e))),
             }
@@ -4781,6 +5001,9 @@ pub async fn ensure_session(
                 crate::session::StartOutcome::Resumed => "resumed",
                 crate::session::StartOutcome::ResumeFailed { .. } => "resume_failed",
                 crate::session::StartOutcome::Fresh => "fresh",
+                crate::session::StartOutcome::FreshAfterFailedResume { .. } => {
+                    "fresh_after_failed_resume"
+                }
             };
             let mut body = serde_json::json!({
                 "status": "restarted",
@@ -4794,6 +5017,14 @@ pub async fn ensure_session(
                 ));
                 body["resume_session_id"] = serde_json::Value::String(sid.clone());
                 return (StatusCode::CONFLICT, Json(body)).into_response();
+            }
+            if let crate::session::StartOutcome::FreshAfterFailedResume { sid } = &outcome {
+                body["message"] = serde_json::Value::String(format!(
+                    "Started fresh; a prior resume attempt failed for sid {sid}. \
+                     The old conversation is still reachable via the agent's own \
+                     resume/history picker."
+                ));
+                body["prior_session_id"] = serde_json::Value::String(sid.clone());
             }
             (StatusCode::OK, Json(body)).into_response()
         }
@@ -5780,15 +6011,354 @@ pub async fn search_sessions(
     Json(SearchResponse { results })
 }
 
+/// Largest artifact the dashboard will serve inline. Generated screenshots
+/// and status pages are small; the cap just bounds a pathological read.
+const MAX_ARTIFACT_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Serve a file from a session's managed artifact directory
+/// (`GET /api/sessions/{id}/artifacts/{*path}`). Auth is enforced by the
+/// global middleware; `resolve_artifact_path` canonicalizes and confines the
+/// request to the session's artifact root, so neither `..` nor a symlink can
+/// escape it and arbitrary host paths are never served. HTML is sent as an
+/// attachment (never inline) so a generated page cannot execute script in the
+/// dashboard's authenticated origin. See #2587.
+pub async fn serve_session_artifact(Path((id, path)): Path<(String, String)>) -> impl IntoResponse {
+    let resolved = tokio::task::spawn_blocking(move || {
+        crate::session::artifacts::resolve_artifact_path(&id, &path)
+    })
+    .await;
+
+    let file_path = match resolved {
+        Ok(Some(p)) => p,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    match tokio::fs::metadata(&file_path).await {
+        Ok(m) if m.len() > MAX_ARTIFACT_BYTES => {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response()
+        }
+        Ok(_) => {}
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    }
+
+    let bytes = match tokio::fs::read(&file_path).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    use axum::http::{header, HeaderMap, HeaderValue};
+    let mime = mime_guess::from_path(&file_path).first_or_octet_stream();
+    let essence = mime.essence_str();
+    // Any type that can execute script when opened as a top-level document is
+    // served as a download, never inline. The frontend opens artifacts via
+    // `window.open(blob:)`, and a blob URL inherits the dashboard's origin, so
+    // an HTML/XHTML/SVG/XML artifact would otherwise run script in the
+    // authenticated origin. Images and other passive types stay inline. See #2587.
+    let force_download = matches!(
+        essence,
+        "text/html" | "application/xhtml+xml" | "image/svg+xml" | "application/xml" | "text/xml"
+    );
+    let content_type = if force_download {
+        "application/octet-stream"
+    } else {
+        essence
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(content_type)
+            .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=60"),
+    );
+    if force_download {
+        headers.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_static("attachment"),
+        );
+    }
+
+    (StatusCode::OK, headers, bytes).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #2587: the artifact route serves only canonicalized files confined to
+    // the session's artifact dir, sets nosniff, and never serves HTML inline.
+    mod artifact_route {
+        use super::*;
+        use axum::body::to_bytes;
+        use axum::extract::Path as AxumPath;
+        use axum::http::header;
+        use serial_test::serial;
+
+        fn isolate_app_dir() -> tempfile::TempDir {
+            let tmp = tempfile::tempdir().expect("temp home");
+            std::env::set_var("HOME", tmp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+            tmp
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn serves_image_with_nosniff() {
+            let _tmp = isolate_app_dir();
+            let id = format!("art-{}", uuid::Uuid::new_v4());
+            let dir = crate::session::artifacts::session_artifact_dir(&id).unwrap();
+            std::fs::write(dir.join("shot.png"), b"\x89PNG\r\n").unwrap();
+            let resp = serve_session_artifact(AxumPath((id, "shot.png".to_string())))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+                "nosniff"
+            );
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "image/png"
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn rejects_traversal_with_empty_body() {
+            let _tmp = isolate_app_dir();
+            let id = format!("art-{}", uuid::Uuid::new_v4());
+            crate::session::artifacts::session_artifact_dir(&id).unwrap();
+            let resp = serve_session_artifact(AxumPath((id, "../../../../etc/hosts".to_string())))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+            assert!(body.is_empty(), "unexpected body: {body:?}");
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn serves_svg_as_attachment() {
+            // #2587: SVG can execute script as a top-level document, and the
+            // frontend opens artifacts via a same-origin blob URL, so SVG must
+            // download rather than render inline.
+            let _tmp = isolate_app_dir();
+            let id = format!("art-{}", uuid::Uuid::new_v4());
+            let dir = crate::session::artifacts::session_artifact_dir(&id).unwrap();
+            std::fs::write(
+                dir.join("d.svg"),
+                b"<svg xmlns='http://www.w3.org/2000/svg'></svg>",
+            )
+            .unwrap();
+            let resp = serve_session_artifact(AxumPath((id, "d.svg".to_string())))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/octet-stream"
+            );
+            assert_eq!(
+                resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+                "attachment"
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn serves_html_as_attachment() {
+            let _tmp = isolate_app_dir();
+            let id = format!("art-{}", uuid::Uuid::new_v4());
+            let dir = crate::session::artifacts::session_artifact_dir(&id).unwrap();
+            std::fs::write(dir.join("status.html"), b"<h1>hi</h1>").unwrap();
+            let resp = serve_session_artifact(AxumPath((id, "status.html".to_string())))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/octet-stream"
+            );
+            assert_eq!(
+                resp.headers().get(header::CONTENT_DISPOSITION).unwrap(),
+                "attachment"
+            );
+        }
+    }
+
     fn make_test_instance() -> Instance {
         let mut inst = Instance::new("test-session", "/tmp/test-project");
         inst.tool = "claude".to_string();
         inst.status = Status::Running;
         inst.group_path = "work/projects".to_string();
         inst
+    }
+
+    #[test]
+    fn fork_from_builds_terminal_seed_for_claude() {
+        // A non-structured (terminal) fork resolves through the shared
+        // `terminal_fork_seed` helper; a claude parent id yields a Terminal
+        // seed whose child id is a fresh, valid session id.
+        let seed = resolve_create_fork_seed("claude", "parent-uuid", false)
+            .expect("claude terminal fork allowed");
+        match seed {
+            crate::session::ForkSeed::Terminal {
+                parent_agent_session_id,
+                child_session_id,
+            } => {
+                assert_eq!(parent_agent_session_id, "parent-uuid");
+                assert!(crate::session::capture::is_valid_session_id(
+                    &child_session_id
+                ));
+            }
+            _ => panic!("expected Terminal seed"),
+        }
+    }
+
+    #[test]
+    fn fork_from_builds_structured_seed_when_view_is_structured() {
+        // A structured fork carries the parent's acp_session_id straight onto a
+        // Structured seed; the builder turns that into the one-shot
+        // fork_pending marker and the live session/fork handshake mints the
+        // child id. The terminal forkability check is intentionally skipped.
+        let seed = resolve_create_fork_seed("claude", "parent-acp-id", true)
+            .expect("structured fork seed is always allowed at create time");
+        assert_eq!(
+            seed,
+            crate::session::ForkSeed::Structured {
+                parent_acp_session_id: "parent-acp-id".into(),
+            }
+        );
+    }
+
+    fn create_body_from_json(value: serde_json::Value) -> CreateSessionBody {
+        serde_json::from_value(value).expect("valid CreateSessionBody")
+    }
+
+    #[test]
+    fn both_import_and_fork_rejected() {
+        // A request that sets both seeds the session from two contradictory
+        // sources; the create handler rejects it before doing any work.
+        let body = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p",
+            "tool": "claude",
+            "import_acp_session_id": "import-id",
+            "fork_from": "parent-id",
+        }));
+        assert!(both_import_and_fork_set(&body));
+
+        // Either alone is fine; trailing whitespace counts as unset.
+        let import_only = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p", "tool": "claude", "import_acp_session_id": "import-id",
+        }));
+        assert!(!both_import_and_fork_set(&import_only));
+        let fork_only = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p", "tool": "claude", "fork_from": "parent-id",
+        }));
+        assert!(!both_import_and_fork_set(&fork_only));
+        let blank_fork = create_body_from_json(serde_json::json!({
+            "path": "/tmp/p",
+            "tool": "claude",
+            "import_acp_session_id": "import-id",
+            "fork_from": "   ",
+        }));
+        assert!(!both_import_and_fork_set(&blank_fork));
+    }
+
+    #[test]
+    fn invalid_fork_id_is_rejected_by_create_guard() {
+        // The create path gates `fork_from` on `is_valid_session_id` so a
+        // malformed id can't slip through to `build_fork_flags`, which fails
+        // closed (no fork flags) and would silently start a fresh session.
+        use crate::session::capture::is_valid_session_id;
+        assert!(!is_valid_session_id("../etc/passwd"));
+        assert!(!is_valid_session_id("has spaces"));
+        assert!(!is_valid_session_id("slash/id"));
+        // A well-formed id still passes the same gate.
+        assert!(is_valid_session_id("parent-uuid_123.v2"));
+    }
+
+    #[test]
+    fn structured_fork_create_guard_matches_acp_can_fork() {
+        // The create-time guard and the web `acp_can_fork` projection share
+        // `agent_is_structured_fork_capable`, so they must agree per agent.
+        // claude is ACP-capable with a real fork strategy: forkable.
+        assert!(agent_is_structured_fork_capable("claude", None));
+        // aoe-agent is ACP-capable but resume-only (no fork strategy), so the
+        // create guard must reject a structured fork for it just as the web
+        // suppresses the Fork affordance; gating on ACP-capability alone would
+        // accept a create that can only fail later at the `session/fork`
+        // handshake.
+        assert!(!agent_is_structured_fork_capable("aoe-agent", None));
+        // codex and opencode are ACP-registered AND declare a real terminal
+        // ForkStrategy (used by the CLI `--fork-from` path), but neither ACP
+        // adapter is verified to implement `session/fork`. Gating on
+        // "fork_strategy != Unsupported" alone would report them forkable and
+        // reproduce the same dead-end-handshake failure this function exists
+        // to prevent for aoe-agent.
+        assert!(!agent_is_structured_fork_capable("codex", None));
+        assert!(!agent_is_structured_fork_capable("opencode", None));
+        // A non-ACP tool is neither ACP-capable nor fork-capable.
+        assert!(!agent_is_structured_fork_capable(
+            "definitely-not-an-acp-agent",
+            None
+        ));
+
+        // The two surfaces must report the same capability for each agent.
+        for tool in [
+            "claude",
+            "aoe-agent",
+            "codex",
+            "opencode",
+            "definitely-not-an-acp-agent",
+        ] {
+            let mut inst = make_test_instance();
+            inst.tool = tool.to_string();
+            assert_eq!(
+                SessionResponse::from_instance(&inst, false).acp_can_fork,
+                agent_is_structured_fork_capable(tool, None),
+                "acp_can_fork and the create guard disagree for '{tool}'"
+            );
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn acp_can_fork_tracks_acp_capable_and_fork_strategy() {
+        // claude is ACP-capable AND declares a real fork strategy, so the web
+        // gets a forkable signal.
+        let mut claude = make_test_instance();
+        claude.tool = "claude".to_string();
+        assert!(SessionResponse::from_instance(&claude, false).acp_can_fork);
+
+        // aoe-agent is ACP-capable (it is in the ACP registry) but declares no
+        // fork strategy, so it is NOT forkable. Gating the web Fork action on
+        // acp_session_id alone would offer a dead-end button for it; this is the
+        // signal that suppresses that.
+        let mut aoe_agent = make_test_instance();
+        aoe_agent.tool = "aoe-agent".to_string();
+        assert!(!SessionResponse::from_instance(&aoe_agent, false).acp_can_fork);
+
+        // codex has a real terminal fork strategy but its ACP adapter is not
+        // verified to implement `session/fork`, so the web signal must stay
+        // false rather than offer a fork the live handshake would refuse.
+        let mut codex = make_test_instance();
+        codex.tool = "codex".to_string();
+        assert!(!SessionResponse::from_instance(&codex, false).acp_can_fork);
+
+        // A non-ACP agent is neither ACP-capable nor fork-capable.
+        let mut other = make_test_instance();
+        other.tool = "definitely-not-an-acp-agent".to_string();
+        assert!(!SessionResponse::from_instance(&other, false).acp_can_fork);
     }
 
     #[test]
@@ -7798,6 +8368,7 @@ mod workspace_ordering_tests {
             id: id.to_string(),
             title: id.to_string(),
             project_path: project_path.to_string(),
+            artifact_dir: String::new(),
             group_path: String::new(),
             tool: "claude".to_string(),
             status: "Idle".to_string(),
@@ -7836,6 +8407,10 @@ mod workspace_ordering_tests {
             acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
             #[cfg(feature = "serve")]
             acp_capable: false,
+            #[cfg(feature = "serve")]
+            acp_session_id: None,
+            #[cfg(feature = "serve")]
+            acp_can_fork: false,
             claude_fullscreen: false,
             workspace_repos: Vec::new(),
             warnings: Vec::new(),

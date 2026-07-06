@@ -635,6 +635,13 @@ fn bail_if_acp(_inst: &crate::session::Instance, _verb: &str) -> Result<()> {
     Ok(())
 }
 
+/// CLI handler for `aoe session stop`.
+///
+/// Treats a docker inspect failure ([`crate::containers::Probe::Unknown`])
+/// as "possibly running" so the session stop proceeds rather than printing
+/// "Session is not running" against a container whose state cannot be
+/// confirmed. The `warn!` for the Unknown case is emitted inside
+/// [`crate::session::Instance::stop`], so this call site does not re-warn.
 async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::new_unwatched(profile)?;
 
@@ -648,9 +655,10 @@ async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
     let was_running = tmux_session.exists();
     let had_container = inst.is_sandboxed()
-        && crate::containers::DockerContainer::from_session_id(&inst.id)
-            .is_running()
-            .unwrap_or(false);
+        && match crate::containers::DockerContainer::from_session_id(&inst.id).probe_running() {
+            crate::containers::Probe::Running | crate::containers::Probe::Unknown(_) => true,
+            crate::containers::Probe::NotRunning => false,
+        };
 
     if !was_running && !had_container {
         println!("Session is not running: {}", title);
@@ -761,6 +769,7 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
 
     let mut succeeded: Vec<(String, String)> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
+    let mut fresh_after_failed_resume: Vec<(String, String)> = Vec::new();
     let mut restarted: Vec<crate::session::Instance> = Vec::new();
     while let Some(joined) = join_set.join_next().await {
         let (title, inst_opt, result) = joined.expect("JoinSet shouldn't panic on join itself");
@@ -773,6 +782,10 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
                 title,
                 format!("resume failed for sid {sid}; preserved for explicit retry"),
             )),
+            Ok(StartOutcome::FreshAfterFailedResume { sid }) => {
+                fresh_after_failed_resume.push((title.clone(), sid));
+                succeeded.push((id, title));
+            }
             Ok(StartOutcome::Resumed | StartOutcome::Fresh) => succeeded.push((id, title)),
             Err(e) => failed.push((title, e.to_string())),
         }
@@ -807,6 +820,15 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     println!("✓ Restarted {}/{} sessions:", succeeded.len(), total);
     for (_id, title) in &succeeded {
         println!("  · {}", title);
+    }
+    if !fresh_after_failed_resume.is_empty() {
+        println!(
+            "ℹ {} started fresh (a prior resume attempt failed for the stored sid; the old conversation is still reachable via the agent's own resume/history picker):",
+            fresh_after_failed_resume.len()
+        );
+        for (title, sid) in &fresh_after_failed_resume {
+            println!("  · {}: sid {}", title, sid);
+        }
     }
     if !orphaned.is_empty() {
         println!(
@@ -930,6 +952,12 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     match outcome {
         StartOutcome::ResumeFailed { sid } => {
             bail!("Resume failed for sid {sid}; preserved for explicit retry");
+        }
+        StartOutcome::FreshAfterFailedResume { sid } => {
+            println!(
+                "✓ Restarted session: {} (started fresh; a prior resume attempt failed for sid {sid}, the old conversation is still reachable via the agent's own resume/history picker)",
+                title
+            );
         }
         StartOutcome::Resumed | StartOutcome::Fresh => {
             println!("✓ Restarted session: {}", title);
@@ -1499,7 +1527,9 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 title
             );
         }
-        crate::session::ResumeIntent::Default => unreachable!(),
+        crate::session::ResumeIntent::Default | crate::session::ResumeIntent::Fork { .. } => {
+            unreachable!()
+        }
     }
     Ok(())
 }

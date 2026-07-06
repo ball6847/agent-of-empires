@@ -230,7 +230,7 @@ pub enum UiError {
     /// newer worker replaced it). The write is dropped rather than resurrecting
     /// stale state.
     StaleWorker,
-    /// The plugin already holds [`MAX_ENTRIES_PER_PLUGIN`] entries.
+    /// The plugin already holds `MAX_ENTRIES_PER_PLUGIN` entries.
     QuotaExceeded,
     /// The payload did not match the slot's typed shape, or a scope rule
     /// (per-session slot needs a `session_id`; a global slot must not have one).

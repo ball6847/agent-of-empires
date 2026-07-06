@@ -80,6 +80,23 @@ test.describe("Desktop live terminal input", () => {
     await clickSidebarSession(page, "pinch-test");
     await page.locator("[data-live-content]").first().waitFor({ state: "visible", timeout: 10_000 });
 
+    // The component requests a wider scrollback window after mount, so a second
+    // frame arrives with history rows. Wait for the content to stop changing
+    // before selecting; otherwise the captured Range drifts onto a row that
+    // renders in the later frame and the clipboard no longer matches `selected`.
+    let prevContent = "";
+    await expect
+      .poll(
+        async () => {
+          const cur = await page.evaluate(() => document.querySelector("[data-live-content]")?.textContent ?? "");
+          const stable = cur !== "" && cur === prevContent;
+          prevContent = cur;
+          return stable;
+        },
+        { timeout: 10_000, intervals: [200] },
+      )
+      .toBe(true);
+
     // Focus the input the way a user does (click the pane), then select a
     // rendered terminal row. The selection lives in the DOM while the hidden
     // input keeps focus, which is exactly the state Ctrl+Shift+C must read.
@@ -104,6 +121,27 @@ test.describe("Desktop live terminal input", () => {
     await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(selected);
     const sentSigint = handle.liveMessages.slice(before).some((m) => m.toString("utf8") === "\x03");
     expect(sentSigint).toBe(false);
+  });
+
+  test("Shift+Tab sends backtab (CSI Z), not a plain Tab", async ({ page }) => {
+    // The keydown handler keyed only on e.key === "Tab" and always returned
+    // "\t", dropping the Shift. Shift+Tab must reach the agent as the backtab
+    // sequence \x1b[Z, which is what the TUI's live_send already emits for BTab.
+    // Without it, apps that read backtab (e.g. Claude Code's permission-mode
+    // cycle) never see Shift+Tab in the web terminal.
+    const handle = await mockTerminalApis(page);
+    await page.goto("/");
+    await clickSidebarSession(page, "pinch-test");
+    await page.locator("[data-live-terminal]").first().waitFor({ state: "visible", timeout: 10_000 });
+    await page.locator("[data-live-terminal]").first().click();
+    await expect(page.locator('textarea[aria-label="Live terminal input"]').first()).toBeFocused();
+
+    const before = handle.liveMessages.length;
+    await page.keyboard.press("Shift+Tab");
+
+    await expect.poll(() => handle.liveMessages.slice(before).map((m) => m.toString("utf8"))).toContainEqual("\x1b[Z");
+    const sentPlainTab = handle.liveMessages.slice(before).some((m) => m.toString("utf8") === "\t");
+    expect(sentPlainTab).toBe(false);
   });
 
   test("renders at the desktop font size, not the small mobile default", async ({ page }) => {

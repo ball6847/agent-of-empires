@@ -40,7 +40,7 @@ use super::state::StartupErrorDetail;
 /// sandbox image stuck below the host floor. User docs deliberately do not
 /// restate the number; the startup-error path reports the exact floor
 /// dynamically at rejection time.
-pub const CLAUDE_AGENT_ACP_MIN_VERSION: &str = "0.49.0";
+pub const CLAUDE_AGENT_ACP_MIN_VERSION: &str = "0.55.0";
 
 /// Parsed form of [`CLAUDE_AGENT_ACP_MIN_VERSION`]. Runs once per adapter
 /// initialize, not in a hot path, so parsing on demand is fine.
@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn non_claude_permissive_on_old_version() {
-        let init = make_init("@zed-industries/codex-acp", "0.0.1");
+        let init = make_init("@agentclientprotocol/codex-acp", "0.0.1");
         validate(ExpectedAgent::CodexAcp, &init).unwrap();
     }
 

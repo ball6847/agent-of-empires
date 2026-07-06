@@ -21,7 +21,7 @@ aoe ships an ACP registry entry for each tool whose ACP server we've verified. F
 | Agent | ACP adapter | Install | Auth |
 |-------|-------------|---------|------|
 | `claude` | `claude-agent-acp` (Zed, recent version required) | `npm install -g @agentclientprotocol/claude-agent-acp@latest` | `claude login`, or `ANTHROPIC_API_KEY` |
-| `codex` | `codex-acp` (Zed) | `npm install -g @zed-industries/codex-acp` | `OPENAI_API_KEY`, or ChatGPT login (local-only) |
+| `codex` | `codex-acp` (ACP) | `npm install -g @agentclientprotocol/codex-acp@latest` | `OPENAI_API_KEY`, or ChatGPT login (local-only) |
 | `opencode` | `opencode acp` (native, ≥1.16.0 recommended) | `curl -fsSL https://opencode.ai/install \| bash` | `opencode auth` / provider env |
 | `gemini` | `gemini --acp` (native) | `npm install -g @google/gemini-cli` | `GEMINI_API_KEY`, OAuth, or Vertex |
 | `vibe` | `vibe-acp` (native) | see [mistral-vibe](https://github.com/mistralai/mistral-vibe) | Mistral API key |
@@ -93,7 +93,7 @@ Non-ACP tools always run in the terminal view, with no toggle.
 
 `--cmd <tool>` resolves through `session.agent_command_override` the same as terminal sessions, so an override like `opencode = "opencode-plannotator"` makes `--cmd opencode` launch `opencode-plannotator acp` (the required ACP args are preserved). Adapter-backed agents such as Claude use `session.agent_acp_cmd` for a full command swap instead. The wizard shows the resolved launch command read-only.
 
-`aoe add` does not prompt for a name by default: it uses `--title`, else the worktree branch name, else a generated name. Pass `-i`/`--interactive` for the same name prompt the TUI and wizard show. Set per-agent defaults for web-created sessions under `[session.acp_defaults.<agent>]`:
+`aoe add` does not prompt for a name by default: it uses `--title`, else the worktree branch name, else a generated name. Pass `-i`/`--interactive` for the same name prompt the TUI and wizard show. Set per-agent defaults for web-created sessions under `[acp.acp_defaults.<agent>]`:
 
 When a structured view session keeps its generated civilization name (no `--title`, no branch name), AoE auto-renames it from your first message using the session's own agent in one-shot mode (`claude -p`, `codex exec`, `opencode run`, `gemini -p`). This is on by default and controlled by `session.smart_rename`. It renames the title only, never the worktree directory (the running agent holds it), and never touches a session you named yourself. Sandboxed sessions, agents with no one-shot mode, and command-overridden agents keep the generated name. See [Configuration: Session](guides/configuration.md#session).
 
@@ -104,12 +104,24 @@ The sidebar shows where each session stands: an `Auto-name` chip (sparkle) marks
 Two chips flag a session that has parked itself but is still alive, so an agent waiting on background work does not read as a dead idle session. A `⏰` countdown shows when the agent scheduled a wakeup (a `ScheduleWakeup` call or a `/loop` run) and ticks down to the fire time. A `👁 monitoring` badge shows when the agent armed a `Monitor` (a background watch, for example waiting for a build or `cargo clippy` to finish); it has no fixed end time, so it stays put while the monitor keeps re-invoking the agent and clears once you send the session a new prompt.
 
 ```toml
-[session.acp_defaults.opencode]
+[acp.acp_defaults.opencode]
 model = "openai/gpt-5.5"
-effort = "high"
+effort = "high"           # default thinking level
+mode = "plan"             # default mode, applied when the agent advertises one
+
+# Per-model thinking: overrides `effort` when that model is the resolved model.
+[acp.acp_defaults.opencode.effort_by_model]
+"openai/gpt-5.5" = "high"
+"anthropic/opus" = "low"
 ```
 
+`model` is forwarded when the worker starts. `effort` and `mode` are applied through the agent's ACP config options (`thought_level` and `mode`) once advertised; a value the agent does not advertise is skipped with a warning rather than failing the session. `effort_by_model` takes precedence over the flat `effort` when the resolved model matches a key. These defaults are also editable per agent from the web dashboard settings (Structured view tab, Structured View Defaults), where the dropdowns are populated from whatever each agent last advertised.
+
 The `[acp]` block holds the structured view's global tuning knobs (timeouts, concurrency, watchdog grace). See [Structured View Internals](development/internals/structured-view.md#global-tuning-acp) for the full list.
+
+## Agent artifacts
+
+Each session gets a managed artifact directory, exposed to the agent as `AOE_ARTIFACT_DIR` (bind-mounted at `/aoe/artifacts` inside a sandbox). A screenshot or status file the agent writes there is served over an authenticated, session-scoped route and opens in the dashboard: transcript links open the file in a new tab, and markdown images render inline. Files written elsewhere (an arbitrary `/tmp` path, for example) cannot be served and render as plain, non-clickable text. To make a generated artifact viewable, write it under `$AOE_ARTIFACT_DIR`.
 
 ## Cross-machine attach
 

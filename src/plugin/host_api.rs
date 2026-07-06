@@ -3,7 +3,7 @@
 //!
 //! Every method maps to a capability the plugin must have declared in its
 //! manifest and had granted at install. The middleware
-//! ([`PluginRpcContext::require`]) refuses an undeclared or ungranted call
+//! (`PluginRpcContext::require`) refuses an undeclared or ungranted call
 //! before the method runs, so a worker can never reach a resource it was not
 //! approved for. This is the cooperative-plugin boundary of the honest v1
 //! model (D8): it stops a well-behaved plugin from overreaching; it does not

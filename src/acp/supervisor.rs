@@ -475,6 +475,11 @@ pub struct SpawnRequest {
     /// advertises `load_session = true`, the spawn calls
     /// `LoadSessionRequest` instead of `NewSessionRequest`.
     pub stored_acp_session_id: Option<String>,
+    /// When `Some`, this spawn is a structured fork: the handshake sends
+    /// `session/fork` against this parent ACP session id (if the agent
+    /// advertises the capability) rather than `session/new` / `session/load`.
+    /// Sourced from `Instance.fork_pending`.
+    pub fork_from: Option<String>,
     /// When `Some`, the agent runs inside the named Docker container.
     /// The supervisor wraps the agent argv in `docker exec` and the
     /// daemon-side fs/terminal handlers route across the container
@@ -952,11 +957,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         deadline: std::time::Duration,
     ) -> Result<(), SupervisorError> {
         // Snapshot the runner's PID BEFORE shutdown removes the registry
-        // entry, so we can poll for the process to actually die.
-        let pid_before = super::worker_registry::load(session_id)
-            .ok()
-            .flatten()
-            .map(|r| r.pid);
+        // entry AND unlinks the socket, so we can poll for the process
+        // to actually die. `pid_source_for` reads the on-disk record and
+        // falls back to `SO_PEERCRED` on the socket when the record is
+        // unreadable at the I/O layer, so an unreadable record no longer
+        // collapses into a silent-skip. See #2102.
+        let pid_before = super::worker_registry::pid_source_for(session_id);
         match self.shutdown(session_id).await {
             Ok(()) => {}
             Err(SupervisorError::UnknownSession(_)) => {
@@ -1296,6 +1302,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             model,
             effort,
             stored_acp_session_id,
+            fork_from,
             sandbox_info,
             source_profile,
             yolo_mode,
@@ -1407,6 +1414,16 @@ impl<S: BroadcastSink> Supervisor<S> {
             Vec::new()
         });
 
+        // Mode has no per-request override today, so resolve it from the same
+        // repo/profile config already loaded above. The apply step only runs on
+        // session/new, so a resumed session/load is unaffected.
+        // ponytail: resolve here instead of threading mode through every
+        // SpawnRequest site; revisit if an explicit per-request mode lands.
+        let default_mode = resolved_cfg
+            .acp
+            .acp_defaults_for(&agent)
+            .and_then(|defaults| defaults.mode());
+
         let config = SpawnConfig {
             agent_key: agent.clone(),
             spec,
@@ -1414,12 +1431,15 @@ impl<S: BroadcastSink> Supervisor<S> {
             additional_dirs,
             provider_env: env,
             default_effort: effort,
+            default_mode,
             socket_path: Some(socket_path),
             stored_acp_session_id: stored_acp_session_id.clone(),
+            fork_from,
             sandbox_info,
             source_profile,
             mcp_servers,
             seed_history_replay,
+            artifact_dir: crate::session::artifacts::session_artifact_dir(&session_id).ok(),
         };
 
         debug!(
@@ -1529,10 +1549,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         // (see `apply_yolo_mode()` in `src/session/instance.rs`); structured view
         // can't pass CLI flags through the ACP adapter, so we set the
         // mode via `session/set_mode` instead. The mode id is adapter-specific
-        // (claude: `bypassPermissions`, codex: `full-access`, gemini: `yolo`),
+        // (claude: `bypassPermissions`, codex: `agent-full-access`, gemini: `yolo`),
         // so resolve it from the agent profile rather than hard-coding Claude's
-        // id; codex advertises `full-access`, not `bypassPermissions`, so a
-        // hard-coded `bypassPermissions` was silently dropped by the
+        // id; codex advertises `agent-full-access`, not `bypassPermissions`, so
+        // a hard-coded or stale id is silently dropped by the
         // not-advertised guard and left codex sessions in their default
         // (approval-prompting) preset. Best-effort: the call is
         // fire-and-forget through cmd_tx, the connection loop warns on
@@ -1657,9 +1677,21 @@ impl<S: BroadcastSink> Supervisor<S> {
                                             target: "acp.supervisor",
                                             session = %session_id,
                                             %reason,
-                                            "clearing cached id after session/load failure"
+                                            "clearing cached id and any pending fork after a context reset"
                                         );
                                         spawn_config.stored_acp_session_id = None;
+                                        // Also drop any pending fork: a reset is
+                                        // emitted when session/fork fails or the
+                                        // agent can't fork. Without clearing this,
+                                        // a crash-respawn re-reads fork_from and
+                                        // re-issues the same failing session/fork
+                                        // (a bounded retry loop up to the respawn
+                                        // budget), and a healthy fork-unsupported
+                                        // fallback re-emits this reset on every
+                                        // respawn. The fork is one-shot; a respawn
+                                        // must resume the child (session/load), not
+                                        // re-fork the parent.
+                                        spawn_config.fork_from = None;
                                     }
                                 }
                                 super::worker_registry::update_stored_acp_session_id(
@@ -3138,6 +3170,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                fork_from: None,
                 seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
@@ -3179,6 +3212,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                fork_from: None,
                 seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
@@ -3393,9 +3427,12 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: Some(socket_path.clone()),
             stored_acp_session_id: None,
+            fork_from: None,
             seed_history_replay: false,
+            artifact_dir: None,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -3485,9 +3522,12 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            fork_from: None,
             seed_history_replay: false,
+            artifact_dir: None,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -3560,9 +3600,12 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            fork_from: None,
             seed_history_replay: false,
+            artifact_dir: None,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -3635,9 +3678,12 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            fork_from: None,
             seed_history_replay: false,
+            artifact_dir: None,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -3763,9 +3809,12 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
+            fork_from: None,
             seed_history_replay: false,
+            artifact_dir: None,
             sandbox_info: None,
             source_profile: None,
             mcp_servers: Vec::new(),
@@ -3898,6 +3947,106 @@ mod tests {
         assert!(
             sink.frames.lock().unwrap().is_empty(),
             "shutdown must not publish for stdio fixtures"
+        );
+    }
+
+    /// Helper for the `shutdown_and_wait_*` tests: inserts a stdio fake
+    /// so `shutdown` returns Ok and the PID-poll block runs.
+    async fn insert_stdio_worker<S: BroadcastSink>(sup: &Supervisor<S>, session_id: &str) {
+        let mut workers = sup.workers.lock().await;
+        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(session_id.into()));
+        let drain = tokio::spawn(async {});
+        workers.insert(
+            session_id.into(),
+            WorkerHandle {
+                client: Arc::new(client),
+                drain_task: drain,
+                restart_history: vec![],
+                kind: WorkerKind::Stdio,
+            },
+        );
+    }
+
+    /// #2102: when the on-disk record is unreadable AND no live socket
+    /// peer is around, `pid_source_for` returns `None` and
+    /// `shutdown_and_wait` degrades to a fast no-poll return without
+    /// panicking or looping. The peer-PID recovery path itself is
+    /// covered by unit tests on `worker_registry::pid_source_for`,
+    /// which don't traverse `terminate` (avoiding a self-killpg risk).
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_and_wait_degrades_when_load_errs_without_peer() {
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-supervisor-", "/tmp").unwrap();
+        // SAFETY: serialised by `#[serial]`.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        let session_id = "sw-err-2102";
+        // Force load() -> Err by writing a real record file and stripping
+        // read permission: path.exists() stays true, but std::fs::read
+        // fails with PermissionDenied. (Corrupt JSON is coerced to
+        // Ok(None) by load itself, so it can't drive the Err arm.)
+        use std::os::unix::fs::PermissionsExt;
+        let socket_path = crate::acp::worker_registry::socket_path_for(session_id).unwrap();
+        let record = crate::acp::worker_registry::WorkerRecord::new(
+            session_id.into(),
+            std::process::id(),
+            socket_path.clone(),
+            "claude-agent-acp".into(),
+            "claude-code".into(),
+            std::env::temp_dir(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::acp::worker_registry::save(&record).unwrap();
+        let record_path = crate::acp::worker_registry::record_path(session_id).unwrap();
+        std::fs::set_permissions(&record_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            crate::acp::worker_registry::load(session_id).is_err(),
+            "fixture must force load() to return Err"
+        );
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink);
+        insert_stdio_worker(&sup, session_id).await;
+        let start = Instant::now();
+        sup.shutdown_and_wait(session_id, Duration::from_secs(2))
+            .await
+            .expect("shutdown_and_wait returns Ok on best-effort fallback");
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "no peer socket means pid_source_for returns None; no poll should run, elapsed={:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Regression: Ok(None) skips the poll and returns promptly.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_and_wait_returns_promptly_when_registry_missing() {
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-supervisor-", "/tmp").unwrap();
+        // SAFETY: serialised by `#[serial]`.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        let session_id = "sw-missing-2102";
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink);
+        insert_stdio_worker(&sup, session_id).await;
+        let start = Instant::now();
+        sup.shutdown_and_wait(session_id, Duration::from_secs(2))
+            .await
+            .expect("shutdown_and_wait returns Ok");
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "no poll must run when registry is missing, elapsed={:?}",
+            start.elapsed()
         );
     }
 
@@ -4797,6 +4946,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                fork_from: None,
                 seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
@@ -4872,6 +5022,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                fork_from: None,
                 seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
@@ -5085,6 +5236,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                fork_from: None,
                 seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,
@@ -5139,6 +5291,7 @@ mod tests {
                 model: None,
                 effort: None,
                 stored_acp_session_id: None,
+                fork_from: None,
                 seed_history_replay: false,
                 sandbox_info: None,
                 source_profile: None,

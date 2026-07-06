@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 //
 // Coverage for the WorkspaceSidebar Trash control (#2489, reworked in #2512):
-// a workspace whose sessions are all trashed is reachable from a Trash icon in
-// the sidebar footer next to Settings, which opens a popover with Open /
-// Restore / Delete actions. Trash is no longer an inline scrolling section.
+// a workspace whose sessions are all trashed is reachable from a labeled Trash
+// control in the sidebar footer next to Settings, which opens a wider panel
+// with Open / Restore / Delete actions. Trash is no longer an inline scrolling
+// section.
 // Also asserts the Projects section renders below "Snoozed & archived" (#2512).
 // Vitest (accurate per-file V8) rather than Playwright, whose bundle->source
 // remap is lossy for this large file.
@@ -121,27 +122,68 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     return renderSidebar({ groups: trashedGroups(), trashedWorkspaces: [trashedWorkspace()], ...over });
   }
 
-  it("reaches a trashed workspace via the footer Trash popover and exposes its actions", () => {
+  it("reaches a trashed workspace via the footer Trash panel and exposes its actions", () => {
     const props = renderWithTrash();
 
     // No inline section in the scrolling list; only the footer toggle.
     expect(screen.queryByTestId("sidebar-trash-section")).toBeNull();
-    // Closed by default: popover and rows hidden until the icon is clicked.
+    expect(screen.getByTestId("sidebar-trash-toggle").textContent).toContain("Trash");
+    // Closed by default: panel and rows hidden until the footer control is clicked.
     expect(screen.queryByTestId("sidebar-trash-menu")).toBeNull();
     expect(screen.queryByTestId("sidebar-trash-row")).toBeNull();
 
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
     expect(screen.getByTestId("sidebar-trash-menu")).toBeTruthy();
     expect(screen.getByTestId("sidebar-trash-row")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-trash-open").textContent).toContain("Open");
+    expect(screen.getByTestId("sidebar-trash-restore").textContent).toContain("Restore");
+    expect(screen.getByTestId("sidebar-trash-purge").textContent).toContain("Delete");
 
     fireEvent.click(screen.getByTestId("sidebar-trash-open"));
     expect(props.onSelect).toHaveBeenCalledWith("trashed-ws");
+    expect(screen.queryByTestId("sidebar-trash-menu")).toBeNull();
 
+    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
     fireEvent.click(screen.getByTestId("sidebar-trash-restore"));
     expect(props.onRestoreSession).toHaveBeenCalledWith(["s1"]);
 
     fireEvent.click(screen.getByTestId("sidebar-trash-purge"));
     expect(props.onDeleteSession).toHaveBeenCalledWith("trashed-ws");
+  });
+
+  it("orders the Trash rows newest-trashed first", () => {
+    const older = workspace("older-ws", [session({ id: "o1", trashed_at: "2026-01-01T00:00:00Z" })]);
+    const newer = workspace("newer-ws", [session({ id: "n1", trashed_at: "2026-06-01T00:00:00Z" })]);
+    // Pass oldest-first to prove the panel re-sorts rather than echoing input order.
+    renderSidebar({
+      groups: buildSessionGroups([older, newer], {
+        idleDecayWindowMs: 60_000,
+        sortMode: "lastActivity",
+        isCollapsed: () => false,
+      }),
+      trashedWorkspaces: [older, newer],
+    });
+    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
+    const rows = screen.getAllByTestId("sidebar-trash-row");
+    expect(rows[0].textContent).toContain("newer-ws");
+    expect(rows[1].textContent).toContain("older-ws");
+  });
+
+  it("renders the count badge next to the Trash icon, not against Settings (#2574)", () => {
+    // The badge must sit right after the Trash icon at the left of the control.
+    // A `flex-1` label that preceded the badge would shove the count to the
+    // button's right edge, where it reads as belonging to the Settings gear.
+    renderWithTrash();
+    const toggle = screen.getByTestId("sidebar-trash-toggle");
+    const badge = screen.getByTestId("sidebar-trash-count");
+    expect(badge.textContent).toBe("1");
+    // Badge is inside the Trash control, not the Settings button.
+    expect(toggle.contains(badge)).toBe(true);
+    // The "Trash" label follows the badge in DOM order; the badge is not the
+    // right-most child pushed up against Settings.
+    const label = Array.from(toggle.querySelectorAll("span")).find((s) => s.textContent === "Trash");
+    expect(label).toBeTruthy();
+    expect(badge.compareDocumentPosition(label!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("closes the Trash popover on Escape", () => {
@@ -166,7 +208,7 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     renderWithTrash();
     fireEvent.click(screen.getByLabelText("Filter sessions"));
     fireEvent.change(screen.getByTestId("sidebar-filter-input"), { target: { value: "zzz-no-match" } });
-    expect(screen.getByTestId("sidebar-trash-toggle")).toBeTruthy();
+    expect(screen.getByTestId("sidebar-trash-toggle").textContent).toContain("Trash");
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
     expect(screen.getByTestId("sidebar-trash-row")).toBeTruthy();
   });

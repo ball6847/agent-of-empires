@@ -836,6 +836,7 @@ pub const AGENTS: &[AgentDef] = &[
         hook_config: None,
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--session"),
+        fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "pip install kimi-cli",

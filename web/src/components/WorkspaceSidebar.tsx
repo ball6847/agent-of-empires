@@ -29,7 +29,9 @@ import {
   Play,
   Plus,
   RotateCcw,
+  ScrollText,
   Sparkles,
+  SquareTerminal,
   Trash2,
   X,
 } from "lucide-react";
@@ -70,15 +72,20 @@ import { menuBus, closeOtherContextMenus } from "../lib/menuBus";
 import { REPO_COLOR_OPTIONS, repoColorStyle, repoSwatchStyle, type RepoAppearanceUpdate } from "../lib/repoAppearance";
 import { STATUS_DOT_CLASS, getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
+import { useWebSettings } from "../hooks/useWebSettings";
 import { exceedsTouchSlop } from "../lib/longPress";
 import { useUnreadIndicatorEnabled } from "../lib/unreadIndicator";
+import { computeSessionRowTag, useSessionRowTagMode } from "../lib/sessionRowTag";
+import { useSessionColorsEnabled } from "../lib/sessionColors";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import {
   createSession,
   renameSession,
+  setSessionColor,
   setSessionNotifications,
   setWorktreeName,
   smartRenameSession,
+  summarizeSession,
   updateSessionGroup,
 } from "../lib/api";
 import { useServerDown, OFFLINE_TITLE } from "../lib/connectionState";
@@ -91,6 +98,7 @@ import { useRateLimitedForSessions } from "../hooks/useAcpRateLimit";
 import {
   triageMenuShape,
   triageStateOf,
+  workspaceAttentionCount,
   workspaceIsPinned,
   workspaceIsSunk,
   workspaceIsTrashed,
@@ -159,6 +167,21 @@ export interface RowBulkApi {
 
 const CTX_ITEM =
   "w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2";
+
+/** MVP per-session color palette (#2383). Mirrors the Rust `SESSION_COLORS`
+ *  list; each entry maps a palette key to its display label and the Tailwind
+ *  class for its status dot. Kept small and status-oriented on purpose. */
+const SESSION_COLOR_OPTIONS: { key: string; label: string; dotClass: string }[] = [
+  { key: "red", label: "Red · needs attention", dotClass: "bg-red-500" },
+  { key: "amber", label: "Amber · working", dotClass: "bg-amber-400" },
+  { key: "green", label: "Green · done", dotClass: "bg-green-500" },
+];
+
+/** Tailwind dot class for a stored color key, or null when unset / unknown. */
+function sessionColorDotClass(color: string | null | undefined): string | null {
+  if (!color) return null;
+  return SESSION_COLOR_OPTIONS.find((o) => o.key === color)?.dotClass ?? null;
+}
 
 /** Triage actions for the right-click menu when more than one row is selected.
  *  Reuses the same eligibility buckets as the old bulk bar so a mixed
@@ -316,6 +339,7 @@ interface Props {
   onRestoreSession?: (sessionIds: string[]) => void;
   onStopSession?: (workspaceId: string) => void;
   onStartSession?: (workspaceId: string) => void;
+  onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   readOnly?: boolean;
   sortMode: SidebarSortMode;
   onSortModeChange: (mode: SidebarSortMode) => void;
@@ -332,6 +356,7 @@ function bestSession(
   status: SessionStatus;
   createdAt: string | null;
   idleEnteredAt: string | null;
+  dormant: boolean;
 } {
   const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
   if (running)
@@ -339,6 +364,7 @@ function bestSession(
       status: running.status,
       createdAt: running.created_at,
       idleEnteredAt: running.idle_entered_at ?? null,
+      dormant: running.dormant,
     };
   const error = ws.sessions.find((s) => s.status === "Error");
   if (error)
@@ -346,12 +372,14 @@ function bestSession(
       status: "Error",
       createdAt: error.created_at,
       idleEnteredAt: null,
+      dormant: false,
     };
   const first = ws.sessions[0];
   return {
     status: first?.status ?? "Unknown",
     createdAt: first?.created_at ?? null,
     idleEnteredAt: first?.idle_entered_at ?? null,
+    dormant: first?.dormant ?? false,
   };
 }
 
@@ -601,7 +629,7 @@ function TrashMenu({
             role="region"
             aria-label="Trash"
             data-testid="sidebar-trash-menu"
-            className="fixed z-40 flex max-h-[min(520px,calc(100vh-5rem))] flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-800 shadow-2xl animate-fade-in"
+            className="fixed z-40 flex max-h-[min(520px,calc(100dvh-5rem))] flex-col overflow-hidden rounded-lg border border-surface-700/60 bg-surface-800 shadow-2xl animate-fade-in"
             style={{ left: panelPosition.left, bottom: panelPosition.bottom, width: panelPosition.width }}
           >
             <div className="flex items-start justify-between gap-3 border-b border-surface-700/60 px-4 py-3">
@@ -761,6 +789,7 @@ function SortableSessionRow({
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
+  onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   onCreateSession?: (repoPath: string) => void;
   readOnly?: boolean;
   dragDisabled?: boolean;
@@ -884,6 +913,7 @@ export const SessionRow = memo(function SessionRow({
   onDelete,
   onStop,
   onStart,
+  onSwitchView,
   onCreateSession,
   readOnly,
   indented,
@@ -905,6 +935,9 @@ export const SessionRow = memo(function SessionRow({
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
   onStart?: (workspaceId: string) => void;
+  // Switch this row's session between structured view and terminal. The parent
+  // (App) opens the confirm dialog and calls acp enable/disable. See #2252.
+  onSwitchView?: (sessionId: string, toStructured: boolean) => void;
   // Open the session wizard prefilled from this row's project (path, agent,
   // and the latest session's options), mirroring the per-project "+" button.
   onCreateSession?: (repoPath: string) => void;
@@ -924,11 +957,18 @@ export const SessionRow = memo(function SessionRow({
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const unreadIndicatorEnabled = useUnreadIndicatorEnabled();
-  const { status: sessionStatus, createdAt, idleEnteredAt } = bestSession(workspace, idleDecayWindowMs);
+  const sessionColorsEnabled = useSessionColorsEnabled();
+  const {
+    status: sessionStatus,
+    createdAt,
+    idleEnteredAt,
+    dormant: sessionDormant,
+  } = bestSession(workspace, idleDecayWindowMs);
   const textClass = getStatusTextClass(
     {
       status: sessionStatus,
       idle_entered_at: idleEnteredAt,
+      dormant: sessionDormant,
     },
     idleDecayWindowMs,
   );
@@ -946,14 +986,20 @@ export const SessionRow = memo(function SessionRow({
   const sessionTitle = firstSession?.title.trim() ?? "";
   const branchLabel = workspace.branch ?? null;
   const baseBranch = firstSession?.base_branch ?? null;
+  const rowTagMode = useSessionRowTagMode();
+  const rowTag = computeSessionRowTag(workspace, rowTagMode);
+  const rowTagTitle =
+    rowTag?.kind === "branch" && baseBranch ? `${rowTag.title} (based on ${baseBranch})` : rowTag?.title;
   const label = singleSession ? sessionTitle || branchLabel || "default" : branchLabel || sessionTitle || "default";
-  const subtitle = singleSession && sessionTitle && branchLabel && sessionTitle !== branchLabel ? branchLabel : null;
-  const subtitleTitle = subtitle && baseBranch ? `${subtitle} (based on ${baseBranch})` : subtitle;
   // Workspace renders as favorited when any of its sessions are
   // favorited. Mirrors the TUI's within-tier pin: the star promotes the
   // row visually so the user can find their starred work fast. Toggled
   // via TUI `f`/`F` or `aoe session favorite|unfavorite`.
   const isFavorited = workspace.sessions.some((s) => s.favorited);
+  // Per-session color label (#2383): the first session in the workspace that
+  // carries a color wins, mirroring how `snoozedUntil` picks the first match.
+  const sessionColor = workspace.sessions.map((s) => s.color).find((c) => c != null) ?? null;
+  const sessionColorDot = sessionColorDotClass(sessionColor);
   // Web-only triage signals. `pinned` floats the workspace to the top
   // of every sort mode; `archived` and `snoozedUntil` mark the row as
   // sunk (the parent splits sunk workspaces into a separate collapsible
@@ -982,6 +1028,17 @@ export const SessionRow = memo(function SessionRow({
   // a live spinner (Running/Waiting/...) stays, since live status outranks it
   // and the auto-mark only ever lands on Idle anyway.
   const showUnreadGlyph = isUnread && (sessionStatus === "Idle" || sessionStatus === "Unknown");
+  // Row-level attention marker, sharing the one predicate the group badge and
+  // jump-to-next use. The existing status glyph already encodes the status;
+  // this only adds emphasis and an accessible label so a Waiting/Error/urgent
+  // row is unmistakable without a second redundant dot.
+  const needsAttention = workspaceAttentionCount(workspace) > 0;
+  const attentionHint =
+    sessionStatus === "Waiting"
+      ? "waiting for your input"
+      : sessionStatus === "Error"
+        ? "needs attention (error)"
+        : "needs your attention";
   const sessionId = firstSession?.id;
   const navigationSessionId = runningSession?.id ?? firstSession?.id ?? null;
   const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
@@ -1020,6 +1077,18 @@ export const SessionRow = memo(function SessionRow({
     setContextMenu(null);
     if (!sessionId || preset === notifyPreset) return;
     await setSessionNotifications(sessionId, preset);
+  };
+
+  // Set (or clear, with `null`) this row's color label. Fire-and-forget: the
+  // dot reflects on the next sessions poll (there is no optimistic overlay for
+  // color). A failed request surfaces a toast. See #2383.
+  const applyColor = async (color: string | null) => {
+    setContextMenu(null);
+    if (!sessionId || color === sessionColor) return;
+    const result = await setSessionColor(sessionId, color);
+    if (!result) {
+      reportError(color ? "Failed to set session color" : "Failed to clear session color");
+    }
   };
 
   // Triage actions (pin / archive / snooze). The optimistic overlay and the
@@ -1080,6 +1149,14 @@ export const SessionRow = memo(function SessionRow({
     requestSwitchAgent(acpSession.id);
   };
 
+  // Switch the row's session between structured view and terminal. The parent
+  // opens the capability-aware confirm dialog and calls acp enable/disable.
+  const handleSwitchView = () => {
+    setContextMenu(null);
+    if (!firstSession) return;
+    onSwitchView?.(firstSession.id, firstSession.view !== "structured");
+  };
+
   // Fork a structured session: create a new structured session that resumes the
   // source's ACP conversation and diverges from it. Gated on a captured
   // `acp_session_id` (the value the server forks from) AND `acp_can_fork`, so a
@@ -1114,6 +1191,22 @@ export const SessionRow = memo(function SessionRow({
     const result = await smartRenameSession(acpSession.id);
     if (!result.ok) {
       reportError(result.message ?? "Could not start auto-name. Please try again.");
+    }
+  };
+
+  // On-demand "summary of the conversation so far" for a structured session
+  // (see #2808). Best-effort and async, like Auto-name now: a 202 means the
+  // one-shot started; the summary appears as a callout in the transcript when
+  // it completes. Available for any structured session (unlike Auto-name, it
+  // does not depend on the title).
+  const handleSummarizeNow = async () => {
+    setContextMenu(null);
+    if (!acpSession) return;
+    const result = await summarizeSession(acpSession.id);
+    if (result.ok) {
+      reportInfo("Summarizing the conversation so far…");
+    } else {
+      reportError(result.message ?? "Could not start the summary. Please try again.");
     }
   };
 
@@ -1312,6 +1405,7 @@ export const SessionRow = memo(function SessionRow({
         tabIndex={isDeleting ? -1 : undefined}
         aria-disabled={isDeleting || undefined}
         data-testid="sidebar-session-row"
+        title={needsAttention ? `${label} · ${attentionHint}` : label}
         draggable={false}
         onClick={(e) => {
           // Let the browser handle non-primary clicks (middle-click still
@@ -1352,20 +1446,38 @@ export const SessionRow = memo(function SessionRow({
         {isSelected && <span className="sr-only">Selected</span>}
         <div className="flex items-center gap-2">
           <span
-            className={`text-sm shrink-0 leading-none font-mono ${showUnreadGlyph ? "text-status-unread font-semibold" : textClass}`}
+            className={`text-sm shrink-0 leading-none font-mono ${showUnreadGlyph ? "text-status-unread font-semibold" : textClass} ${
+              needsAttention && !showUnreadGlyph ? "motion-safe:animate-pulse font-semibold" : ""
+            }`}
+            data-attention={needsAttention && !showUnreadGlyph ? "true" : undefined}
+            aria-label={needsAttention && !showUnreadGlyph ? `${sessionStatus} · ${attentionHint}` : undefined}
           >
             {showUnreadGlyph ? (
               <span title="Unread" aria-label="Unread" data-testid="sidebar-unread-dot">
                 ●
               </span>
             ) : (
-              <StatusGlyph status={sessionStatus} createdAt={createdAt} idleEnteredAt={idleEnteredAt} />
+              <StatusGlyph
+                status={sessionStatus}
+                createdAt={createdAt}
+                idleEnteredAt={idleEnteredAt}
+                dormant={sessionDormant}
+              />
             )}
           </span>
           <div className="min-w-0 flex-1">
             <span
               className={`flex items-center gap-1.5 text-[13px] md:text-[14px] ${showUnreadGlyph ? "text-status-unread font-semibold" : isSessionActive({ status: sessionStatus, idle_entered_at: idleEnteredAt }, idleDecayWindowMs) ? textClass : isActive ? "text-text-primary" : "text-text-secondary"} ${isFavorited || effectivePinned ? "font-semibold" : ""} ${effectiveArchived || effectiveSnoozed ? "italic opacity-70" : ""}`}
             >
+              {sessionColorsEnabled && sessionColorDot && (
+                <span
+                  title={`Color: ${sessionColor}`}
+                  aria-label={`Color: ${sessionColor}`}
+                  data-testid="sidebar-session-color-dot"
+                  data-color={sessionColor ?? undefined}
+                  className={`shrink-0 inline-block h-2 w-2 rounded-full ${sessionColorDot}`}
+                />
+              )}
               {effectivePinned && (
                 <span title="Pinned" aria-label="Pinned" className="shrink-0 inline-flex text-brand-400">
                   <Pin className="h-3 w-3 -rotate-45" />
@@ -1379,6 +1491,19 @@ export const SessionRow = memo(function SessionRow({
               <span className="truncate" title={label}>
                 {label}
               </span>
+              {rowTag && (
+                <span
+                  data-testid="sidebar-session-row-tag"
+                  title={rowTagTitle}
+                  className={`inline-flex shrink-0 items-center rounded border px-1 py-0 text-[10px] font-mono font-medium ${
+                    rowTag.kind === "branch"
+                      ? "border-brand-700/40 bg-brand-700/5 text-brand-300"
+                      : "border-surface-700/40 bg-surface-800/40 text-text-dim"
+                  }`}
+                >
+                  [{rowTag.content}]
+                </span>
+              )}
               {hasDraft && (
                 <span title="Unsent draft" aria-label="Unsent draft" className="inline-flex shrink-0">
                   <Pencil className="h-3 w-3 text-amber-400/90" />
@@ -1460,12 +1585,6 @@ export const SessionRow = memo(function SessionRow({
               {firstSession?.monitor_active && <MonitorBadge description={firstSession.monitor_description} />}
             </span>
             {firstSession && <PluginRowLine sessionId={firstSession.id} />}
-            {subtitle && (
-              <span className="block text-[11px] font-mono text-text-dim truncate" title={subtitleTitle ?? subtitle}>
-                {subtitle}
-                {baseBranch && <span className="ml-1 text-text-dim/70">← {baseBranch}</span>}
-              </span>
-            )}
             {firstSession?.plan_summary &&
               firstSession.plan_summary.total > 0 &&
               // Hide the completed-plan bar when the session is also
@@ -1505,7 +1624,7 @@ export const SessionRow = memo(function SessionRow({
             style={{
               left: contextMenu.x,
               top: contextMenu.y,
-              maxHeight: "calc(100vh - 16px)",
+              maxHeight: "calc(100dvh - 16px)",
             }}
           >
             {contextMenu.scope.kind === "bulk" ? (
@@ -1555,6 +1674,16 @@ export const SessionRow = memo(function SessionRow({
                     Edit group
                   </button>
                 )}
+                {!readOnly && firstSession && (firstSession.view === "structured" || firstSession.acp_capable) && (
+                  <button
+                    onClick={handleSwitchView}
+                    data-testid="sidebar-context-menu-switch-view"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <SquareTerminal className="h-3.5 w-3.5 shrink-0" />
+                    {firstSession.view === "structured" ? "Switch to terminal" : "Switch to structured view"}
+                  </button>
+                )}
                 {!readOnly && acpSession && (
                   <button
                     onClick={handleSwitchAgent}
@@ -1583,6 +1712,16 @@ export const SessionRow = memo(function SessionRow({
                   >
                     <Sparkles className="h-3.5 w-3.5 shrink-0" />
                     Auto-name now
+                  </button>
+                )}
+                {!readOnly && acpSession && (
+                  <button
+                    onClick={() => void handleSummarizeNow()}
+                    data-testid="sidebar-context-menu-summarize"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                  >
+                    <ScrollText className="h-3.5 w-3.5 shrink-0" />
+                    Summarize conversation
                   </button>
                 )}
                 {!readOnly && canStop && (
@@ -1625,6 +1764,41 @@ export const SessionRow = memo(function SessionRow({
                     </button>
                   );
                 })}
+                {!readOnly && sessionColorsEnabled && (
+                  <>
+                    <div className="border-t border-surface-700/20 my-1" />
+                    <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
+                      Color
+                    </div>
+                    {SESSION_COLOR_OPTIONS.map((opt) => {
+                      const selected = sessionColor === opt.key;
+                      return (
+                        <button
+                          key={opt.key}
+                          onClick={() => void applyColor(opt.key)}
+                          data-testid={`sidebar-context-menu-color-${opt.key}`}
+                          className={`w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2 ${
+                            selected ? "text-text-primary" : "text-text-secondary"
+                          }`}
+                        >
+                          <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${opt.dotClass}`} />
+                          {opt.label}
+                          {selected && <span className="ml-auto text-brand-500">✓</span>}
+                        </button>
+                      );
+                    })}
+                    {sessionColor && (
+                      <button
+                        onClick={() => void applyColor(null)}
+                        data-testid="sidebar-context-menu-color-clear"
+                        className="w-full text-left pl-6 pr-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors flex items-center gap-2"
+                      >
+                        <span className="h-2.5 w-2.5 shrink-0 rounded-full border border-surface-600" />
+                        Clear color
+                      </button>
+                    )}
+                  </>
+                )}
                 {!readOnly && (
                   <>
                     <div className="border-t border-surface-700/20 my-1" />
@@ -2185,6 +2359,9 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
   // workspaceIsSunk). Summing raw sessions inflated the badge above the
   // visible row count. See #2372.
   const sessionCount = group.workspaces.filter((v) => !workspaceIsSunk(v.workspace)).length;
+  // Aggregate signal: how many sessions under this group need the user. Shown
+  // even when collapsed, which is exactly when the per-row glyphs are hidden.
+  const attentionCount = group.workspaces.reduce((n, v) => n + workspaceAttentionCount(v.workspace), 0);
 
   // The whole header row is the drag activator now (no grip handle), so a
   // drag ends with the pointer over one of the row's controls. Suppress the
@@ -2365,6 +2542,21 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
           <span className="text-[13px] md:text-[14px] font-medium truncate flex-1" title={headerTitle}>
             {group.displayName}
           </span>
+          {attentionCount > 0 && (
+            <Tooltip
+              text={`${attentionCount} session${attentionCount === 1 ? "" : "s"} need${
+                attentionCount === 1 ? "s" : ""
+              } attention`}
+            >
+              <span
+                className="shrink-0 min-w-[1.25rem] rounded-full bg-status-error px-1.5 text-[11px] font-semibold leading-[1.25rem] tabular-nums text-white text-center"
+                data-testid="sidebar-group-attention-badge"
+                aria-label={`${attentionCount} needing attention`}
+              >
+                {attentionCount}
+              </span>
+            </Tooltip>
+          )}
           <span className="shrink-0 text-[12px] tabular-nums text-text-dim" data-testid="sidebar-group-session-count">
             ({sessionCount})
           </span>
@@ -2401,7 +2593,7 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
             style={{
               left: contextMenu.x,
               top: contextMenu.y,
-              maxHeight: "calc(100vh - 16px)",
+              maxHeight: "calc(100dvh - 16px)",
             }}
           >
             {canPin && (
@@ -2575,6 +2767,7 @@ export function WorkspaceSidebar({
   onRestoreSession,
   onStopSession,
   onStartSession,
+  onSwitchView,
   readOnly,
   sortMode,
   onSortModeChange,
@@ -2583,6 +2776,11 @@ export function WorkspaceSidebar({
   axis,
   onAxisChange,
 }: Props) {
+  // Which mobile edge the drawer slides in from (client-local, #2244). Only
+  // affects the `fixed` mobile drawer; on desktop the sidebar is `md:static`
+  // and always sits to the left of the content.
+  const { settings: webSettings } = useWebSettings();
+  const rightSide = webSettings.sidebarSide === "right";
   // Plugin sort/filter slots (#2401). Read the live snapshot here so the facet
   // control and the sort-picker options stay local to the sidebar; the active
   // plugin sort comparator itself is built and threaded by AppContent.
@@ -3084,9 +3282,9 @@ export function WorkspaceSidebar({
       <div
         {...tourAnchor(TOUR_ANCHORS.sidebar)}
         style={{ width }}
-        className={`fixed top-12 bottom-0 left-0 z-40 md:static md:z-auto bg-surface-800 border-r border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
-          open ? "translate-x-0" : "-translate-x-full md:hidden"
-        }`}
+        className={`fixed top-12 bottom-0 z-40 md:static md:z-auto bg-surface-800 border-surface-700/60 flex flex-col md:h-full shrink-0 transition-transform duration-300 ease-in-out md:transition-none ${
+          rightSide ? "right-0 border-l md:border-l-0 md:border-r" : "left-0 border-r"
+        } ${open ? "translate-x-0" : `${rightSide ? "translate-x-full" : "-translate-x-full"} md:hidden`}`}
       >
         <div className="px-3 pt-3 pb-1 flex items-center">
           <span data-testid="sidebar-axis-heading" className="text-sm text-text-muted flex-1">
@@ -3308,6 +3506,7 @@ export function WorkspaceSidebar({
                                     onDelete={onDeleteSession}
                                     onStop={onStopSession}
                                     onStart={onStartSession}
+                                    onSwitchView={onSwitchView}
                                     onCreateSession={onCreateSession}
                                     readOnly={readOnly}
                                     optimistic={triage.optimisticFor(v.workspace.id)}
@@ -3416,6 +3615,7 @@ export function WorkspaceSidebar({
                                 onDelete={onDeleteSession}
                                 onStop={onStopSession}
                                 onStart={onStartSession}
+                                onSwitchView={onSwitchView}
                                 readOnly={readOnly}
                                 optimistic={triage.optimisticFor(v.workspace.id)}
                                 onPinToggle={triage.pinToggle}
@@ -3490,6 +3690,7 @@ export function WorkspaceSidebar({
                       onDelete={onDeleteSession}
                       onStop={onStopSession}
                       onStart={onStartSession}
+                      onSwitchView={onSwitchView}
                       readOnly={readOnly}
                       optimistic={triage.optimisticFor(v.workspace.id)}
                       onPinToggle={triage.pinToggle}

@@ -161,19 +161,19 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
     }
     match target.kind {
         HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
-            install_hooks(&target.path, target.events, HookInstallTarget::Host)
+            install_hooks(&target.path, &target.events, HookInstallTarget::Host)
         }
         HookTargetKind::CodexToml => {
             let preserved = snapshot_codex_hooks_state(&target.path)?;
             install_codex_hooks_with_preserved_state(
                 &target.path,
-                target.events,
+                &target.events,
                 preserved,
                 HookInstallTarget::Host,
             )
         }
         HookTargetKind::Sidecar(sidecar) => {
-            (sidecar.install)(&target.path, HookInstallTarget::Host)
+            (sidecar.install)(&target.path, HookInstallTarget::Host, &target.events)
         }
     }
 }
@@ -475,6 +475,7 @@ fn read_environment_from_toml(path: &Path) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::test_support::EnvGuard;
     use serde_json::Value;
     use std::fs;
     use tempfile::TempDir;
@@ -488,38 +489,17 @@ mod tests {
         printf running > \"/tmp/aoe-hooks/$AOE_INSTANCE_ID/status\" 2>/dev/null; \
         exit 0'";
 
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<String>)>,
-    }
-    impl EnvGuard {
-        fn unset_all() -> Self {
-            let keys = [
-                "CODEX_HOME",
-                "CLAUDE_CONFIG_DIR",
-                "CURSOR_CONFIG_DIR",
-                "GEMINI_CONFIG_DIR",
-                "QWEN_CONFIG_DIR",
-            ];
-            let saved = keys
-                .iter()
-                .map(|k| {
-                    let prev = std::env::var(k).ok();
-                    std::env::remove_var(k);
-                    (*k, prev)
-                })
-                .collect();
-            Self { saved }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, v) in &self.saved {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
+    /// Clears CODEX_HOME, CLAUDE_CONFIG_DIR, etc. for the test duration so
+    /// the migration's path resolution sees only the explicit fixtures in
+    /// `home` / `app_dir`.
+    fn unset_agent_home_env() -> EnvGuard {
+        EnvGuard::unset(&[
+            "CODEX_HOME",
+            "CLAUDE_CONFIG_DIR",
+            "CURSOR_CONFIG_DIR",
+            "GEMINI_CONFIG_DIR",
+            "QWEN_CONFIG_DIR",
+        ])
     }
 
     fn setup_dirs() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -601,7 +581,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn rewrites_pre_v017_claude_settings_to_per_user_base() {
-        let _env = EnvGuard::unset_all();
+        let _env = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let claude = home.join(".claude").join("settings.json");
         write_json(&claude, &pre_v017_claude_settings());
@@ -614,7 +594,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn skips_files_without_aoe_marker() {
-        let _env = EnvGuard::unset_all();
+        let _env = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let claude = home.join(".claude").join("settings.json");
         let user_settings = serde_json::json!({
@@ -641,7 +621,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn idempotent_byte_identical_on_second_run() {
-        let _env = EnvGuard::unset_all();
+        let _env = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
         let claude = home.join(".claude").join("settings.json");
         write_json(&claude, &pre_v017_claude_settings());
@@ -658,7 +638,7 @@ mod tests {
     #[serial_test::serial(shell_env)]
     fn rewrite_failure_keeps_legacy_dir_intact_for_manual_recovery() {
         use std::os::unix::fs::PermissionsExt;
-        let _env = EnvGuard::unset_all();
+        let _env = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
 
         let claude = home.join(".claude").join("settings.json");
@@ -692,7 +672,7 @@ mod tests {
     #[serial_test::serial(shell_env)]
     fn legacy_sweep_full_success_removes_owned_dir() {
         use std::os::unix::fs::PermissionsExt;
-        let _env = EnvGuard::unset_all();
+        let _env = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
 
         let claude = home.join(".claude").join("settings.json");
@@ -717,11 +697,47 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privdrop_v017_sweep_leaves_alien_uid_entry_intact() {
+        use crate::hooks::test_support::{make_alien_owned, privdrop_test_enabled};
+        use std::os::unix::fs::PermissionsExt;
+
+        if !privdrop_test_enabled() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let legacy = tmp.path().join("legacy-aoe-hooks-mixed");
+        fs::create_dir(&legacy).unwrap();
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let owned = legacy.join("owned-instance");
+        fs::create_dir(&owned).unwrap();
+        fs::write(owned.join("status"), b"idle").unwrap();
+
+        let alien = legacy.join("alien-instance");
+        fs::create_dir(&alien).unwrap();
+        fs::write(alien.join("status"), b"running").unwrap();
+        make_alien_owned(&alien);
+
+        super::sweep_legacy_base_in(&legacy);
+
+        assert!(!owned.exists(), "owned legacy entry must be removed");
+        assert!(
+            alien.join("status").exists(),
+            "alien-owned legacy entry and its contents must survive"
+        );
+        assert!(
+            legacy.exists(),
+            "legacy parent must remain while an alien-owned entry exists"
+        );
+    }
+
     #[test]
     #[serial_test::serial(shell_env)]
     fn legacy_sweep_handles_symlink_at_legacy_path() {
         use std::os::unix::fs::PermissionsExt;
-        let _env = EnvGuard::unset_all();
+        let _env = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
 
         let canary = _tmp.path().join("canary");
@@ -749,7 +765,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn sandbox_baked_hooks_under_aoe_sandbox_subpath_are_untouched() {
-        let _env = EnvGuard::unset_all();
+        let _env = unset_agent_home_env();
         let (_tmp, home, app_dir) = setup_dirs();
 
         let claude = home.join(".claude").join("settings.json");

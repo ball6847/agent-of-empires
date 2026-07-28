@@ -26,6 +26,8 @@ aoe ships an ACP registry entry for each tool whose ACP server we've verified. F
 | `gemini` | `gemini --acp` (native) | `npm install -g @google/gemini-cli` | `GEMINI_API_KEY`, OAuth, or Vertex |
 | `vibe` | `vibe-acp` (native) | see [mistral-vibe](https://github.com/mistralai/mistral-vibe) | Mistral API key |
 | `pi` | `pi-acp` (adapter) | `npm install -g pi-acp` (plus `@earendil-works/pi-coding-agent`) | `pi-acp --terminal-login`, or provider env |
+| `omp` | `omp acp` (native) | `curl -fsSL https://omp.sh/install \| sh` | provider environment or OMP login |
+| `kimi` | `kimi acp` (native) | `curl -fsSL https://code.kimi.com/kimi-code/install.sh \| bash` | `kimi login`, or provider env |
 | `aoe-agent` | bundled (Vercel AI SDK 6) | ships with `aoe` | provider env vars |
 
 Tools not yet wired into the registry (aider, cursor, copilot, droid, hermes, kiro) always run in the terminal view. A **custom agent** can opt in by setting an ACP launch command via `agent_acp_cmd` (see [Configuration](guides/configuration.md#running-a-custom-agent-in-the-structured-view)).
@@ -47,7 +49,7 @@ Each feature fires for any ACP agent, only when the agent's profile opts in, or 
 | Subagent indentation | ✓ | — | unverified | — | — |
 | Session resume across `aoe serve` restart | ✓ | depends | ✓ | depends | depends |
 
-Codex/opencode/gemini support is built from adapter docs and code reading rather than hands-on walkthroughs, so some tool aliases may need adjustment; file an issue with the observed `tool.kind` + `tool.name`. opencode ≥1.16.0 is recommended: it classifies `apply_patch` as `edit` and `task` as `think`, populates `external_directory` permission context, and emits clean read-tool content. Older opencode still works but falls back to generic tool cards, verbose read text, and blind permission prompts. Mode picker, slash palette, and usage display depend on the adapter advertising the matching channels; when it doesn't, the UI stays empty rather than showing stale state. How profiles gate these is covered in [Structured View Internals](development/internals/structured-view.md#agent-profiles).
+Codex/opencode/gemini support is built from adapter docs and code reading rather than hands-on walkthroughs, so some tool aliases may need adjustment; file an issue with the observed `tool.kind` + `tool.name`. opencode ≥1.16.0 is recommended: it classifies `apply_patch` as `edit` and `task` as `think`, populates `external_directory` permission context, and emits clean read-tool content. Older opencode still works but falls back to generic tool cards, verbose read text, and blind permission prompts. Mode picker, slash palette, and usage display depend on the adapter advertising the matching channels; when it doesn't, the UI stays empty rather than showing stale state. Codex currently does not advertise a Plan-mode channel, so AoE does not render a Codex Plan switch. How profiles gate these is covered in [Structured View Internals](development/internals/structured-view.md#agent-profiles).
 
 ## Quickstart
 
@@ -79,13 +81,13 @@ aoe acp doctor          # reports Node + each configured agent's reachability
 aoe acp doctor --fix    # npm-install the npm-distributed adapters (claude / codex / pi)
 ```
 
-It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `--json` for machine-readable output. Install the native CLIs (opencode / gemini / vibe) through their own channels.
+It exits 1 if Node is missing, 2 if some agents are unreachable, else 0. Pass `--json` for machine-readable output. Install the native CLIs (opencode / gemini / vibe / omp) through their own channels.
 
 ## Choosing the view per session
 
 - **Web wizard:** defaults to the structured view; turn off **Use structured view** to get the terminal view.
-- **CLI / TUI:** default to the terminal view. From the CLI, opt in with `--structured-view` or `--agent`.
-- Either way, switch an existing session from the session view at any time. The agent restarts in a fresh pane; the worktree, open files, and commits are preserved, but the in-memory conversation for that session resets.
+- **CLI / TUI:** default to the terminal view. From the CLI, opt in with `--structured-view` or `--agent`; in the TUI new-session dialog, toggle the **Structured** field (shown for ACP-capable tools).
+- Either way, an existing active session can switch views: the web sidebar's right-click menu (**Switch to terminal** / **Switch to structured view**) or the TUI's right-click context menu (needs a running `aoe serve` daemon; archived, trashed, and still-creating rows are excluded until they leave that state). Both surfaces confirm first. The worktree, open files, and commits are always preserved. For a **claude** session the conversation is kept in both directions: the terminal resumes it with `claude --resume`, and switching back to structured view reloads it via the ACP adapter. Every other agent restarts fresh on the target surface, resetting the in-memory conversation.
 
 Non-ACP tools always run in the terminal view, with no toggle.
 
@@ -95,9 +97,11 @@ Non-ACP tools always run in the terminal view, with no toggle.
 
 `aoe add` does not prompt for a name by default: it uses `--title`, else the worktree branch name, else a generated name. Pass `-i`/`--interactive` for the same name prompt the TUI and wizard show. Set per-agent defaults for web-created sessions under `[acp.acp_defaults.<agent>]`:
 
-When a structured view session keeps its generated civilization name (no `--title`, no branch name), AoE auto-renames it from your first message using the session's own agent in one-shot mode (`claude -p`, `codex exec`, `opencode run`, `gemini -p`). This is on by default and controlled by `session.smart_rename`. It renames the title only, never the worktree directory (the running agent holds it), and never touches a session you named yourself. Sandboxed sessions, agents with no one-shot mode, and command-overridden agents keep the generated name. See [Configuration: Session](guides/configuration.md#session).
+When a structured view session keeps its generated civilization name (no `--title`, no branch name), AoE auto-renames it from its first turn using the session's own agent in one-shot mode (`claude -p`, `codex exec`, `opencode run`, `gemini -p`, `omp -p`). This is on by default and controlled by `session.smart_rename`. It renames the title only, never the worktree directory (the running agent holds it), and never touches a session you named yourself. Sandboxed sessions, agents with no one-shot mode, and command-overridden agents keep the generated name. See [Configuration: Session](guides/configuration.md#session).
 
-To name with a different agent than the session's own (e.g. a cheaper or more obedient title model), set `session.smart_rename_agent` to any installed one-shot-capable agent; leave it empty to use the session's agent. If the automatic rename never lands (the one-shot timed out or returned unusable output), right-click the session in the sidebar and pick "Auto-name now" to re-run it; the action is offered only while the session is still default-named.
+The rename waits for the first turn to finish and titles from the whole transcript, your prompt and the agent's response, so the title reflects what the turn did (and the one-shot never races the live agent for the provider API).
+
+To name with a different agent than the session's own (e.g. a cheaper or more obedient title model), set `session.smart_rename_agent` to any installed one-shot-capable agent; leave it empty to use the session's agent. The same setting also picks the agent for the conversation-summary one-shot. If the automatic rename never lands (the one-shot timed out or returned unusable output), right-click the session in the sidebar and pick "Auto-name now" to re-run it; the action is offered only while the session is still default-named. "Auto-name now" runs on demand even when `session.smart_rename` is off, so you can name a session by hand without enabling automatic renaming. The native TUI has the same on-demand action on a still-default-named session, via the `v` key or the command palette ("Auto-name now").
 
 The sidebar shows where each session stands: an `Auto-name` chip (sparkle) marks a session that is still default-named and will be renamed on its first message, and a `Naming…` chip (pulsing dot) shows while the one-shot title call is in flight. The chips disappear once the session is renamed or if it is not eligible.
 

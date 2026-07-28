@@ -384,7 +384,7 @@ fn test_quit_during_creation_shows_confirm() {
     h.wait_for_absent("Creating...", Duration::from_secs(5));
 }
 
-/// Write a global config that opts into `new_session_attach_mode = "live_send"`
+/// Write a global config that opts into `default_attach_mode = "live_send"`
 /// so creation routes into live-send mode instead of the historical tmux
 /// attach. No hooks; the sync create path applies (this is the path that
 /// originally bypassed the setting).
@@ -401,7 +401,7 @@ last_seen_version = "{version}"
 has_acknowledged_agent_hooks = true
 
 [session]
-new_session_attach_mode = "live_send"
+default_attach_mode = "live_send"
 "#,
         version = env!("CARGO_PKG_VERSION"),
     );
@@ -525,7 +525,7 @@ fn test_new_session_from_saved_project_prefills_path() {
 
 #[test]
 #[serial]
-fn test_new_session_from_project_empty_state() {
+fn test_new_session_from_project_empty_state_opens_add_form() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("new_from_project_empty");
@@ -534,7 +534,14 @@ fn test_new_session_from_project_empty_state() {
     h.send_keys("Enter"); // dismiss first-run welcome
     h.wait_for("No sessions yet");
 
-    // With no saved projects, `b` surfaces the info dialog instead.
+    // With no saved projects, `b` opens the project add form directly.
     h.send_keys("b");
-    h.wait_for("No Projects");
+    h.wait_for(" Projects ");
+    h.assert_screen_contains("Path:");
+    h.assert_screen_contains("Base branch:");
+
+    // Esc should cancel the direct add flow without requiring a second Esc.
+    h.send_keys("Escape");
+    h.wait_for_absent(" Projects ", Duration::from_secs(5));
+    h.assert_screen_contains("No sessions yet");
 }

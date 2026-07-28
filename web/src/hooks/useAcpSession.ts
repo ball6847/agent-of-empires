@@ -13,6 +13,7 @@ import {
   applyEvent,
   emptyAcpState,
   isTurnActive,
+  mergePrependedActivity,
   normaliseTurnCounters,
   reduceFrames,
   setActivityLimit,
@@ -53,8 +54,9 @@ export type Action =
   | { kind: "prepend"; frames: AcpFrame[]; oldestSeq: number }
   | { kind: "handshake"; frames: AcpFrame[] }
   | { kind: "lagged"; skipped: number }
-  | { kind: "user_prompt"; text: string; attachments?: AcpAttachment[] }
+  | { kind: "user_prompt"; text: string; attachments?: AcpAttachment[]; id?: string }
   | { kind: "prompt_send_rejected" }
+  | { kind: "rollback_optimistic_prompt"; id: string }
   | { kind: "error"; message: string }
   | { kind: "clear_error" }
   | { kind: "approval_resolved_locally"; nonce: string }
@@ -436,11 +438,11 @@ export function acpHookReducer(state: AcpState, action: Action): AcpState {
   return reducer(state, action);
 }
 
-/** Build the single combined prompt fired when
- *  `acp.queue_drain_mode = combined` and the agent transitions to
- *  idle with a non-empty queue. Joins every queued entry's text with a
- *  blank line so the agent sees them as one batch follow-up. Extracted
- *  for testability; consumed by the drain effect below. See #1031. */
+/** Build the single combined prompt fired when the agent transitions
+ *  to idle with a non-empty queue. Joins every queued entry's text
+ *  with a blank line so the agent sees them as one batch follow-up.
+ *  Extracted for testability; consumed by the drain effect below.
+ *  See #1031. */
 export function combineQueuedPrompts(queue: ReadonlyArray<QueuedPrompt>): string {
   // Skip empty entries: an attachment-only queued prompt carries no
   // text, and gluing its "" in would leave stray blank-line separators.
@@ -520,7 +522,11 @@ export function reducer(state: AcpState, action: Action): AcpState {
     // split-turn seam and no overlap to dedupe. See #2236.
     const next = { ...state, oldestSeq: action.oldestSeq };
     if (action.frames.length === 0) return next;
-    next.activity = reduceFrames(action.frames).activity.concat(state.activity);
+    // A tool call split across the seam left a synthesized start in the
+    // tail; merge the older page's real start into it rather than emitting
+    // a duplicate `toolCallId` that crashes assistant-ui's useResources
+    // ("Duplicate key"). See #2711.
+    next.activity = mergePrependedActivity(reduceFrames(action.frames).activity, state.activity);
     return next;
   }
   if (action.kind === "handshake") {
@@ -603,7 +609,10 @@ export function reducer(state: AcpState, action: Action): AcpState {
     return {
       ...state,
       activity: state.activity.concat({
-        id: `user-${Date.now()}-${state.activity.length}`,
+        // Accept a caller-supplied id so a transient send failure can
+        // roll this exact row back (see `rollback_optimistic_prompt`)
+        // rather than guessing which row to remove.
+        id: action.id ?? `user-${Date.now()}-${state.activity.length}`,
         kind: "user_prompt",
         text: action.text,
         attachments: action.attachments && action.attachments.length > 0 ? action.attachments : undefined,
@@ -636,6 +645,28 @@ export function reducer(state: AcpState, action: Action): AcpState {
         pendingUserPromptSeq: state.pendingUserPromptSeq,
         lastStoppedSeq,
       }),
+    };
+  }
+  if (action.kind === "rollback_optimistic_prompt") {
+    // A transient send failure (worker_not_ready 503 while resuming) re-queues
+    // the prompt, so its optimistic transcript row must be removed: otherwise
+    // the drain's re-send appends a second copy (the duplicate bubbles in the
+    // report) that the server `UserPromptSent` cannot dedupe. Remove exactly
+    // the row we appended; the prompt now lives only in `queuedPrompts` (the
+    // QUEUED strip), matching the busy-agent enqueue path where no optimistic
+    // row exists until the drain actually sends.
+    //
+    // Deliberately DO NOT touch `pendingUserPromptSeq` / `turnActive`: leaving
+    // the turn pending keeps the drain effect braked on `if (state.turnActive)
+    // return` so it does not hot-loop re-POSTing the wake while the worker is
+    // still resuming. The phantom turn is retired instead on the next
+    // `AcpSessionAssigned` (the worker-online signal), which is when the drain
+    // should fire. See #3094 / #3087.
+    const idx = state.activity.findIndex((r) => r.id === action.id);
+    if (idx === -1) return state;
+    return {
+      ...state,
+      activity: state.activity.slice(0, idx).concat(state.activity.slice(idx + 1)),
     };
   }
   if (action.kind === "enqueue_prompt") {
@@ -777,15 +808,7 @@ export function useAcpSession(
   useEffect(() => {
     snoozedUntilRef.current = snoozedUntil;
   }, [snoozedUntil]);
-  // Drain mode is sourced from the daemon's resolved `[acp]` config
-  // and republished via `AcpPrefsProvider` (App.tsx). Held in a ref
-  // so the drain effect's pop logic always sees the latest value
-  // without re-running the effect on every toggle. See #1031.
-  const { queueDrainMode, replayEvents } = useAcpPrefs();
-  const drainModeRef = useRef(queueDrainMode);
-  useEffect(() => {
-    drainModeRef.current = queueDrainMode;
-  }, [queueDrainMode]);
+  const { replayEvents } = useAcpPrefs();
   // Clear-conversation aliases for the session's active agent. The drain
   // effect needs them to slice the queued-prompt snapshot at clear-command
   // boundaries so `/clear` (claude) / `/new` (codex, opencode) fires as a
@@ -1531,10 +1554,14 @@ export function useAcpSession(
       }));
       // Optimistically echo the user's message; the agent reply
       // streams back as session/update events on the WS. If the POST
-      // fails we'll surface a banner and the user can retry; the
-      // optimistic row stays so they see what they tried to send.
+      // fails with a 4xx the optimistic row stays so the user sees what
+      // they tried to send; a transient worker_not_ready 503 rolls this
+      // exact row back (by id) because the prompt is re-queued and the
+      // drain would otherwise echo a duplicate. See #3094 / #3087.
+      const optimisticId = `user-opt-${crypto.randomUUID()}`;
       dispatch({
         kind: "user_prompt",
+        id: optimisticId,
         text,
         attachments: previews.length > 0 ? previews : undefined,
       });
@@ -1579,6 +1606,11 @@ export function useAcpSession(
           const workerNotReady = res.status === 503 && detail.startsWith("worker_not_ready");
           if (rejected) {
             dispatch({ kind: "prompt_send_rejected" });
+          } else if (workerNotReady) {
+            // Undo the optimistic row + turn: the caller re-queues this
+            // prompt, so it must live only in the queue until the drain
+            // resends it once the worker is back online. See #3094 / #3087.
+            dispatch({ kind: "rollback_optimistic_prompt", id: optimisticId });
           }
           if (!workerNotReady) {
             dispatch({
@@ -1695,11 +1727,8 @@ export function useAcpSession(
   );
 
   // Drain effect: when the agent transitions to idle and the queue is
-  // non-empty, dispatch follow-ups per `acp.queue_drain_mode`:
-  //   - combined (default): join every queued entry with `\n\n` and
-  //     fire one prompt; the agent's single response covers the batch.
-  //   - serial: pop the head only; the next Stopped re-runs this effect
-  //     and fires the following entry. One response per entry.
+  // non-empty, join every queued entry with `\n\n` and fire one
+  // prompt; the agent's single response covers the batch.
   // Guarded by `drainingRef` so a re-render between the dequeue
   // dispatch and the next state tick doesn't fire the same head twice.
   // Skipped while a worker-stopped / restarting banner is showing; a
@@ -1734,66 +1763,52 @@ export function useAcpSession(
     if (statusRef.current !== "open") return;
     if (state.queuedPrompts.length === 0) return;
     drainingRef.current = true;
-    if (drainModeRef.current === "combined") {
-      // Slice the leading sub-batch out of the queue and POST only that.
-      // The boundary is each clear-command alias (`/clear`, `/new`); when
-      // the head is a clear alias it fires alone, otherwise the run of
-      // non-clear entries up to the next alias is joined into one
-      // combined POST. The remaining entries stay queued and the next
-      // `Stopped` re-runs this effect, dispatching the next sub-batch.
-      // Single-pass POST per drain matches the existing combined-mode
-      // contract (one prompt fires per turn cycle), and the agent sees a
-      // clean clear-command boundary instead of `/clear\n\n<text>`.
-      // See #1356.
-      //
-      // The user can enqueue MORE prompts during the await; on success
-      // we only clear the items in the snapshot so newly-typed entries
-      // survive into the next turn. On failure (POST non-OK / network
-      // blip / WS dropped mid-send) we leave the queue untouched so the
-      // next Stopped retries.
-      const queue = state.queuedPrompts;
-      const aliases = clearAliasesRef.current;
-      const headIsClear = aliases.length > 0 && isClearAlias(queue[0]!.text, aliases);
-      let batchEnd = 1;
-      if (!headIsClear && aliases.length > 0) {
-        while (batchEnd < queue.length && !isClearAlias(queue[batchEnd]!.text, aliases)) {
-          batchEnd += 1;
-        }
-      } else if (aliases.length === 0) {
-        batchEnd = queue.length;
+    // Slice the leading sub-batch out of the queue and POST only that.
+    // The boundary is each clear-command alias (`/clear`, `/new`); when
+    // the head is a clear alias it fires alone, otherwise the run of
+    // non-clear entries up to the next alias is joined into one
+    // combined POST. The remaining entries stay queued and the next
+    // `Stopped` re-runs this effect, dispatching the next sub-batch.
+    // Single-pass POST per drain matches the existing combined-mode
+    // contract (one prompt fires per turn cycle), and the agent sees a
+    // clean clear-command boundary instead of `/clear\n\n<text>`.
+    // See #1356.
+    //
+    // The user can enqueue MORE prompts during the await; on success
+    // we only clear the items in the snapshot so newly-typed entries
+    // survive into the next turn. On failure (POST non-OK / network
+    // blip / WS dropped mid-send) we leave the queue untouched so the
+    // next Stopped retries.
+    const queue = state.queuedPrompts;
+    const aliases = clearAliasesRef.current;
+    const headIsClear = aliases.length > 0 && isClearAlias(queue[0]!.text, aliases);
+    let batchEnd = 1;
+    if (!headIsClear && aliases.length > 0) {
+      while (batchEnd < queue.length && !isClearAlias(queue[batchEnd]!.text, aliases)) {
+        batchEnd += 1;
       }
-      const snapshot = queue.slice(0, batchEnd);
-      const combined = combineQueuedPrompts(snapshot);
-      // Merge every attachment in the sub-batch into the one combined
-      // POST. If that overflows the server's per-prompt cap the POST
-      // 4xx-rejects and the batch retires via the non-retryable path
-      // below, same as any other rejected combined send. See #1833.
-      const combinedAttachments = snapshot.flatMap((q) => q.attachments ?? []);
-      const sentIds = snapshot.map((q) => q.id);
-      void dispatchPromptNow(combined, combinedAttachments.length > 0 ? combinedAttachments : undefined)
-        .then((result) => {
-          // Retire on success and on non-retryable rejection; only a
-          // transient failure keeps the batch queued for the next retry.
-          if (result !== "retryable_failure") {
-            dispatch({ kind: "dequeue_prompts_by_id", ids: sentIds });
-          }
-        })
-        .finally(() => {
-          drainingRef.current = false;
-        });
-    } else {
-      const head = state.queuedPrompts[0]!;
-      const headId = head.id;
-      void dispatchPromptNow(head.text, head.attachments)
-        .then((result) => {
-          if (result !== "retryable_failure") {
-            dispatch({ kind: "dequeue_prompt", id: headId });
-          }
-        })
-        .finally(() => {
-          drainingRef.current = false;
-        });
+    } else if (aliases.length === 0) {
+      batchEnd = queue.length;
     }
+    const snapshot = queue.slice(0, batchEnd);
+    const combined = combineQueuedPrompts(snapshot);
+    // Merge every attachment in the sub-batch into the one combined
+    // POST. If that overflows the server's per-prompt cap the POST
+    // 4xx-rejects and the batch retires via the non-retryable path
+    // below, same as any other rejected combined send. See #1833.
+    const combinedAttachments = snapshot.flatMap((q) => q.attachments ?? []);
+    const sentIds = snapshot.map((q) => q.id);
+    void dispatchPromptNow(combined, combinedAttachments.length > 0 ? combinedAttachments : undefined)
+      .then((result) => {
+        // Retire on success and on non-retryable rejection; only a
+        // transient failure keeps the batch queued for the next retry.
+        if (result !== "retryable_failure") {
+          dispatch({ kind: "dequeue_prompts_by_id", ids: sentIds });
+        }
+      })
+      .finally(() => {
+        drainingRef.current = false;
+      });
   }, [
     status,
     workerState,

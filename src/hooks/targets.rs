@@ -42,9 +42,9 @@ pub(crate) struct HookTarget {
     pub agent_name: &'static str,
     pub kind: HookTargetKind,
     pub path: PathBuf,
-    /// Hook events to register; empty for `Sidecar` (sidecar installers carry
-    /// their own static event tables internally).
-    pub events: &'static [crate::agents::HookEvent],
+    /// Hook events to register. Migration targets use defaults, not
+    /// profile-specific status maps, because migrations repair canonical files.
+    pub events: Vec<crate::agents::ResolvedHookEvent>,
 }
 
 /// Enumerate every hook target reachable from the running AoE process: the
@@ -89,20 +89,30 @@ pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Ve
                 crate::agents::HookFormat::CodexJson => HookTargetKind::CodexJson,
             };
             for path in paths {
+                let events = crate::agents::resolved_hook_events(
+                    agent,
+                    &crate::session::config::Config::default(),
+                )
+                .unwrap_or_default();
                 out.push(HookTarget {
                     agent_name: agent.name,
                     kind,
                     path,
-                    events: hook_cfg.events,
+                    events,
                 });
             }
         }
         if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
+            let events = crate::agents::resolved_sidecar_hook_events(
+                agent,
+                &crate::session::config::Config::default(),
+            )
+            .unwrap_or_default();
             out.push(HookTarget {
                 agent_name: agent.name,
                 kind: HookTargetKind::Sidecar(sidecar),
                 path: home.join(sidecar.host_config_subpath),
-                events: &[],
+                events,
             });
         }
     }
@@ -164,6 +174,10 @@ pub(crate) fn has_aoe_marker(target: &HookTarget) -> bool {
             crate::agents::SidecarFormat::SettlToml => settl_config_has_aoe_marker(&target.path),
             crate::agents::SidecarFormat::HermesYaml => hermes_config_has_aoe_marker(&target.path),
             crate::agents::SidecarFormat::KiroJson => kiro_config_has_aoe_marker(&target.path),
+            // Kimi's config.toml uses the same flat `[[hooks]]` array of
+            // `{ event, command }` entries as settl, so the settl marker
+            // walker identifies AoE-managed hooks in it unchanged.
+            crate::agents::SidecarFormat::KimiToml => settl_config_has_aoe_marker(&target.path),
         },
     }
 }

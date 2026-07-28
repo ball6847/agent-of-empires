@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::collections::HashSet;
 
-use crate::session::{GroupTree, StartOutcome, Storage};
+use crate::session::{ClaimOp, GroupTree, Instance, ResumeIntent, StartOutcome, Storage};
 
 #[derive(Subcommand)]
 pub enum SessionCommands {
@@ -55,13 +55,23 @@ pub enum SessionCommands {
     /// Wake a snoozed session immediately
     Unsnooze(SessionIdArgs),
 
-    /// Mark a session as a favorite. Favorited rows pin to the top of
-    /// their status tier in the Attention sort and render with a leading
-    /// `* ` glyph plus bold + underline.
+    /// Mark a session as a favorite. With `session.favorites_first` on (the
+    /// default), favorited rows pin to the top of their sibling scope in every
+    /// sort order; with it off, they pin within their status tier in the
+    /// Attention sort only. Either way the row renders with a leading `*`
+    /// marker plus bold and underline wherever the pin applies. Snoozing a
+    /// favorite suspends the pin until it wakes.
     Favorite(SessionIdArgs),
 
     /// Clear the favorite flag on a session.
     Unfavorite(SessionIdArgs),
+
+    /// Set (or clear) a per-session color label, rendered as a colored dot in
+    /// the web sidebar for at-a-glance status signaling. Intended for a
+    /// running agent to flag its own state, e.g.
+    /// `aoe session color $(aoe session current -q) red`. Colors: `red`
+    /// (needs attention), `amber` (working), `green` (done); `none` clears it.
+    Color(SetColorArgs),
 
     /// Archive a session: sink it in the Attention sort and tear down its
     /// tmux sessions. Worktree, branch, container preserved. `--no-kill`
@@ -75,11 +85,55 @@ pub enum SessionCommands {
     /// transcript and metadata intact. See #2489.
     Restore(SessionIdArgs),
 
+    /// Import existing Claude Code sessions from disk. Scans the given
+    /// path(s) (default: current directory) for Claude Code conversations
+    /// whose working directory is at or under a path, and creates an AoE
+    /// session for each: a terminal/tmux session that resumes the
+    /// conversation with `claude --resume <id>` (default), or a
+    /// structured-view session with `--structured`.
+    Import(ImportArgs),
+
     /// List the sessions currently in the trash.
     ListTrash,
 
     /// Permanently purge every trashed session in the profile (irreversible).
     EmptyTrash,
+}
+
+#[derive(Args)]
+pub struct ImportArgs {
+    /// Directories to scan. Only Claude sessions whose recorded working
+    /// directory is at or under one of these are imported. Defaults to the
+    /// current directory. Cannot be combined with `--all`.
+    pub paths: Vec<String>,
+
+    /// Import every discoverable Claude session, ignoring the path filter.
+    #[arg(long, conflicts_with = "paths")]
+    pub all: bool,
+
+    /// Import as structured-view sessions (rendered in the web dashboard and
+    /// the structured TUI view) instead of terminal/tmux sessions. Structured
+    /// sessions replay their transcript under `aoe serve`.
+    #[cfg(feature = "serve")]
+    #[arg(long)]
+    pub structured: bool,
+
+    /// Place imported sessions under this session group.
+    #[arg(long)]
+    pub group: Option<String>,
+
+    /// Start terminal sessions immediately after importing (spawns the tmux
+    /// pane running `claude --resume <id>`). Ignored for structured imports.
+    #[arg(long)]
+    pub launch: bool,
+
+    /// List what would be imported without creating anything.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Skip the confirmation prompt when importing more than one session.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 #[derive(Args)]
@@ -235,6 +289,15 @@ pub struct SetBaseArgs {
     pub clear: bool,
 }
 
+#[derive(Args)]
+pub struct SetColorArgs {
+    /// Session ID or title
+    pub identifier: String,
+    /// Color label: `red` (needs attention), `amber` (working), `green`
+    /// (done), or `none`/`clear` to remove the label.
+    pub color: String,
+}
+
 #[derive(Serialize)]
 struct SessionDetails {
     id: String,
@@ -267,16 +330,18 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Unsnooze(args) => unsnooze_session(profile, args).await,
         SessionCommands::Favorite(args) => favorite_session(profile, args).await,
         SessionCommands::Unfavorite(args) => unfavorite_session(profile, args).await,
+        SessionCommands::Color(args) => set_color_session(profile, args).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
         SessionCommands::Unarchive(args) => unarchive_session(profile, args).await,
         SessionCommands::Restore(args) => restore_session(profile, args).await,
+        SessionCommands::Import(args) => import_sessions(profile, args).await,
         SessionCommands::ListTrash => list_trash(profile).await,
         SessionCommands::EmptyTrash => empty_trash(profile).await,
     }
 }
 
 async fn favorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.favorite();
@@ -288,7 +353,7 @@ async fn favorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn unfavorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.unfavorite();
@@ -299,8 +364,33 @@ async fn unfavorite_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
+async fn set_color_session(profile: &str, args: SetColorArgs) -> Result<()> {
+    // `none`/`clear`/empty clears the label; anything else must be a palette
+    // member (validated inside `Instance::set_color`).
+    let normalized = args.color.trim().to_lowercase();
+    let new_color = match normalized.as_str() {
+        "none" | "clear" | "" => None,
+        other => Some(other.to_string()),
+    };
+
     let storage = Storage::new_unwatched(profile)?;
+    let (title, color) = storage.update(|instances, _groups| {
+        super::patch_instance(instances, &args.identifier, |inst| {
+            inst.set_color(new_color.clone())
+                .map_err(|e| anyhow::anyhow!(e))?;
+            Ok((inst.title.clone(), inst.color.clone()))
+        })
+    })?;
+
+    match color {
+        Some(c) => println!("✓ Set color for '{}': {}", title, c),
+        None => println!("✓ Cleared color for '{}'", title),
+    }
+    Ok(())
+}
+
+async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
+    let storage = Storage::open_unwatched(profile)?;
 
     // Phase 1 (unlocked): resolve identifier.
     let (instances, _groups) = storage.load_with_groups()?;
@@ -339,24 +429,19 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
 }
 
 async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
-        let id = super::resolve_session(&args.identifier, instances)?
-            .id
-            .clone();
-        let inst = instances
-            .iter_mut()
-            .find(|i| i.id == id)
-            .expect("resolve_session returned an id that is no longer in instances");
-        inst.unarchive();
-        Ok(inst.title.clone())
+        super::patch_instance(instances, &args.identifier, |inst| {
+            inst.unarchive();
+            Ok(inst.title.clone())
+        })
     })?;
     println!("Unarchived: {}", title);
     Ok(())
 }
 
 async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Resolve within the trashed subset only. The CLI advertises the argument
     // as an id OR title, and a live or archived session can share a title/path
@@ -374,6 +459,28 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         .clone();
     let restore_id = inst.id.clone();
 
+    // Symmetric claim (#2541): win the Restore claim under the flock BEFORE the
+    // unlocked worktree move, so a concurrent purge from another process cannot
+    // tear the worktree down while this restore relocates it. A fresh Purge
+    // claim wins here and the restore bails.
+    let claim = storage.update(|instances, _groups| {
+        Ok(crate::session::claim::decide_restore_claim(
+            instances,
+            &restore_id,
+            chrono::Utc::now(),
+        ))
+    })?;
+    match claim {
+        crate::session::claim::RestoreClaimDecision::AlreadyGone => {
+            anyhow::bail!("No trashed session matching '{}'", args.identifier)
+        }
+        crate::session::claim::RestoreClaimDecision::PurgeInProgress => anyhow::bail!(
+            "Session {} is being purged by another process, so it was not restored",
+            inst.title
+        ),
+        crate::session::claim::RestoreClaimDecision::Claimed => {}
+    }
+
     // Move the worktree back to its pre-trash location before flipping the
     // marker. Strict: if the original path is occupied or git refuses, leave
     // the session trashed and surface the error rather than restoring it to
@@ -381,27 +488,47 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     if let crate::session::trash::RestoreOutcome::Failed { reason } =
         crate::session::trash::restore_worktree_location(&mut inst)
     {
+        release_restore_claim(&storage, &restore_id);
         anyhow::bail!("Cannot restore worktree: {reason}");
     }
     let restored_path = inst.project_path.clone();
     let restored_pre = inst.pre_trash_project_path.clone();
 
-    let title = storage.update(|instances, _groups| {
-        let stored = instances
-            .iter_mut()
-            .find(|i| i.id == restore_id)
-            .ok_or_else(|| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?;
-        stored.project_path = restored_path.clone();
-        stored.pre_trash_project_path = restored_pre.clone();
-        stored.untrash();
-        Ok(stored.title.clone())
+    let commit = storage.update(|instances, _groups| {
+        Ok(crate::session::claim::finalize_restore_commit(
+            instances,
+            &restore_id,
+            &restored_path,
+            &restored_pre,
+        ))
     })?;
-    println!("Restored: {}", title);
+    match commit {
+        crate::session::claim::RestoreCommit::Committed => {}
+        crate::session::claim::RestoreCommit::PurgeStoleClaim => anyhow::bail!(
+            "Session {} was claimed by a purge mid-restore, so it was not restored",
+            inst.title
+        ),
+        crate::session::claim::RestoreCommit::AlreadyGone => {
+            anyhow::bail!("No trashed session matching '{}'", args.identifier)
+        }
+    }
+    println!("Restored: {}", inst.title);
     Ok(())
 }
 
+/// Release a Restore claim after a failed worktree move, ownership-guarded so a
+/// peer's fresh Purge claim (stale-override) is never cleared. See #2541.
+fn release_restore_claim(storage: &Storage, restore_id: &str) {
+    let _ = storage.update(|instances, _groups| {
+        if let Some(stored) = instances.iter_mut().find(|i| i.id == restore_id) {
+            stored.clear_op_claim_if_owned(ClaimOp::Restore);
+        }
+        Ok(())
+    });
+}
+
 async fn list_trash(profile: &str) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
     let trashed: Vec<_> = instances.iter().filter(|i| i.is_trashed()).collect();
     if trashed.is_empty() {
@@ -420,7 +547,7 @@ async fn list_trash(profile: &str) -> Result<()> {
 }
 
 async fn empty_trash(profile: &str) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Phase 1 (unlocked): snapshot the trashed sessions and run the slow
     // teardown for each. Purge is permanent; force removal so a dirty
@@ -437,7 +564,38 @@ async fn empty_trash(profile: &str) -> Result<()> {
     }
 
     let mut purged_ids = Vec::new();
+    // Rows we claimed and tore down but whose teardown/transcript purge failed:
+    // genuinely kept for retry (distinct from rows a peer is restoring). See #2541.
+    let mut claimed_failed_ids = Vec::new();
+    // Rows a peer is restoring: either it holds a fresh Restore claim
+    // (RestoreInProgress) or it already un-trashed the row before our claim
+    // (Restored). Either way we never tore anything down, so they are benign and
+    // reported as one figure.
+    let mut being_restored_elsewhere = 0usize;
     for inst in &trashed {
+        // Per-row claim just before each teardown (#2541), via the shared
+        // decision. A single up-front batch claim would risk overrunning the
+        // TTL for late rows in a large empty-trash; claiming per row keeps every
+        // teardown inside a fresh claim. Only a `Claimed` decision tears down;
+        // every other outcome is skipped and counted for an honest report.
+        let claim = storage.update(|all_instances, _groups| {
+            Ok(crate::session::claim::decide_purge_claim(
+                all_instances,
+                &inst.id,
+                true,
+                chrono::Utc::now(),
+            ))
+        })?;
+        match claim {
+            crate::session::claim::PurgeClaimDecision::Claimed => {}
+            crate::session::claim::PurgeClaimDecision::RestoreInProgress
+            | crate::session::claim::PurgeClaimDecision::Restored => {
+                being_restored_elsewhere += 1;
+                continue;
+            }
+            crate::session::claim::PurgeClaimDecision::AlreadyGone => continue,
+        }
+
         let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
             profile,
             std::path::Path::new(&inst.project_path),
@@ -477,11 +635,16 @@ async fn empty_trash(profile: &str) -> Result<()> {
         if result.success {
             match super::purge_acp_transcript(inst) {
                 Ok(()) => purged_ids.push(inst.id.clone()),
-                Err(e) => eprintln!(
-                    "Warning ({}): transcript not purged, keeping session in trash: {}",
-                    inst.title, e
-                ),
+                Err(e) => {
+                    eprintln!(
+                        "Warning ({}): transcript not purged, keeping session in trash: {}",
+                        inst.title, e
+                    );
+                    claimed_failed_ids.push(inst.id.clone());
+                }
             }
+        } else {
+            claimed_failed_ids.push(inst.id.clone());
         }
     }
 
@@ -489,39 +652,50 @@ async fn empty_trash(profile: &str) -> Result<()> {
     // state. #2534: revalidate under the lock; a candidate restored mid-purge
     // (no longer trashed) must survive even though its teardown already ran on
     // the snapshot. #2527: report the count actually removed, not the candidate
-    // count, plus how many were kept (teardown/transcript failed, or restored).
+    // count. `kept_for_retry` counts only rows we claimed whose teardown failed,
+    // NOT rows a peer is restoring (those are reported separately). See #2541.
     let purged_set: HashSet<String> = purged_ids.into_iter().collect();
-    let candidate_ids: HashSet<String> = trashed.iter().map(|i| i.id.clone()).collect();
-    // Compute `kept` from candidate rows that are STILL present after the purge,
-    // not `candidates - removed`: a candidate a peer already removed before this
-    // lock is neither removed by us nor still around, so subtracting would
-    // wrongly report it as kept for retry.
-    let (removed, restored, kept) = storage.update(|all_instances, _groups| {
-        let (removed, restored) = super::apply_empty_trash_purge(all_instances, &purged_set);
-        let kept = all_instances
-            .iter()
-            .filter(|i| candidate_ids.contains(&i.id))
-            .count();
-        Ok((removed, restored, kept))
+    let claimed_failed_set: HashSet<String> = claimed_failed_ids.into_iter().collect();
+    let outcome = storage.update(|all_instances, _groups| {
+        Ok(super::finalize_empty_trash(
+            all_instances,
+            &purged_set,
+            &claimed_failed_set,
+        ))
     })?;
-    if restored > 0 {
+    // A restore that raced our teardown (after it began) is the only case that
+    // risks orphaned artifacts, so it gets the repair warning; benign
+    // being-restored-elsewhere rows (no teardown ran) do not.
+    if outcome.restored_after_teardown > 0 {
         eprintln!(
-            "Warning: {restored} session(s) were restored while the trash was being \
-             emptied; kept the restored records, but their worktree, branch, container, \
-             or transcript may already have been removed. Inspect and repair them."
+            "Warning: {} session(s) were restored mid-purge after teardown began; kept the \
+             restored records, but their worktree, branch, container, or transcript may already \
+             have been removed. Inspect and repair them.",
+            outcome.restored_after_teardown
         );
     }
-    if kept > 0 {
-        println!(
-            "Emptied trash: purged {removed} session(s), kept {kept} for retry, from profile '{}'.",
-            storage.profile()
-        );
-    } else {
-        println!(
-            "Emptied trash: purged {removed} session(s) from profile '{}'.",
-            storage.profile()
-        );
+    // Each figure is its own disjoint category, so the "restored mid-purge"
+    // count matches the warning above exactly (no summary/warning mismatch).
+    let mut parts = vec![format!("purged {} session(s)", outcome.removed)];
+    if outcome.kept_for_retry > 0 {
+        parts.push(format!("kept {} for retry", outcome.kept_for_retry));
     }
+    if being_restored_elsewhere > 0 {
+        parts.push(format!(
+            "{being_restored_elsewhere} being restored by another process"
+        ));
+    }
+    if outcome.restored_after_teardown > 0 {
+        parts.push(format!(
+            "{} restored mid-purge",
+            outcome.restored_after_teardown
+        ));
+    }
+    println!(
+        "Emptied trash: {} (profile '{}').",
+        parts.join(", "),
+        storage.profile()
+    );
     Ok(())
 }
 
@@ -538,7 +712,7 @@ async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
     crate::session::validate_snooze_duration(raw_minutes).map_err(|e| anyhow::anyhow!("{}", e))?;
     let minutes = raw_minutes as u32;
 
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.snooze(minutes);
@@ -550,7 +724,7 @@ async fn snooze_session(profile: &str, args: SnoozeArgs) -> Result<()> {
 }
 
 async fn unsnooze_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let title = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             inst.unsnooze();
@@ -562,7 +736,7 @@ async fn unsnooze_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Phase 1 (unlocked): snapshot the target by identifier, rehydrate
     // `source_profile` so config resolution honors the right profile.
@@ -635,6 +809,243 @@ fn bail_if_acp(_inst: &crate::session::Instance, _verb: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the scan roots for `aoe session import`. Empty input means the
+/// current directory. Each root is canonicalized (falling back to the path as
+/// given if it does not resolve) so the component-aware filter compares against
+/// absolute paths.
+fn resolve_import_roots(paths: &[String]) -> Result<Vec<std::path::PathBuf>> {
+    let raw: Vec<std::path::PathBuf> = if paths.is_empty() {
+        vec![std::env::current_dir()?]
+    } else {
+        paths.iter().map(std::path::PathBuf::from).collect()
+    };
+    Ok(raw
+        .into_iter()
+        .map(|p| p.canonicalize().unwrap_or(p))
+        .collect())
+}
+
+/// True when `id` is already imported by some instance, so a re-run does not
+/// create duplicates. Checks the terminal resume target, the poller-observed
+/// id, and (serve builds) the structured-view id.
+fn already_imported(instances: &[Instance], id: &str) -> bool {
+    instances.iter().any(|inst| {
+        if inst.agent_session_id.as_deref() == Some(id) {
+            return true;
+        }
+        if matches!(&inst.resume_intent, ResumeIntent::Use(s) if s == id) {
+            return true;
+        }
+        #[cfg(feature = "serve")]
+        if inst.acp_session_id.as_deref() == Some(id) {
+            return true;
+        }
+        false
+    })
+}
+
+/// Build the AoE `Instance` for one discovered Claude session. Terminal imports
+/// pin `resume_intent` so the first launch emits `claude --resume <id>`;
+/// structured imports (serve only) seed the fields the reconciler reads to
+/// replay the transcript.
+fn build_import_instance(
+    s: &crate::session::claude_import::ClaudeSessionSummary,
+    structured: bool,
+    group: &str,
+) -> Instance {
+    let title = s.title.clone().unwrap_or_else(|| {
+        let short = s.session_id.get(..8).unwrap_or(s.session_id.as_str());
+        format!("Claude import {short}")
+    });
+    let mut inst = Instance::new(&title, &s.cwd);
+    inst.tool = "claude".to_string();
+    if !group.is_empty() {
+        inst.group_path = group.to_string();
+    }
+    apply_import_mode(&mut inst, s, structured);
+    inst
+}
+
+#[cfg(feature = "serve")]
+fn apply_import_mode(
+    inst: &mut Instance,
+    s: &crate::session::claude_import::ClaudeSessionSummary,
+    structured: bool,
+) {
+    if structured {
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = Some(s.session_id.clone());
+        inst.import_pending = Some(true);
+    } else {
+        inst.resume_intent = ResumeIntent::Use(s.session_id.clone());
+    }
+}
+
+#[cfg(not(feature = "serve"))]
+fn apply_import_mode(
+    inst: &mut Instance,
+    s: &crate::session::claude_import::ClaudeSessionSummary,
+    _structured: bool,
+) {
+    inst.resume_intent = ResumeIntent::Use(s.session_id.clone());
+}
+
+async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
+    use crate::session::claude_import::{scan_sessions, sessions_under_paths, MAX_SESSIONS};
+
+    #[cfg(feature = "serve")]
+    let structured = args.structured;
+    #[cfg(not(feature = "serve"))]
+    let structured = false;
+
+    // Discover, then narrow to the requested paths unless --all.
+    let mut discovered = scan_sessions();
+    if !args.all {
+        let roots = resolve_import_roots(&args.paths)?;
+        discovered = sessions_under_paths(discovered, &roots);
+    }
+
+    // A session whose recorded cwd no longer exists cannot be resumed:
+    // `claude --resume` resolves the transcript by cwd, so a dead cwd would
+    // silently start a fresh conversation. Skip and report those.
+    let (candidates, missing_cwd): (Vec<_>, Vec<_>) =
+        discovered.into_iter().partition(|s| s.cwd_exists);
+
+    // Dedupe against sessions already imported into this profile.
+    let (existing, _groups) = Storage::open_unwatched(profile)?.load_with_groups()?;
+    let candidate_count = candidates.len();
+    let mut to_import: Vec<_> = candidates
+        .into_iter()
+        .filter(|s| !already_imported(&existing, &s.session_id))
+        .collect();
+    let already = candidate_count - to_import.len();
+
+    // Bulk safety backstop; the picker cap also applies to the CLI.
+    let capped = to_import.len() > MAX_SESSIONS;
+    if capped {
+        to_import.truncate(MAX_SESSIONS);
+    }
+
+    let report_skipped = || {
+        if already > 0 {
+            println!("  ({already} already imported, skipped)");
+        }
+        if !missing_cwd.is_empty() {
+            println!(
+                "  ({} skipped: working directory no longer exists)",
+                missing_cwd.len()
+            );
+        }
+        if capped {
+            println!("  (capped at {MAX_SESSIONS}; narrow the path(s) to import the rest)");
+        }
+    };
+
+    if to_import.is_empty() {
+        println!("No new Claude Code sessions to import.");
+        report_skipped();
+        return Ok(());
+    }
+
+    let kind = if structured { "structured" } else { "terminal" };
+    println!(
+        "Found {} Claude Code session(s) to import as {kind} sessions:",
+        to_import.len()
+    );
+    for s in &to_import {
+        let short = s.session_id.get(..8).unwrap_or(s.session_id.as_str());
+        let title = s.title.as_deref().unwrap_or("(no title)");
+        println!("  {short}  {title}  [{}]", s.cwd);
+    }
+    report_skipped();
+
+    if args.dry_run {
+        println!("Dry run: nothing created.");
+        return Ok(());
+    }
+
+    if to_import.len() > 1 && !args.yes {
+        use std::io::Write;
+        print!("Import {} session(s)? [y/N] ", to_import.len());
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let group = args.group.clone().unwrap_or_default();
+    let storage = Storage::open_unwatched(profile)?;
+    let created_ids = storage.update(|all_instances, groups| {
+        let mut ids = Vec::new();
+        for s in &to_import {
+            // Re-check under the lock so a concurrent import does not duplicate.
+            if already_imported(all_instances, &s.session_id) {
+                continue;
+            }
+            let inst = build_import_instance(s, structured, &group);
+            ids.push(inst.id.clone());
+            all_instances.push(inst.clone());
+            if !inst.group_path.is_empty() {
+                let mut tree = GroupTree::new_with_groups(all_instances, groups);
+                tree.create_group(&inst.group_path);
+                *groups = tree.get_all_groups();
+            }
+        }
+        Ok(ids)
+    })?;
+
+    println!("✓ Imported {} session(s).", created_ids.len());
+
+    if structured {
+        if args.launch {
+            println!("Note: --launch is ignored for structured imports.");
+        }
+        println!(
+            "Structured sessions replay their transcript on the next `aoe serve` \
+             (auto-spawned within ~2s while serve is running)."
+        );
+        return Ok(());
+    }
+
+    if args.launch {
+        launch_imported(profile, &created_ids)?;
+    } else if !created_ids.is_empty() {
+        println!("Start them with `aoe session start <id>` (or launch on import with --launch).");
+    }
+    Ok(())
+}
+
+/// Start freshly imported terminal sessions, spawning each tmux pane. Mirrors
+/// `start_session`'s three-phase pattern; failures are reported per session and
+/// do not abort the rest.
+fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
+    let storage = Storage::open_unwatched(profile)?;
+    for id in ids {
+        let (instances, _groups) = storage.load_with_groups()?;
+        let Some(inst) = instances.iter().find(|i| &i.id == id) else {
+            continue;
+        };
+        let mut working = inst.clone();
+        working.source_profile = profile.to_string();
+        if let Err(e) = working.start_with_size(crate::terminal::get_size()) {
+            eprintln!("Warning: failed to start {}: {e}", working.title);
+            continue;
+        }
+        let wid = working.id.clone();
+        storage.update(|instances, _groups| {
+            if let Some(stored) = instances.iter_mut().find(|i| i.id == wid) {
+                stored.merge_post_start(&working);
+            }
+            Ok(())
+        })?;
+        println!("✓ Started {}", working.title);
+    }
+    Ok(())
+}
+
 /// CLI handler for `aoe session stop`.
 ///
 /// Treats a docker inspect failure ([`crate::containers::Probe::Unknown`])
@@ -643,7 +1054,7 @@ fn bail_if_acp(_inst: &crate::session::Instance, _verb: &str) -> Result<()> {
 /// confirmed. The `warn!` for the Unknown case is emitted inside
 /// [`crate::session::Instance::stop`], so this call site does not re-warn.
 async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Phase 1 (unlocked): resolve identifier, do tmux/container shutdown.
     // Loaded snapshot is read-only here; the persistence happens in phase 2.
@@ -705,7 +1116,7 @@ async fn restart_session_dispatch(profile: &str, args: RestartArgs) -> Result<()
 }
 
 async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Phase 1 (unlocked): snapshot the targets. We don't hold the flock
     // across the parallel restart fan-out below; phase 3 re-loads under
@@ -877,7 +1288,7 @@ fn pick_targets_for_restart_all(instances: &[crate::session::Instance]) -> Vec<S
 }
 
 async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Phase 1 (unlocked): snapshot the target by identifier and
     // rehydrate `source_profile` for config resolution.
@@ -993,7 +1404,7 @@ async fn wait_for_pane_ready(session_id: &str, title: &str, max_wait: std::time:
 }
 
 async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let inst = super::resolve_session(&args.identifier, &instances)?;
@@ -1012,7 +1423,7 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 }
 
 async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let mut inst = if let Some(id) = &args.identifier {
@@ -1075,7 +1486,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
 }
 
 async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let inst = if let Some(id) = &args.identifier {
@@ -1161,7 +1572,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         bail!("At least one of --title or --group must be specified");
     }
 
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
 
     // Phase 1 (unlocked): resolve the target id (auto-detect from tmux if
     // no identifier given) and the old/new title pair so we can do the
@@ -1333,7 +1744,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
 }
 
 async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<()> {
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = if let Some(id) = &args.identifier {
         super::resolve_session(id, &instances)?
@@ -1444,7 +1855,7 @@ async fn current_session(args: CurrentArgs) -> Result<()> {
     let profiles = crate::session::list_profiles()?;
 
     for profile_name in &profiles {
-        if let Ok(storage) = Storage::new_unwatched(profile_name) {
+        if let Ok(storage) = Storage::open_unwatched(profile_name) {
             if let Ok((instances, _)) = storage.load_with_groups() {
                 if let Some(inst) = instances.iter().find(|i| {
                     let tmux_name = crate::tmux::Session::generate_name(&i.id, &i.title);
@@ -1493,7 +1904,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
         crate::session::ResumeIntent::Use(trimmed)
     };
 
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (title, tool) = storage.update(|instances, _groups| {
         super::patch_instance(instances, &args.identifier, |inst| {
             #[cfg(feature = "serve")]
@@ -1538,7 +1949,7 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
     if !args.clear && args.branch.is_none() {
         bail!("Provide a branch ref or pass --clear to remove the override.");
     }
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let instances = storage.load()?;
 
     let inst = super::resolve_session(&args.identifier, &instances)?;
@@ -1781,6 +2192,93 @@ mod set_session_id_tests {
     }
 }
 
+#[cfg(test)]
+mod set_color_tests {
+    use super::{set_color_session, SetColorArgs};
+    use crate::session::{Instance, Storage};
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    async fn seed(profile: &str) -> (Storage, String) {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let inst = Instance::new("color_session", "/tmp/x");
+        let id = inst.id.clone();
+        let on_disk = inst.clone();
+        storage
+            .update(|i, g| {
+                *i = vec![on_disk.clone()];
+                *g =
+                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
+                        .get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+        (storage, id)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn set_color_persists_palette_value_and_clears() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+        let (storage, id) = seed("set-color-ok").await;
+
+        set_color_session(
+            "set-color-ok",
+            SetColorArgs {
+                identifier: id.clone(),
+                color: "Red".to_string(), // case-insensitive
+            },
+        )
+        .await
+        .unwrap();
+        let loaded = storage.load().unwrap();
+        assert_eq!(
+            loaded.iter().find(|i| i.id == id).unwrap().color.as_deref(),
+            Some("red")
+        );
+
+        set_color_session(
+            "set-color-ok",
+            SetColorArgs {
+                identifier: id.clone(),
+                color: "none".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let loaded = storage.load().unwrap();
+        assert_eq!(loaded.iter().find(|i| i.id == id).unwrap().color, None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn set_color_rejects_unknown_color() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+        let (storage, id) = seed("set-color-bad").await;
+
+        let result = set_color_session(
+            "set-color-bad",
+            SetColorArgs {
+                identifier: id.clone(),
+                color: "chartreuse".to_string(),
+            },
+        )
+        .await;
+        assert!(result.is_err(), "unknown color must error");
+        // The rejected write must not have touched disk.
+        let loaded = storage.load().unwrap();
+        assert_eq!(loaded.iter().find(|i| i.id == id).unwrap().color, None);
+    }
+}
+
 #[cfg(all(test, feature = "serve"))]
 mod acp_reject_tests {
     use super::{set_session_id, SetSessionIdArgs};
@@ -1839,5 +2337,68 @@ mod acp_reject_tests {
             inst_disk.agent_session_id, None,
             "rejected call must not mutate sid",
         );
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    use crate::session::claude_import::ClaudeSessionSummary;
+
+    fn summary(id: &str, cwd: &str, title: Option<&str>) -> ClaudeSessionSummary {
+        ClaudeSessionSummary {
+            session_id: id.to_string(),
+            cwd: cwd.to_string(),
+            title: title.map(str::to_string),
+            last_modified_ms: 0,
+            cwd_exists: true,
+        }
+    }
+
+    #[test]
+    fn terminal_import_pins_resume_target() {
+        let s = summary("abc123-def456", "/home/me/proj", Some("Fix bug"));
+        let inst = build_import_instance(&s, false, "");
+        assert_eq!(inst.tool, "claude");
+        assert_eq!(inst.project_path, "/home/me/proj");
+        assert_eq!(inst.title, "Fix bug");
+        assert_eq!(
+            inst.resume_intent,
+            ResumeIntent::Use("abc123-def456".to_string())
+        );
+    }
+
+    #[test]
+    fn title_falls_back_to_short_id() {
+        let s = summary("abcdef12-3456-7890", "/home/me/proj", None);
+        let inst = build_import_instance(&s, false, "team/imports");
+        assert_eq!(inst.title, "Claude import abcdef12");
+        assert_eq!(inst.group_path, "team/imports");
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn structured_import_seeds_replay_fields() {
+        let s = summary("sid-1", "/home/me/proj", Some("x"));
+        let inst = build_import_instance(&s, true, "");
+        assert!(inst.is_structured());
+        assert_eq!(inst.acp_session_id.as_deref(), Some("sid-1"));
+        assert_eq!(inst.import_pending, Some(true));
+        // Structured imports do not pin a terminal resume target.
+        assert_eq!(inst.resume_intent, ResumeIntent::Default);
+    }
+
+    #[test]
+    fn already_imported_matches_resume_and_observed_ids() {
+        let mut by_resume = Instance::new("a", "/p");
+        by_resume.resume_intent = ResumeIntent::Use("id-1".to_string());
+        let mut by_observed = Instance::new("b", "/p");
+        by_observed.agent_session_id = Some("id-2".to_string());
+        let fresh = Instance::new("c", "/p");
+        let instances = vec![by_resume, by_observed, fresh];
+
+        assert!(already_imported(&instances, "id-1"));
+        assert!(already_imported(&instances, "id-2"));
+        assert!(!already_imported(&instances, "id-3"));
     }
 }

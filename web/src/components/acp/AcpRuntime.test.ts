@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, activityToThreadMessages } from "./AcpRuntime";
-import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
+import { applyEvent, emptyAcpState, type AcpFrame, type ActivityRow, type ToolCall } from "../../lib/acpTypes";
 
 function userRow(text: string, id = "u1"): ActivityRow {
   return {
@@ -55,6 +55,113 @@ function messageRow(text: string, id = "m1"): ActivityRow {
     at: "2026-05-12T00:00:00Z",
   };
 }
+
+describe("activityToThreadMessages; reused tool ids", () => {
+  it("keeps message ids unique when a rate-limited adapter reuses a tool_call_id", () => {
+    const session_id = "digests";
+    const tool_call_id = "toolu_reused_after_resume";
+    const frames: AcpFrame[] = [
+      { session_id, seq: 1, event: { UserPromptSent: { text: "first digest" } } },
+      {
+        session_id,
+        seq: 2,
+        event: {
+          ToolCallStarted: {
+            tool_call: {
+              id: tool_call_id,
+              name: "Terminal",
+              kind: "execute",
+              args_preview: "{}",
+              started_at: "2026-07-20T14:48:22Z",
+            },
+          },
+        },
+      },
+      {
+        session_id,
+        seq: 3,
+        event: { ToolCallCompleted: { tool_call_id, is_error: false, content: "first result" } },
+      },
+      { session_id, seq: 4, event: { UserPromptSent: { text: "second digest" } } },
+      {
+        session_id,
+        seq: 5,
+        event: {
+          ToolCallStarted: {
+            tool_call: {
+              id: tool_call_id,
+              name: "Terminal",
+              kind: "execute",
+              args_preview: "{}",
+              started_at: "2026-07-25T00:00:05Z",
+            },
+          },
+        },
+      },
+      {
+        session_id,
+        seq: 6,
+        event: { ToolCallCompleted: { tool_call_id, is_error: false, content: "second result" } },
+      },
+      {
+        session_id,
+        seq: 7,
+        event: { AgentMessageChunk: { text: "You've hit your weekly limit" } },
+      },
+      {
+        session_id,
+        seq: 8,
+        event: {
+          RateLimit: {
+            info: {
+              status: "You've hit your weekly limit",
+              resets_at: "2026-07-28T06:00:00Z",
+              kind: "rate_limit",
+            },
+          },
+        },
+      },
+      { session_id, seq: 9, event: { Stopped: { reason: "rate_limited" } } },
+      { session_id, seq: 10, event: { UserPromptSent: { text: "third digest" } } },
+      {
+        session_id,
+        seq: 11,
+        event: {
+          ToolCallStarted: {
+            tool_call: {
+              id: tool_call_id,
+              name: "Terminal",
+              kind: "execute",
+              args_preview: "{}",
+              started_at: "2026-07-25T00:17:03Z",
+            },
+          },
+        },
+      },
+      {
+        session_id,
+        seq: 12,
+        event: { ToolCallCompleted: { tool_call_id, is_error: false, content: "third result" } },
+      },
+      {
+        session_id,
+        seq: 13,
+        event: { AgentMessageChunk: { text: "You've hit your weekly limit" } },
+      },
+    ];
+
+    const state = frames.reduce(applyEvent, emptyAcpState());
+    const messages = activityToThreadMessages(state.activity, false);
+    const ids = messages.map((message) => message.id);
+
+    expect(state.activity.filter((row) => row.kind === "tool_complete").map((row) => row.id)).toEqual([
+      `done-${tool_call_id}`,
+      `done-${tool_call_id}-6`,
+      `done-${tool_call_id}-12`,
+    ]);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});
 
 describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
   it("folds a run of ≥3 consecutive tool calls into one group", () => {
@@ -207,6 +314,57 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     expect(toolParts[0]!.toolName).toBe(TODO_GROUP_NAME);
     const payload = JSON.parse((toolParts[0] as { argsText?: string }).argsText!);
     expect(payload.children.map((c: { toolCallId: string }) => c.toolCallId)).toEqual(["td1", "td2", "td3"]);
+  });
+
+  it("anchors the generic group id to the first child, stable as the run grows (#2802)", () => {
+    const groupId = (rows: ActivityRow[]) => {
+      const parts = activityToThreadMessages([userRow("go"), ...rows], false).find((m) => m.role === "assistant")!
+        .content as Array<{ type: string; toolName?: string; toolCallId?: string }>;
+      return parts.find((p) => p.type === "tool-call" && p.toolName === TOOL_GROUP_NAME)!.toolCallId;
+    };
+    const three = groupId([toolStart("t1"), toolStart("t2"), toolStart("t3")]);
+    const four = groupId([toolStart("t1"), toolStart("t2"), toolStart("t3"), toolStart("t4")]);
+    // Keyed by the first child, not the join of every child id, so
+    // appending a tool call does not change the id (which would remount
+    // the card and re-collapse it mid-stream).
+    expect(three).toBe("group-t1");
+    expect(four).toBe(three);
+  });
+
+  it("anchors the todo group id to the first child, stable as the run grows (#2802)", () => {
+    const groupId = (rows: ActivityRow[]) => {
+      const parts = activityToThreadMessages([userRow("go"), ...rows], false).find((m) => m.role === "assistant")!
+        .content as Array<{ type: string; toolName?: string; toolCallId?: string }>;
+      return parts.find((p) => p.type === "tool-call" && p.toolName === TODO_GROUP_NAME)!.toolCallId;
+    };
+    const snap = (id: string, status: string) => todoStart(id, [{ content: "a", status }]);
+    const three = groupId([snap("td1", "pending"), snap("td2", "in_progress"), snap("td3", "completed")]);
+    const four = groupId([
+      snap("td1", "pending"),
+      snap("td2", "in_progress"),
+      snap("td3", "completed"),
+      snap("td4", "completed"),
+    ]);
+    expect(three).toBe("todogroup-td1");
+    expect(four).toBe(three);
+  });
+
+  it("gives two text-split runs distinct group ids so neither collides (#2802)", () => {
+    const parts = activityToThreadMessages(
+      [
+        userRow("go"),
+        toolStart("a1"),
+        toolStart("a2"),
+        toolStart("a3"),
+        messageRow("Found it."),
+        toolStart("b1"),
+        toolStart("b2"),
+        toolStart("b3"),
+      ],
+      false,
+    ).find((m) => m.role === "assistant")!.content as Array<{ type: string; toolName?: string; toolCallId?: string }>;
+    const ids = parts.filter((p) => p.type === "tool-call" && p.toolName === TOOL_GROUP_NAME).map((p) => p.toolCallId);
+    expect(ids).toEqual(["group-a1", "group-b1"]);
   });
 
   it("uses the generic group for todo-shaped runs when todos are disabled", () => {
@@ -699,5 +857,30 @@ describe("activityToThreadMessages; stopped status threading (#1646)", () => {
     const subagent = parts.find((p) => p.type === "tool-call" && p.toolName === SUBAGENT_TASK_NAME)!;
     const payload = JSON.parse(subagent.argsText!);
     expect(payload.children[0].result.stopped).toBe(true);
+  });
+});
+
+describe("activityToThreadMessages; conversation summary (#2808)", () => {
+  it("renders a summary row as a blockquote callout with the body", () => {
+    const summaryRow: ActivityRow = {
+      id: "sum-1",
+      kind: "summary",
+      text: "- fixed the login bug\n- next: wire the UI",
+      at: "2026-05-12T00:00:00Z",
+    };
+    const messages = activityToThreadMessages([userRow("go"), summaryRow], false);
+    const summaryMsg = messages.find(
+      (m) =>
+        m.role === "assistant" &&
+        (m.content as Array<{ type: string; text?: string }>).some((c) =>
+          c.text?.includes("Summary of conversation so far"),
+        ),
+    )!;
+    expect(summaryMsg).toBeTruthy();
+    const text = (summaryMsg.content as Array<{ type: string; text?: string }>)[0].text!;
+    expect(text).toContain("> 📝 **Summary of conversation so far**");
+    // Each body line is quoted so the whole block renders as one callout.
+    expect(text).toContain("> - fixed the login bug");
+    expect(text).toContain("> - next: wire the UI");
   });
 });

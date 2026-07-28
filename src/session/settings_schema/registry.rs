@@ -79,14 +79,9 @@ mod tests {
             "default_agent",
             "max_concurrent_workers",
             "replay_events",
-            "replay_bytes",
             "node_path",
             "show_tool_durations",
-            "queue_drain_mode",
-            "max_concurrent_resumes",
-            "force_end_turn_threshold_secs",
             "silent_orphan_grace_secs",
-            "silent_orphan_fast_grace_secs",
         ] {
             assert!(
                 acp.iter().any(|f| f == expected),
@@ -105,12 +100,12 @@ mod tests {
     }
 
     #[test]
-    fn acp_queue_drain_is_select_with_options() {
-        let d = descriptor("acp", "queue_drain_mode").expect("queue_drain_mode");
+    fn session_row_tag_is_select_with_options() {
+        let d = descriptor("session", "row_tag").expect("row_tag");
         match d.widget {
             WidgetKind::Select { options } => {
                 let values: Vec<_> = options.iter().map(|o| o.value.as_str()).collect();
-                assert_eq!(values, ["combined", "serial"]);
+                assert_eq!(values, ["none", "auto", "profile", "sandbox", "branch"]);
             }
             other => panic!("expected select, got {other:?}"),
         }

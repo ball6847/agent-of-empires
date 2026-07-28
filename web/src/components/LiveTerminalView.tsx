@@ -6,7 +6,7 @@ import { MobileTerminalToolbar } from "./MobileTerminalToolbar";
 import { MobileLiveTerminal } from "./MobileLiveTerminal";
 import { KeyboardFab } from "./KeyboardFab";
 import { TerminalConnectionBanners } from "./TerminalConnectionBanners";
-import { ensureSession, ensureTerminal } from "../lib/api";
+import { ensureSession, ensureTerminal, pasteImage } from "../lib/api";
 import type { SessionResponse } from "../lib/types";
 import {
   FOCUS_TERMINAL_EVENT,
@@ -61,11 +61,12 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
   const [ensureState, setEnsureState] = useState<"pending" | "ready" | "error">("pending");
   const [ensureError, setEnsureError] = useState<string | null>(null);
   const live = useLiveTerminal(ensureState === "ready" ? session.id : null, wsPath);
-  // Only the iOS-regular-Safari bottom inset comes from the viewport
-  // hook. Keyboard open/closed state does NOT: on a touch device the
-  // keyboard is open exactly when our input has focus, and focus events
-  // are ground truth where viewport-occlusion heuristics misread.
-  const { keyboardHeight } = useMobileKeyboard();
+  // The viewport hook supplies the iOS-regular-Safari bottom inset and
+  // the occlusion-based keyboardOpen used to gate the pane's sizing
+  // latch (occlusion is what shrinks the container, whichever element is
+  // focused). The CHROME's open/closed state still comes from input
+  // focus below, which is exact where occlusion heuristics misread.
+  const { keyboardHeight, keyboardOpen } = useMobileKeyboard();
   const [inputFocused, setInputFocused] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const [ctrlActive, setCtrlActive] = useState(false);
@@ -81,6 +82,8 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     setEnsureError(null);
   }
   const lastEnsuredSessionIdRef = useRef<string | null>(null);
+
+  const uploadPastedImage = useCallback((file: File) => pasteImage(session.id, file), [session.id]);
 
   const focusSelf = useCallback(() => {
     const ta = inputRef.current;
@@ -279,6 +282,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           enterReading={live.enterReading}
           returnToLive={live.returnToLive}
           sendData={live.sendData}
+          uploadPastedImage={uploadPastedImage}
           forwardWheel={live.forwardWheel}
           forwardButton={live.forwardButton}
           ctrlActiveRef={ctrlActiveRef}
@@ -286,6 +290,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           inputRef={inputRef}
           onInputFocusChange={setInputFocused}
           bottomAlign={surface === "agent"}
+          keyboardOpen={keyboardOpen}
         />
         {coarse && live.state.connected && <KeyboardFab keyboardOpen={inputFocused} onToggle={toggleKeyboard} />}
       </div>

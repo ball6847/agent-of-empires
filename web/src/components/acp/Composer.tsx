@@ -20,6 +20,7 @@ import { AtSign, ChevronUp, Paperclip, Pencil, Slash, Square, X } from "lucide-r
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
 import { SessionConfigControls } from "./SessionConfigControls";
+import { Tooltip } from "../Tooltip";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 import {
   clearPendingSwitchAgent,
@@ -33,7 +34,7 @@ import type {
   PromptCapabilities,
   QueuedPrompt,
 } from "../../lib/acpTypes";
-import { getDraft, setDraft } from "../../lib/acpDrafts";
+import { clearDraft, clearDraftAttachments, getDraft, setDraft } from "../../lib/acpDrafts";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useAgentProfile } from "../../lib/agentProfileContext";
@@ -41,6 +42,10 @@ import { resolveModeChannel } from "../../lib/modeChannel";
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
 import { nextRecallTarget, recallBannerInfo, type RecallCursor, type RecallNav } from "./recallNav";
+import { PluginComposerActions } from "../plugin/PluginSlots";
+import { composerDraftOperation, type ComposerDraftOperation } from "../plugin/composerDraftOperation";
+import { usePluginUiEntries } from "../../lib/pluginUiContext";
+import { sessionEntries } from "../../lib/pluginUi";
 
 export {
   DICTATION_BURST_TIMEOUT_MS,
@@ -574,18 +579,70 @@ export function Composer({
         return;
       }
     }
-    void sendFromTextarea(taRef, composerRuntime, enqueuePrompt, supportedPendingAttachments, () =>
+    void sendFromTextarea(taRef, composerRuntime, enqueuePrompt, sessionId, supportedPendingAttachments, () =>
       setPendingAttachments([]),
     );
   }, [
     composerRuntime,
     enqueuePrompt,
+    sessionId,
     setPendingAttachments,
     supportedPendingAttachments,
     queuedPrompts,
     editQueuedPrompt,
     applyRecall,
   ]);
+  const getPluginComposerSnapshot = useCallback(() => {
+    const ta = taRef.current;
+    const text = composerRuntime.getState().text;
+    const fallbackPos = text.length;
+    return {
+      text,
+      selectionStart: ta?.selectionStart ?? fallbackPos,
+      selectionEnd: ta?.selectionEnd ?? ta?.selectionStart ?? fallbackPos,
+    };
+  }, [composerRuntime]);
+  const applyPluginDraftOperation = useCallback(
+    (operation: ComposerDraftOperation) => {
+      const ta = taRef.current;
+      if (!ta) {
+        if (operation.kind === "set-text") composerRuntime.setText(operation.text);
+        else composerRuntime.setText(`${composerRuntime.getState().text}${operation.text}`);
+        return;
+      }
+      if (operation.kind === "set-text") {
+        composerRuntime.setText(operation.text);
+        requestAnimationFrame(() => {
+          const el = taRef.current;
+          if (!el) return;
+          el.focus();
+          const len = operation.text.length;
+          el.setSelectionRange(len, len);
+          el.style.height = "auto";
+          el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+        });
+        return;
+      }
+      insertRawTextAtCaret(ta, operation.text, operation.kind === "replace-selection");
+    },
+    [composerRuntime],
+  );
+  const pluginUiEntries = usePluginUiEntries();
+  const pluginComposerEntries = useMemo(
+    () => sessionEntries(pluginUiEntries, "composer-action", sessionId),
+    [pluginUiEntries, sessionId],
+  );
+  const seenPluginDraftOpsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    for (const entry of pluginComposerEntries) {
+      const draft = composerDraftOperation(entry);
+      if (!draft) continue;
+      const key = `${entry.plugin_id}:${entry.id}:${draft.id}`;
+      if (seenPluginDraftOpsRef.current.has(key)) continue;
+      seenPluginDraftOpsRef.current.add(key);
+      applyPluginDraftOperation(draft.operation);
+    }
+  }, [applyPluginDraftOperation, pluginComposerEntries]);
 
   // Manual agent switch dialog. Opened from the sidebar row context menu
   // (see WorkspaceSidebar's "Switch agent" item) via the cross-component
@@ -1088,6 +1145,7 @@ export function Composer({
 
               <div data-testid="composer-actions" className="flex shrink-0 items-center gap-2">
                 <UsageHint usage={sessionUsage} />
+                <PluginComposerActions sessionId={sessionId} getSnapshot={getPluginComposerSnapshot} />
                 {turnActive ? (
                   <>
                     <StopButton />
@@ -1245,6 +1303,26 @@ export function insertAtCaret(ref: React.RefObject<HTMLTextAreaElement | null>, 
   const pos = before.length + needsSpace.length + text.length;
   ta.focus();
   ta.setSelectionRange(pos, pos);
+}
+
+function insertRawTextAtCaret(ta: HTMLTextAreaElement, text: string, replaceSelection: boolean) {
+  const start = ta.selectionStart ?? ta.value.length;
+  const end = replaceSelection ? (ta.selectionEnd ?? start) : start;
+  const next = ta.value.slice(0, start) + text + ta.value.slice(end);
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+  setter?.call(ta, next);
+  ta.dispatchEvent(
+    new InputEvent("input", {
+      bubbles: true,
+      inputType: "insertText",
+      data: text,
+    }),
+  );
+  const pos = start + text.length;
+  ta.focus();
+  ta.setSelectionRange(pos, pos);
+  ta.style.height = "auto";
+  ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
 }
 
 function extDescription(path: string): string | undefined {
@@ -1451,21 +1529,23 @@ function UsageHint({ usage }: { usage: AcpState["sessionUsage"] }) {
   const usedLabel = formatTokens(usage.used);
   const sizeLabel = formatTokens(usage.size);
   const cost = usage.cost ? formatCost(usage.cost.amount, usage.cost.currency) : null;
-  const title =
-    `Context: ${usage.used.toLocaleString()} / ${usage.size.toLocaleString()} tokens (${pct}%)` +
-    (cost ? ` · session cost ${cost}` : "");
+  const explanation =
+    `Context window: ${usage.used.toLocaleString()} of ${usage.size.toLocaleString()} tokens used (${pct}%). ` +
+    `Color warns as the window fills.` +
+    (cost ? ` ${cost} is cumulative session spend since the last /clear or /compact.` : "");
   return (
-    <span
-      className={`hidden sm:inline-flex items-center gap-1 text-[11px] tabular-nums ${tone}`}
-      title={title}
-      aria-label={title}
-    >
-      <span>
-        {usedLabel}/{sizeLabel}
+    <Tooltip text={explanation} multiline>
+      <span
+        className={`hidden sm:inline-flex items-center gap-1 text-[11px] tabular-nums ${tone}`}
+        aria-label={explanation}
+      >
+        <span>
+          {usedLabel}/{sizeLabel}
+        </span>
+        <span className="opacity-70">({pct}%)</span>
+        {cost ? <span className="opacity-70">· {cost}</span> : null}
       </span>
-      <span className="opacity-70">({pct}%)</span>
-      {cost ? <span className="opacity-70">· {cost}</span> : null}
-    </span>
+    </Tooltip>
   );
 }
 
@@ -1601,6 +1681,7 @@ function sendFromTextarea(
   taRef: React.RefObject<HTMLTextAreaElement | null>,
   composerRuntime: ReturnType<typeof useComposerRuntime>,
   enqueuePrompt: (text: string, attachments?: PromptAttachmentInput[]) => void | Promise<void>,
+  sessionId: string,
   attachments: PromptAttachmentInput[] = [],
   clearAttachments?: () => void,
 ): void {
@@ -1611,6 +1692,11 @@ function sendFromTextarea(
   if (!text && attachments.length === 0) return;
   void enqueuePrompt(text, attachments.length > 0 ? attachments : undefined);
   composerRuntime.setText("");
+  // Clear the persisted draft synchronously, not via the 250ms debounced
+  // flush: a remount racing a resume/queue re-render otherwise restores the
+  // just-sent text from localStorage. See #3094 / #3087.
+  clearDraft(sessionId);
+  clearDraftAttachments(sessionId);
   clearAttachments?.();
   // Manually reset the textarea height; auto-grow runs on input events
   // and we cleared the value without firing one.

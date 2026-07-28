@@ -5,6 +5,7 @@
 // component renders unknown frames gracefully.
 
 import type { DiffComment } from "../components/diff/comments/types";
+import { resolveAgentProfile } from "./agentProfiles";
 
 export type ApprovalDecision = "Allow" | "AllowAlways" | "Deny" | "Cancelled";
 
@@ -28,6 +29,13 @@ export interface Plan {
 export interface ToolCall {
   id: string;
   name: string;
+  /** The original ACP `ToolCallStarted.name` (the wire tool identity,
+   *  e.g. `"task"`). Unlike `name`, this is NEVER overwritten by a later
+   *  `ToolCallUpdated.title`, so agent classification can key on the
+   *  stable tool identity instead of a mutable display title. Set once at
+   *  ingestion; undefined for rows synthesized from an update/completion
+   *  that never saw a start frame. See #3070. */
+  raw_name?: string;
   /** ACP ToolKind lowercased: read | edit | delete | move | search |
    *  execute | think | fetch | switch_mode | other. Drives the per-tool
    *  renderer in StructuredView. */
@@ -535,7 +543,8 @@ export type AcpEvent =
   | { WakeupScheduled: { at: string; reason: string | null } }
   | { MonitorArmed: { description: string | null } }
   | { PromptRejected: { reason: string; text: string } }
-  | { AgentSwitched: { from: string; to: string; reason: string } };
+  | { AgentSwitched: { from: string; to: string; reason: string } }
+  | { ConversationSummary: { text: string; summarized_until_seq: number } };
 
 /** Metadata-only attachment ref as it rides on a `UserPromptSent`
  *  event from the server (mirrors Rust `PromptAttachmentRef`). The
@@ -938,7 +947,8 @@ export interface ActivityRow {
     | "empty_output"
     | "context_reset"
     | "session_cleared"
-    | "compacted";
+    | "compacted"
+    | "summary";
   text: string;
   toolCallId?: string;
   /** Full ToolCall payload, present on tool_start rows so the UI can
@@ -1101,6 +1111,14 @@ function applyNewTurnResets(next: AcpState): void {
   // Any pending context-primer offer is consumed once the user submits
   // a new prompt; the recovery affordance is one-shot.
   next.contextPrimerAvailable = null;
+  // A fresh turn means the session is live again, so any rate-limit park
+  // is over. Clear the banner here (not only on the auto-resume
+  // `RateLimitAutoResumed` / `AgentSwitched` paths) so a session resumed
+  // by a plain prompt or a draining queued follow-up does not keep a
+  // stale "Rate-limited; resets at ..." banner, and so the dead
+  // `RESUME NOW` button it renders can no longer 409 against an
+  // already-running worker. See #3028.
+  next.rateLimit = null;
 }
 
 /** Pure reducer. Returns a new state; never mutates the input.
@@ -1196,14 +1214,23 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("ToolCallStarted" in event) {
-    const tc = event.ToolCallStarted.tool_call;
+    // Copy so the preserved `raw_name` (the immutable wire tool identity)
+    // stamped here can't leak back onto the shared event object. A later
+    // ToolCallUpdated overwrites `name` with the title but leaves
+    // `raw_name` intact for classification. See #3070.
+    const tc = { ...event.ToolCallStarted.tool_call };
+    tc.raw_name = tc.raw_name ?? tc.name;
     // An AskUserQuestion tool call is rendered by its elicitation card, not
     // a transcript tool card. If the elicitation arrived first, drop the
     // redundant start frame entirely. See ElicitationRequested.
     if (tc.id && next.elicitationToolCallIds.includes(tc.id)) {
       return next;
     }
-    next.inFlightTool = tc;
+    // A duplicate start frame for the same id (e.g. once full args/content are
+    // known) must not clobber diffs a `ToolCallUpdated` already attached to the
+    // in-flight tool, if that update raced ahead of this frame.
+    next.inFlightTool =
+      next.inFlightTool && next.inFlightTool.id === tc.id ? mergeToolStart(next.inFlightTool, tc) : tc;
     // A tool call after the monitor armed means the monitor fired and the
     // agent is acting on it; gate the badge clear on the next Stopped. The
     // Monitor tool's own start precedes its MonitorArmed, so it never marks
@@ -1288,8 +1315,15 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // duration label survives page reload. Events persisted before
     // `completed_at` landed fall back to "now" (same bug as before for
     // those specific rows only).
+    const baseId = `done-${tool_call_id}`;
+    // Some adapters reuse a tool_call_id after reconnecting. Keep the
+    // historical id for the first completion, but disambiguate later rows
+    // with the event seq. Otherwise separate assistant groups can inherit
+    // the same `assistant-done-<tool_call_id>` message id and assistant-ui's
+    // MessageRepository crashes the entire structured view.
+    const rowId = next.activity.some((row) => row.id === baseId) ? `${baseId}-${frame.seq}` : baseId;
     next.activity = pushActivity(next.activity, {
-      id: `done-${tool_call_id}`,
+      id: rowId,
       kind: is_error ? "tool_error" : "tool_complete",
       text,
       toolCallId: tool_call_id,
@@ -1306,6 +1340,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("ToolCallUpdated" in event) {
     const { tool_call_id, title, args_preview, started_at, diffs } = event.ToolCallUpdated;
+    // Ignore claude keepalive heartbeats persisted by older backends: they
+    // have no start and no completion, so the synth-on-missing-start path
+    // below would render a phantom titleless card that never resolves.
+    // Gated on the session agent's profile so another adapter that uses a
+    // `-heartbeat-N` id for a real tool is not dropped on replay. #3084.
+    if (isHeartbeatToolCallId(tool_call_id) && resolveAgentProfile(next.agent).capabilities.heartbeatKeepalives) {
+      return next;
+    }
     // Per ACP, content is a replacement: a non-empty diff list overwrites
     // the card's diffs; null/empty leaves an earlier frame's diffs intact
     // so a text-only update can't blank the edit card. See #1721.
@@ -1425,6 +1467,17 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // raw; only `cost` is rebased. clamp to zero defensively in case
     // an upstream restart ever reports a smaller cumulative. See #1354.
     const incoming = event.UsageUpdated.usage;
+    // Bandaid for upstream claude-agent-acp #596: mid-turn usage_update
+    // reports the 200k DEFAULT_CONTEXT_WINDOW for models whose real
+    // window is 1M (the `sonnet` / `default` aliases miss its `\b1m\b`
+    // heuristic), and only snaps to the authoritative window at the
+    // turn's `result`. Rendering each frame verbatim makes the footer
+    // flicker 200k <-> 1M every turn. Latch the largest window learned
+    // this session; a real context boundary (clear / compact /
+    // agent-switch / context-reset / model change) nulls sessionUsage,
+    // which resets the latch to the next raw value. Drop once upstream
+    // stops emitting the downgraded mid-turn guess.
+    const size = Math.max(incoming.size, next.sessionUsage?.size ?? 0);
     if (next.usageBaseline && incoming.cost) {
       const rebasedAmount = Math.max(0, incoming.cost.amount - next.usageBaseline.cost);
       const rebasedCost = {
@@ -1433,11 +1486,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       };
       next.sessionUsage = {
         used: incoming.used,
-        size: incoming.size,
+        size,
         cost: rebasedCost,
       };
     } else {
-      next.sessionUsage = incoming;
+      next.sessionUsage = { used: incoming.used, size, cost: incoming.cost };
     }
     return next;
   }
@@ -1474,6 +1527,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("ConfigOptionsUpdated" in event) {
     const options = event.ConfigOptionsUpdated.options;
+    // A model change moves the context window, so drop the latched
+    // usage window (see the UsageUpdated arm) and relearn it for the
+    // new model instead of holding the prior model's larger window.
+    const priorModel = next.configOptions.find((o) => o.category === "model")?.current_value;
+    const nextModel = options.find((o) => o.category === "model")?.current_value;
+    if (priorModel !== undefined && nextModel !== undefined && priorModel !== nextModel) {
+      next.sessionUsage = null;
+    }
     next.configOptions = options;
     // The snapshot is authoritative, so any in-flight pending click
     // resolves here regardless of whether the adapter applied the
@@ -1821,6 +1882,24 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // fired, the runner was SIGTERMed, and the respawn handshake has
     // now landed. See #1240.
     next.agentOrphaned = false;
+    // A fresh worker healed the session, including a rate-limit park that
+    // was resumed without an explicit `RateLimitAutoResumed` (e.g. a
+    // manual respawn). Clear the banner so it does not outlive the park
+    // and leave a dead `RESUME NOW` button. See #3028.
+    next.rateLimit = null;
+    // A prompt sent to an idle-dormant worker gets a transient
+    // `worker_not_ready` 503 and is re-queued, but its optimistic dispatch
+    // left `pendingUserPromptSeq` bumped (turn pending) so the drain effect
+    // stays braked instead of hot-looping the wake. The respawn handshake is
+    // the worker-online signal: retire that phantom turn so the drain fires
+    // and delivers the queued prompt, instead of the session sitting stuck
+    // until the user hits Stop. Scoped to a non-empty queue so a normal
+    // (re)spawn without parked work never clears a legitimately active turn.
+    // See #3094 / #3087.
+    if (next.queuedPrompts.length > 0 && next.pendingUserPromptSeq > next.lastStoppedSeq) {
+      next.lastStoppedSeq = next.pendingUserPromptSeq;
+      next.turnActive = isTurnActive(next);
+    }
     return next;
   }
   if ("SessionContextReset" in event) {
@@ -1858,6 +1937,18 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       resetSeq: frame.seq,
       reason: event.SessionContextReset.reason || "Conversation context reset; agent transcript was unavailable.",
     };
+    return next;
+  }
+  if ("ConversationSummary" in event) {
+    // aoe-generated recap of the conversation so far (see #2808). Not a
+    // model/session state change; append a callout row the renderer maps
+    // to a summary block.
+    next.activity = pushActivity(next.activity, {
+      id: `summary-${frame.seq}`,
+      kind: "summary",
+      text: event.ConversationSummary.text,
+      at: new Date().toISOString(),
+    });
     return next;
   }
   if ("WakeupScheduled" in event) {
@@ -2047,6 +2138,16 @@ function hasToolStart(rows: ActivityRow[], toolCallId: string): boolean {
   return rows.some((r) => r.kind === "tool_start" && r.toolCallId === toolCallId);
 }
 
+/** Claude Code keepalive pings for long-running tools arrive under a derived
+ *  id `<baseToolId>-heartbeat-<N>` (no start, no completion). The backend now
+ *  drops them at ingress (see `is_heartbeat_tool_call_id` in acp_client.rs),
+ *  but historical session logs still hold the orphan `ToolCallUpdated` rows;
+ *  this guard stops a replay from synthesizing a phantom card for them. See
+ *  #3084. Mirror of the Rust predicate: trailing `-heartbeat-<digits>`. */
+function isHeartbeatToolCallId(toolCallId: string): boolean {
+  return /-heartbeat-\d+$/.test(toolCallId);
+}
+
 /** Build a minimal `tool_start` row for a tool call we never saw start.
  *  Some agents (Gemini's permission flow) emit updates/completions with
  *  no preceding start frame; synthesizing one keeps the card visible.
@@ -2089,6 +2190,10 @@ function mergeToolStart(prev: ToolCall, incoming: ToolCall): ToolCall {
     ...prev,
     ...incoming,
     name: incoming.name.length > 0 ? incoming.name : prev.name,
+    // Keep whichever start frame carried a non-empty wire identity; a
+    // sparse permission start (#1713) has an empty name/raw_name and must
+    // not clobber the real start's `raw_name`. See #3070.
+    raw_name: incoming.raw_name && incoming.raw_name.length > 0 ? incoming.raw_name : prev.raw_name,
     kind: incoming.kind && incoming.kind !== "other" ? incoming.kind : prev.kind,
     args_preview: incoming.args_preview.trim().length > 0 ? incoming.args_preview : prev.args_preview,
     started_at: startedAt,
@@ -2096,6 +2201,45 @@ function mergeToolStart(prev: ToolCall, incoming: ToolCall): ToolCall {
     parent_tool_call_id: incoming.parent_tool_call_id ?? prev.parent_tool_call_id,
     memory_recall: incoming.memory_recall ?? prev.memory_recall,
   };
+}
+
+/** Prepend an older history page's rows ahead of the loaded tail, deduping
+ *  any `tool_start` whose `toolCallId` already exists in the tail. A tool
+ *  call split across the page seam (its `ToolCallStarted` in this older
+ *  page, its `ToolCallCompleted` already in the tail) left a synthesized
+ *  placeholder start in `tailRows` (see synthToolStartRow / #1713). Without
+ *  a cross-page merge the real start would prepend as a second row with the
+ *  same id, and two assistant-ui `tool-call` parts sharing a `toolCallId`
+ *  make `useResources` throw "Duplicate key" and crash the panel (#2711).
+ *  Merge the real start into the existing row in place (real name/kind/args
+ *  and its earlier `started_at` win) and drop the duplicate. Also covers a
+ *  plain frame overlap at the seam. */
+export function mergePrependedActivity(olderRows: ActivityRow[], tailRows: ActivityRow[]): ActivityRow[] {
+  const startIndexById = new Map<string, number>();
+  tailRows.forEach((row, i) => {
+    if (row.kind === "tool_start" && row.toolCallId) startIndexById.set(row.toolCallId, i);
+  });
+  if (startIndexById.size === 0) return olderRows.concat(tailRows);
+
+  let tail = tailRows;
+  const prepended: ActivityRow[] = [];
+  for (const row of olderRows) {
+    const idx = row.kind === "tool_start" && row.toolCallId ? startIndexById.get(row.toolCallId) : undefined;
+    if (idx === undefined) {
+      prepended.push(row);
+      continue;
+    }
+    const existing = tail[idx];
+    if (existing && existing.kind === "tool_start" && existing.tool && row.tool) {
+      const merged = mergeToolStart(existing.tool, row.tool);
+      // Keep the real start's timestamp; the synth placeholder carried the
+      // completion time, which would zero out the duration label (#1060).
+      if (row.tool.started_at) merged.started_at = row.tool.started_at;
+      tail = tail.slice();
+      tail[idx] = { ...existing, tool: merged, text: merged.name, at: merged.started_at };
+    }
+  }
+  return prepended.concat(tail);
 }
 
 function pushActivity(rows: ActivityRow[], row: ActivityRow): ActivityRow[] {

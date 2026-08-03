@@ -35,20 +35,10 @@ const COMPLETED_ACTIVITY_MARKERS: &[&str] = &[
     "successfully",
 ];
 
-/// Rich's "moon" spinner frames — shown by Kimi when a turn is active but no
-/// content has arrived yet.
-const MOON_SPINNER_CHARS: &[&str] = &["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"];
-
 fn has_any_spinner(lines: &[&str]) -> bool {
     lines
         .iter()
         .any(|line| SPINNER_CHARS.iter().any(|s| line.contains(s)))
-}
-
-fn has_any_moon_spinner(lines: &[&str]) -> bool {
-    lines
-        .iter()
-        .any(|line| MOON_SPINNER_CHARS.iter().any(|s| line.contains(s)))
 }
 
 fn has_live_activity_word(text_lower: &str) -> bool {
@@ -1646,9 +1636,10 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
 /// prose routinely contains activity words ("now working on #443", "reading
 /// the file") and a scrollback frame can still hold a spinner glyph, so
 /// scanning too many lines for those substrings pinned the session on
-/// Running forever. Pi extensions (e.g. pikit's footer plugin) can add many
-/// lines below the spinner, so the window is generous (132) to reach through
-/// them while still excluding the bulk of a finished turn's response prose.
+/// Running forever. Pi extensions (e.g. pikit's footer plugin) push the
+/// spinner up to ~9 non-empty lines above the bottom, so a 16-line window
+/// reaches it through them while still excluding the bulk of a finished
+/// turn's response prose.
 pub fn detect_pi_status(raw_content: &str) -> Status {
     let clean = strip_ansi(raw_content);
     let non_empty_lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -1658,7 +1649,7 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
     let footer: Vec<&str> = non_empty_lines
         .iter()
         .rev()
-        .take(132)
+        .take(16)
         .rev()
         .copied()
         .collect();
@@ -2041,10 +2032,6 @@ pub fn detect_qwen_status(raw_content: &str) -> Status {
     Status::Idle
 }
 
-/// Kimi Code CLI status detection via tmux pane parsing.
-/// Kimi uses a Rich-based TUI that renders "Thinking" labels with animated
-/// bullets, dots spinners during composition, and approval modals for tool
-/// confirmations.
 pub fn detect_antigravity_status(raw_content: &str) -> Status {
     let content = raw_content.to_lowercase();
     let lines: Vec<&str> = content.lines().collect();

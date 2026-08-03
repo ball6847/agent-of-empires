@@ -1645,21 +1645,20 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
 /// non-empty lines) rather than the whole capture: a finished turn's response
 /// prose routinely contains activity words ("now working on #443", "reading
 /// the file") and a scrollback frame can still hold a spinner glyph, so
-/// scanning the last 30 lines for those substrings pinned the session on
-/// Running forever. This mirrors the footer-only approach already used by
-/// `detect_omp_status` and `detect_copilot_status`.
+/// scanning too many lines for those substrings pinned the session on
+/// Running forever. Pi extensions (e.g. pikit's footer plugin) can add many
+/// lines below the spinner, so the window is generous (132) to reach through
+/// them while still excluding the bulk of a finished turn's response prose.
 pub fn detect_pi_status(raw_content: &str) -> Status {
     let clean = strip_ansi(raw_content);
     let non_empty_lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
 
-    // The `⠹ Working...` status line sits ~5 non-empty lines above the bottom
-    // (above the input box's two rules, the cwd line, and the status line), so
-    // the footer window must reach it while staying tight enough to exclude the
-    // bulk of a finished turn's response prose.
+    // The `⠹ Working...` status line sits below the footer, status bar, and
+    // input box. The window must reach it through any plugin layout.
     let footer: Vec<&str> = non_empty_lines
         .iter()
         .rev()
-        .take(6)
+        .take(132)
         .rev()
         .copied()
         .collect();

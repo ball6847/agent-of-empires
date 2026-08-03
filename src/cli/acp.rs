@@ -20,11 +20,25 @@ pub enum AcpCommands {
         /// Emit machine-readable JSON instead of a human report.
         #[arg(long)]
         json: bool,
-        /// Attempt safe remediations: install missing claude-code-acp
-        /// adapter, verify aoe-agent presence, etc. (Reserved for future
-        /// release; the flag exists so scripts can opt in early.)
+        /// Attempt safe remediations: download the bundled Node runtime if
+        /// none is present, then install the pinned npm ACP adapter into the
+        /// data dir with that Node's own npm (no global install, no sudo).
+        /// Installs claude-agent-acp by default; each adapter is a separate
+        /// several-hundred-MB tree, so pick others with --adapter.
         #[arg(long)]
         fix: bool,
+        /// Adapter to install with --fix (repeatable). Defaults to
+        /// claude-agent-acp. One of: claude-agent-acp, codex-acp, pi-acp.
+        #[arg(
+            long,
+            requires = "fix",
+            value_parser = ["claude-agent-acp", "codex-acp", "pi-acp"]
+        )]
+        adapter: Vec<String>,
+        /// Install every pinned adapter with --fix instead of just the
+        /// default one.
+        #[arg(long, requires = "fix", conflicts_with = "adapter")]
+        all_adapters: bool,
     },
     /// List configured agents (claude-code, aoe-agent, etc.).
     Agents,
@@ -148,7 +162,12 @@ pub enum AcpCommands {
 #[tracing::instrument(target = "cli.acp", skip_all)]
 pub async fn run(command: AcpCommands) -> Result<()> {
     match command {
-        AcpCommands::Doctor { json, fix } => doctor(json, fix).await,
+        AcpCommands::Doctor {
+            json,
+            fix,
+            adapter,
+            all_adapters,
+        } => doctor(json, fix, adapter, all_adapters).await,
         AcpCommands::Agents => agents(),
         AcpCommands::Ps { json } => ps(json),
         AcpCommands::Stop {
@@ -205,63 +224,204 @@ struct AgentDoctorEntry {
     description: String,
 }
 
-/// ACP adapters that ship as npm packages (binary name → package id).
-/// The doctor's `--fix` path runs `npm install -g <package>` for each
-/// entry whose binary isn't already on PATH.
-const NPM_INSTALLABLE_ACP: &[(&str, &str)] = &[
-    (
-        "claude-agent-acp",
-        "@agentclientprotocol/claude-agent-acp@latest",
-    ),
-    ("codex-acp", "@agentclientprotocol/codex-acp@latest"),
-    ("pi-acp", "pi-acp"),
-];
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DoctorFixAction {
+    PrintHint { reason: String },
+    Skip,
+}
 
-async fn doctor(json: bool, fix: bool) -> Result<()> {
+/// Decide how `doctor --fix` handles a version-gated native adapter (the
+/// npm-distributed adapters are installed by `adapters::install`, not
+/// here). Missing or stale gated adapters get a manual install hint; a
+/// current or ungated adapter is left alone.
+#[cfg(feature = "serve")]
+fn doctor_fix_action(
+    gate: Option<crate::acp::agent_compat::VersionGate>,
+    probe: &crate::acp::version_probe::ProbeStatus,
+) -> DoctorFixAction {
+    use crate::acp::version_probe::ProbeStatus;
+    let is_gated = gate.is_some();
+
+    match probe {
+        ProbeStatus::Missing if is_gated => DoctorFixAction::PrintHint {
+            reason: "not found on PATH".to_string(),
+        },
+        ProbeStatus::Missing => DoctorFixAction::Skip,
+        ProbeStatus::Version { parsed, .. } => {
+            let Some(gate) = gate else {
+                return DoctorFixAction::Skip;
+            };
+            let Ok(min) = semver::Version::parse(gate.min_version) else {
+                return DoctorFixAction::Skip;
+            };
+            if parsed >= &min {
+                return DoctorFixAction::Skip;
+            }
+            DoctorFixAction::PrintHint {
+                reason: format!("installed {parsed}; requires >={}", gate.min_version),
+            }
+        }
+        ProbeStatus::Unparseable { raw } if is_gated => DoctorFixAction::PrintHint {
+            reason: format!("reported an unparseable version `{raw}`"),
+        },
+        ProbeStatus::Failed { message } if is_gated => DoctorFixAction::PrintHint {
+            reason: format!("version probe failed: {message}"),
+        },
+        ProbeStatus::TimedOut if is_gated => DoctorFixAction::PrintHint {
+            reason: "version probe timed out".to_string(),
+        },
+        ProbeStatus::Unparseable { .. } | ProbeStatus::Failed { .. } | ProbeStatus::TimedOut => {
+            DoctorFixAction::Skip
+        }
+    }
+}
+
+/// True when `doctor --fix` should not report on a gated adapter at all:
+/// one aoe bundles that is simply absent from `PATH` is already covered by
+/// the bundled install above. A bundled adapter that IS on `PATH` still
+/// gets checked, because that copy shadows the pinned one (PATH-first
+/// resolution) and a stale one would break the session anyway.
+#[cfg(feature = "serve")]
+fn skip_gate_check(binary: &str, on_path: bool) -> bool {
+    !on_path && crate::acp::adapters::is_bundled(binary)
+}
+
+#[cfg(feature = "serve")]
+async fn run_doctor_fix_action(binary: &str) {
+    let gate = crate::acp::agent_compat::version_gate_for(
+        crate::acp::agent_compat::ExpectedAgent::from_command(binary),
+    );
+    let probe = crate::acp::version_probe::probe_binary_version(binary).await;
+    match doctor_fix_action(gate, &probe) {
+        DoctorFixAction::PrintHint { reason } => {
+            let hint = install_hint_for(binary).unwrap_or("(see project docs)");
+            // Only claim the PATH copy shadows the bundle when a bundle is
+            // actually installed. Since #1017, resolution prefers the pinned
+            // bundle whenever it can prove the PATH copy is below the floor, so
+            // with a bundle present the shadowing advice is simply false.
+            let bundle_installed = crate::session::get_app_dir().is_ok_and(|app_dir| {
+                crate::acp::adapters::bundled_adapter_bin(&app_dir, binary).is_some()
+            });
+            if crate::acp::adapters::is_bundled(binary) && !bundle_installed {
+                println!(
+                    "{binary}: {reason}. That copy is on your PATH and no bundled copy is \
+                     installed yet. Upgrade it ({hint}), or run `aoe acp doctor --fix` to \
+                     install the pinned one."
+                );
+            } else if crate::acp::adapters::is_bundled(binary) {
+                println!(
+                    "{binary}: {reason}. aoe will use its pinned bundled copy for new sessions; \
+                     upgrade the PATH copy ({hint}) or remove it to silence this."
+                );
+            } else {
+                println!("{binary}: {reason}. Install manually: {hint}");
+            }
+        }
+        DoctorFixAction::Skip => {}
+    }
+}
+
+/// Which adapters `--fix` installs: everything with `--all-adapters`, the
+/// explicit `--adapter` list when given, else just [`DEFAULT_ADAPTER`].
+/// Unknown names are returned so the caller can report them instead of
+/// silently installing nothing.
+fn adapters_to_install(requested: &[String], all: bool) -> Result<Vec<&'static str>, Vec<String>> {
+    use crate::acp::adapters;
+    if all {
+        return Ok(adapters::BUNDLED_ADAPTERS
+            .iter()
+            .map(|a| a.binary)
+            .collect());
+    }
+    if requested.is_empty() {
+        return Ok(vec![adapters::DEFAULT_ADAPTER]);
+    }
+    let (known, unknown): (Vec<_>, Vec<_>) = requested
+        .iter()
+        .partition(|name| adapters::is_bundled(name));
+    if !unknown.is_empty() {
+        return Err(unknown.into_iter().cloned().collect());
+    }
+    Ok(known
+        .into_iter()
+        .filter_map(|name| adapters::lookup(name).map(|a| a.binary))
+        .collect())
+}
+
+async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool) -> Result<()> {
     if fix {
-        // Auto-remediate: download the bundled Node runtime if Node is
-        // missing or the wrong version on PATH.
-        if let Ok(app_dir) = crate::session::get_app_dir() {
-            match node::resolve("", &app_dir) {
-                Ok(_) => println!("Node already available; skipping download."),
-                Err(node::NodeError::NoNode(_)) | Err(node::NodeError::TooOld { .. }) => {
-                    println!("Downloading Node {} runtime...", node::PINNED_NODE_VERSION);
-                    match node::download(&app_dir).await {
-                        Ok(resolved) => {
-                            println!(
-                                "Installed Node {} at {}",
-                                resolved.version,
-                                resolved.path.display()
-                            );
+        // Resolve a usable Node (download the pinned bundled runtime when
+        // the host has none), then install the pinned npm ACP adapters into
+        // the data dir with that Node's own npm. No `npm install -g`, no
+        // sudo, a version aoe controls. See #1017.
+        match crate::session::get_app_dir() {
+            Err(e) => println!(
+                "Cannot resolve the app data dir ({e}); skipping the Node and adapter install."
+            ),
+            Ok(app_dir) => {
+                let node = match node::resolve("", &app_dir) {
+                    Ok(node) => {
+                        println!("Node available: {} ({})", node.path.display(), node.version);
+                        Some(node)
+                    }
+                    Err(node::NodeError::NoNode(_)) | Err(node::NodeError::TooOld { .. }) => {
+                        println!("Downloading Node {} runtime...", node::PINNED_NODE_VERSION);
+                        match node::download(&app_dir).await {
+                            Ok(node) => {
+                                println!(
+                                    "Installed Node {} at {}",
+                                    node.version,
+                                    node.path.display()
+                                );
+                                Some(node)
+                            }
+                            Err(e) => {
+                                println!("Node download failed: {e}");
+                                None
+                            }
                         }
-                        Err(e) => {
-                            println!("Download failed: {e}");
+                    }
+                    Err(e) => {
+                        println!("Cannot probe Node: {e}");
+                        None
+                    }
+                };
+                if let Some(node) = node {
+                    match adapters_to_install(&adapter, all_adapters) {
+                        Err(unknown) => println!(
+                            "Unknown adapter(s): {}. Valid values: {}.",
+                            unknown.join(", "),
+                            crate::acp::adapters::BUNDLED_ADAPTERS
+                                .iter()
+                                .map(|a| a.binary)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        Ok(wanted) => {
+                            for binary in wanted {
+                                println!("Installing bundled ACP adapter {binary}...");
+                                match crate::acp::adapters::install(&app_dir, &node, binary) {
+                                    Ok(()) => println!("{binary} ready."),
+                                    Err(e) => println!("{binary} install failed: {e}"),
+                                }
+                            }
                         }
                     }
                 }
-                Err(e) => println!("Cannot probe Node: {e}"),
             }
         }
-        // Auto-install npm-distributed ACP adapters that aren't on
-        // PATH. Native CLIs (opencode / gemini / vibe) have to be
-        // installed via their own channels; we only print a hint for
-        // those.
-        for (binary, npm_pkg) in NPM_INSTALLABLE_ACP {
-            if find_in_path(binary).is_some() {
+        // Report every gated adapter we did not just install: the native
+        // CLIs (opencode / gemini / vibe / ...) that can't be bundled, and
+        // any bundled adapter whose PATH copy shadows the pinned one. A
+        // stale global would otherwise win at spawn with `--fix` reporting
+        // success. See #1017.
+        #[cfg(feature = "serve")]
+        for gate in crate::acp::agent_compat::version_gates() {
+            if skip_gate_check(gate.binary, find_in_path(gate.binary).is_some()) {
                 continue;
             }
-            println!("Installing {npm_pkg} globally via npm...");
-            let status = std::process::Command::new("npm")
-                .args(["install", "-g", npm_pkg])
-                .status();
-            match status {
-                Ok(s) if s.success() => println!("Installed {npm_pkg}."),
-                Ok(s) => println!("npm install {npm_pkg} exited with status {s}"),
-                Err(e) => {
-                    println!("Could not run npm: {e}. Install Node.js + npm first.");
-                    break;
-                }
-            }
+            run_doctor_fix_action(gate.binary).await;
         }
     }
     let registry = AgentRegistry::with_defaults();
@@ -403,7 +563,12 @@ pub(crate) fn command_present(command: &str) -> bool {
     } else if command.contains('/') || command.contains('\\') {
         std::path::Path::new(command).exists()
     } else {
+        // PATH first, then the bundled adapter aoe installs on demand.
         find_in_path(command).is_some()
+            || crate::session::get_app_dir()
+                .ok()
+                .and_then(|app_dir| crate::acp::adapters::bundled_adapter_bin(&app_dir, command))
+                .is_some()
     }
 }
 
@@ -426,7 +591,7 @@ fn agents() -> Result<()> {
 }
 
 fn ps(json: bool) -> Result<()> {
-    use crate::acp::worker_registry;
+    use crate::process::worker_registry;
     let mut records = worker_registry::list().unwrap_or_default();
     records.sort_by_key(|r| r.started_at);
     if json {
@@ -502,8 +667,8 @@ fn render_build_cell(build_version: &str, stale: bool) -> String {
 }
 
 async fn stop(session: Option<String>, all: bool, timeout_secs: u64) -> Result<()> {
-    use crate::acp::worker_registry;
-    let targets: Vec<crate::acp::worker_registry::WorkerRecord> = if all {
+    use crate::process::worker_registry;
+    let targets: Vec<crate::process::worker_registry::WorkerRecord> = if all {
         worker_registry::list().unwrap_or_default()
     } else {
         let id = match session {
@@ -530,17 +695,17 @@ async fn stop(session: Option<String>, all: bool, timeout_secs: u64) -> Result<(
 /// reflect it in their exit status instead of silently reporting zero workers;
 /// per-worker signaling stays best-effort.
 pub(crate) async fn stop_all_workers(timeout_secs: u64) -> Result<usize> {
-    use crate::acp::worker_registry;
+    use crate::process::worker_registry;
     let targets = worker_registry::list()?;
     stop_worker_records(&targets, timeout_secs).await;
     Ok(targets.len())
 }
 
 async fn stop_worker_records(
-    targets: &[crate::acp::worker_registry::WorkerRecord],
+    targets: &[crate::process::worker_registry::WorkerRecord],
     timeout_secs: u64,
 ) {
-    use crate::acp::worker_registry;
+    use crate::process::worker_registry;
     for record in targets {
         // Delete the registry entry BEFORE SIGTERM. The running daemon
         // (if any) uses the registry-gone signal in `restart_decision`
@@ -560,7 +725,7 @@ async fn stop_worker_records(
 }
 
 fn kill_now(session: &str) -> Result<()> {
-    use crate::acp::worker_registry;
+    use crate::process::worker_registry;
     let Some(record) = worker_registry::load(session)? else {
         anyhow::bail!("No agent worker registry entry for session {session}");
     };
@@ -579,8 +744,11 @@ fn kill_now(session: &str) -> Result<()> {
     Ok(())
 }
 
-async fn signal_and_wait(record: &crate::acp::worker_registry::WorkerRecord, timeout_secs: u64) {
-    use crate::acp::worker_registry;
+async fn signal_and_wait(
+    record: &crate::process::worker_registry::WorkerRecord,
+    timeout_secs: u64,
+) {
+    use crate::process::worker_registry;
     // Group signals so the whole agent tree (runner + node + SDK child)
     // goes down together, not just the runner pid. Sent unconditionally:
     // the group can outlive its leader pid, so gating on leader liveness
@@ -597,7 +765,7 @@ async fn signal_and_wait(record: &crate::acp::worker_registry::WorkerRecord, tim
 }
 
 fn logs(session: Option<String>, follow: bool) -> Result<()> {
-    use crate::acp::worker_registry;
+    use crate::process::worker_registry;
     let id = match session {
         Some(s) => s,
         None => {
@@ -653,7 +821,7 @@ fn logs(session: Option<String>, follow: bool) -> Result<()> {
 }
 
 fn restart(session: &str) -> Result<()> {
-    use crate::acp::worker_registry;
+    use crate::process::worker_registry;
     let Some(record) = worker_registry::load(session)? else {
         anyhow::bail!("No agent worker registry entry for session {session}");
     };
@@ -920,6 +1088,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::SessionContextReset { .. } => "session_context_reset",
         Event::SessionCleared => "session_cleared",
         Event::ConversationCompacted => "conversation_compacted",
+        Event::ConversationSummary { .. } => "conversation_summary",
         Event::WakeupScheduled { .. } => "wakeup_scheduled",
         Event::MonitorArmed { .. } => "monitor_armed",
         Event::PromptRejected { .. } => "prompt_rejected",
@@ -937,6 +1106,103 @@ mod tests {
         assert_eq!(parse_node_major("v20.0.0"), Some(20));
         assert_eq!(parse_node_major("18.17.1"), Some(18));
         assert_eq!(parse_node_major("not a version"), None);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn doctor_fix_hints_missing_and_stale_gated_agents() {
+        let claude = crate::acp::agent_compat::version_gate_for(
+            crate::acp::agent_compat::ExpectedAgent::ClaudeAgentAcp,
+        );
+        assert!(matches!(
+            doctor_fix_action(claude, &crate::acp::version_probe::ProbeStatus::Missing),
+            DoctorFixAction::PrintHint { .. }
+        ));
+        assert!(matches!(
+            doctor_fix_action(
+                claude,
+                &crate::acp::version_probe::ProbeStatus::Version {
+                    raw: "0.0.1".to_string(),
+                    parsed: semver::Version::parse("0.0.1").unwrap(),
+                },
+            ),
+            DoctorFixAction::PrintHint { .. }
+        ));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn doctor_fix_skips_current_and_ungated_agents() {
+        let claude = crate::acp::agent_compat::version_gate_for(
+            crate::acp::agent_compat::ExpectedAgent::ClaudeAgentAcp,
+        );
+        assert_eq!(
+            doctor_fix_action(
+                claude,
+                &crate::acp::version_probe::ProbeStatus::Version {
+                    raw: crate::acp::agent_compat::CLAUDE_AGENT_ACP_MIN_VERSION.to_string(),
+                    parsed: semver::Version::parse(
+                        crate::acp::agent_compat::CLAUDE_AGENT_ACP_MIN_VERSION,
+                    )
+                    .unwrap(),
+                },
+            ),
+            DoctorFixAction::Skip,
+        );
+        assert!(matches!(
+            doctor_fix_action(
+                claude,
+                &crate::acp::version_probe::ProbeStatus::Unparseable {
+                    raw: "weird".to_string(),
+                },
+            ),
+            DoctorFixAction::PrintHint { .. }
+        ));
+        // Ungated adapter: uncertain version is left alone.
+        assert_eq!(
+            doctor_fix_action(
+                None,
+                &crate::acp::version_probe::ProbeStatus::Unparseable {
+                    raw: "weird".to_string(),
+                },
+            ),
+            DoctorFixAction::Skip,
+        );
+        // Ungated and missing is also left alone, same as every other arm.
+        assert_eq!(
+            doctor_fix_action(None, &crate::acp::version_probe::ProbeStatus::Missing),
+            DoctorFixAction::Skip,
+        );
+    }
+
+    /// A stale global adapter shadows the bundled pinned copy, so
+    /// `--fix` must still check a bundled binary that is present on PATH;
+    /// only an absent one is covered by the bundled install. See #1017.
+    #[test]
+    fn skip_gate_check_only_skips_absent_bundled_adapters() {
+        assert!(skip_gate_check("claude-agent-acp", false));
+        assert!(!skip_gate_check("claude-agent-acp", true));
+        // Native CLIs are never bundled, so they are always reported.
+        assert!(!skip_gate_check("opencode", false));
+        assert!(!skip_gate_check("opencode", true));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn doctor_fix_hints_non_npm_stale_agents() {
+        let opencode = crate::acp::agent_compat::version_gate_for(
+            crate::acp::agent_compat::ExpectedAgent::OpenCode,
+        );
+        assert!(matches!(
+            doctor_fix_action(
+                opencode,
+                &crate::acp::version_probe::ProbeStatus::Version {
+                    raw: "1.15.0".to_string(),
+                    parsed: semver::Version::parse("1.15.0").unwrap(),
+                },
+            ),
+            DoctorFixAction::PrintHint { .. }
+        ));
     }
 
     /// Story 3: `aoe acp ps` surfaces the worker build version, tags

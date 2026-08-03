@@ -1,4 +1,4 @@
-use serial_test::serial;
+use serial_test::parallel;
 use std::path::Path;
 use std::process::Command;
 
@@ -14,7 +14,7 @@ fn read_sessions_json(h: &TuiTestHarness) -> serde_json::Value {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_and_list() {
     let h = TuiTestHarness::new("cli_add_list");
     let project = h.project_path();
@@ -44,7 +44,7 @@ fn test_cli_add_and_list() {
 /// Regression test for #848: `aoe add` "Next steps" hint should reference
 /// the actual binary name (`aoe`), not the long project name.
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_next_steps_uses_aoe_binary_name() {
     let h = TuiTestHarness::new("cli_add_next_steps_name");
     let project = h.project_path();
@@ -75,7 +75,7 @@ fn test_cli_add_next_steps_uses_aoe_binary_name() {
 /// a name collision. The native config also carries a secret that must never
 /// reach stdout.
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_mcp_list_provenance_and_redaction() {
     let h = TuiTestHarness::new("cli_mcp_list");
     let home = h.home_path();
@@ -139,12 +139,57 @@ fn test_cli_mcp_list_provenance_and_redaction() {
     assert_eq!(native_only["envNames"], serde_json::json!(["TOKEN"]));
 }
 
+/// Native Codex entries with `enabled = false` remain known to drift tracking
+/// but do not appear in the effective set printed by `aoe mcp list`.
+#[test]
+#[parallel]
+fn test_cli_mcp_list_honors_codex_enabled_flag() {
+    let h = TuiTestHarness::new("cli_mcp_codex_enabled");
+    let home = h.home_path();
+    let codex_dir = home.join(".codex");
+    std::fs::create_dir_all(&codex_dir).expect("create .codex dir");
+    std::fs::write(
+        codex_dir.join("config.toml"),
+        r#"
+[mcp_servers.omitted]
+command = "omitted"
+
+[mcp_servers.explicit_true]
+command = "true"
+enabled = true
+
+[mcp_servers.explicit_false]
+command = "false"
+enabled = false
+"#,
+    )
+    .expect("write Codex config");
+
+    let out = h.run_cli(&["mcp", "list", "--agent", "codex", "--json"]);
+    assert!(
+        out.status.success(),
+        "aoe mcp list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let val: serde_json::Value = serde_json::from_str(&stdout).expect("output is JSON");
+    let effective = val["effective"].as_array().expect("effective array");
+    let names = effective
+        .iter()
+        .map(|server| server["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["explicit_true", "omitted"]);
+    assert_eq!(val["keptOnRemoval"], serde_json::json!([]));
+    assert_eq!(val["conflicts"], serde_json::json!([]));
+    assert_eq!(val["driftPaused"], false);
+}
+
 /// #1909: `aoe add --interactive` must fail loudly when stdin is not a
 /// terminal instead of hanging on the name prompt. `run_cli` runs the
 /// binary as a plain subprocess with no controlling TTY, which is the
 /// non-interactive case the guard protects.
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_interactive_requires_tty() {
     let h = TuiTestHarness::new("cli_add_interactive_no_tty");
     let project = h.project_path();
@@ -174,7 +219,7 @@ fn test_cli_add_interactive_requires_tty() {
 /// the TUI `n` flow. Driven through a tmux pane so stdin is a real
 /// terminal; the typed name must become the session title.
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_interactive_prompts_for_name() {
     require_tmux!();
 
@@ -220,7 +265,7 @@ fn test_cli_add_interactive_prompts_for_name() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_invalid_path() {
     let h = TuiTestHarness::new("cli_add_invalid");
 
@@ -247,7 +292,7 @@ fn test_cli_add_invalid_path() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_respects_config_extra_args() {
     let h = TuiTestHarness::new("cli_add_config_extra_args");
     let project = h.project_path();
@@ -287,7 +332,7 @@ agent_extra_args = {{ claude = "--verbose --debug" }}
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_respects_config_command_override() {
     let h = TuiTestHarness::new("cli_add_config_cmd_override");
     let project = h.project_path();
@@ -327,7 +372,7 @@ agent_command_override = {{ claude = "my-custom-claude" }}
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_cmd_respects_command_override_for_availability() {
     // `qwen` is a built-in agent whose binary is not installed in CI. The
     // override remaps it to a wrapper that we shim on PATH. Pre-fix, the
@@ -383,7 +428,7 @@ agent_command_override = {{ qwen = "qwen-plannotator" }}
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_cli_flags_override_config() {
     let h = TuiTestHarness::new("cli_add_flags_override");
     let project = h.project_path();
@@ -439,7 +484,7 @@ agent_command_override = {{ claude = "config-claude" }}
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_respects_default_tool() {
     let h = TuiTestHarness::new("cli_add_default_tool");
     let project = h.project_path();
@@ -482,7 +527,7 @@ default_tool = "opencode"
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_cmd_overrides_default_tool() {
     let h = TuiTestHarness::new("cli_add_cmd_overrides");
     let project = h.project_path();
@@ -527,7 +572,7 @@ default_tool = "opencode"
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_respects_yolo_mode_default() {
     let h = TuiTestHarness::new("cli_add_yolo_default");
     let project = h.project_path();
@@ -565,7 +610,7 @@ yolo_mode_default = true
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_yolo_flag_without_config() {
     let h = TuiTestHarness::new("cli_add_yolo_flag");
     let project = h.project_path();
@@ -587,7 +632,7 @@ fn test_cli_add_yolo_flag_without_config() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_default_tool_no_config() {
     let h = TuiTestHarness::new("cli_add_no_config");
     let project = h.project_path();
@@ -613,7 +658,7 @@ fn test_cli_add_default_tool_no_config() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn cli_add_custom_agent_persists_configured_command_extra_args_and_detect_as() {
     let h = TuiTestHarness::new("cli_add_custom_agent_success");
     let project = h.project_path();
@@ -661,7 +706,7 @@ agent_detect_as = {{ custom = "claude" }}
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn cli_add_custom_agent_allows_missing_detect_as_mapping() {
     let h = TuiTestHarness::new("cli_add_custom_agent_no_detect_as");
     let project = h.project_path();
@@ -698,7 +743,7 @@ custom_agents = {{ custom = "bash -lc true" }}
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn cli_add_custom_agent_unknown_tool_fails_safely_without_persistence() {
     let h = TuiTestHarness::new("cli_add_custom_agent_unknown");
     let project = h.project_path();
@@ -746,7 +791,7 @@ custom_agents = {{ custom = "secret-custom-command-for-leak-check" }}
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn cli_add_custom_agent_rejects_custom_cmd_override() {
     let h = TuiTestHarness::new("cli_add_custom_agent_cmd_override");
     let project = h.project_path();
@@ -782,7 +827,7 @@ custom_agents = {{ custom = "bash -lc true" }}
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn cli_add_custom_agent_rejects_empty_configured_command() {
     let h = TuiTestHarness::new("cli_add_custom_agent_empty_command");
     let project = h.project_path();
@@ -821,7 +866,7 @@ custom_agents = {{ custom = "" }}
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn cli_add_custom_agent_rejects_invalid_detect_as_target() {
     let h = TuiTestHarness::new("cli_add_custom_agent_bad_detect_as");
     let project = h.project_path();
@@ -861,7 +906,7 @@ agent_detect_as = {{ custom = "not-a-built-in" }}
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn cli_add_custom_agent_allows_builtin_cmd_override() {
     let h = TuiTestHarness::new("cli_add_builtin_tool_cmd_override");
     let project = h.project_path();
@@ -890,7 +935,7 @@ fn cli_add_custom_agent_allows_builtin_cmd_override() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn cli_add_custom_agent_tool_conflicts_with_cmd() {
     let h = TuiTestHarness::new("cli_add_tool_cmd_conflict");
     let project = h.project_path();
@@ -919,7 +964,7 @@ fn cli_add_custom_agent_tool_conflicts_with_cmd() {
 
 /// `aoe session capture` should return pane content or empty output for a stopped session.
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_session_capture_stopped() {
     let h = TuiTestHarness::new("cli_capture_stopped");
     let project = h.project_path();
@@ -951,7 +996,7 @@ fn test_cli_session_capture_stopped() {
 
 /// `aoe session capture` plain text mode should output raw content.
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_session_capture_plain() {
     let h = TuiTestHarness::new("cli_capture_plain");
     let project = h.project_path();
@@ -978,7 +1023,7 @@ fn test_cli_session_capture_plain() {
 /// Renaming a session via CLI should rename the tmux session, not kill it.
 /// Regression test for https://github.com/agent-of-empires/agent-of-empires/issues/431
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_rename_preserves_tmux_session() {
     require_tmux!();
 
@@ -1083,7 +1128,7 @@ fn test_cli_rename_preserves_tmux_session() {
 /// invariant "session removed implies tmux gone" that the audit identified
 /// as untested on every removal path.
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_rm_kills_agent_tmux_session() {
     require_tmux!();
 
@@ -1183,7 +1228,7 @@ fn init_git_repo(path: &Path) {
 /// Regression test for #591: repo on_create hooks should execute for multi-repo
 /// workspace sessions created via `aoe add --repo`.
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_workspace_repo_hooks_execute() {
     let h = TuiTestHarness::new("cli_workspace_hooks");
 
@@ -1245,7 +1290,7 @@ fn test_cli_add_workspace_repo_hooks_execute() {
 /// Regression test for #591: global hooks should execute as fallback when no
 /// repo hooks are defined, even for workspace sessions.
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_workspace_global_hook_fallback() {
     let h = TuiTestHarness::new("cli_workspace_global_hooks");
 
@@ -1316,7 +1361,7 @@ on_create = ["touch {}"]
 /// because the computed path collides. Matches the TUI's
 /// "Attach to existing branch" behavior.
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_attaches_to_existing_worktree() {
     let h = TuiTestHarness::new("cli_attach_existing");
     let project = h.home_path().join("attach-project");
@@ -1379,7 +1424,92 @@ fn test_cli_add_attaches_to_existing_worktree() {
 }
 
 #[test]
-#[serial]
+#[parallel]
+fn test_cli_add_sanitizes_explicit_worktree_branch() {
+    let h = TuiTestHarness::new("cli_branch_sanitize");
+    let project = h.home_path().join("branch-sanitize-project");
+    init_git_repo(&project);
+
+    let add_output = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-w",
+        "Exploration and issues v2",
+        "-b",
+        "-t",
+        "SanitizedBranch",
+    ]);
+    assert!(
+        add_output.status.success(),
+        "aoe add with unsanitized explicit branch should succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&add_output.stdout),
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let json = read_sessions_json(&h);
+    let sessions = json.as_array().expect("sessions array");
+    let session = sessions
+        .iter()
+        .find(|s| s["title"].as_str() == Some("SanitizedBranch"))
+        .expect("SanitizedBranch session should exist");
+    assert_eq!(
+        session["worktree_info"]["branch"].as_str(),
+        Some("Exploration-and-issues-v2"),
+        "CLI should persist the same sanitized explicit branch name as the TUI/API path"
+    );
+
+    let branch = Command::new("git")
+        .args(["branch", "--list", "Exploration-and-issues-v2"])
+        .current_dir(&project)
+        .output()
+        .expect("git branch --list");
+    assert!(
+        String::from_utf8_lossy(&branch.stdout).contains("Exploration-and-issues-v2"),
+        "sanitized branch should exist in the source repo"
+    );
+}
+
+#[test]
+#[parallel]
+fn test_cli_add_blank_worktree_branch_falls_back_to_normal_title() {
+    let h = TuiTestHarness::new("cli_blank_branch_title_fallback");
+    let project = h.home_path().join("blank-branch-title-project");
+    init_git_repo(&project);
+
+    let add_output = h.run_cli(&["add", project.to_str().unwrap(), "-w", "   ", "-b"]);
+    assert!(
+        add_output.status.success(),
+        "blank explicit worktree branch should fall back instead of creating branch 'session':\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&add_output.stdout),
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let json = read_sessions_json(&h);
+    let sessions = json.as_array().expect("sessions array");
+    assert_eq!(sessions.len(), 1, "expected exactly one session");
+    let session = &sessions[0];
+    assert!(
+        !session["title"].as_str().unwrap_or_default().is_empty(),
+        "blank worktree branch should not become an empty session title"
+    );
+    assert!(
+        session["worktree_info"].is_null(),
+        "blank worktree branch should not create a managed worktree"
+    );
+
+    let branch = Command::new("git")
+        .args(["branch", "--list", "session"])
+        .current_dir(&project)
+        .output()
+        .expect("git branch --list");
+    assert!(
+        String::from_utf8_lossy(&branch.stdout).trim().is_empty(),
+        "blank explicit branch should not create the sanitizer fallback branch"
+    );
+}
+
+#[test]
+#[parallel]
 fn test_cli_add_scratch_provisions_dir() {
     let h = TuiTestHarness::new("cli_add_scratch");
 
@@ -1442,7 +1572,7 @@ fn test_cli_add_scratch_provisions_dir() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_scratch_rejects_explicit_path() {
     let h = TuiTestHarness::new("cli_add_scratch_path");
     let project = h.project_path();
@@ -1461,7 +1591,7 @@ fn test_cli_add_scratch_rejects_explicit_path() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_rm_keep_scratch_leaves_dir_on_disk() {
     let h = TuiTestHarness::new("cli_rm_keep_scratch");
 
@@ -1515,7 +1645,7 @@ fn test_cli_rm_keep_scratch_leaves_dir_on_disk() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_add_scratch_conflicts_with_worktree_flag() {
     let h = TuiTestHarness::new("cli_add_scratch_worktree");
 
@@ -1535,11 +1665,35 @@ fn test_cli_add_scratch_conflicts_with_worktree_flag() {
     );
 }
 
+/// #1051: `aoe ps --json` is substrate-agnostic and fail-soft. On an empty
+/// profile with no tmux server it must emit an empty JSON array and exit 0,
+/// never abort because a substrate probe failed.
+#[test]
+#[parallel]
+fn test_cli_ps_empty_json() {
+    let h = TuiTestHarness::new("cli_ps_empty_json");
+
+    let output = h.run_cli(&["ps", "--json"]);
+    assert!(
+        output.status.success(),
+        "aoe ps --json should succeed on an empty profile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("aoe ps --json must emit valid JSON");
+    assert!(
+        value.as_array().map(|a| a.is_empty()).unwrap_or(false),
+        "expected an empty JSON array, got:\n{stdout}"
+    );
+}
+
 /// `aoe stop` (with or without args) is a hidden trap, not a real command: it
 /// must exit non-zero and redirect the user to the scoped stop verbs and
 /// `killall` rather than silently doing nothing or triggering a teardown.
 #[test]
-#[serial]
+#[parallel]
 fn test_cli_stop_trap_redirects() {
     let h = TuiTestHarness::new("cli_stop_trap");
     for argv in [vec!["stop"], vec!["stop", "abc123"], vec!["stop", "--all"]] {

@@ -11,24 +11,41 @@ interface Props {
   onSelectSession: (sessionId: string) => void;
   onNewSession: () => void;
   onCloneFromUrl: () => void;
+  /** When false (CityHall client mode), the "Clone URL" action is hidden;
+   *  cloning a repo is a project-management action. Defaults to true. See #7. */
+  canManageProjects?: boolean;
   onToggleSidebar: () => void;
   readOnly?: boolean;
 }
 
-export function Dashboard({ sessions, onNewSession, onCloneFromUrl, onToggleSidebar, readOnly }: Props) {
+export function Dashboard({
+  sessions,
+  onNewSession,
+  onCloneFromUrl,
+  onToggleSidebar,
+  readOnly,
+  canManageProjects = true,
+}: Props) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const stats = useMemo(() => {
     const projects = new Set<string>();
+    let total = 0;
     let active = 0;
     let waiting = 0;
     let errors = 0;
     for (const s of sessions) {
+      // Trashed sessions are conceptually deleted (the sidebar buckets them
+      // into a dedicated Trash section, out of the active/archived buckets), so
+      // they must not skew this summary: a session left in an Error state does
+      // not matter once it is in the trash. See #2489.
+      if (s.trashed_at) continue;
+      total++;
       projects.add(s.main_repo_path || s.project_path);
       if (isSessionActive(s, idleDecayWindowMs)) active++;
       if (s.status === "Waiting") waiting++;
       if (s.status === "Error") errors++;
     }
-    return { active, waiting, errors, projects: projects.size };
+    return { total, active, waiting, errors, projects: projects.size };
   }, [idleDecayWindowMs, sessions]);
 
   return (
@@ -90,7 +107,7 @@ export function Dashboard({ sessions, onNewSession, onCloneFromUrl, onToggleSide
       </div>
 
       {/* Session summary for returning users */}
-      {sessions.length > 0 && (
+      {stats.total > 0 && (
         <div className="flex items-center gap-2 text-xs font-mono text-text-muted mb-6">
           {stats.active > 0 && <span className="text-status-running">{stats.active} running</span>}
           {stats.waiting > 0 && <span className="text-status-waiting">{stats.waiting} waiting</span>}
@@ -100,7 +117,7 @@ export function Dashboard({ sessions, onNewSession, onCloneFromUrl, onToggleSide
             </span>
           )}
           <span>
-            {sessions.length} session{sessions.length !== 1 ? "s" : ""} across {stats.projects} project
+            {stats.total} session{stats.total !== 1 ? "s" : ""} across {stats.projects} project
             {stats.projects !== 1 ? "s" : ""}
           </span>
         </div>
@@ -149,7 +166,9 @@ export function Dashboard({ sessions, onNewSession, onCloneFromUrl, onToggleSide
             featured
             dataTour={TOUR_ANCHORS.dashboardNewSession}
           />
-          <ActionPane title="Clone URL" subtitle="Clone a repo from a URL" onClick={onCloneFromUrl} icon="git" />
+          {canManageProjects && (
+            <ActionPane title="Clone URL" subtitle="Clone a repo from a URL" onClick={onCloneFromUrl} icon="git" />
+          )}
           <ActionPane
             title="Docs"
             subtitle="Guides and reference"

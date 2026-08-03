@@ -8,6 +8,7 @@ import {
   fetchSettings,
   createSession,
   fetchVolumeIgnoresPreview,
+  fetchIsGitRepo,
   markVolumeIgnoresGlobsAcknowledged,
   type VolumeIgnoresGlobPreview,
   type HooksNeedTrust,
@@ -22,7 +23,6 @@ import { SessionStep } from "./steps/SessionStep";
 import { AgentPickerEssentials } from "./steps/AgentPickerEssentials";
 import { AgentOptions } from "./steps/AgentOptions";
 import { LaunchFooter } from "./LaunchFooter";
-import { getSubmittedBranch } from "./sessionNames";
 import { initialData, reducer, type WizardData } from "./wizardReducer";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "./commandMaps";
 
@@ -111,9 +111,14 @@ interface Props {
   onClose: () => void;
   onCreated: (session?: SessionResponse) => void;
   prefill?: WizardPrefill;
+  /** CityHall client mode: collapse the wizard to a name-only form. The
+   *  project set, view, and agent are derived server-side (every configured
+   *  project, structured view, default agent), so the client only asks for a
+   *  title. See #7. */
+  nameOnly?: boolean;
 }
 
-export function SessionWizard({ onClose, onCreated, prefill }: Props) {
+export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }: Props) {
   const baseInitial = buildInitialData();
   const prefillData: WizardData = prefill
     ? {
@@ -228,6 +233,27 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Probe whether the selected path is a git repository so the worktree
+  // toggle can be disabled for a plain folder (e.g. a root picked via "Use
+  // this folder"). `/api/git/is-repo` uses the same `GitWorktree::is_git_repo`
+  // gate the builder enforces, so the UI matches the server's accept/reject.
+  // Only act on a definitive answer: on a transient failure (null) leave the
+  // optimistic default so a probe blip can't misreport a repo as a non-repo.
+  // Scratch sessions have no path and never use a worktree, so skip the probe.
+  const probePath = state.data.scratch ? "" : state.data.path;
+  useEffect(() => {
+    if (!probePath) return;
+    let cancelled = false;
+    fetchIsGitRepo(probePath).then((isRepo) => {
+      if (!cancelled && isRepo !== null) {
+        dispatch({ type: "SET_FIELD", field: "pathIsGitRepo", value: isRepo });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [probePath]);
+
   const handleChange = useCallback((field: string, value: unknown) => {
     dispatch({ type: "SET_FIELD", field, value });
   }, []);
@@ -264,7 +290,11 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       title: d.title || undefined,
       group: d.group || undefined,
       yolo_mode: d.yoloMode,
-      worktree_branch: !d.scratch && d.useWorktree ? getSubmittedBranch(d.title, d.worktreeBranch) : undefined,
+      worktree_enabled: !d.scratch && d.useWorktree,
+      worktree_branch:
+        !d.scratch && d.useWorktree && d.worktreeBranchDirty && d.worktreeBranch.trim()
+          ? d.worktreeBranch.trim()
+          : undefined,
       create_new_branch: !d.scratch && d.useWorktree && !d.attachExisting,
       base_branch:
         !d.scratch && d.useWorktree && !d.attachExisting && d.baseBranch.trim() ? d.baseBranch.trim() : undefined,
@@ -375,12 +405,14 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
           </button>
         </div>
         <div className="flex-1 overflow-y-auto px-5 py-5 space-y-6">
-          <ProjectStep
-            data={state.data}
-            onChange={handleChange}
-            initialTab={prefill?.initialTab}
-            agents={state.agents}
-          />
+          {!nameOnly && (
+            <ProjectStep
+              data={state.data}
+              onChange={handleChange}
+              initialTab={prefill?.initialTab}
+              agents={state.agents}
+            />
+          )}
 
           <div>
             <label className="block text-sm text-text-dim mb-1.5">Session title</label>
@@ -396,50 +428,54 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
             </p>
           </div>
 
-          <div>
-            <h2 className="text-lg font-semibold text-text-primary mb-1">Which AI agent?</h2>
-            <p className="text-sm text-text-muted mb-5">Pick the coding assistant for this session.</p>
-            <AgentPickerEssentials data={state.data} onChange={handleChange} agents={state.agents} />
-          </div>
+          {!nameOnly && (
+            <div>
+              <h2 className="text-lg font-semibold text-text-primary mb-1">Which AI agent?</h2>
+              <p className="text-sm text-text-muted mb-5">Pick the coding assistant for this session.</p>
+              <AgentPickerEssentials data={state.data} onChange={handleChange} agents={state.agents} />
+            </div>
+          )}
 
-          <div className="border-t border-surface-700/20 pt-4">
-            <button
-              type="button"
-              onClick={toggleMoreOpen}
-              aria-expanded={moreOpen}
-              className="flex items-center gap-2 text-sm font-medium text-text-secondary hover:text-text-primary py-1 cursor-pointer w-full"
-            >
-              <svg
-                className={`w-3 h-3 transition-transform ${moreOpen ? "rotate-90" : ""}`}
-                viewBox="0 0 12 12"
-                fill="currentColor"
+          {!nameOnly && (
+            <div className="border-t border-surface-700/20 pt-4">
+              <button
+                type="button"
+                onClick={toggleMoreOpen}
+                aria-expanded={moreOpen}
+                className="flex items-center gap-2 text-sm font-medium text-text-secondary hover:text-text-primary py-1 cursor-pointer w-full"
               >
-                <path
-                  d="M4.5 2l4.5 4-4.5 4"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                  fill="none"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
-              More options
-            </button>
-            {moreOpen && (
-              <div className="mt-4 space-y-6">
-                <SessionStep data={state.data} onChange={handleChange} embedded />
-                <AgentOptions
-                  data={state.data}
-                  onChange={handleChange}
-                  agents={state.agents}
-                  profiles={state.profiles}
-                  dockerAvailable={state.dockerAvailable}
-                  onApplyProfileDefaults={handleApplyProfileDefaults}
-                  commandMaps={commandMaps}
-                />
-              </div>
-            )}
-          </div>
+                <svg
+                  className={`w-3 h-3 transition-transform ${moreOpen ? "rotate-90" : ""}`}
+                  viewBox="0 0 12 12"
+                  fill="currentColor"
+                >
+                  <path
+                    d="M4.5 2l4.5 4-4.5 4"
+                    stroke="currentColor"
+                    strokeWidth="1.5"
+                    fill="none"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+                More options
+              </button>
+              {moreOpen && (
+                <div className="mt-4 space-y-6">
+                  <SessionStep data={state.data} onChange={handleChange} embedded />
+                  <AgentOptions
+                    data={state.data}
+                    onChange={handleChange}
+                    agents={state.agents}
+                    profiles={state.profiles}
+                    dockerAvailable={state.dockerAvailable}
+                    onApplyProfileDefaults={handleApplyProfileDefaults}
+                    commandMaps={commandMaps}
+                  />
+                </div>
+              )}
+            </div>
+          )}
         </div>
         <div className="px-5 py-4 border-t border-surface-700/20">
           <LaunchFooter
@@ -447,6 +483,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
             isSubmitting={state.isSubmitting}
             error={state.error}
             onSubmit={handleSubmit}
+            nameOnly={nameOnly}
           />
         </div>
       </div>

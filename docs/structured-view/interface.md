@@ -14,7 +14,7 @@ surface, so the conversation log, pending approvals, and worker state
 stay in sync.
 
 - **Sessions started in structured view** appear in the TUI session list
-  with a `[acp]` badge. Pressing Enter opens the native structured view,
+  with a `[structured]` badge. Pressing Enter opens the native structured view,
   which requires an `aoe serve` daemon to be already running. If one
   isn't, the view shows an actionable error pointing at
   `aoe serve --daemon` (localhost), `aoe serve --daemon --remote`
@@ -23,11 +23,13 @@ stay in sync.
   the choice between localhost, tunnel, and named tunnel stays explicit.
 - **Sessions started in tmux mode** work in both surfaces. The TUI
   attaches to the pane; the dashboard renders the pane via xterm.js.
-- **Switching views** (web wizard or the per-session "Switch to
-  structured view" / "Switch to tmux" action) destroys the in-memory
-  conversation history for that session. The git worktree, files on
-  disk, and any commits remain. The next prompt starts a fresh
-  conversation under the new view.
+- **Switching views** (the per-session "Switch to terminal" / "Switch to
+  structured view" action in the web sidebar or the TUI context menu)
+  keeps the git worktree, files on disk, and any commits. For a **claude**
+  session the conversation is kept in both directions: to the terminal via
+  `claude --resume`, and back to structured view by reloading the
+  transcript. Every other agent starts a fresh conversation under the new
+  view.
 - **TUI status indicators**: a healthy structured view session shows as
   Idle/Active in the session list, observed via the ACP event stream
   rather than tmux pane probing.
@@ -38,10 +40,18 @@ stay in sync.
 
 ### TUI structured view keybinds
 
-The TUI structured view has three focusable regions: composer (where
-you type prompts), transcript (the activity feed), and approval cards
-(one per pending tool authorization). Tab cycles focus; the status
-banner at the bottom shows the current focus.
+The TUI structured view opens with the composer ready for typing. The
+transcript remains scrollable from the composer, while a pending tool
+authorization opens a focused approval shelf above it. The status line
+keeps the current worker state and primary controls visible.
+
+**Visual hierarchy.** The active session uses a compact metadata card in
+the upper-left for the agent, session, directory, and permission mode. The
+conversation stays on the terminal background instead of sitting inside a
+full-width frame: user turns use a `›` gutter, agent replies use a `•`
+gutter, and the composer repeats the same open prompt treatment. Session
+identity and readiness stay on the bottom status line. Only modal decisions,
+such as a pending approval, receive a full-width border.
 
 | Focus       | Key             | Action                                                |
 | ----------- | --------------- | ----------------------------------------------------- |
@@ -61,12 +71,15 @@ banner at the bottom shows the current focus.
 | Transcript  | `g` / `G`       | Jump to top / bottom                                  |
 | Transcript  | `i`             | Focus the composer                                    |
 | Transcript  | `Tab`           | Cycle to the approval card (if any pending)           |
+| Transcript  | `m`             | Open the permission-mode picker (when the agent advertises modes) |
+| Transcript  | `a`             | Answer a pending question natively (single-select forms) |
+| Transcript  | `s` / `c`       | Skip / cancel a pending question                      |
 | Transcript  | `o`             | Open this session in the web dashboard                |
 | Transcript  | `Esc`           | Close the structured view and return to the session list |
 | Approval    | `a`             | Allow once                                            |
 | Approval    | `Shift+A`       | Allow always (session-scoped allow-list entry)        |
 | Approval    | `d`             | Deny                                                  |
-| Approval    | `Esc`           | Return focus to the transcript                        |
+| Approval    | `Esc`           | Stop the in-flight turn                               |
 | Any         | `Ctrl+C`        | Cancel the in-flight prompt                           |
 | Any         | `Ctrl+O`        | Open the session in the web dashboard                 |
 | Any         | `Ctrl+X`        | Clear every queued (not-yet-sent) prompt              |
@@ -84,6 +97,19 @@ agent has advertised commands.
 the approval card has focus. Typing "always allow" into the composer
 will never approve a pending tool; the composer captures every
 keystroke.
+
+**Compact activity.** Successful tool calls collapse to one line with
+their target and, for edits, added and removed line counts. Running and
+failed calls stay expanded so progress and errors remain visible. The
+latest agent plan is pinned as a single progress summary above the
+transcript instead of adding a new checklist for every update. Press
+`o` to inspect full tool output and plan history in the web dashboard.
+
+**Approval shelf.** A pending authorization is pinned above the composer
+with the command or path, destructive warning, and decision keys. The
+transcript records the final decision after the shelf closes, without
+showing internal approval identifiers. Multiple requests advance by
+their stable identity, so the action shown is always the action resolved.
 
 **Approval card detail.** The web approval card shows a one-line preview
 of the tool call in its header (the command for a shell call, the path
@@ -191,9 +217,8 @@ accept them yet. Three cases:
    response, the Send button becomes a paper-plane with a pending-count
    badge. Click (or press Enter) and your text lands in the **Queued
    (N)** strip above the composer. Once the agent reports `Stopped`, the
-   queue drains per the `acp.queue_drain_mode` setting (combined, the
-   default, sends every parked entry as one prompt; serial fires them one
-   at a time).
+   queue drains: every parked entry is joined into one combined prompt
+   (clear commands like `/clear` fire alone so they keep their meaning).
 2. **Inactive session.** If the WebSocket is mid-reconnect or the worker
    is stopped or restarting, the composer still accepts submissions. The
    tooltip swaps to `Queue message until session resumes` and the parked
@@ -225,9 +250,8 @@ than queueing a duplicate.
 **TUI structured view.** The TUI has the same client-side queue.
 Pressing `Enter` while a turn is active (or while the WebSocket is down)
 parks the prompt in a **Queued (N)** strip instead of sending; the queue
-drains on the next `Stopped` per the daemon's `acp.queue_drain_mode`
-(read from `/api/about`, so a remote attach honors the remote daemon's
-setting). `Ctrl+X` clears the queue, and pressing `Enter` on an empty
+drains on the next `Stopped` as one combined prompt, the same batching
+as the web composer. `Ctrl+X` clears the queue, and pressing `Enter` on an empty
 composer when idle retries the drain (useful if a send failed and left
 prompts parked). Queued prompts can be recalled for editing the same way
 as the web: with the composer empty (caret at the start), `↑` pulls

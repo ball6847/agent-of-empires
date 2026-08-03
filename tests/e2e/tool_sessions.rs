@@ -2,10 +2,11 @@
 //! integration, the invalid-hotkey info dialog, and the full attach +
 //! cleanup roundtrip against a real agent session.
 
-use serial_test::serial;
+use serial_test::parallel;
 use std::fs;
+use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::harness::{app_dir_in, require_tmux, TuiTestHarness};
 
@@ -49,8 +50,27 @@ fn kill_lingering_tool_sessions_on(socket: &std::path::Path, prefix_marker: &str
     }
 }
 
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn wait_for_file_contents(path: &Path, timeout: Duration) -> String {
+    let start = Instant::now();
+    loop {
+        if let Ok(contents) = fs::read_to_string(path) {
+            if !contents.trim().is_empty() {
+                return contents;
+            }
+        }
+        if start.elapsed() >= timeout {
+            panic!("timed out waiting for {}", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
-#[serial]
+#[parallel]
 fn test_tool_picker_lists_configured_tools() {
     require_tmux!();
 
@@ -83,7 +103,7 @@ command = "yazi"
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_tool_picker_does_not_open_with_no_tools_configured() {
     require_tmux!();
 
@@ -99,7 +119,7 @@ fn test_tool_picker_does_not_open_with_no_tools_configured() {
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_command_palette_includes_tool_entries() {
     require_tmux!();
 
@@ -123,7 +143,90 @@ hotkey = "Alt+g"
 }
 
 #[test]
-#[serial]
+#[parallel]
+fn test_background_tool_runs_without_tmux_session_or_preview_switch() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("tool_background_run");
+    let output_path = h.home_path().join("background-tool-pwd.txt");
+    append_tools_config(
+        &h,
+        &format!(
+            r#"
+[tools.bgpwd]
+command = "pwd > {}"
+hotkey = "Alt+b"
+background = true
+"#,
+            shell_quote_path(&output_path),
+        ),
+    );
+
+    let project = h.project_path();
+    let expected_project = fs::canonicalize(&project).expect("canonicalize project path");
+    let add = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "BackgroundToolSession",
+    ]);
+    assert!(
+        add.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let sessions_path = app_dir_in(h.home_path()).join("profiles/default/sessions.json");
+    let sessions_str = fs::read_to_string(&sessions_path).expect("read sessions.json");
+    let sessions: serde_json::Value =
+        serde_json::from_str(&sessions_str).expect("parse sessions.json");
+    let session_id = sessions[0]["id"]
+        .as_str()
+        .expect("session id present in sessions.json")
+        .to_string();
+    let id_suffix = &session_id[..session_id.len().min(8)];
+    let harness_sock = h.home_path().join("tmux.sock");
+    kill_lingering_tool_sessions_on(&harness_sock, id_suffix);
+
+    h.spawn_tui();
+    h.wait_for("BackgroundToolSession");
+
+    h.send_keys("C-k");
+    h.wait_for("Commands");
+    h.type_text("bgpwd");
+    h.wait_for("Run: bgpwd");
+    h.send_keys("Enter");
+    let contents = wait_for_file_contents(&output_path, Duration::from_secs(5));
+    assert_eq!(contents.trim(), expected_project.to_string_lossy());
+    h.assert_screen_not_contains("Tool: bgpwd");
+
+    fs::remove_file(&output_path).expect("remove palette output");
+    h.send_keys("M-b");
+    let contents = wait_for_file_contents(&output_path, Duration::from_secs(5));
+    assert_eq!(contents.trim(), expected_project.to_string_lossy());
+    h.assert_screen_not_contains("Tool: bgpwd");
+
+    fs::remove_file(&output_path).expect("remove hotkey output");
+    h.send_keys("\\;");
+    h.wait_for("Tool Sessions");
+    h.assert_screen_contains("[bg]");
+    h.send_keys("Enter");
+    let contents = wait_for_file_contents(&output_path, Duration::from_secs(5));
+    assert_eq!(contents.trim(), expected_project.to_string_lossy());
+    h.assert_screen_not_contains("Tool: bgpwd");
+
+    let sessions = list_tmux_sessions_on(&harness_sock);
+    assert!(
+        !sessions
+            .iter()
+            .any(|s| s.starts_with("aoe_dev_tool_") && s.contains(id_suffix)),
+        "background tool should not create a tmux tool session. sessions seen: {:?}",
+        sessions
+    );
+}
+
+#[test]
+#[parallel]
 fn test_invalid_hotkey_surfaces_info_dialog() {
     require_tmux!();
 
@@ -145,7 +248,7 @@ hotkey = "Ctrl+x"
 }
 
 #[test]
-#[serial]
+#[parallel]
 fn test_tool_session_full_attach_and_cleanup_roundtrip() {
     require_tmux!();
 

@@ -11,6 +11,7 @@ import {
   ToggleField,
 } from "./FormFields";
 import { CUSTOM_SETTINGS_WIDGETS } from "./customWidgetRegistry";
+import { CronField, DynamicSelectField, ObjectListField } from "./StructuredWidgets";
 
 interface Props {
   /** Config section name (e.g. "sandbox"). */
@@ -40,6 +41,11 @@ interface Props {
    *  can spotlight a single control (e.g. the worktree path template) rather
    *  than the whole section. */
   fieldAnchor?: { field: string; anchor: TourAnchorId };
+  /** CityHall client mode curation. `onlyFields`, when set, restricts the
+   *  section to those field names (allowlist); `hideFields` drops the named
+   *  fields (denylist). Both apply on top of the local_only skip. See #7. */
+  onlyFields?: string[];
+  hideFields?: string[];
 }
 
 /** Client-side list-entry validator derived from the server's validation rule,
@@ -170,6 +176,45 @@ function renderField(
           validate={listValidator(d.validation)}
         />
       );
+    case "dynamic_select":
+      return (
+        <DynamicSelectField
+          key={d.field}
+          label={d.label}
+          description={description}
+          section={d.section}
+          source={widget.source}
+          dependsOn={widget.depends_on ?? []}
+          sectionValues={values}
+          value={typeof raw === "string" ? raw : ""}
+          onChange={save}
+        />
+      );
+    case "cron":
+      return (
+        <CronField
+          key={d.field}
+          label={d.label}
+          description={description}
+          value={typeof raw === "string" ? raw : ""}
+          onChange={save}
+        />
+      );
+    case "object_list":
+      return (
+        <ObjectListField
+          key={d.field}
+          label={d.label}
+          description={description}
+          section={d.section}
+          idField={widget.id_field}
+          fields={widget.fields}
+          minItems={widget.min_items}
+          maxItems={widget.max_items}
+          items={Array.isArray(raw) ? (raw as Record<string, unknown>[]) : []}
+          onChange={save}
+        />
+      );
     case "custom": {
       const Widget = CUSTOM_SETTINGS_WIDGETS[widget.id];
       if (!Widget) {
@@ -197,8 +242,16 @@ export function SchemaSection({
   onAfterSave,
   focusRequest,
   fieldAnchor,
+  onlyFields,
+  hideFields,
 }: Props) {
-  const fields = schema.filter((d) => d.section === section && d.web_write.policy !== "local_only");
+  const fields = schema.filter(
+    (d) =>
+      d.section === section &&
+      d.web_write.policy !== "local_only" &&
+      (!onlyFields || onlyFields.includes(d.field)) &&
+      !hideFields?.includes(d.field),
+  );
   const primary = fields.filter((d) => !d.advanced);
   const advanced = fields.filter((d) => d.advanced);
 

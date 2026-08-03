@@ -65,20 +65,32 @@ fn worktree_for(inst: &Instance) -> Option<WorktreeJson> {
     })
 }
 
+fn session_json(inst: &Instance, profile: &str) -> SessionJson {
+    SessionJson {
+        id: inst.id.clone(),
+        title: inst.title.clone(),
+        path: inst.project_path.clone(),
+        group: inst.group_path.clone(),
+        tool: inst.tool.clone(),
+        command: inst.command.clone(),
+        profile: profile.to_string(),
+        created_at: inst.created_at,
+        workspace_repos: workspace_repos_for(inst),
+        worktree: worktree_for(inst),
+    }
+}
+
+/// Via `all_repos` so a session converted by `attach_project` (#3103) lists both
+/// repos here, exactly like one created multi-repo.
 fn workspace_repos_for(inst: &Instance) -> Vec<WorkspaceRepoJson> {
-    inst.workspace_info
-        .as_ref()
-        .map(|w| {
-            w.repos
-                .iter()
-                .map(|r| WorkspaceRepoJson {
-                    name: r.name.clone(),
-                    source_path: r.source_path.clone(),
-                    branch: r.branch.clone(),
-                })
-                .collect()
+    inst.all_repos()
+        .iter()
+        .map(|r| WorkspaceRepoJson {
+            name: r.name.clone(),
+            source_path: r.source_path.clone(),
+            branch: r.branch.clone(),
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn print_table_header() {
@@ -120,7 +132,7 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
         return run_all_profiles(args.json).await;
     }
 
-    let storage = Storage::new_unwatched(profile)?;
+    let storage = Storage::open_unwatched(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     if instances.is_empty() {
@@ -131,18 +143,7 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
     if args.json {
         let sessions: Vec<SessionJson> = instances
             .iter()
-            .map(|inst| SessionJson {
-                id: inst.id.clone(),
-                title: inst.title.clone(),
-                path: inst.project_path.clone(),
-                group: inst.group_path.clone(),
-                tool: inst.tool.clone(),
-                command: inst.command.clone(),
-                profile: storage.profile().to_string(),
-                created_at: inst.created_at,
-                workspace_repos: workspace_repos_for(inst),
-                worktree: worktree_for(inst),
-            })
+            .map(|inst| session_json(inst, storage.profile()))
             .collect();
         super::output::print_json(&sessions)?;
         return Ok(());
@@ -171,23 +172,10 @@ async fn run_all_profiles(json: bool) -> Result<()> {
     if json {
         let mut all_sessions: Vec<SessionJson> = Vec::new();
         for profile_name in &profiles {
-            if let Ok(storage) = Storage::new_unwatched(profile_name) {
+            if let Ok(storage) = Storage::open_unwatched(profile_name) {
                 if let Ok((instances, _)) = storage.load_with_groups() {
-                    for inst in instances {
-                        let workspace_repos = workspace_repos_for(&inst);
-                        let worktree = worktree_for(&inst);
-                        all_sessions.push(SessionJson {
-                            id: inst.id,
-                            title: inst.title,
-                            path: inst.project_path,
-                            group: inst.group_path,
-                            tool: inst.tool,
-                            command: inst.command,
-                            profile: profile_name.clone(),
-                            created_at: inst.created_at,
-                            workspace_repos,
-                            worktree,
-                        });
+                    for inst in &instances {
+                        all_sessions.push(session_json(inst, profile_name));
                     }
                 }
             }
@@ -198,7 +186,7 @@ async fn run_all_profiles(json: bool) -> Result<()> {
 
     let mut total_sessions = 0;
     for profile_name in &profiles {
-        if let Ok(storage) = Storage::new_unwatched(profile_name) {
+        if let Ok(storage) = Storage::open_unwatched(profile_name) {
             if let Ok((instances, _)) = storage.load_with_groups() {
                 if instances.is_empty() {
                     continue;

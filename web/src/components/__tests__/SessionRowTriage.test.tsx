@@ -22,6 +22,8 @@ const SINGLE_BULK_API: RowBulkApi = {
   snooze: () => {},
 };
 import { UnreadIndicatorContext } from "../../lib/unreadIndicator";
+import { SessionRowTagContext, type SessionRowTagMode } from "../../lib/sessionRowTag";
+import { SessionColorsContext } from "../../lib/sessionColors";
 import { useSidebarTriage } from "../../hooks/useSidebarTriage";
 import type { SessionResponse, Workspace } from "../../lib/types";
 import { OPEN_SESSION_EVENT } from "../../lib/sessionRoute";
@@ -75,9 +77,23 @@ function workspace(id: string, sessions: SessionResponse[]): Workspace {
   };
 }
 
-function Wrap({ children }: { children: ReactNode }) {
+function Wrap({
+  children,
+  rowTagMode = "branch",
+  colorsEnabled = true,
+}: {
+  children: ReactNode;
+  rowTagMode?: SessionRowTagMode;
+  colorsEnabled?: boolean;
+}) {
   const ref = useRef(0);
-  return <DragSuppressContext.Provider value={ref}>{children}</DragSuppressContext.Provider>;
+  return (
+    <DragSuppressContext.Provider value={ref}>
+      <SessionRowTagContext.Provider value={rowTagMode}>
+        <SessionColorsContext.Provider value={colorsEnabled}>{children}</SessionColorsContext.Provider>
+      </SessionRowTagContext.Provider>
+    </DragSuppressContext.Provider>
+  );
 }
 
 // Mounts a SessionRow wired to the real `useSidebarTriage` controller, the
@@ -221,6 +237,84 @@ describe("SessionRow chips", () => {
     // coexisting at the session level, but defensive rendering
     // hides the snooze chip if the workspace surfaces both.
     expect(screen.queryByLabelText("Snoozed")).toBeNull();
+  });
+});
+
+describe("SessionRow row tags", () => {
+  it("renders a compact branch tag and removes the hardcoded branch subtitle", () => {
+    const ws = {
+      ...workspace("w-branch", [session({ branch: "feature/web-row-tag" })]),
+      branch: "feature/web-row-tag",
+    };
+    render(
+      <Wrap rowTagMode="branch">
+        <Row ws={ws} />
+      </Wrap>,
+    );
+
+    expect(screen.getByTestId("sidebar-session-row-tag").textContent).toBe("[web-row-tag]");
+    expect(screen.queryByText("feature/web-row-tag")).toBeNull();
+  });
+
+  it("hides all session suffix metadata when row_tag is none", () => {
+    const ws = {
+      ...workspace("w-none", [session({ branch: "feature/hidden" })]),
+      branch: "feature/hidden",
+    };
+    render(
+      <Wrap rowTagMode="none">
+        <Row ws={ws} />
+      </Wrap>,
+    );
+
+    expect(screen.queryByTestId("sidebar-session-row-tag")).toBeNull();
+    expect(screen.queryByText("feature/hidden")).toBeNull();
+  });
+
+  it("renders profile, auto, and sandbox tags from the first session", () => {
+    const ws = workspace("w-profile", [session({ profile: "forit-backup", is_sandboxed: true })]);
+
+    const { rerender } = render(
+      <Wrap rowTagMode="profile">
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.getByTestId("sidebar-session-row-tag").textContent).toBe("[fb]");
+
+    rerender(
+      <Wrap rowTagMode="auto">
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.getByTestId("sidebar-session-row-tag").textContent).toBe("[fb]");
+
+    rerender(
+      <Wrap rowTagMode="sandbox">
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.getByTestId("sidebar-session-row-tag").textContent).toBe("[sb]");
+  });
+
+  it("renders multi-repo workspace branch tags without removing repo chips", () => {
+    const ws = workspace("w-workspace", [
+      session({
+        workspace_repos: [
+          { name: "api", source_path: "/repo/api", branch: "feature/web-tags" },
+          { name: "web", source_path: "/repo/web", branch: "feature/web-tags" },
+        ],
+      }),
+    ]);
+
+    render(
+      <Wrap rowTagMode="branch">
+        <Row ws={ws} />
+      </Wrap>,
+    );
+
+    expect(screen.getByTestId("sidebar-session-row-tag").textContent).toBe("[web-tags+2]");
+    expect(screen.getByText("api")).not.toBeNull();
+    expect(screen.getByText("web")).not.toBeNull();
   });
 });
 
@@ -694,5 +788,118 @@ describe("SessionRow unread", () => {
     expect(screen.queryByTestId("sidebar-unread-dot")).toBeNull();
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
     expect(screen.queryByTestId("sidebar-context-menu-unread")).toBeNull();
+  });
+});
+
+describe("SessionRow color label (#2383)", () => {
+  it("renders the color dot when a session carries a color", () => {
+    const ws = workspace("w-color", [session({ id: "s-color", color: "red" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    const dot = screen.getByTestId("sidebar-session-color-dot");
+    expect(dot.getAttribute("data-color")).toBe("red");
+    expect(dot.className).toContain("bg-red-500");
+  });
+
+  it("renders no color dot when color is unset", () => {
+    const ws = workspace("w-nocolor", [session({ id: "s-nocolor" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-session-color-dot")).toBeNull();
+  });
+
+  it("renders no color dot for an unknown color value", () => {
+    const ws = workspace("w-badcolor", [session({ id: "s-bad", color: "chartreuse" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-session-color-dot")).toBeNull();
+  });
+
+  it("Color swatch click fires PATCH /api/sessions/:id/color with { color: 'red' }", async () => {
+    const ws = workspace("w-live", [session({ id: "sess-color-it" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-color-red"));
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-color-it/color");
+    expect(init?.method).toBe("PATCH");
+    expect(JSON.parse(init!.body as string)).toEqual({ color: "red" });
+  });
+
+  it("shows a Clear color item on a colored row that fires { color: null }", async () => {
+    const ws = workspace("w-colored", [session({ id: "sess-clear-it", color: "green" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-color-clear"));
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-clear-it/color");
+    expect(JSON.parse(init!.body as string)).toEqual({ color: null });
+  });
+
+  it("hides the Clear color item when no color is set", () => {
+    const ws = workspace("w-nocolor", [session({ id: "sess-noclear" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-color-clear")).toBeNull();
+  });
+
+  it("hides the color section in read-only mode", () => {
+    const ws = workspace("w-ro", [session({ id: "sess-ro-color", color: "amber" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} readOnly />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-color-red")).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-color-clear")).toBeNull();
+  });
+
+  // `session.show_session_colors = false` (#3104). The gate hides, it does not
+  // forbid: the stored value is untouched, so re-enabling brings the dot back.
+  it("renders no color dot when session colors are disabled, even with a color stored", () => {
+    const ws = workspace("w-off-dot", [session({ id: "sess-off-dot", color: "red" })]);
+    render(
+      <Wrap colorsEnabled={false}>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-session-color-dot")).toBeNull();
+  });
+
+  it("hides the whole color section when session colors are disabled", () => {
+    const ws = workspace("w-off-menu", [session({ id: "sess-off-menu", color: "green" })]);
+    render(
+      <Wrap colorsEnabled={false}>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    for (const key of ["red", "amber", "green", "clear"]) {
+      expect(screen.queryByTestId(`sidebar-context-menu-color-${key}`)).toBeNull();
+    }
   });
 });

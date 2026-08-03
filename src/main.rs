@@ -21,6 +21,25 @@ fn is_serve_command(_cli: &Cli) -> bool {
     false
 }
 
+/// Bridge the serve `--cityhall` flag into the `AOE_CITYHALL_MODE` env var at
+/// the early, single-threaded point in `main` (before the tokio worker pool),
+/// so downstream readers stay env-driven without an in-runtime `set_var`. #7.
+#[cfg(feature = "serve")]
+fn seed_cityhall_env(cli: &Cli) {
+    if let Some(Commands::Serve(args)) = &cli.command {
+        if args.cityhall {
+            // SAFETY: single-threaded here, same invariant as the
+            // AOE_DAEMON_URL seed above (no worker threads spawned yet).
+            unsafe {
+                std::env::set_var("AOE_CITYHALL_MODE", "1");
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "serve"))]
+fn seed_cityhall_env(_cli: &Cli) {}
+
 /// Did the parent `aoe serve --daemon` spawn this process as the detached
 /// child? Set by `start_daemon()` via the hidden `--daemon-child` flag.
 /// Drives sink resolution: child's stdout/stderr are redirected to the
@@ -38,17 +57,64 @@ fn is_serve_daemon_child(_cli: &Cli) -> bool {
     false
 }
 
+/// When the `aoe.web` plugin is disabled, a fresh `aoe serve` start behaves as
+/// an unrecognized subcommand rather than starting the dashboard (the dashboard
+/// surface is a plugin, so a disabled plugin means the command is not available).
+/// The daemon lifecycle verbs (`--stop` / `--status` / `--restart`) stay usable
+/// so a running daemon can always be inspected and brought down. Returns the
+/// clap error to raise, or `None` when the invocation is allowed. Only the
+/// caller calls `.exit()`, so the decision stays unit-testable.
+#[cfg(feature = "serve")]
+fn serve_unavailable_error(cli: &Cli) -> Option<clap::Error> {
+    cli::graft::serve_start_blocked(cli, cli::graft::web_disabled()).then(|| {
+        Cli::command().error(
+            clap::error::ErrorKind::InvalidSubcommand,
+            "unrecognized subcommand 'serve'",
+        )
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Hidden internal helper for the `AOE_VT_LIVE` live-preview path (default
-    // on): `aoe __vt-pipe <socket>` forwards a tmux pipe-pane stream to a unix
-    // socket. Handled before clap so it never appears on the CLI/docs surface.
+    // Hidden internal helper for the VT live-preview path (`[tmux] vt_live`,
+    // default on): `aoe __vt-pipe <socket>` forwards a tmux pipe-pane stream to
+    // a unix socket. Handled before clap so it never appears on the CLI/docs
+    // surface.
     {
         let mut a = std::env::args();
         let _ = a.next();
         if a.next().as_deref() == Some("__vt-pipe") {
             let sock = a.next().unwrap_or_default();
             return agent_of_empires::tui::run_vt_pipe(&sock).map_err(Into::into);
+        }
+    }
+
+    // Hidden internal helper for on-demand smart rename:
+    // `aoe __smart-rename [--force] <profile> <session-id>` runs the one-shot
+    // title generator for a session and writes the title back to storage.
+    // Spawned detached by the status pollers on a session's first
+    // `Running -> Idle` edge (no `--force`), and by the TUI "Auto-name now"
+    // action (`--force`, to bypass the disabled setting per #3039). Handled
+    // before clap so it never appears on the CLI/docs surface. Best-effort: any
+    // failure just leaves the auto-generated name in place.
+    {
+        let mut a = std::env::args();
+        let _ = a.next();
+        if a.next().as_deref() == Some("__smart-rename") {
+            let mut next = a.next();
+            let force = next.as_deref() == Some("--force");
+            if force {
+                next = a.next();
+            }
+            let profile = next.unwrap_or_default();
+            let session_id = a.next().unwrap_or_default();
+            let _ = agent_of_empires::session::smart_rename::run_smart_rename_now(
+                &profile,
+                &session_id,
+                force,
+            )
+            .await;
+            return Ok(());
         }
     }
 
@@ -69,6 +135,14 @@ async fn main() -> Result<()> {
         }
     };
 
+    // With the `aoe.web` plugin disabled, a fresh `aoe serve` start is treated
+    // as an unrecognized subcommand. Done here, before any logging/app-dir side
+    // effects, so a rejected start creates no serve log or ProcessContext.
+    #[cfg(feature = "serve")]
+    if let Some(err) = serve_unavailable_error(&cli) {
+        err.exit();
+    }
+
     // If the user passed --daemon-url, mirror the value into the env
     // var so the acp::client::discovery layer (used by both the
     // remote TUI home and the `aoe acp *` verbs) picks it up
@@ -84,22 +158,18 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Seed CityHall mode from the serve `--cityhall` flag here, at the same
+    // early single-threaded point, so `AOE_CITYHALL_MODE` is set before the
+    // tokio worker pool and every later reader (AppState, profile_config, the
+    // serve banner) sees it without an in-runtime `set_var`. The flag and the
+    // env var are equivalent; this bridges the flag into the env var path. #7.
+    seed_cityhall_env(&cli);
+
     // Detect drift between release-build state and dev-build state BEFORE
     // anything below calls `get_app_dir()` (which would auto-create the dev
     // dir and silently flip the trigger condition for the rest of this
     // process). Compiled away in release builds.
     let debug_namespace_drift = agent_of_empires::session::debug_namespace_drift();
-
-    // Lazy holder for the loaded config. Populated by the logging-init block
-    // when it needs the `[logging]` section, and reused by the session-id
-    // poller seed below the early-return command dispatch. Staying lazy here
-    // means commands that don't need app data (`aoe completion`,
-    // `aoe init`, `aoe agents`, `aoe uninstall`, `aoe update`, …) never
-    // call `get_app_dir()` as a side effect. `config_load_attempted` lets
-    // the seed block skip a redundant load (and a redundant error warning)
-    // when the logging block already tried.
-    let mut loaded_config: Option<agent_of_empires::session::Config> = None;
-    let mut config_load_attempted = false;
 
     let mut debug_log_warning: Option<String> = None;
     // Subscriber installation. One resolver picks the sink based on
@@ -138,14 +208,17 @@ async fn main() -> Result<()> {
 
         match agent_of_empires::session::get_app_dir() {
             Ok(app_dir) => {
-                loaded_config = match agent_of_empires::session::load_config() {
+                // Loaded only for the `[logging]` section; commands that
+                // don't reach this block (`aoe completion`, `aoe init`,
+                // `aoe agents`, …) never call `get_app_dir()` as a side
+                // effect.
+                let loaded_config = match agent_of_empires::session::load_config() {
                     Ok(opt) => opt,
                     Err(e) => {
                         eprintln!("warning: could not load config, using built-in defaults: {e}");
                         None
                     }
                 };
-                config_load_attempted = true;
                 let log_cfg = loaded_config
                     .as_ref()
                     .map(|c| c.logging.clone())
@@ -221,9 +294,53 @@ async fn main() -> Result<()> {
         tracing::info!(target: "log.runtime", "Debug logging at {} to {}", lvl.as_str(), path.display());
     }
 
+    // Route a fatal from the dispatch through the tracing sink `aoe logs`
+    // reads, so a failure after logging init lands in `[logging].file_path`
+    // instead of only the process's raw stderr (issue #2896). Both surfaces
+    // use `{e:#}` (anyhow's inline cause chain): it joins the causes with `: `
+    // and omits the backtrace, so the formatter adds no newlines of its own,
+    // unlike `{e:?}` whose multi-line `Caused by:` block and `RUST_BACKTRACE`
+    // dump would fragment a record across the line-oriented sink. The
+    // `eprintln!` is the interactive fallback: a one-shot CLI runs without a
+    // subscriber, so the tracing line is dropped and stderr is all the user
+    // sees. It is skipped for the detached `--daemon-child`, whose stderr is
+    // already redirected into the same log file by `cli::serve`, so printing
+    // would duplicate the tracing line. Errors before logging init bypass the
+    // sink: clap parse and the serve-availability check exit through clap,
+    // while the pre-clap `__vt-pipe` / `__smart-rename` helpers and the
+    // plugin-command dispatch return before it. That pre-init window is a
+    // known limitation.
+    if let Err(e) = run(
+        cli,
+        is_daemon_child,
+        debug_namespace_drift,
+        debug_log_warning,
+    )
+    .await
+    {
+        tracing::error!(target: "log.runtime", "fatal: {e:#}");
+        if !is_daemon_child {
+            eprintln!("Error: {e:#}");
+        }
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Dispatch every command that runs after logging init. Split out of `main`
+/// so one wrapper can route any returned `Err` through the tracing sink before
+/// the process exits. This covers both the app-data-free early-return arms and
+/// the final `match`, so no startup bail can bypass the sink.
+async fn run(
+    cli: Cli,
+    is_daemon_child: bool,
+    debug_namespace_drift: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    debug_log_warning: Option<String>,
+) -> Result<()> {
     // CLI invocations get the dev-namespace drift warning on stderr right
     // away. TUI mode handles it via the existing startup-warning popup
-    // pipeline below — we don't print here for TUI because ratatui's
+    // pipeline below; we don't print here for TUI because ratatui's
     // alt-screen would clobber the message.
     if cli.command.is_some() {
         if let Some((release, dev)) = debug_namespace_drift.as_ref() {
@@ -299,34 +416,6 @@ async fn main() -> Result<()> {
     let profile_explicit = cli.profile.is_some();
     let profile = cli.profile.unwrap_or_default();
 
-    // Seed the session-id poller cap from persisted config. Reached only
-    // for commands that may spawn sessions (early-return commands above
-    // have already exited). Reuses the config loaded by the logging-init
-    // block when available; otherwise loads now. Skips a redundant load
-    // (and a redundant warning) when the logging block already attempted.
-    let cap_config = if let Some(cfg) = loaded_config.take() {
-        Some(cfg)
-    } else if config_load_attempted {
-        None
-    } else {
-        match agent_of_empires::session::load_config() {
-            Ok(opt) => opt,
-            Err(e) => {
-                eprintln!(
-                    "warning: could not load config to seed session-id poller cap, \
-                     using built-in default of {}: {e}",
-                    agent_of_empires::session::poller::DEFAULT_SESSION_ID_POLLER_MAX_THREADS,
-                );
-                None
-            }
-        }
-    };
-    if let Some(cfg) = cap_config {
-        agent_of_empires::session::poller::set_session_id_poller_max_threads(
-            cfg.session.session_id_poller_max_threads,
-        );
-    }
-
     // TUI mode handles migrations with a spinner; CLI runs them silently
     if cli.command.is_some() {
         migrations::run_migrations()?;
@@ -335,6 +424,7 @@ async fn main() -> Result<()> {
     let result = match cli.command {
         Some(Commands::Add(args)) => cli::add::run(&profile, *args).await,
         Some(Commands::List(args)) => cli::list::run(&profile, args).await,
+        Some(Commands::Ps(args)) => cli::ps::run(&profile, profile_explicit, args).await,
         Some(Commands::Remove(args)) => cli::remove::run(&profile, args).await,
         Some(Commands::Send(args)) => cli::send::run(&profile, args).await,
         Some(Commands::Status(args)) => cli::status::run(&profile, args).await,
@@ -342,7 +432,7 @@ async fn main() -> Result<()> {
         Some(Commands::Session { command }) => cli::session::run(&profile, command).await,
         Some(Commands::Group { command }) => cli::group::run(&profile, command).await,
         Some(Commands::Plugin { command }) => cli::plugin::run(command).await,
-        Some(Commands::Profile { command }) => cli::profile::run(command).await,
+        Some(Commands::Profile { command }) => cli::profile::run(&profile, command).await,
         Some(Commands::Project { command }) => {
             cli::project::run(&profile, profile_explicit, command).await
         }
@@ -354,7 +444,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "serve")]
         Some(Commands::Acp { command }) => cli::acp::run(command).await,
         #[cfg(feature = "serve")]
-        Some(Commands::AcpRunner(args)) => agent_of_empires::acp::runner::run(*args).await,
+        Some(Commands::AcpRunner(args)) => agent_of_empires::process::runner::run(*args).await,
         None => {
             // Fold the drift notice into the existing startup-warning channel
             // so the TUI surfaces both (debug-log + drift, if both fire) in a

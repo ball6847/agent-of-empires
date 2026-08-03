@@ -47,6 +47,22 @@ pub fn read_hook_status(instance_id: &str) -> Option<Status> {
     parse_status(&bytes)
 }
 
+/// Time since the hook status file was last written, i.e. how long the current
+/// value has been standing.
+///
+/// The running-mapped hooks (`PreToolUse`, `UserPromptSubmit`, `ElicitationResult`)
+/// rewrite the file on every fire, so a fresh mtime means the last write is
+/// recent. `reconcile_claude_hook_status` uses this to tell a genuinely fresh
+/// `running` (a turn that just started, spinner not yet rendered) from a stale
+/// one that a missed idle hook left standing after the turn ended.
+///
+/// Returns `None` when the file is absent or its mtime can't be read.
+pub fn read_hook_status_age(instance_id: &str) -> Option<std::time::Duration> {
+    let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
+    let meta = dir_guard::metadata_at(dir.as_fd(), "status").ok()??;
+    meta.modified().ok()?.elapsed().ok()
+}
+
 fn parse_status(bytes: &[u8]) -> Option<Status> {
     let trimmed = std::str::from_utf8(bytes).ok()?.trim();
     match trimmed {
@@ -106,10 +122,7 @@ pub fn read_hook_urgent(instance_id: &str) -> bool {
         return false;
     }
     if let Some(exp) = value.get("urgent_expires_at").and_then(|v| v.as_i64()) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        let now = crate::util::now_secs() as i64;
         if now > exp {
             return false;
         }
@@ -183,6 +196,25 @@ mod tests {
     fn test_read_missing_file() {
         let (_g, _, _tmp) = BaseGuard::ready();
         assert_eq!(read_hook_status("nonexistent_instance_id"), None);
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_read_hook_status_age_fresh_after_write() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_status_via_guard("age_fresh", "running");
+        let age = read_hook_status_age("age_fresh").expect("age present after write");
+        assert!(
+            age < Duration::from_secs(5),
+            "just-written status should be fresh, got {age:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_read_hook_status_age_none_when_absent() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        assert_eq!(read_hook_status_age("age_absent_instance"), None);
     }
 
     #[test]
@@ -278,11 +310,7 @@ mod tests {
     #[serial_test::serial(hook_base)]
     fn test_read_hook_urgent_true_when_expires_future() {
         let (_g, _, _tmp) = BaseGuard::ready();
-        let future = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            + 3600;
+        let future = crate::util::now_secs() + 3600;
         let body = format!(r#"{{"urgent":true,"urgent_expires_at":{}}}"#, future);
         write_attention_json("urgent_future", &body);
         assert!(read_hook_urgent("urgent_future"));

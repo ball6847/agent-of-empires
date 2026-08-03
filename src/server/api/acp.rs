@@ -23,6 +23,7 @@ use crate::acp::protocol::{
 };
 use crate::acp::state::{Event, PromptAttachmentKind, RateLimitInfo};
 use crate::acp::supervisor::SupervisorError;
+use crate::server::session_service::{SendTurnError, SessionCaller};
 use crate::server::AppState;
 
 /// Maximum attachments per prompt.
@@ -31,6 +32,23 @@ const MAX_ATTACHMENTS: usize = 8;
 const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum decoded size of all attachments on one prompt (20 MiB).
 const MAX_TOTAL_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+/// Startup-error banner text for a failed detached structured-view spawn,
+/// shared by the create-path (`create_session`) and enable-path
+/// (`acp_enable`). `CapacityFull` is transient and user-actionable, so its
+/// Display (which carries "capacity full" + "max_concurrent_workers", matching
+/// the front-end capacity regex) is surfaced verbatim instead of the generic
+/// crash-style message, so the session shows the capacity banner rather than a
+/// misleading failure. The detached task runs before the reconciler sees the
+/// session, so on `CapacityFull` the first reconciler tick re-publishes the
+/// same banner once via its `capacity_deferred` gate: a single benign
+/// duplicate the front-end reducer collapses idempotently. See #1027.
+pub(crate) fn structured_spawn_error_message(err: &SupervisorError, agent: &str) -> String {
+    match err {
+        SupervisorError::CapacityFull { .. } => err.to_string(),
+        _ => format!("Failed to start structured view agent {agent:?}: {err}"),
+    }
+}
 
 /// MIME types accepted per attachment kind. Conservative on purpose:
 /// `image/svg+xml` is excluded (scriptable XML), and embedded resources
@@ -59,7 +77,7 @@ fn mime_allowed(kind: PromptAttachmentKind, mime: &str) -> bool {
 /// True if `bytes` start with a magic-number signature for a supported
 /// raster image. Guards against a client mislabeling arbitrary bytes as
 /// `image/png` to smuggle them past the allowlist.
-fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+pub(crate) fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
         Some("image/png")
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
@@ -210,7 +228,7 @@ fn rate_limit_resume_marker_resets_at(
     match latest_status {
         Some(Event::Stopped { reason }) if reason == "rate_limited" => Some(
             latest_rate_limit
-                .map(|info| info.resets_at)
+                .and_then(|info| info.resets_at)
                 .unwrap_or(fallback_resets_at),
         ),
         _ => None,
@@ -252,19 +270,56 @@ pub struct SpawnAcpResponse {
 /// by `sessions.rs` write endpoints so the read-only contract is uniform
 /// across the API surface.
 pub(crate) fn read_only_block(state: &AppState) -> Option<axum::response::Response> {
-    if state.read_only {
-        return Some(
-            (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": "read_only",
-                    "message": "Server is in read-only mode",
-                })),
-            )
-                .into_response(),
-        );
+    state.read_only.then(super::read_only_response)
+}
+
+/// Canonical status + body mapping for a `SupervisorError`. Bodies stay
+/// plain text: every dashboard consumer of these endpoints reads the raw
+/// body for display (`safeText` in `useAcpSession.ts`), and the behavioral
+/// discriminators (the `worker_not_ready` prefix, nonce-echoing 404s) are
+/// text matches. Context-specific overrides (retryable `worker_not_ready`,
+/// nonce echoes) live as explicit pre-match arms at their call sites.
+/// `context` prefixes the fallback 500 body so "prompt failed" vs "cancel
+/// failed" stays distinguishable in banners and logs.
+fn supervisor_error_response(context: &str, err: &SupervisorError) -> axum::response::Response {
+    match err {
+        SupervisorError::UnknownSession(_) => (
+            StatusCode::NOT_FOUND,
+            "session has no running structured view",
+        )
+            .into_response(),
+        SupervisorError::UnknownAgent(name) => (
+            StatusCode::BAD_REQUEST,
+            format!("unknown structured view agent: {name}"),
+        )
+            .into_response(),
+        SupervisorError::AlreadyRunning(_) => (
+            StatusCode::CONFLICT,
+            "structured view worker already running for session",
+        )
+            .into_response(),
+        SupervisorError::CapacityFull { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
+        }
+        SupervisorError::Acp(_)
+        | SupervisorError::InvalidAgentCommand(_)
+        | SupervisorError::SpawnCancelled(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{context}: {err}"),
+        )
+            .into_response(),
     }
-    None
+}
+
+fn not_structured_response() -> axum::response::Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "not_structured",
+            "message": "Switch the session to structured view before starting an ACP worker",
+        })),
+    )
+        .into_response()
 }
 
 pub async fn spawn_acp(
@@ -275,15 +330,32 @@ pub async fn spawn_acp(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Manual worker spawn is an admin/power operation with no composer surface.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Json(req) = match req {
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let instances = state.instances.read().await;
-    let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
-        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    {
+        let instances = state.instances.read().await;
+        if !instances.iter().any(|i| i.id == id) {
+            return (StatusCode::NOT_FOUND, "session not found").into_response();
+        }
+    }
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+    let instance = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
+            return (StatusCode::NOT_FOUND, "session not found").into_response();
+        };
+        if !instance.is_structured() {
+            return not_structured_response();
+        }
+        instance
     };
-    drop(instances);
 
     // Pick the structured view agent: explicit request override > stored
     // agent_name on the instance > registry entry keyed on the
@@ -306,8 +378,10 @@ pub async fn spawn_acp(
         .map(|p| (p.key, p.value))
         .collect();
     let model = req.model.or_else(|| instance.agent_model.clone());
+    let effort = instance.acp_effort.clone();
     let stored_acp_session_id = instance.acp_session_id.clone();
     let yolo_mode = instance.yolo_mode;
+    let acp_mode_id = instance.acp_mode_id.clone();
     // #2276: seed the transcript from the session/load replay when importing
     // an existing Claude session (import_pending set, empty store). The
     // supervisor clears any partial replay from a prior attempt after it
@@ -317,10 +391,8 @@ pub async fn spawn_acp(
     // parent id instead of session/new. Cleared once the forked id lands.
     let fork_from = instance.fork_pending.clone();
 
-    let inst_lock = state.instance_lock(&id).await;
-    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
+    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
         &state.instances,
-        &inst_lock,
         &id,
         false,
     )
@@ -371,12 +443,13 @@ pub async fn spawn_acp(
             additional_dirs: req.additional_dirs,
             provider_env,
             model,
-            effort: None,
+            effort,
             stored_acp_session_id,
             fork_from,
             sandbox_info,
             source_profile,
             yolo_mode,
+            acp_mode_id,
             agent_command_override: crate::server::acp_reconciler::command_override_for_spawn(
                 &instance.tool,
                 &instance.command,
@@ -388,6 +461,10 @@ pub async fn spawn_acp(
     match spawn_result {
         Ok(()) => {
             if let Some(resets_at) = rate_limit_resume_resets_at {
+                // Continue the rate-limit-interrupted turn instead of leaving
+                // the resumed agent idle; the pending-turn drain delivers it
+                // once the worker is live (#3028).
+                crate::server::acp_reconciler::enqueue_rate_limit_continuation(&state, &id).await;
                 state
                     .acp_supervisor
                     .publish_rate_limit_auto_resumed(&id, resets_at);
@@ -401,6 +478,7 @@ pub async fn spawn_acp(
         }
         Err(SupervisorError::AlreadyRunning(_)) if rate_limit_resume_resets_at.is_some() => {
             if let Some(resets_at) = rate_limit_resume_resets_at {
+                crate::server::acp_reconciler::enqueue_rate_limit_continuation(&state, &id).await;
                 state
                     .acp_supervisor
                     .publish_rate_limit_auto_resumed(&id, resets_at);
@@ -412,24 +490,7 @@ pub async fn spawn_acp(
             })
             .into_response()
         }
-        Err(SupervisorError::AlreadyRunning(_)) => (
-            StatusCode::CONFLICT,
-            "structured view already running for session",
-        )
-            .into_response(),
-        Err(SupervisorError::UnknownAgent(name)) => (
-            StatusCode::BAD_REQUEST,
-            format!("unknown structured view agent: {name}"),
-        )
-            .into_response(),
-        Err(e @ SupervisorError::CapacityFull { .. }) => {
-            (StatusCode::SERVICE_UNAVAILABLE, format!("{e}")).into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("spawn failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("spawn failed", &e),
     }
 }
 
@@ -478,21 +539,153 @@ pub struct InstallAgentResponse {
     pub recovered_sessions: usize,
 }
 
+/// How long a single `npm install -g` (host or in-container) may run before
+/// it is killed and the held install lock released.
+const INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Run `npm install -g <package>` on the daemon host. Returns the process
+/// output on completion, or a ready-to-send error response for the failure
+/// modes (`npm` absent, spawn failure, timeout).
+async fn install_on_host(package: &str) -> Result<std::process::Output, axum::response::Response> {
+    let Ok(npm) = which::which("npm") else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "npm_missing",
+                "message": "`npm` is not on the daemon's PATH. Start `aoe serve` from a shell where `which npm` resolves.",
+            })),
+        )
+            .into_response());
+    };
+
+    // Bound the install so a network stall or a wedged lifecycle script
+    // cannot hang the request (and the held lock) forever. kill_on_drop
+    // reaps the child if the timeout fires.
+    match tokio::time::timeout(
+        INSTALL_TIMEOUT,
+        tokio::process::Command::new(&npm)
+            .arg("install")
+            .arg("-g")
+            .arg(package)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => Ok(o),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "npm_start_failed",
+                "message": format!("npm install failed to start: {e}"),
+            })),
+        )
+            .into_response()),
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "error": "install_timeout",
+                "message": "`npm install -g` did not finish within 180s.",
+            })),
+        )
+            .into_response()),
+    }
+}
+
+/// Run `npm install -g <package>` inside the session's sandbox container via
+/// `<runtime> exec`. The container must be running for `exec` to land, so a
+/// stopped/absent container returns a targeted error rather than a cryptic
+/// runtime one. Mirrors [`install_on_host`]'s fixed-argv, no-shell, bounded
+/// execution.
+async fn install_in_container(
+    session_id: &str,
+    package: &str,
+) -> Result<std::process::Output, axum::response::Response> {
+    use crate::containers::DockerContainer;
+
+    let sid = session_id.to_string();
+    let running = tokio::task::spawn_blocking(move || {
+        DockerContainer::from_session_id(&sid)
+            .is_running()
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false);
+    if !running {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "container_not_running",
+                "message": "The session's sandbox container is not running. Open the session (which starts its container) and try again.",
+            })),
+        )
+            .into_response());
+    }
+
+    let container_name = DockerContainer::generate_name(session_id);
+    let runtime_bin = crate::containers::runtime_binary();
+    match tokio::time::timeout(
+        INSTALL_TIMEOUT,
+        tokio::process::Command::new(runtime_bin)
+            .arg("exec")
+            .arg(&container_name)
+            .arg("npm")
+            .arg("install")
+            .arg("-g")
+            .arg(package)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => Ok(o),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "exec_start_failed",
+                "message": format!("`{runtime_bin} exec` failed to start: {e}"),
+            })),
+        )
+            .into_response()),
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({
+                "error": "install_timeout",
+                "message": "`npm install -g` in the sandbox did not finish within 180s.",
+            })),
+        )
+            .into_response()),
+    }
+}
+
 /// `POST /api/sessions/{id}/acp/install-agent`: run `npm install -g <pkg>`
-/// for the session's agent on the host, then let the client respawn.
+/// for the session's agent where the adapter actually lives, then let the
+/// client respawn.
+///
+/// A host-run session installs on the host; a sandboxed session installs
+/// *inside its container* (`<runtime> exec … npm install -g`), because a
+/// host `npm install -g` never reaches the containerized adapter. This is
+/// the recovery path when a cached `aoe-sandbox` image ships a
+/// `claude-agent-acp` below the current floor: the in-container install
+/// lifts the running container's adapter without recreating it. The image
+/// itself stays stale for *future* containers until refreshed; the
+/// structured-view error screen points sandboxed users at that follow-up.
 ///
 /// Hardened, opt-in (Tier 2 of #2109): blocked in read-only mode; gated on
 /// the `acp.allow_agent_install` setting (default off, `local_only`); the
 /// package is resolved server-side from the session's agent via a static
 /// npm-only table, never from client input; npm runs with fixed argv and no
 /// shell; the per-session instance lock serializes installs so a
-/// double-click cannot race the global npm prefix. Sandbox sessions are
-/// refused because a host install never reaches the containerized agent.
+/// double-click cannot race the global npm prefix (host) or the container.
 pub async fn install_agent(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    // Installing agent binaries is an admin operation, not a composer action.
+    if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     if !crate::session::Config::load_or_warn()
@@ -514,17 +707,6 @@ pub async fn install_agent(
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     };
     drop(instances);
-
-    if instance.is_sandboxed() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "sandboxed",
-                "message": "This session runs in a sandbox container; a host install would not reach the agent. Install it inside the container or rebuild its image.",
-            })),
-        )
-            .into_response();
-    }
 
     // Resolve the binary the session would spawn, then its npm package.
     let agent = state
@@ -572,61 +754,29 @@ pub async fn install_agent(
     let inst_lock = state.instance_lock(&id).await;
     let _guard = inst_lock.lock().await;
 
-    let Ok(npm) = which::which("npm") else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "npm_missing",
-                "message": "`npm` is not on the daemon's PATH. Start `aoe serve` from a shell where `which npm` resolves.",
-            })),
-        )
-            .into_response();
-    };
-
-    // Bound the install so a network stall or a wedged lifecycle script
-    // cannot hang the request (and the held lock) forever. kill_on_drop
-    // reaps the child if the timeout fires.
-    let output = match tokio::time::timeout(
-        std::time::Duration::from_secs(180),
-        tokio::process::Command::new(&npm)
-            .arg("install")
-            .arg("-g")
-            .arg(package)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "npm_start_failed",
-                    "message": format!("npm install failed to start: {e}"),
-                })),
-            )
-                .into_response();
+    // Run the install where the adapter actually lives: on the host for a
+    // host-run session, inside the container for a sandboxed one.
+    let output = if instance.is_sandboxed() {
+        match install_in_container(&id, package).await {
+            Ok(output) => output,
+            Err(resp) => return resp,
         }
-        Err(_) => {
-            return (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({
-                    "error": "install_timeout",
-                    "message": "`npm install -g` did not finish within 180s.",
-                })),
-            )
-                .into_response();
+    } else {
+        match install_on_host(package).await {
+            Ok(output) => output,
+            Err(resp) => return resp,
         }
     };
 
-    // On success the global npm prefix now carries the required version, so
-    // every other session parked on the same binary's compatibility check
-    // can recover too. Queue them for the reconciler to fresh-spawn; the
-    // current session is excluded because the client respawns it directly
-    // (and a double-spawn would race). See #2109.
+    // On success a *host* install updates the global npm prefix shared by
+    // every host-run session, so others parked on the same binary's
+    // compatibility check can recover too; queue them for the reconciler to
+    // fresh-spawn (the current session is excluded because the client
+    // respawns it directly and a double-spawn would race). A *container*
+    // install only touched this session's container, so no cross-session
+    // recovery applies. See #2109.
     let mut recovered_sessions = 0;
-    if output.status.success() {
+    if output.status.success() && !instance.is_sandboxed() {
         for other in state
             .acp_supervisor
             .incompatible_sessions_for_binary(&binary)
@@ -659,14 +809,13 @@ pub async fn shutdown_acp(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Worker shutdown is a lifecycle/admin action with no composer surface.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     match state.acp_supervisor.shutdown(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(SupervisorError::UnknownSession(_)) => StatusCode::NOT_FOUND.into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("shutdown failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("shutdown failed", &e),
     }
 }
 
@@ -744,6 +893,11 @@ pub async fn switch_acp_agent(
     Json(req): Json<SwitchAgentRequest>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    // CityHall sessions are pinned to their configured ACP agent; switching
+    // agents (including to a non-ACP one) would break the locked-down mode.
+    if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
 
@@ -830,6 +984,10 @@ pub async fn switch_acp_agent(
             additional_dirs: vec![],
             provider_env: vec![],
             model: model.clone(),
+            // Effort vocabularies are adapter-specific ("high" on one adapter,
+            // "xhigh" / "medium" naming on another), so the previous agent's
+            // pick is meaningless here. The new agent starts on its configured
+            // default and the persist below clears the stale value.
             effort: None,
             // Different ACP backend; the cached Claude session id would
             // be rejected by codex / opencode.
@@ -839,6 +997,7 @@ pub async fn switch_acp_agent(
             sandbox_info,
             source_profile,
             yolo_mode: instance.yolo_mode,
+            acp_mode_id: instance.acp_mode_id.clone(),
             // Gated in the supervisor: only applies when the selected
             // agent equals the instance tool and its binary matches, so
             // an explicit switch to a different agent is unaffected.
@@ -851,26 +1010,7 @@ pub async fn switch_acp_agent(
         })
         .await;
     if let Err(e) = spawn_result {
-        return match e {
-            SupervisorError::UnknownAgent(name) => (
-                StatusCode::BAD_REQUEST,
-                format!("unknown structured view agent: {name}"),
-            )
-                .into_response(),
-            SupervisorError::AlreadyRunning(_) => (
-                StatusCode::CONFLICT,
-                "structured view worker already running for session",
-            )
-                .into_response(),
-            e @ SupervisorError::CapacityFull { .. } => {
-                (StatusCode::SERVICE_UNAVAILABLE, format!("{e}")).into_response()
-            }
-            e => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("spawn failed: {e}"),
-            )
-                .into_response(),
-        };
+        return supervisor_error_response("spawn failed", &e);
     }
 
     // Spawn succeeded: a mid-session agent switch actually happened. Tally it
@@ -895,24 +1035,38 @@ pub async fn switch_acp_agent(
             // later spawn/reconciler pass treats this as an import and clears
             // the store before spawning.
             inst.import_pending = None;
+            // Drop the old agent's effort pick: its vocabulary does not carry
+            // to the new agent, so the session falls back to the new agent's
+            // configured default until the user picks again.
+            inst.acp_effort = None;
             if let Some(m) = &model {
                 inst.agent_model = Some(m.clone());
             }
         }
     }
-    if let Ok(storage) = crate::session::Storage::new(&profile_for_save, state.file_watch.clone()) {
-        if let Err(e) = storage.update(|instances, _groups| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
-                inst.agent_name = Some(target_for_save.clone());
-                inst.acp_session_id = None;
-                inst.import_pending = None;
+    match crate::session::Storage::new(&profile_for_save, state.file_watch.clone()) {
+        Ok(storage) => {
+            if let Err(e) = storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
+                    inst.agent_name = Some(target_for_save.clone());
+                    inst.acp_session_id = None;
+                    inst.import_pending = None;
+                    inst.acp_effort = None;
+                }
+                Ok(())
+            }) {
+                tracing::error!(
+                    target: "http.api.acp",
+                    session = %id_for_save,
+                    "failed to persist agent_name after switch: {e}"
+                );
             }
-            Ok(())
-        }) {
+        }
+        Err(e) => {
             tracing::error!(
                 target: "http.api.acp",
                 session = %id_for_save,
-                "failed to persist agent_name after switch: {e}"
+                "failed to open storage to persist agent_name after switch: {e}"
             );
         }
     }
@@ -1057,89 +1211,70 @@ pub async fn acp_prompt(
         Ok(a) => a,
         Err((code, msg)) => return (code, msg).into_response(),
     };
-    // Resume a worker that is not currently live. Two cases:
-    //   - Idle-dormant wake: the worker was auto-stopped for inactivity
-    //     (#1689) and the reconciler will not respawn it until its next
-    //     ~2s tick.
-    //   - Dead worker: the worker exited for another reason (e.g. the
-    //     silent-orphan watchdog escalated a monitor / `/loop` turn) and
-    //     is neither dormant nor mid-respawn, so a send would otherwise
-    //     404 and force a manual `aoe acp restart`.
-    // Either way, reserve the resume slot synchronously and drive a fresh
-    // spawn in a detached task NOW so the `send_prompt` below blocks on
-    // `wait_for_worker` until the worker is live instead of racing ahead
-    // to a 404. The detached task survives this request being cancelled on
-    // client disconnect. `is_running` is true for a live or mid-respawn
-    // worker, so a healthy session never double-spawns. See #1748.
-    let needs_resume = woke_idle_dormant || !state.acp_supervisor.is_running(&id).await;
-    if needs_resume {
-        use crate::server::acp_reconciler::ResumeTrigger;
-        match crate::server::acp_reconciler::trigger_resume_background(&state, &id).await {
-            Ok(ResumeTrigger::NotFound) => {
-                // The session was deleted (or triaged) between the wake and
-                // the resume snapshot. Do not publish into a session that no
-                // longer exists; a 404 is the honest answer, not a retryable
-                // worker_not_ready. See #1748.
-                return (StatusCode::NOT_FOUND, "session not found").into_response();
-            }
-            Ok(_) => {}
-            Err(SupervisorError::CapacityFull { current, limit }) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("worker_capacity_full ({current}/{limit})"),
-                )
-                    .into_response();
-            }
-            Err(e) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("worker_not_ready: {e}"),
-                )
-                    .into_response();
-            }
-        }
-    }
-    // Publish the user's prompt into the event stream BEFORE forwarding
-    // to the agent so the replay buffer / on-disk store captures it
-    // even if the agent forward fails. The frontend treats UserPromptSent
-    // as authoritative and dedupes against its own optimistic row.
-    state
-        .acp_supervisor
-        .publish_user_prompt_with_attachments(&id, req.text.clone(), &attachments)
-        .await;
-    // Smart-rename now fires from `acp_event_listener` on the first clean
-    // `prompt_complete` `Event::Stopped` for this session, so the one-shot
-    // never races this handler's live worker for the same provider API.
-    // The event-store lookup of the first prompt happens in the listener.
-    // See `session::smart_rename` and #2348.
-    match state
-        .acp_supervisor
-        .send_prompt(&id, &req.text, &attachments)
-        .await
+    // A fresh user prompt supersedes any queued rate-limit resume
+    // continuation, so drop it before sending: otherwise the reconciler could
+    // later replay the older interrupted prompt after this newer one (#3028).
+    // The clear alone runs under the per-session `instance_lock`, and the
+    // guard is dropped before `send_turn`. Mutual exclusion with the
+    // pending-turn drain is enough to keep the #3028 ordering: the drain
+    // holds this same lock across its whole snapshot -> reload -> send ->
+    // clear, so whichever side wins the lock, the stale continuation can
+    // never be published after this newer prompt. If the drain wins it
+    // delivers first; if we win, the drain then reads None and returns.
+    //
+    // Holding the guard across `send_turn` is what broke #3172:
+    // `send_turn` -> `trigger_resume_background` detaches a task that calls
+    // `build_spawn_request`, which takes this very lock, so the spawn could
+    // not start until this handler released it, and the handler was busy
+    // burning `WORKER_READY_TIMEOUT` waiting for that spawn. Resume +
+    // publish + forward still live in the shared service so the plugin host
+    // delivers turns through the same path (#2897).
     {
+        let inst_lock = state.instance_lock(&id).await;
+        let _serialized = inst_lock.lock().await;
+        state.session_service.clear_pending_initial_turn(&id).await;
+    }
+    let outcome = state
+        .session_service
+        .send_turn(
+            &SessionCaller::User,
+            &id,
+            &req.text,
+            &attachments,
+            woke_idle_dormant,
+        )
+        .await;
+    // Smart-rename fires from `acp_event_listener` on the first clean
+    // `prompt_complete` `Event::Stopped` (turn-end), so the one-shot never
+    // races this handler's live worker for the provider API. See
+    // `session::smart_rename` and #2348.
+    match outcome {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
-        Err(SupervisorError::UnknownSession(_)) => {
-            if needs_resume {
-                // The respawn we kicked above did not finish within
-                // `send_prompt`'s wait window (slow sandbox / spawn). The
-                // worker is still coming; signal a retryable typed status
-                // so the frontend keeps the prompt queued and re-fires on
-                // the next `AcpSessionAssigned`, rather than dropping it
-                // on a 404. See #1748.
-                (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
-            } else {
-                (
-                    StatusCode::NOT_FOUND,
-                    "session has no running structured view",
-                )
-                    .into_response()
-            }
+        Err(SendTurnError::SessionNotFound) => {
+            (StatusCode::NOT_FOUND, "session not found").into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("prompt failed: {e}"),
+        Err(SendTurnError::ResumeFailed(SupervisorError::CapacityFull { current, limit })) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("worker_capacity_full ({current}/{limit})"),
         )
             .into_response(),
+        Err(SendTurnError::ResumeFailed(e)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("worker_not_ready: {e}"),
+        )
+            .into_response(),
+        Err(SendTurnError::WorkerNotReady) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
+        }
+        // Unreachable for a User caller; mapped defensively so the match
+        // stays exhaustive as the service grows plugin-only failure modes.
+        Err(SendTurnError::NotOwner) => {
+            (StatusCode::FORBIDDEN, "session not owned by caller").into_response()
+        }
+        Err(SendTurnError::ModeApplication(e)) => {
+            supervisor_error_response("mode application failed", &e)
+        }
+        Err(SendTurnError::Send(e)) => supervisor_error_response("prompt failed", &e),
     }
 }
 
@@ -1175,7 +1310,9 @@ pub async fn acp_prompt_diff_comments(
     // acp_prompt. See #1748.
     if woke_idle_dormant {
         use crate::server::acp_reconciler::ResumeTrigger;
-        match crate::server::acp_reconciler::trigger_resume_background(&state, &id).await {
+        match crate::server::acp_reconciler::trigger_resume_background(&state.session_service, &id)
+            .await
+        {
             Ok(ResumeTrigger::NotFound) => {
                 return (StatusCode::NOT_FOUND, "session not found").into_response();
             }
@@ -1216,22 +1353,11 @@ pub async fn acp_prompt_diff_comments(
         .await
     {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
-        Err(SupervisorError::UnknownSession(_)) => {
-            if woke_idle_dormant {
-                (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
-            } else {
-                (
-                    StatusCode::NOT_FOUND,
-                    "session has no running structured view",
-                )
-                    .into_response()
-            }
+        // Retryable worker_not_ready override; mirrors acp_prompt. See #1748.
+        Err(SupervisorError::UnknownSession(_)) if woke_idle_dormant => {
+            (StatusCode::SERVICE_UNAVAILABLE, "worker_not_ready").into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("prompt failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("prompt failed", &e),
     }
 }
 
@@ -1272,16 +1398,7 @@ pub async fn acp_cancel(
     }
     match state.acp_supervisor.cancel_prompt(&id).await {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
-        Err(SupervisorError::UnknownSession(_)) => (
-            StatusCode::NOT_FOUND,
-            "session has no running structured view",
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("cancel failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("cancel failed", &e),
     }
 }
 
@@ -1308,6 +1425,10 @@ pub async fn acp_files(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // Enumerates the workspace tree for the Files pane, which CityHall hides.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let instances = state.instances.read().await;
     let Some(inst) = instances.iter().find(|i| i.id == id).cloned() else {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
@@ -1374,6 +1495,10 @@ pub async fn acp_worker_log(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<WorkerLogQuery>,
 ) -> impl IntoResponse {
+    // Raw worker logs are a debug surface, not part of the composer.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let instances = state.instances.read().await;
     let session_known = instances.iter().any(|i| i.id == id);
     drop(instances);
@@ -1381,7 +1506,7 @@ pub async fn acp_worker_log(
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     }
 
-    let log_path = match crate::acp::worker_registry::log_path_for(&id) {
+    let log_path = match crate::process::worker_registry::log_path_for(&id) {
         Ok(p) => p,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, format!("invalid session id: {e}")).into_response();
@@ -1549,11 +1674,59 @@ pub struct ViewSwitchResponse {
 /// History is destroyed in the swap: the tmux scrollback is dropped
 /// when the pane is killed; structured view starts with an empty conversation.
 /// The frontend warns the user before calling this endpoint.
+/// How a structured-view spawn seeds its transcript when the view is enabled.
+struct StructuredSeed {
+    stored_acp_session_id: Option<String>,
+    seed_history_replay: bool,
+}
+
+/// Decide the seed for an `acp_enable` spawn.
+///
+/// - An existing `acp_session_id` (a prior structured session, or a #2276
+///   import) is loaded; history replay is seeded only when `import_pending`.
+/// - Otherwise, #2252 direction B: a claude terminal session whose resumable
+///   transcript sits in `agent_session_id` is carried into a seeded
+///   `session/load`, so switching a terminal claude session into structured
+///   view continues the same conversation. `transcript_present` gates this so a
+///   stale id does not hard-fail the seeded spawn.
+/// - Failing both, the spawn starts a fresh `session/new`.
+fn resolve_structured_seed(
+    tool: &str,
+    acp_agent: &str,
+    acp_session_id: Option<&str>,
+    agent_session_id: Option<&str>,
+    import_pending: bool,
+    transcript_present: bool,
+) -> StructuredSeed {
+    if let Some(id) = acp_session_id {
+        return StructuredSeed {
+            stored_acp_session_id: Some(id.to_string()),
+            seed_history_replay: import_pending,
+        };
+    }
+    if crate::agents::acp_transcript_cli_resumable(tool, acp_agent) && transcript_present {
+        if let Some(id) = agent_session_id.filter(|s| !s.trim().is_empty()) {
+            return StructuredSeed {
+                stored_acp_session_id: Some(id.to_string()),
+                seed_history_replay: true,
+            };
+        }
+    }
+    StructuredSeed {
+        stored_acp_session_id: None,
+        seed_history_replay: import_pending,
+    }
+}
+
 pub async fn acp_enable(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    // Enabling ACP on a session is an admin toggle mirroring the gated disable.
+    if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     let (mut instance, profile) = {
@@ -1687,11 +1860,39 @@ pub async fn acp_enable(
     let supervisor = state.acp_supervisor.clone();
     let session_id = id.clone();
     let model = instance.agent_model.clone();
-    let stored_acp_session_id = instance.acp_session_id.clone();
+    let effort = instance.acp_effort.clone();
     let yolo_mode = instance.yolo_mode;
-    // #2276: seed the transcript from the session/load replay when enabling
-    // the structured view on an imported session (import_pending, empty store).
-    let seed_history_replay = instance.import_pending == Some(true);
+    let acp_mode_id = instance.acp_mode_id.clone();
+    // #2252 direction B: a claude terminal session's resumable transcript lives
+    // in `agent_session_id`, not `acp_session_id`. When present on the host (the
+    // seeded `session/load` hard-fails on a missing id), carry it into the
+    // structured spawn so the conversation continues in structured view. The
+    // in-container transcript can't be probed from the host, so sandboxed
+    // sessions attempt the load unconditionally.
+    let transcript_present = instance.is_sandboxed()
+        || instance
+            .agent_session_id
+            .as_deref()
+            .map(|sid| {
+                !crate::session::capture::claude_host_transcript_confirmed_absent(
+                    &instance.project_path,
+                    sid,
+                )
+            })
+            .unwrap_or(false);
+    let seed = resolve_structured_seed(
+        &instance.tool,
+        &agent_name,
+        instance.acp_session_id.as_deref(),
+        instance.agent_session_id.as_deref(),
+        instance.import_pending == Some(true),
+        transcript_present,
+    );
+    let stored_acp_session_id = seed.stored_acp_session_id;
+    // #2276: seed the transcript from the session/load replay when enabling the
+    // structured view on an imported session, or on a direction-B keep-context
+    // switch (empty store, load an existing transcript).
+    let seed_history_replay = seed.seed_history_replay;
     // Structured fork: send session/fork against the parent id on first connect.
     let fork_from = instance.fork_pending.clone();
     let profile_for_spawn = profile.clone();
@@ -1730,18 +1931,21 @@ pub async fn acp_enable(
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model,
-                effort: None,
+                effort,
                 stored_acp_session_id,
                 fork_from,
                 sandbox_info,
                 source_profile,
                 yolo_mode,
+                acp_mode_id,
                 agent_command_override: command_override,
                 seed_history_replay,
             })
             .await
         {
-            let message = format!("Failed to start structured view agent {agent_name:?}: {e}");
+            // Capacity-aware banner selection (and the benign first-tick
+            // duplicate) is documented on `structured_spawn_error_message`.
+            let message = structured_spawn_error_message(&e, &agent_name);
             tracing::warn!(target: "acp.switch", session = %session_id, "spawn after enable: {message}");
             supervisor.publish_startup_error(&session_id, message);
         }
@@ -1757,9 +1961,14 @@ pub async fn acp_enable(
 /// Switch a structured view session back to tmux. Idempotent: a session that
 /// is already tmux-mode returns 200 with no work done.
 ///
-/// History is destroyed in the swap: the structured view conversation log
-/// (still in the broadcast replay buffer) is dropped, and tmux comes
-/// back with an empty pane that the agent fills as it runs.
+/// When the agent pairing shares a CLI-resumable transcript (claude, see
+/// `agents::acp_transcript_cli_resumable`) and an `acp_session_id` is set,
+/// the swap preserves context: the worker is shut down WITHOUT `session/delete`
+/// so the transcript survives, the ACP session id is carried into the terminal
+/// `agent_session_id` as a pinned resume target, and tmux comes back running
+/// `claude --resume <id>` on the same conversation (#2252). Otherwise history
+/// is destroyed: `session/delete` releases the transcript and tmux comes back
+/// with an empty pane the agent fills as it runs.
 pub async fn acp_disable(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1767,6 +1976,19 @@ pub async fn acp_disable(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Disabling ACP drops the session to the terminal view, which CityHall
+    // mode forbids. Keep sessions in structured view.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
+    {
+        let instances = state.instances.read().await;
+        if !instances.iter().any(|i| i.id == id) {
+            return (StatusCode::NOT_FOUND, "session not found").into_response();
+        }
+    }
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
     let (mut instance, profile) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id).cloned() else {
@@ -1787,12 +2009,34 @@ pub async fn acp_disable(
     // A real acp -> terminal transition is now committed (the idempotent
     // already-terminal case returned above).
 
-    // Tear down the acp worker. Disabling acp mode discards the
-    // conversation (we delete on-disk history and clear the stored ACP
-    // id below), so release the agent's persisted transcript too via
-    // session/delete. UnknownSession is fine, the supervisor may not
-    // have a worker if startup never completed. See #1710.
-    match state.acp_supervisor.shutdown_and_delete(&id).await {
+    // Decide whether this swap can preserve context. Resolve the ACTIVE
+    // structured-view adapter (switch_acp_agent can point agent_name away
+    // from the tool's default) and keep context only when it shares a
+    // CLI-resumable transcript with the terminal `<tool> --resume`, and an
+    // acp_session_id was actually captured. See #2252.
+    let acp_agent = state
+        .acp_supervisor
+        .pick_agent_for_tool(
+            &instance.tool,
+            instance.agent_name.as_deref(),
+            &profile,
+            std::path::Path::new(&instance.project_path),
+        )
+        .await;
+    let keep_context = crate::agents::acp_transcript_cli_resumable(&instance.tool, &acp_agent)
+        && instance.acp_session_id.is_some();
+
+    // Tear down the acp worker. `shutdown` preserves the agent's on-disk
+    // transcript (no session/delete) so the terminal can resume it;
+    // `shutdown_and_delete` releases it for the destructive path. UnknownSession
+    // is fine, the supervisor may not have a worker if startup never completed.
+    // See #1710.
+    let shutdown_result = if keep_context {
+        state.acp_supervisor.shutdown(&id).await
+    } else {
+        state.acp_supervisor.shutdown_and_delete(&id).await
+    };
+    match shutdown_result {
         Ok(()) | Err(SupervisorError::UnknownSession(_)) => {}
         Err(e) => {
             tracing::warn!(target: "acp.switch", session = %id, "shutdown structured view failed: {e}");
@@ -1804,42 +2048,61 @@ pub async fn acp_disable(
     // collide on a stale seq with the buffer entry from this
     // conversation, and the client-side dedupe would silently eat it.
     state.acp_supervisor.forget_session(&id);
-    // Drop on-disk history so the next acp_enable starts truly
-    // fresh — without this, the seq=1 first publish would collide
-    // with a row already on disk and INSERT OR IGNORE would silently
-    // drop it.
+    // Drop the structured-view event projection either way: on keep-context,
+    // the terminal `claude --resume` reprints the conversation itself, so the
+    // tmux pane does not need the AoE event replay, and terminal turns would
+    // otherwise leave it stale. See #2252.
     state.acp_event_store.delete_session(&id);
-    instance.view = crate::session::View::Terminal;
-    // Clear the stored ACP session id: the agent's transcript is
-    // tied to the structured view-mode lifecycle. If the user re-enables
-    // structured view later, the agent should start a fresh session/new
-    // rather than try to resume an id that's no longer relevant.
-    if instance.acp_session_id.is_some() {
+    if keep_context {
         tracing::debug!(
             target: "acp.switch",
             session = %id,
-            "clearing acp_session_id on disable"
+            "keeping context on disable: carrying acp_session_id into agent_session_id for claude --resume"
         );
-        instance.acp_session_id = None;
-        // Disabling structured view abandons any pending import (#2276).
-        instance.import_pending = None;
+        instance.switch_to_terminal_keep_context();
+    } else {
+        instance.view = crate::session::View::Terminal;
+        // Clear the stored ACP session id: the agent's transcript is
+        // tied to the structured view-mode lifecycle. If the user re-enables
+        // structured view later, the agent should start a fresh session/new
+        // rather than try to resume an id that's no longer relevant.
+        if instance.acp_session_id.is_some() {
+            tracing::debug!(
+                target: "acp.switch",
+                session = %id,
+                "clearing acp_session_id on disable"
+            );
+            instance.acp_session_id = None;
+            // Disabling structured view abandons any pending import (#2276).
+            instance.import_pending = None;
+        }
     }
 
     // Persist + start tmux. start() now no longer short-circuits for
     // structured_view, so it will create a fresh tmux session and run
     // the agent CLI in the pane.
     //
-    // The on-disk and in-memory updates mutate ONLY the structured view-specific
-    // fields (`structured_view = false`, `acp_session_id = None`).
+    // The on-disk and in-memory updates mutate ONLY the fields this handler
+    // owns (view, acp_session_id, import_pending, and on keep-context the
+    // resume target agent_session_id + resume_intent), copied from the
+    // mutated in-memory `instance` so all three copies stay in sync.
     // Wholesale replacement with a pre-lock snapshot would clobber
     // concurrent writes to other fields made by the status poll loop or
     // other handlers between the snapshot and the lock acquisition.
+    let persist_acp_session_id = instance.acp_session_id.clone();
+    let persist_import_pending = instance.import_pending;
+    let persist_agent_session_id = instance.agent_session_id.clone();
+    let persist_resume_intent = instance.resume_intent.clone();
     {
         let mut instances = state.instances.write().await;
         if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
             slot.view = crate::session::View::Terminal;
-            slot.acp_session_id = None;
-            slot.import_pending = None;
+            slot.acp_session_id = persist_acp_session_id.clone();
+            slot.import_pending = persist_import_pending;
+            if keep_context {
+                slot.agent_session_id = persist_agent_session_id.clone();
+                slot.resume_intent = persist_resume_intent.clone();
+            }
         }
     }
     let id_for_save = id.clone();
@@ -1850,8 +2113,12 @@ pub async fn acp_disable(
         storage.update(|all, _groups| {
             if let Some(slot) = all.iter_mut().find(|i| i.id == id_for_save) {
                 slot.view = crate::session::View::Terminal;
-                slot.acp_session_id = None;
-                slot.import_pending = None;
+                slot.acp_session_id = persist_acp_session_id.clone();
+                slot.import_pending = persist_import_pending;
+                if keep_context {
+                    slot.agent_session_id = persist_agent_session_id.clone();
+                    slot.resume_intent = persist_resume_intent.clone();
+                }
             }
             Ok(())
         })?;
@@ -1891,24 +2158,27 @@ pub struct SetModeRequest {
     pub mode_id: String,
 }
 
-/// Whether a mode value selects plan mode. `"plan"` is the canonical plan value
-/// on both mode channels: the legacy `session/set_mode` `mode_id` and the
-/// config-option `value` (claude-agent-acp v0.37.0+, OpenCode). Routing both
-/// `acp_set_mode` and `acp_set_config_option` through this one check keeps the
-/// plan-mode telemetry tally from drifting between the two paths. See the web
-/// `modeChannel.ts`, where the plan choice id is `"plan"` regardless of channel.
+/// Whether a mode value selects plan mode. `"plan"` is the canonical value for
+/// both the mode endpoint's `mode_id` and the config-option endpoint's `value`.
+/// Routing both through this one check keeps the plan-mode telemetry tally from
+/// drifting between the two paths. See the web `modeChannel.ts`, where the plan
+/// choice id is `"plan"` regardless of channel.
 fn is_plan_mode_value(value: &str) -> bool {
     value == "plan"
 }
 
 /// Set the active session mode (Default / Plan / AcceptEdits /
-/// BypassPermissions). Sends an ACP `session/set_mode` request.
+/// BypassPermissions) through the adapter's advertised mode channel.
 pub async fn acp_set_mode(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     req: Result<Json<SetModeRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    // Agent mode switching is a power control the dumbed-down composer omits.
+    if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     let Json(req) = match req {
@@ -1927,14 +2197,7 @@ pub async fn acp_set_mode(
             }
             StatusCode::ACCEPTED.into_response()
         }
-        Err(SupervisorError::UnknownSession(_)) => {
-            (StatusCode::NOT_FOUND, "session has no running acp").into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("set_mode failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("set_mode failed", &e),
     }
 }
 
@@ -1942,6 +2205,119 @@ pub async fn acp_set_mode(
 pub struct SetConfigOptionRequest {
     pub config_id: String,
     pub value: String,
+}
+
+/// Which persisted `Instance` field a successful config-option pick writes to.
+/// Carries the field name for logging and the mutation together so the two
+/// cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistedSelector {
+    /// `Instance.agent_model`, re-injected on every spawn.
+    Model,
+    /// `Instance.acp_mode_id`, re-asserted via `session/set_mode` on every
+    /// worker (re)spawn (#2897).
+    Mode,
+    /// `Instance.acp_effort`, re-applied through the agent's thought-level
+    /// config option after every handshake.
+    ThoughtLevel,
+}
+
+impl PersistedSelector {
+    fn field(self) -> &'static str {
+        match self {
+            Self::Model => "agent_model",
+            Self::Mode => "acp_mode_id",
+            Self::ThoughtLevel => "acp_effort",
+        }
+    }
+
+    fn apply(self, inst: &mut crate::session::Instance, value: String) {
+        match self {
+            Self::Model => inst.agent_model = Some(value),
+            Self::Mode => inst.acp_mode_id = Some(value),
+            Self::ThoughtLevel => inst.acp_effort = Some(value),
+        }
+    }
+}
+
+/// Write a picked selector value back onto the instance, both in the in-memory
+/// registry (what the reconciler reads to respawn a worker this daemon
+/// lifetime) and on disk (what survives a daemon restart). Called from
+/// `acp_set_config_option` after the live pick succeeds; see the comment there
+/// for why the live call alone is not enough.
+async fn persist_selector(
+    state: &Arc<AppState>,
+    id: &str,
+    selector: PersistedSelector,
+    value: &str,
+) {
+    let profile = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            return;
+        };
+        selector.apply(inst, value.to_string());
+        inst.source_profile.clone()
+    };
+    match crate::session::Storage::new(&profile, state.file_watch.clone()) {
+        Ok(storage) => {
+            let id_owned = id.to_string();
+            let value_owned = value.to_string();
+            if let Err(e) = storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
+                    selector.apply(inst, value_owned.clone());
+                }
+                Ok(())
+            }) {
+                tracing::error!(
+                    target: "http.api.acp",
+                    session = %id,
+                    field = selector.field(),
+                    "failed to persist selector after config-option pick: {e}"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "http.api.acp",
+                session = %id,
+                field = selector.field(),
+                "failed to open storage to persist selector after config-option pick: {e}"
+            );
+        }
+    }
+}
+
+/// Category the agent advertised for `config_id`, or `None` when the option is
+/// unknown. Resolved from the agent's advertised option catalog rather than
+/// hardcoded ids, so a mode pick is told apart from a model / thought-level
+/// pick without assuming any adapter's naming. The daemon keeps no live
+/// per-session `AcpState`, so the option catalog (recorded on
+/// `ConfigOptionsUpdated`) is the only handler-reachable source of a session's
+/// advertised options; if it has no entry yet we return `None` and skip
+/// persistence (no regression).
+async fn config_option_category(
+    state: &Arc<AppState>,
+    id: &str,
+    config_id: &str,
+) -> Option<crate::acp::state::ConfigOptionCategory> {
+    let agent = {
+        let instances = state.instances.read().await;
+        instances.iter().find(|i| i.id == id).map(|i| {
+            i.agent_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(i.tool.as_str())
+                .to_string()
+        })
+    }?;
+    crate::acp::option_catalog::load()
+        .agents
+        .get(&agent)
+        .into_iter()
+        .flat_map(|entry| entry.options.iter())
+        .find(|opt| opt.id == config_id)
+        .map(|opt| opt.category.clone())
 }
 
 /// Set a per-session selector (model, reasoning effort, etc.) via ACP
@@ -1957,6 +2333,10 @@ pub async fn acp_set_config_option(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Agent config options are a power control the dumbed-down composer omits.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Json(req) = match req {
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
@@ -1969,29 +2349,59 @@ pub async fn acp_set_config_option(
         Ok(()) => {
             // Tally plan-mode adoption. claude-agent-acp v0.37.0+ (and OpenCode)
             // advertise the mode picker as a config option of category "mode" and
-            // switch through this path rather than the legacy `session/set_mode`
-            // handled by `acp_set_mode`, so the plan tally has to live here too or
-            // the modern fleet reports zero. No other config category (model,
+            // the web picker writes directly through this endpoint, so the plan
+            // tally has to live here too or the modern fleet reports zero. No other
+            // config category (model,
             // thought level) carries a "plan" value, so keying on the value alone
-            // is safe and stays in sync with the legacy path via the shared check.
+            // is safe and stays in sync with the mode endpoint via the shared check.
             if is_plan_mode_value(&req.value) {
                 state
                     .telemetry_structured
                     .plan_mode_seen
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            // Persist a model pick so it survives a worker respawn. The live
+            // set_config_option above only reconfigures the running process; the
+            // reconciler re-reads `agent_model` on every spawn and injects it as
+            // AOE_AGENT_MODEL, so without this write-back a respawn reverts to
+            // the stale stored model and silently overrides the agent's own
+            // default. Mirrors the persist step of the agent-switch path above.
+            // ponytail: keys on the well-known "model" config id, which every
+            // current adapter and the frontend use; resolve category == Model
+            // from the session's config_options if a future adapter uses another
+            // id.
+            // A Mode-category pick is persisted for the same reason: the
+            // reconciler re-asserts `acp_mode_id` via `session/set_mode` on
+            // every (re)spawn (#2897), so without the write-back the id stays
+            // at its creation value (commonly None) and a respawn reverts the
+            // session to the adapter's prompting default. See #3086.
+            //
+            // A ThoughtLevel pick is persisted so the handshake can re-apply it
+            // through the agent's thought-level config option; without it a
+            // respawn spawns with `effort: None` and the pick reverts to the
+            // agent default.
+            let selector = if req.config_id == "model" {
+                Some(PersistedSelector::Model)
+            } else {
+                match config_option_category(&state, &id, &req.config_id).await {
+                    Some(crate::acp::state::ConfigOptionCategory::Model) => {
+                        Some(PersistedSelector::Model)
+                    }
+                    Some(crate::acp::state::ConfigOptionCategory::Mode) => {
+                        Some(PersistedSelector::Mode)
+                    }
+                    Some(crate::acp::state::ConfigOptionCategory::ThoughtLevel) => {
+                        Some(PersistedSelector::ThoughtLevel)
+                    }
+                    Some(crate::acp::state::ConfigOptionCategory::Other(_)) | None => None,
+                }
+            };
+            if let Some(selector) = selector {
+                persist_selector(&state, &id, selector, &req.value).await;
+            }
             StatusCode::ACCEPTED.into_response()
         }
-        Err(SupervisorError::UnknownSession(_)) => (
-            StatusCode::NOT_FOUND,
-            "session has no running structured view",
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("set_config_option failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("set_config_option failed", &e),
     }
 }
 
@@ -2018,24 +2428,17 @@ pub async fn resolve_approval(
             record_approval_decision(&state, decision);
             StatusCode::NO_CONTENT.into_response()
         }
-        Err(SupervisorError::UnknownSession(_)) => {
-            (StatusCode::NOT_FOUND, "session has no running acp").into_response()
-        }
         Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::UnknownNonce)) => {
-            // Echo the nonce so clients (web + native TUI) can confirm the
-            // 404 refers to the card they resolved, not a generic miss. See
-            // #1821.
+            // Intentional override of the canonical Acp 500: echo the nonce
+            // so clients (web + native TUI) can confirm the 404 refers to
+            // the card they resolved, not a generic miss. See #1821.
             (
                 StatusCode::NOT_FOUND,
                 format!("no pending approval with nonce {nonce_str}"),
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("resolve failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("resolve failed", &e),
     }
 }
 
@@ -2064,25 +2467,19 @@ pub async fn resolve_elicitation(
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(SupervisorError::UnknownSession(_)) => {
-            (StatusCode::NOT_FOUND, "session has no running acp").into_response()
-        }
+        // Intentional override: nonce echo, mirrors resolve_approval. See #1821.
         Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::UnknownNonce)) => (
             StatusCode::NOT_FOUND,
             format!("no pending elicitation with nonce {nonce_str}"),
         )
             .into_response(),
-        // A failed server-side validation leaves the elicitation pending,
-        // so 422 (not 404): the client can correct the answer and resubmit
-        // the same nonce.
+        // Intentional override: a failed server-side validation leaves the
+        // elicitation pending, so 422 (not 404): the client can correct the
+        // answer and resubmit the same nonce.
         Err(SupervisorError::Acp(crate::acp::acp_client::AcpError::InvalidAnswer(msg))) => {
             (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("resolve failed: {e}"),
-        )
-            .into_response(),
+        Err(e) => supervisor_error_response("resolve failed", &e),
     }
 }
 
@@ -2218,7 +2615,7 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
-    let mut sessions = tokio::task::spawn_blocking(crate::acp::claude_import::scan_sessions)
+    let mut sessions = tokio::task::spawn_blocking(crate::session::claude_import::scan_sessions)
         .await
         .unwrap_or_default();
     // Drop sessions AoE owns: importing one is a no-op and they are noise in
@@ -2264,7 +2661,7 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
     });
     // Cap AFTER ownership filtering so a burst of AoE-managed sessions can't
     // push real imports off the (newest-first) list. See #2276.
-    sessions.truncate(crate::acp::claude_import::MAX_SESSIONS);
+    sessions.truncate(crate::session::claude_import::MAX_SESSIONS);
     Json(sessions).into_response()
 }
 
@@ -2277,6 +2674,48 @@ mod tests {
         DateTime::parse_from_rfc3339(raw)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    #[test]
+    fn resolve_structured_seed_covers_import_direction_b_and_fresh() {
+        // Existing acp_session_id (prior structured / import): load it; replay
+        // only when import_pending.
+        let s = resolve_structured_seed(
+            "claude",
+            "claude",
+            Some("acp-1"),
+            Some("agent-1"),
+            true,
+            true,
+        );
+        assert_eq!(s.stored_acp_session_id.as_deref(), Some("acp-1"));
+        assert!(s.seed_history_replay);
+        let s = resolve_structured_seed("claude", "claude", Some("acp-1"), None, false, true);
+        assert_eq!(s.stored_acp_session_id.as_deref(), Some("acp-1"));
+        assert!(!s.seed_history_replay);
+
+        // Direction B: terminal claude, no acp id, resumable transcript present.
+        let s = resolve_structured_seed("claude", "claude", None, Some("agent-1"), false, true);
+        assert_eq!(s.stored_acp_session_id.as_deref(), Some("agent-1"));
+        assert!(s.seed_history_replay);
+
+        // Transcript confirmed absent: do not attempt the seeded load.
+        let s = resolve_structured_seed("claude", "claude", None, Some("agent-1"), false, false);
+        assert_eq!(s.stored_acp_session_id, None);
+        assert!(!s.seed_history_replay);
+
+        // Non-resumable pairing (adapter swapped away, or non-claude): fresh.
+        let s = resolve_structured_seed("claude", "codex", None, Some("agent-1"), false, true);
+        assert_eq!(s.stored_acp_session_id, None);
+        assert!(!s.seed_history_replay);
+        let s = resolve_structured_seed("codex", "codex", None, Some("agent-1"), false, true);
+        assert_eq!(s.stored_acp_session_id, None);
+        assert!(!s.seed_history_replay);
+
+        // No id anywhere: fresh session/new.
+        let s = resolve_structured_seed("claude", "claude", None, None, false, true);
+        assert_eq!(s.stored_acp_session_id, None);
+        assert!(!s.seed_history_replay);
     }
 
     #[test]
@@ -2297,7 +2736,7 @@ mod tests {
 
     #[test]
     fn plan_mode_value_matches_only_plan() {
-        // Both `acp_set_mode` (legacy `mode_id`) and `acp_set_config_option`
+        // Both `acp_set_mode` (`mode_id`) and `acp_set_config_option`
         // (config-option `value`) tally plan-mode adoption through this check, so
         // it must accept the canonical "plan" value and reject every other mode or
         // selector value (Default / AcceptEdits / model ids / thought levels).
@@ -2308,6 +2747,343 @@ mod tests {
         assert!(!is_plan_mode_value("yolo"));
         assert!(!is_plan_mode_value("Plan"));
         assert!(!is_plan_mode_value(""));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persist_agent_model_updates_memory_and_storage() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let profile = "default";
+
+        let mut inst = crate::session::Instance::new("t", "/tmp");
+        inst.source_profile = profile.to_string();
+        inst.agent_model = Some("claude-sonnet-4-6".to_string());
+        let id = inst.id.clone();
+
+        // Seed on disk so the storage write-back can find the row to update.
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed);
+                Ok(())
+            })
+            .unwrap();
+
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        persist_selector(&state, &id, PersistedSelector::Model, "claude-sonnet-5").await;
+
+        // In-memory registry updated (what the reconciler reads to respawn).
+        assert_eq!(
+            state.instances.read().await[0].agent_model.as_deref(),
+            Some("claude-sonnet-5")
+        );
+
+        // On disk too (what survives a daemon restart).
+        let reloaded = crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(
+            reloaded
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap()
+                .agent_model
+                .as_deref(),
+            Some("claude-sonnet-5")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persist_acp_mode_updates_memory_and_storage() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let profile = "default";
+
+        // A Codex session created without an explicit mode: acp_mode_id is None,
+        // which is the exact state that made a picked mode vanish on respawn.
+        let mut inst = crate::session::Instance::new("t", "/tmp");
+        inst.source_profile = profile.to_string();
+        assert_eq!(inst.acp_mode_id, None);
+        let id = inst.id.clone();
+
+        // Seed on disk so the storage write-back can find the row to update.
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed);
+                Ok(())
+            })
+            .unwrap();
+
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        persist_selector(&state, &id, PersistedSelector::Mode, "agent-full-access").await;
+
+        // In-memory registry updated (what the reconciler re-asserts on respawn).
+        assert_eq!(
+            state.instances.read().await[0].acp_mode_id.as_deref(),
+            Some("agent-full-access")
+        );
+
+        // On disk too (what survives a daemon restart).
+        let reloaded = crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(
+            reloaded
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap()
+                .acp_mode_id
+                .as_deref(),
+            Some("agent-full-access")
+        );
+    }
+
+    /// An explicit thought-level pick must reach both the in-memory registry
+    /// and disk, or the handshake has nothing to re-apply and the pick reverts
+    /// to the agent default on the next respawn.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persist_acp_effort_updates_memory_and_storage() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let profile = "default";
+
+        // A session created without an explicit effort: acp_effort is None, so
+        // it inherits the configured default until the user picks.
+        let mut inst = crate::session::Instance::new("t", "/tmp");
+        inst.source_profile = profile.to_string();
+        assert_eq!(inst.acp_effort, None);
+        let id = inst.id.clone();
+
+        // Seed on disk so the storage write-back can find the row to update.
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed);
+                Ok(())
+            })
+            .unwrap();
+
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        persist_selector(&state, &id, PersistedSelector::ThoughtLevel, "high").await;
+
+        // In-memory registry updated (what the reconciler reads to respawn).
+        assert_eq!(
+            state.instances.read().await[0].acp_effort.as_deref(),
+            Some("high")
+        );
+
+        // On disk too (what survives a daemon restart).
+        let reloaded = crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(
+            reloaded
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap()
+                .acp_effort
+                .as_deref(),
+            Some("high")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn config_option_category_resolves_categories_from_catalog() {
+        use crate::acp::state::{ConfigOptionCategory, ConfigOptionChoice, ConfigOptionDescriptor};
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+
+        let mut inst = crate::session::Instance::new("codex", "/tmp");
+        inst.agent_name = Some("codex".to_string());
+        let id = inst.id.clone();
+
+        let opts = vec![
+            ConfigOptionDescriptor {
+                id: "codex-mode".to_string(),
+                name: "Mode".to_string(),
+                description: None,
+                category: ConfigOptionCategory::Mode,
+                current_value: "agent".to_string(),
+                options: vec![ConfigOptionChoice {
+                    value: "agent-full-access".to_string(),
+                    name: "Agent (full access)".to_string(),
+                    description: None,
+                }],
+            },
+            ConfigOptionDescriptor {
+                id: "model".to_string(),
+                name: "Model".to_string(),
+                description: None,
+                category: ConfigOptionCategory::Model,
+                current_value: "gpt-5".to_string(),
+                options: vec![],
+            },
+            ConfigOptionDescriptor {
+                id: "reasoning-effort".to_string(),
+                name: "Reasoning effort".to_string(),
+                description: None,
+                category: ConfigOptionCategory::ThoughtLevel,
+                current_value: "medium".to_string(),
+                options: vec![ConfigOptionChoice {
+                    value: "high".to_string(),
+                    name: "High".to_string(),
+                    description: None,
+                }],
+            },
+        ];
+        crate::acp::option_catalog::record("codex", &opts, "2026-07-24T00:00:00Z".to_string())
+            .unwrap();
+
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        assert_eq!(
+            config_option_category(&state, &id, "codex-mode").await,
+            Some(ConfigOptionCategory::Mode)
+        );
+        assert_eq!(
+            config_option_category(&state, &id, "model").await,
+            Some(ConfigOptionCategory::Model)
+        );
+        assert_eq!(
+            config_option_category(&state, &id, "reasoning-effort").await,
+            Some(ConfigOptionCategory::ThoughtLevel)
+        );
+        assert_eq!(config_option_category(&state, &id, "unknown").await, None);
+    }
+
+    #[tokio::test]
+    async fn spawn_acp_missing_session_does_not_create_instance_lock() {
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+
+        let response = spawn_acp(
+            State(state.clone()),
+            Path("missing".to_string()),
+            Ok(Json(SpawnAcpRequest {
+                agent: None,
+                model: None,
+                additional_dirs: Vec::new(),
+                provider_env: Vec::new(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(state.instance_locks.read().await.is_empty());
+    }
+
+    /// #3172: two invariants of the idle-dormant prompt-wake path, both of
+    /// which the pre-fix tree violates.
+    ///
+    /// 1. `acp_prompt` must release `instance_lock` before it awaits the
+    ///    worker. The detached spawn task the wake kicks needs that same
+    ///    lock inside `build_spawn_request`, so a handler that keeps it
+    ///    stalls its own resume for the whole `WORKER_READY_TIMEOUT` and
+    ///    then reports the worker never arrived.
+    /// 2. A prompt that never reaches a worker must not be published. A
+    ///    `UserPromptSent` with no turn behind it renders as a session
+    ///    stuck on "running" that only a stop plus re-send clears.
+    ///
+    /// A held `ResumeReservation` stands in for a spawn in flight: it makes
+    /// `wait_for_worker` park exactly as it does mid-respawn, with no
+    /// process, sandbox, or agent involved. It also pins the subtler of the
+    /// two publish branches, because a reservation counts as `is_running`:
+    /// `needs_resume` is false here even though no worker exists, so only
+    /// an unconditional readiness gate catches it. Pre-fix that combination
+    /// published the prompt and then answered 404; it is now a retryable
+    /// 503 with nothing written.
+    #[tokio::test]
+    async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker() {
+        use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
+        use std::time::Duration;
+
+        let mut inst = crate::session::Instance::new("wake-3172", "/tmp/aoe-3172-project");
+        inst.id = "sess-3172".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        // Hold the reservation for the whole probe so no worker can land.
+        let reservation = match state
+            .acp_supervisor
+            .begin_resume(&id, ResumeKind::Spawn)
+            .await
+            .expect("begin_resume must not error under capacity")
+        {
+            ResumeReservationOutcome::Reserved(r) => r,
+            ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
+        };
+
+        let handler = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                acp_prompt(
+                    State(state),
+                    Path(id),
+                    Ok(Json(PromptRequest {
+                        text: "lgtm".to_string(),
+                        attachments: Vec::new(),
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        });
+
+        // Let the handler reach its parked wait. It cannot return until the
+        // reservation drops, so anything past the lock scope is enough.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The 2s budget is far under the 10s `WORKER_READY_TIMEOUT` the
+        // pre-fix handler holds the lock for, and far over the microseconds
+        // the fixed one needs to clear and release.
+        let inst_lock = state.instance_lock(&id).await;
+        let acquired = tokio::time::timeout(Duration::from_secs(2), inst_lock.lock()).await;
+        assert!(
+            acquired.is_ok(),
+            "acp_prompt must not hold instance_lock while it waits for the worker"
+        );
+        drop(acquired);
+
+        drop(reservation);
+        let response = tokio::time::timeout(Duration::from_secs(30), handler)
+            .await
+            .expect("handler must finish once the reservation drops")
+            .expect("handler task must not panic");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        assert!(
+            !state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .iter()
+                .any(|(_, e)| matches!(e, Event::UserPromptSent { .. })),
+            "a prompt no worker ever received must not reach the event store"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_disable_missing_session_does_not_create_instance_lock() {
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+
+        let response = acp_disable(State(state.clone()), Path("missing".to_string()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(state.instance_locks.read().await.is_empty());
     }
 
     #[test]
@@ -2336,7 +3112,7 @@ mod tests {
         let fallback = utc_ts("2099-01-01T00:00:00Z");
         let info = RateLimitInfo {
             status: "limited".to_string(),
-            resets_at,
+            resets_at: Some(resets_at),
             kind: "rate_limit".to_string(),
         };
 
@@ -2355,6 +3131,27 @@ mod tests {
 
         assert_eq!(
             rate_limit_resume_marker_resets_at(Some(&stopped), None, fallback),
+            Some(fallback)
+        );
+    }
+
+    /// The park exists but the agent reported no reset: the marker has to
+    /// fall through to the caller's fallback, or auto-resume loses its
+    /// schedule for exactly the sessions #3152 is about.
+    #[test]
+    fn rate_limit_resume_marker_falls_back_when_reset_unknown() {
+        let stopped = Event::Stopped {
+            reason: "rate_limited".to_string(),
+        };
+        let fallback = utc_ts("2099-01-01T00:00:00Z");
+        let info = RateLimitInfo {
+            status: "limited".to_string(),
+            resets_at: None,
+            kind: "rate_limit".to_string(),
+        };
+
+        assert_eq!(
+            rate_limit_resume_marker_resets_at(Some(&stopped), Some(&info), fallback),
             Some(fallback)
         );
     }

@@ -157,6 +157,23 @@ pub fn is_dirty_worktree_error(error: &str) -> bool {
         || (lower.contains("--force") && lower.contains("contains"))
 }
 
+/// Returns true if a `git worktree` stderr indicates git has no admin entry
+/// for the path (`fatal: '<path>' is not a working tree`).
+///
+/// This is the "already gone from git's point of view" case, not a failure to
+/// act on: the checkout can still be on disk with a dangling `.git` pointer
+/// (its `gitdir:` target under `.git/worktrees/` was pruned or the repo was
+/// re-cloned), so `git worktree remove` refuses while the directory itself is
+/// still ours to delete. Callers recover by removing the directory by hand and
+/// pruning, the same path a missing `.git` takes.
+///
+/// Without this classifier the error fell through to the generic arm and the
+/// trash auto-purge failed on every hourly sweep forever, never draining the
+/// expired session (#3171).
+pub fn is_not_a_worktree_error(error: &str) -> bool {
+    error.to_lowercase().contains("is not a working tree")
+}
+
 /// Enumerate modified, staged, and untracked files inside a worktree using
 /// libgit2. Returns a vec of `"<status> <path>"` entries (e.g.
 /// `"modified src/foo.rs"`, `"untracked debug.log"`).
@@ -413,16 +430,31 @@ pub fn is_permission_error(error: &str) -> bool {
 /// `find . -mindepth 1 -delete` to remove all contents (including
 /// root-owned files that the host user cannot delete directly).
 ///
-/// If the running-state probe fails ([`crate::containers::Probe::Unknown`]),
-/// a `warn!` is emitted and a container start is attempted anyway
-/// (idempotent if the container is already running), preserving best-effort
-/// behavior while surfacing the failure in logs.
+/// The existence probe is fail-open with a `warn!`: on a transient runtime
+/// failure (daemon down, permission denied, or any other non-success stderr
+/// classified by `RuntimeBase::classify_probe_failure`) the cleanup is
+/// skipped and the failure surfaces in logs. The running-state probe warns
+/// on failure via `classify_probe_failure` and attempts `container.start()`
+/// (idempotent when running); cleanup only skips if the start itself fails.
+///
+/// Collapsing the existence probe to `unwrap_or(false)` re-introduces the
+/// swallowing-existence-probe class of bug (#2596 / #2652 / #2654).
 ///
 /// Returns true if the container successfully deleted the contents.
 pub fn cleanup_sandbox_worktree(instance: &Instance) -> bool {
     let container = DockerContainer::from_session_id(&instance.id);
-    if !container.exists().unwrap_or(false) {
-        return false;
+    match container.exists() {
+        Ok(true) => {}
+        Ok(false) => return false,
+        Err(e) => {
+            tracing::warn!(
+                target: "containers.runtime",
+                session = %instance.id,
+                error = %e,
+                "container existence probe failed during worktree cleanup; skipping best-effort cleanup"
+            );
+            return false;
+        }
     }
     let needs_start = match container.probe_running() {
         crate::containers::Probe::Running => false,
@@ -432,7 +464,7 @@ pub fn cleanup_sandbox_worktree(instance: &Instance) -> bool {
                 target: "containers.runtime",
                 session = %instance.id,
                 error = %e,
-                "docker inspect failed while probing sandbox container for worktree cleanup; attempting container start (safe if already running)"
+                "container running-state probe failed during worktree cleanup; attempting container start (safe if already running)"
             );
             true
         }
@@ -535,6 +567,13 @@ pub fn remove_managed_worktree(
                 }
             }
         }
+        // `prune` is repo-wide but lock-respecting: it reaps entries whose
+        // checkout is missing yet SKIPS locked ones, so an aoe-locked worktree
+        // whose checkout is invisible from here (a sibling sandbox, a container
+        // mount) is never wrongly reaped (#2414). If this session's own locked
+        // entry survives here because its stored path diverged from git's
+        // registered path, the scoped self-heal in `delete_branch` reaps it by
+        // the exact path git reports for this branch.
         if let Err(e) = git_wt.prune_worktrees() {
             errors.push(format!("Worktree: {}", e));
         }
@@ -558,10 +597,45 @@ pub fn remove_managed_worktree(
                     is_submodule = is_submodule_blocker(&err_str),
                     "git worktree remove failed"
                 );
+                // git has no admin entry for this path, so there is nothing
+                // for `git worktree remove` to do and re-running can never
+                // succeed. The checkout is still on disk (with a dangling
+                // `.git` pointer), so finish the job by hand exactly as the
+                // missing-`.git` branch above does. Checked before the
+                // permission/submodule fallbacks: those recover a live
+                // worktree, and this one is not one. See #3171.
+                if is_not_a_worktree_error(&err_str) {
+                    tracing::info!(target: "git.worktree",
+                        path = %worktree_path.display(),
+                        "git has no worktree entry for this path; removing the leftover directory by hand"
+                    );
+                    let effective_force = force || instance.is_sandboxed();
+                    match remove_worktree_dir(worktree_path, main_repo, effective_force) {
+                        Ok(()) => worktree_removed = true,
+                        Err(e2) if is_permission_error(&e2.to_string()) => {
+                            if try_sandbox_dir_cleanup(
+                                worktree_path,
+                                main_repo,
+                                instance,
+                                allow_container_removal,
+                            ) {
+                                worktree_removed = true;
+                            } else {
+                                errors.push(format!("Worktree: {}", e2));
+                            }
+                        }
+                        Err(e2) => errors.push(format!("Worktree: {}", e2)),
+                    }
+                    if worktree_removed {
+                        if let Err(e2) = git_wt.prune_worktrees() {
+                            errors.push(format!("Worktree: {}", e2));
+                        }
+                    }
+                }
                 // Container cleanup deletes everything including .git, so
                 // git worktree remove won't work afterward. Fall back to
                 // removing the directory and pruning stale references.
-                if is_permission_error(&err_str)
+                else if is_permission_error(&err_str)
                     && try_sandbox_dir_cleanup(
                         worktree_path,
                         main_repo,
@@ -988,6 +1062,98 @@ mod tests {
         ));
         assert!(!is_dirty_worktree_error("permission denied"));
         assert!(!is_dirty_worktree_error("file not found"));
+    }
+
+    #[test]
+    fn test_is_not_a_worktree_error_matches_git_message() {
+        assert!(is_not_a_worktree_error(
+            "fatal: '/tmp/wt/.aoe-trash/abc' is not a working tree"
+        ));
+        // The wrapped form callers actually see through GitError.
+        assert!(is_not_a_worktree_error(
+            "Git worktree command failed: fatal: '/tmp/wt' is not a working tree"
+        ));
+        assert!(!is_not_a_worktree_error("permission denied"));
+        assert!(!is_not_a_worktree_error(
+            "fatal: '/tmp/wt' contains modified or untracked files"
+        ));
+    }
+
+    /// A trashed worktree whose git admin entry went missing (pruned, or the
+    /// main repo re-cloned) keeps its checkout and a now-dangling `.git`
+    /// pointer on disk. `git worktree remove` refuses with "is not a working
+    /// tree", which is unfixable by retrying: before #3171 that error fell
+    /// through to the generic arm, so `remove_managed_worktree` failed and
+    /// the hourly trash auto-purge re-failed on the same session forever
+    /// (observed retrying every hour with no progress). The recovery is to
+    /// delete the leftover directory by hand and prune, the same as a
+    /// missing `.git`.
+    #[test]
+    fn test_remove_managed_worktree_recovers_from_missing_admin_entry() {
+        use crate::session::Instance;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let main_repo = tmp.path().join("main");
+        let worktree_path = tmp.path().join("trashed");
+        std::fs::create_dir(&main_repo).unwrap();
+
+        let repo = git2::Repository::init(&main_repo).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+
+        let status = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "feature/orphaned-admin-entry",
+                worktree_path.to_str().unwrap(),
+            ])
+            .current_dir(&main_repo)
+            .output()
+            .unwrap();
+        assert!(
+            status.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+
+        // Orphan the checkout: drop git's admin entry while leaving the
+        // worktree (and its `.git` pointer file) on disk. This is the exact
+        // state that makes both `worktree unlock` and `worktree remove`
+        // report "is not a working tree".
+        let admin = main_repo.join(".git/worktrees");
+        std::fs::remove_dir_all(&admin).unwrap();
+        assert!(
+            worktree_path.join(".git").exists(),
+            "test must exercise the has_dot_git branch"
+        );
+
+        let instance = Instance::new("Test", worktree_path.to_str().unwrap());
+        let git_wt = GitWorktree::new(main_repo.clone()).unwrap();
+
+        // force=true mirrors the auto-purge, which forces removal so a dirty
+        // tree can't pin an expired session in the trash forever.
+        let result =
+            remove_managed_worktree(&git_wt, &worktree_path, &main_repo, &instance, true, false);
+
+        assert!(
+            result.is_ok(),
+            "orphaned admin entry must not fail removal: {:?}",
+            result
+        );
+        assert!(
+            !worktree_path.exists(),
+            "leftover worktree dir should be gone"
+        );
+
+        // Idempotent: the purge may re-run before its registry entry drains.
+        let again =
+            remove_managed_worktree(&git_wt, &worktree_path, &main_repo, &instance, true, false);
+        assert!(again.is_ok(), "second removal must be a no-op: {:?}", again);
     }
 
     fn init_repo_with_commit() -> (tempfile::TempDir, std::path::PathBuf) {

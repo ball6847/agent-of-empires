@@ -142,6 +142,42 @@ export async function ensureTerminal(id: string, index = 0, container = false): 
   }
 }
 
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("read failed"));
+    reader.onload = () => {
+      const result = reader.result as string;
+      // Drop the `data:<mime>;base64,` prefix; the server wants raw base64.
+      const comma = result.indexOf(",");
+      resolve(comma >= 0 ? result.slice(comma + 1) : result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+/**
+ * Upload a clipboard image pasted into the live terminal. The host writes it
+ * into the session worktree and returns the path the tmux pane can read, so
+ * the CLI agent (e.g. Claude Code) attaches it. Returns null on any failure.
+ * See #2678.
+ */
+export async function pasteImage(id: string, file: File): Promise<string | null> {
+  try {
+    const data = await fileToBase64(file);
+    const res = await fetch(`/api/sessions/${id}/paste-image`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mime_type: file.type, data }),
+    });
+    if (!res.ok) return null;
+    const body = await res.json().catch(() => ({}));
+    return typeof body.path === "string" ? body.path : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Kill an extra terminal tab's host + container shells (index >= 1). Index 0
  *  is the primary terminal shared with the native TUI and cannot be killed
  *  from the web UI (the server rejects it); closing that tab only hides it. */
@@ -173,6 +209,22 @@ export function getSessionFileContents(
   const params = new URLSearchParams({ path: filePath });
   if (repoName) params.set("repo", repoName);
   return fetchJson<RichFileContentsResponse>(`/api/sessions/${id}/diff/file?${params.toString()}`);
+}
+
+export interface SessionFileResponse {
+  content: string;
+  is_binary: boolean;
+  truncated: boolean;
+}
+
+/**
+ * Read a session file for the file viewer (#3088). Path may be project-relative
+ * or an absolute path the agent touched this session; the server enforces
+ * provenance confinement. See `GET /api/sessions/{id}/file`.
+ */
+export function getSessionFile(id: string, filePath: string): Promise<SessionFileResponse | null> {
+  const params = new URLSearchParams({ path: filePath });
+  return fetchJson<SessionFileResponse>(`/api/sessions/${id}/file?${params.toString()}`);
 }
 
 // --- Settings ---
@@ -667,7 +719,7 @@ export async function dismissPluginUpdate(id: string, fingerprint: string): Prom
  *  validates it to this closed set; each surface maps it to a color. */
 export type PluginUiTone = "neutral" | "info" | "success" | "warn" | "danger";
 
-/** The nine host-rendered slots, kebab-case as the host serializes them. */
+/** The host-rendered slots, kebab-case as the host serializes them. */
 export type PluginUiSlot =
   | "status-bar"
   | "row-badge"
@@ -676,7 +728,10 @@ export type PluginUiSlot =
   | "filter-facet"
   | "card"
   | "pane"
+  | "composer-action"
   | "detail-badge"
+  | "settings-page"
+  | "tool-card-badge"
   | "notification";
 
 /** One piece of UI state a worker pushed. `payload` shape is determined by
@@ -698,6 +753,10 @@ export interface PluginUiNotification {
   title: string;
   body?: string;
   session_id?: string;
+  /** A URL a worker asked the surface to open (`ui.open_url`). When present the
+   *  toast is rendered as click-to-open: a browser blocks `window.open` from an
+   *  async push, so the open happens on the user's click. Always http/https. */
+  href?: string;
 }
 
 export interface PluginUiState {
@@ -738,19 +797,19 @@ export async function setPluginEnabled(id: string, enabled: boolean): Promise<Pl
 }
 
 /** A worker accepted an action. `baselineRevision` is the scope's UI mutation
- *  counter the host read before forwarding; the pane holds its spinner until
- *  the polled counter moves off this value. `null` means the daemon did not
- *  report a baseline (older daemon), so the caller skips the wait and just
+ *  counter the host read before forwarding; the UI action can hold its spinner
+ *  until the polled counter moves off this value. `null` means the daemon did
+ *  not report a baseline (older daemon), so the caller skips the wait and just
  *  clears when the POST settles. */
 export interface PluginActionAccepted {
   baselineRevision: number | null;
 }
 
 /**
- * Forward a plugin pane's UI action (e.g. a "Refresh" button) to the plugin's
- * worker. Fire-and-forget at the worker: the worker runs the named method and
- * re-pushes its UI state, which a later ui-state poll renders. `sessionId`
- * scopes the baseline revision to the firing pane's session. Returns the
+ * Forward a plugin UI action (e.g. a "Refresh" or composer button) to the
+ * plugin's worker. Fire-and-forget at the worker: the worker runs the named
+ * method and re-pushes its UI state, which a later ui-state poll renders.
+ * `sessionId` scopes the baseline revision to the firing UI's session. Returns the
  * accepted baseline (or null if the daemon omitted one), or null on read-only
  * (403), no running worker (404), or network failure.
  */
@@ -774,6 +833,27 @@ export async function invokePluginAction(
     return { baselineRevision: rev };
   } catch {
     return null;
+  }
+}
+
+/**
+ * Invoke an action-less plugin command (`POST /api/plugins/commands/{fqid}/invoke`).
+ * These commands (e.g. the GitHub plugin's `status` / `refresh`) carry no client
+ * `action`, so the host dispatches a fixed `plugin.command.invoke` notification
+ * to the worker. Fire-and-forget: `true` means the daemon accepted and
+ * dispatched it, `false` on read-only, unknown command/session, no worker, or
+ * network failure.
+ */
+export async function invokePluginCommand(fqid: string, sessionId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/plugins/commands/${encodeURIComponent(fqid)}/invoke`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
   }
 }
 
@@ -1116,26 +1196,16 @@ export interface ServerAbout {
   auth_mode: "token" | "passphrase" | "none";
   read_only: boolean;
   behind_tunnel: boolean;
+  /** CityHall client mode (`AOE_CITYHALL_MODE`). Locks the dashboard
+   *  down to a composer + structured-view end-user client: name-only
+   *  session creation, theme-only settings, no terminal / diff /
+   *  project-management. Enforced server-side too. See #7. */
+  cityhall_mode: boolean;
   profile: string;
   /** Resolved `acp.show_tool_durations` from the active profile's
    *  config. Drives the per-tool elapsed-time label in the acp
    *  web UI; cross-device since it lives in config.toml. */
   acp_show_tool_durations: boolean;
-  /** Resolved `acp.queue_drain_mode` from the active profile's
-   *  config. Selects how the composer drains client-side queued
-   *  follow-up prompts on Stopped: `combined` (default) joins them
-   *  with blank lines into a single prompt; `serial` fires one entry
-   *  at a time. See #1031. */
-  acp_queue_drain_mode: "combined" | "serial";
-  /** Resolved `acp.max_concurrent_resumes` from the active
-   *  profile's config. Upper bound on parallel acp worker
-   *  spawns/attaches the reconciler runs on `aoe serve` cold start.
-   *  See #1088. */
-  acp_max_concurrent_resumes: number;
-  /** Resolved `acp.force_end_turn_threshold_secs` from the active
-   *  profile's config. Seconds of streaming inactivity after which
-   *  the acp web UI offers a "Force end turn" button. See #1100. */
-  acp_force_end_turn_threshold_secs: number;
   /** Resolved `acp.replay_events` from the active profile's
    *  config. Per-session retention cap on the acp event log;
    *  0 means unlimited. Mirrored onto the in-memory activity buffer
@@ -1149,6 +1219,24 @@ export interface ServerAbout {
    *  installed PWA has no refresh affordance, so it keeps running old
    *  code after the binary updates until prompted to reload). */
   web_build_id?: string | null;
+  /** Read-only runtime state of the daemon's sleep-inhibit reconciler.
+   *  Always present: `get_about` emits it unconditionally
+   *  (`SleepInhibitStatus`, not `Option`). Informational only; no dashboard
+   *  flow consumes it yet. */
+  sleep_inhibit: {
+    /** The `session.prevent_sleep_when_active` toggle as the reconciler
+     *  last read it: the raw config toggle, not whether an assertion is
+     *  held. */
+    prevent_sleep_enabled: boolean;
+    /** Whether the daemon holds an OS sleep assertion as of the last
+     *  reconcile; can trail the backing child's death by up to one poll
+     *  interval. */
+    currently_held: boolean;
+    /** Whether a real OS backend is still believed able to hold the
+     *  assertion. Optimistic: `true` means no failure latched yet, not
+     *  verified working. */
+    backend_available: boolean;
+  };
 }
 
 export function fetchAbout(): Promise<ServerAbout | null> {
@@ -1227,7 +1315,6 @@ export interface UpdateStatus {
   latest_version: string | null;
   update_available: boolean;
   release_url: string | null;
-  web_poll_interval_minutes: number;
   error: string | null;
   /** Version the user already dismissed the banner for, persisted server-side
    *  in app_state so the acknowledgement is once-per-account, not per device. */
@@ -1270,6 +1357,16 @@ export function fetchBranches(path: string, includeRemote = false): Promise<Bran
   const params = new URLSearchParams({ path });
   if (includeRemote) params.set("include_remote", "true");
   return fetchJson<BranchInfo[]>(`/api/git/branches?${params.toString()}`);
+}
+
+/** Whether `path` is a git repository, per the same gate the session builder
+ *  enforces. Returns the boolean, or null on a transient failure so callers
+ *  can stay optimistic rather than misreport a repo as a non-repo. Used by the
+ *  new-session wizard to disable the worktree toggle for a plain folder. */
+export async function fetchIsGitRepo(path: string): Promise<boolean | null> {
+  const params = new URLSearchParams({ path });
+  const res = await fetchJson<{ is_git_repo: boolean }>(`/api/git/is-repo?${params.toString()}`);
+  return res ? res.is_git_repo : null;
 }
 
 // --- Acp context primer ---
@@ -1359,6 +1456,31 @@ export async function switchAcpAgent(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+  });
+}
+
+/** Response from the view-switch endpoints. `view` is the session's view
+ *  after the swap. */
+export interface ViewSwitchResponse {
+  session_id: string;
+  view?: "structured" | "terminal";
+}
+
+/** Switch a session into structured view (POST /acp/enable). For a claude
+ *  session with a resumable transcript the conversation is carried over; other
+ *  agents restart fresh. Resolves with the updated view or null on non-2xx. */
+export async function acpEnable(sessionId: string): Promise<ViewSwitchResponse | null> {
+  return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/enable`, {
+    method: "POST",
+  });
+}
+
+/** Switch a session back to a terminal (POST /acp/disable). A claude session's
+ *  conversation continues via `claude --resume`; other agents restart fresh.
+ *  Resolves with the updated view or null on non-2xx. */
+export async function acpDisable(sessionId: string): Promise<ViewSwitchResponse | null> {
+  return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/disable`, {
+    method: "POST",
   });
 }
 
@@ -1487,6 +1609,30 @@ export async function browseFilesystem(
 
 export async function fetchGroups(): Promise<GroupInfo[]> {
   return (await fetchJson<GroupInfo[]>("/api/groups")) ?? [];
+}
+
+/** Resolve a plugin `dynamic_select` widget's options from the host (#2897).
+ *  `depends` carries the current values of the widget's `depends_on` siblings
+ *  in declaration order (for acp_models/acp_modes the first entry is the
+ *  selected agent). Returns [] on any failure so the picker degrades to an
+ *  empty list rather than throwing. */
+export async function resolvePluginOptions(
+  pluginId: string,
+  source: string,
+  depends: string[],
+): Promise<{ value: string; label: string }[]> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/settings/options/resolve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source, depends }),
+    });
+    if (!res.ok) return [];
+    const body = (await res.json()) as { options?: { value: string; label: string }[] };
+    return body.options ?? [];
+  } catch {
+    return [];
+  }
 }
 
 export async function fetchProjects(scope?: "global" | "profile"): Promise<ProjectInfo[]> {
@@ -1931,6 +2077,33 @@ export async function smartRenameSession(id: string): Promise<{ ok: boolean; mes
 }
 
 /**
+ * Request an on-demand "summary of the conversation so far" for a
+ * structured-view session (see #2808). Best-effort: a 202 means the summary
+ * one-shot started, and the result arrives later as a ConversationSummary
+ * event over the structured-view WS. Returns the server's message on a gate
+ * failure (not structured, no one-shot agent, sandboxed) so the caller can
+ * surface it.
+ */
+export async function summarizeSession(id: string): Promise<{ ok: boolean; message?: string }> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/summarize`, {
+      method: "POST",
+    });
+    if (res.ok) return { ok: true };
+    let message: string | undefined;
+    try {
+      const body = await res.json();
+      message = typeof body?.message === "string" ? body.message : undefined;
+    } catch {
+      // non-JSON error body; fall through with no message
+    }
+    return { ok: false, message };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/**
  * Edit a managed worktree session's workdir name: move the worktree
  * directory and, optionally, rename its git branch. The session must not be
  * running. Returns the server's validation message on failure so the caller
@@ -1956,6 +2129,79 @@ export async function setWorktreeName(
       // non-JSON error body; fall through with no message
     }
     return { ok: false, message };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/** What happened to the session's agent after a repo was attached. */
+export type AttachProjectWorker = "restarted" | "not_running" | "restart_failed";
+
+export interface AttachProjectResult {
+  ok: boolean;
+  /** Server validation message on failure, or the worker message on a failed restart. */
+  message?: string;
+  worker?: AttachProjectWorker;
+  /** Directory leaf the repo was attached under. */
+  name?: string;
+  branch?: string;
+  /** False when aoe checked out a branch the repo already had. */
+  branchCreated?: boolean;
+  /** New working directory when the attach converted the session into a
+   *  workspace; absent when it already was one and nothing moved. */
+  movedTo?: string;
+  warnings?: string[];
+}
+
+/**
+ * Attach another repo to a session that already exists, so an agent that turns
+ * out to need a second repo keeps its conversation instead of the session being
+ * recreated. Converts the session into a multi-repo workspace, which moves its
+ * working directory unless it already was one, and restarts it there. See #3103.
+ *
+ * `project` is a path or the name of a registered project.
+ *
+ * A 200 with `worker: "restart_failed"` means the repo is attached and durable
+ * but the session did not come back, so the caller must surface that rather than
+ * treating the call as a plain success.
+ */
+export async function attachSessionProject(
+  id: string,
+  project: string,
+  opts: { attachExistingBranch?: boolean } = {},
+): Promise<AttachProjectResult> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/projects`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project,
+        attach_existing_branch: opts.attachExistingBranch ?? false,
+      }),
+    });
+    let body: Record<string, unknown> | undefined;
+    try {
+      body = await res.json();
+    } catch {
+      // non-JSON body; fall through with no detail
+    }
+    if (!res.ok) {
+      return {
+        ok: false,
+        message: typeof body?.message === "string" ? body.message : undefined,
+      };
+    }
+    const attached = body?.attached as Record<string, unknown> | undefined;
+    return {
+      ok: true,
+      worker: body?.worker as AttachProjectWorker | undefined,
+      message: typeof body?.worker_message === "string" ? body.worker_message : undefined,
+      name: typeof attached?.name === "string" ? attached.name : undefined,
+      branch: typeof attached?.branch === "string" ? attached.branch : undefined,
+      branchCreated: typeof attached?.branch_created === "boolean" ? attached.branch_created : undefined,
+      movedTo: typeof attached?.moved_to === "string" ? attached.moved_to : undefined,
+      warnings: Array.isArray(body?.warnings) ? (body.warnings as string[]) : undefined,
+    };
   } catch {
     return { ok: false };
   }
@@ -2035,6 +2281,23 @@ export async function setSessionPin(id: string, pinned: boolean): Promise<Sessio
   }
 }
 
+/** Set (or clear, with `null`) a session's color label. Rendered as a colored
+ *  status dot in the sidebar; the palette is `red` / `amber` / `green`. Also
+ *  settable from the CLI via `aoe session color`. See #2383. */
+export async function setSessionColor(id: string, color: string | null): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/color`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ color }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
 /** Archive or unarchive a session. On archive (with `killPane` true or
  *  omitted), the server tears down all tmux sessions and shuts down the
  *  ACP worker for acp-mode sessions. Sending a message auto-unarchives.
@@ -2060,7 +2323,7 @@ export async function setSessionArchive(
 /** Move a session to the trash (#2489): stops the live session (ACP
  *  shutdown, which preserves the transcript, plus optional tmux teardown)
  *  and hides it from the normal list while keeping every durable artifact so
- *  it can be restored. NOT a permanent delete; use `deleteSession` for that. */
+ *  it can be restored. NOT a permanent delete; use `deleteWorkspace` for that. */
 export async function trashSession(id: string, killPane = true): Promise<SessionResponse | null> {
   try {
     const res = await fetch(`/api/sessions/${id}/trash`, {
@@ -2171,30 +2434,57 @@ export interface DeleteSessionOptions {
   keep_scratch?: boolean;
 }
 
-export interface DeleteSessionResult {
+export interface WorkspaceDeleteFailure {
+  id: string;
+  error: string;
+}
+
+export interface DeleteWorkspaceResult {
   ok: boolean;
   error?: string;
   messages?: string[];
+  /** Ids the server actually deleted. */
+  deleted?: string[];
+  /** Sessions that could not be deleted, with their error. */
+  failed?: WorkspaceDeleteFailure[];
 }
 
-export async function deleteSession(id: string, options: DeleteSessionOptions = {}): Promise<DeleteSessionResult> {
+/** Atomically delete a whole multi-session workspace in one call (#2536).
+ *  `sessionIds` is the workspace's full session set in display order; the
+ *  server treats `sessionIds[0]` as the worktree owner (removed last) and the
+ *  rest as record-only siblings. Replaces the old per-session delete fan-out,
+ *  so a mid-delete disconnect can no longer half-delete the workspace. */
+export async function deleteWorkspace(
+  sessionIds: string[],
+  options: DeleteSessionOptions = {},
+): Promise<DeleteWorkspaceResult> {
   try {
-    const res = await fetch(`/api/sessions/${id}`, {
+    const res = await fetch(`/api/workspaces`, {
       method: "DELETE",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(options),
+      body: JSON.stringify({ session_ids: sessionIds, ...options }),
     });
+    const data = (await res.json().catch(() => ({}))) as {
+      message?: string;
+      messages?: string[];
+      deleted?: string[];
+      failed?: WorkspaceDeleteFailure[];
+    };
     if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
       return {
         ok: false,
         error: data.message || `Server error (${res.status})`,
+        failed: data.failed,
       };
     }
-    const data = (await res.json().catch(() => ({}))) as {
-      messages?: string[];
-    };
-    return { ok: true, messages: data.messages };
+    // The endpoint always reports which sessions it removed. A 2xx without a
+    // `deleted` array is not a confirmed deletion, so treat it as a failure
+    // rather than dropping local state (drafts, caches) for sessions the
+    // server may not have touched.
+    if (!Array.isArray(data.deleted)) {
+      return { ok: false, error: "Server did not confirm which sessions were deleted" };
+    }
+    return { ok: true, messages: data.messages, deleted: data.deleted, failed: data.failed };
   } catch (e) {
     return {
       ok: false,

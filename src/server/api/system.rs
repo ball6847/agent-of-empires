@@ -215,6 +215,12 @@ pub async fn update_settings(
     State(state): State<Arc<AppState>>,
     body: Result<Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall mode exposes only the theme control, which writes through the
+    // dedicated `PATCH /api/theme` endpoint; the general settings PATCH stays
+    // fully closed so advanced settings cannot be reached. See #7.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     if state.read_only {
         return (
             StatusCode::FORBIDDEN,
@@ -240,17 +246,38 @@ pub async fn update_settings(
     if let Err(rej) = validate_patch_with(&runtime_schema(), &body, Scope::Global, true) {
         return reject_response(rej);
     }
+    // Capture which plugins this patch touches (top-level `plugin:<id>`
+    // sections and their changed field keys) BEFORE the rewrite folds them
+    // into `plugins.<id>.settings.*`, so we can emit `plugin.settings.changed`
+    // after a successful write (#2897).
+    let plugin_changes: Vec<(String, Vec<String>)> = body
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(section, value)| {
+                    let id = crate::session::settings_schema::section_plugin_id(section)?;
+                    let keys: Vec<String> = value
+                        .as_object()
+                        .map(|m| m.keys().cloned().collect())
+                        .unwrap_or_default();
+                    Some((id.to_string(), keys))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     // Fold validated `plugin:<id>` sections into their on-disk storage path
     // (`plugins.<id>.settings.*`) before the generic merge.
     rewrite_plugin_sections(&mut body);
 
     let result = tokio::task::spawn_blocking(move || {
-        let config = crate::session::Config::load_or_warn();
-        let mut current = serde_json::to_value(&config)?;
-        crate::session::settings_schema::merge_json(&mut current, &body);
-        let config: crate::session::Config = serde_json::from_value(current)?;
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(config)
+        crate::session::update_config(|config| -> anyhow::Result<()> {
+            let mut current = serde_json::to_value(&*config)?;
+            crate::session::settings_schema::merge_json(&mut current, &body);
+            *config = serde_json::from_value(current)?;
+            Ok(())
+        })
+        .and_then(|inner| inner)?;
+        Ok::<_, anyhow::Error>(crate::session::Config::load_or_warn())
     })
     .await;
 
@@ -265,6 +292,14 @@ pub async fn update_settings(
                     &config.logging.targets,
                     &app_dir,
                 );
+            }
+            // Tell each touched plugin's worker its settings changed (#2897),
+            // after the durable write. Best-effort; config.get is the fallback.
+            #[cfg(feature = "serve")]
+            if !plugin_changes.is_empty() {
+                if let Some(host) = &state.plugin_host {
+                    host.emit_settings_changed(&plugin_changes).await;
+                }
             }
             match serde_json::to_value(&config) {
                 Ok(val) => (StatusCode::OK, Json(val)).into_response(),
@@ -354,10 +389,15 @@ pub async fn update_theme(
         )
             .into_response();
     }
-    let Json(patch) = match body {
+    let Json(mut patch) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
+    // CityHall hides the color-mode control in the Theme tab, so drop any
+    // client-supplied color_mode; only the theme name is writable here (#7).
+    if state.cityhall_mode {
+        patch.color_mode = None;
+    }
     // Reject an unknown theme name so a typo can't repaint to the `default`
     // fallback. Empty is allowed (clears back to the default builtin).
     if let Some(name) = &patch.name {
@@ -377,21 +417,20 @@ pub async fn update_theme(
         }
     }
     let result = tokio::task::spawn_blocking(move || {
-        // `Config::load()` (not `load_or_warn`) so a corrupt config.toml is not
-        // silently replaced with defaults, wiping every other setting, just to
-        // change a theme. Mirrors `mark_web_tour_seen`. A parse error surfaces
-        // as a 400 below.
-        let mut config = crate::session::Config::load()?;
-        if let Some(name) = patch.name {
-            config.theme.name = name;
-        }
-        if let Some(mode) = patch.color_mode {
-            config.theme.color_mode = mode;
-        }
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(crate::tui::styles::resolve_theme(
-            &config.effective_theme_name(),
-        ))
+        // `update_config` re-loads via `Config::load()` (not `load_or_warn`),
+        // so a corrupt config.toml surfaces as an error instead of being
+        // silently replaced with defaults, wiping every other setting, just
+        // to change a theme. A parse error surfaces as a 400 below.
+        let theme_name = crate::session::update_config(|config| {
+            if let Some(name) = patch.name {
+                config.theme.name = name;
+            }
+            if let Some(mode) = patch.color_mode {
+                config.theme.color_mode = mode;
+            }
+            config.effective_theme_name()
+        })?;
+        Ok::<_, anyhow::Error>(crate::tui::styles::resolve_theme(&theme_name))
     })
     .await;
 
@@ -430,12 +469,11 @@ pub async fn update_theme(
 ///
 /// Single-purpose write so the cosmetic flag never widens the
 /// `PATCH /api/settings` surface (which carries security-sensitive
-/// sections like `sandbox`/`worktree` and the `app_state`
-/// hooks-acknowledgement field). Deliberately exempt from the
+/// sections like `sandbox`/`worktree`). Deliberately exempt from the
 /// elevation/passphrase wall: it flips one cosmetic bool, grants no
-/// capability, and `read_only` still blocks it. Uses `Config::load()`
-/// (not `load_or_warn`) so a corrupt config is not silently replaced
-/// with defaults just to persist this flag.
+/// capability, and `read_only` still blocks it. Persisted via
+/// `update_app_state` into `state.toml`, entirely separate from
+/// `config.toml`, so a corrupt global config can never block this flag.
 pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -448,10 +486,9 @@ pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl Into
     }
 
     let result = tokio::task::spawn_blocking(|| {
-        let mut config = crate::session::Config::load()?;
-        config.app_state.has_seen_web_tour = true;
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        crate::session::update_app_state(|state| {
+            state.has_seen_web_tour = true;
+        })
     })
     .await;
 
@@ -549,12 +586,12 @@ pub struct MarkTipSeenBody {
     pub id: String,
 }
 
-/// Marks one tip seen by appending its id to the shared `app_state.tips_seen`,
-/// so the dashboard's mark-seen-on-view sticks across devices and matches the
-/// TUI. Single-purpose write mirroring [`mark_web_tour_seen`]: exempt from the
-/// elevation wall, still blocked by `read_only`, and uses `Config::load()` so a
-/// corrupt config is not silently replaced. Rejects an id that is not in the
-/// catalog so junk can't accumulate in the persisted seen list.
+/// Marks one tip seen by appending its id to the shared `app_state.tips_seen`
+/// in `state.toml`, so the dashboard's mark-seen-on-view sticks across devices
+/// and matches the TUI. Single-purpose write mirroring [`mark_web_tour_seen`]:
+/// exempt from the elevation wall, still blocked by `read_only`. Rejects an id
+/// that is not in the catalog so junk can't accumulate in the persisted seen
+/// list.
 pub async fn mark_tip_seen(
     State(state): State<Arc<AppState>>,
     body: Result<Json<MarkTipSeenBody>, axum::extract::rejection::JsonRejection>,
@@ -581,12 +618,11 @@ pub async fn mark_tip_seen(
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut config = crate::session::Config::load()?;
-        if !config.app_state.tips_seen.iter().any(|s| s == &id) {
-            config.app_state.tips_seen.push(id);
-        }
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        crate::session::update_app_state(|state| {
+            if !state.tips_seen.iter().any(|s| s == &id) {
+                state.tips_seen.push(id);
+            }
+        })
     })
     .await;
 
@@ -642,10 +678,9 @@ pub async fn set_show_tips(
     };
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut config = crate::session::Config::load()?;
-        config.session.show_tips = enabled;
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        crate::session::update_config(|config| {
+            config.session.show_tips = enabled;
+        })
     })
     .await;
 
@@ -680,12 +715,11 @@ pub struct DismissUpdateBody {
 }
 
 /// Records that the user dismissed the update banner for a specific version,
-/// persisting to the shared `app_state.dismissed_update_version` so the
-/// dismissal sticks across devices (and matches the TUI's snooze) rather than
-/// living in per-browser localStorage. Single-purpose write mirroring
-/// [`mark_web_tour_seen`]: exempt from the elevation wall, still blocked by
-/// `read_only`, and uses `Config::load()` so a corrupt config is not silently
-/// replaced with defaults.
+/// persisting to the shared `app_state.dismissed_update_version` in
+/// `state.toml` so the dismissal sticks across devices (and matches the
+/// TUI's snooze) rather than living in per-browser localStorage.
+/// Single-purpose write mirroring [`mark_web_tour_seen`]: exempt from the
+/// elevation wall, still blocked by `read_only`.
 pub async fn dismiss_update(
     State(state): State<Arc<AppState>>,
     body: Result<Json<DismissUpdateBody>, axum::extract::rejection::JsonRejection>,
@@ -707,10 +741,9 @@ pub async fn dismiss_update(
     let persisted = version.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut config = crate::session::Config::load()?;
-        config.app_state.dismissed_update_version = Some(persisted);
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        crate::session::update_app_state(|state| {
+            state.dismissed_update_version = Some(persisted);
+        })
     })
     .await;
 
@@ -806,21 +839,20 @@ pub async fn patch_web_ui_state(
     }
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut config = crate::session::Config::load()?;
-        for (key, value) in patch {
-            match value {
-                serde_json::Value::Null => {
-                    config.app_state.web_ui_state.remove(&key);
+        crate::session::update_app_state(|state| {
+            for (key, value) in patch {
+                match value {
+                    serde_json::Value::Null => {
+                        state.web_ui_state.remove(&key);
+                    }
+                    serde_json::Value::String(s) => {
+                        state.web_ui_state.insert(key, s);
+                    }
+                    // Already rejected above; keep exhaustive for safety.
+                    _ => {}
                 }
-                serde_json::Value::String(s) => {
-                    config.app_state.web_ui_state.insert(key, s);
-                }
-                // Already rejected above; keep exhaustive for safety.
-                _ => {}
             }
-        }
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        })
     })
     .await;
 
@@ -849,8 +881,7 @@ pub async fn patch_web_ui_state(
 /// expansion (#2045), so the new-session wizard's confirm modal is shown once
 /// and never again. Single-purpose write mirroring [`mark_web_tour_seen`]: it
 /// flips one bool, grants no capability, stays exempt from the elevation wall,
-/// and `read_only` still blocks it. `Config::load()` (not `load_or_warn`) keeps
-/// a corrupt config from being silently overwritten.
+/// and `read_only` still blocks it.
 pub async fn mark_volume_ignores_globs_acknowledged(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -865,10 +896,9 @@ pub async fn mark_volume_ignores_globs_acknowledged(
     }
 
     let result = tokio::task::spawn_blocking(|| {
-        let mut config = crate::session::Config::load()?;
-        config.app_state.has_acknowledged_volume_ignores_globs = true;
-        crate::session::save_config(&config)?;
-        Ok::<_, anyhow::Error>(())
+        crate::session::update_app_state(|state| {
+            state.has_acknowledged_volume_ignores_globs = true;
+        })
     })
     .await;
 
@@ -1040,7 +1070,10 @@ struct BrowseResponse {
     has_more: bool,
 }
 
-pub async fn filesystem_home() -> impl IntoResponse {
+pub async fn filesystem_home(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     match dirs::home_dir() {
         Some(home) => (
             StatusCode::OK,
@@ -1083,8 +1116,12 @@ fn skip_git_probe(parent: &std::path::Path, name: &str, home: Option<&std::path:
 }
 
 pub async fn browse_filesystem(
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<BrowseQuery>,
 ) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let result = tokio::task::spawn_blocking(move || {
         let limit = query.limit.unwrap_or(100);
         let filter = query.filter.map(|f| f.trim().to_lowercase());
@@ -1220,6 +1257,47 @@ pub async fn docker_status() -> Json<DockerStatus> {
     Json(result)
 }
 
+/// Read-only runtime view of the `aoe serve` daemon's sleep-inhibit reconciler.
+/// Derived from a snapshot the poll loop publishes plus the live backend latch;
+/// never a control surface.
+#[derive(Serialize)]
+pub struct SleepInhibitStatus {
+    /// The `session.prevent_sleep_when_active` toggle as the reconciler last
+    /// read it: the raw config toggle only, not the reconciler's `desired`
+    /// (which also folds in recent activity), nor whether an assertion is held.
+    pub prevent_sleep_enabled: bool,
+    /// Whether the daemon is holding an OS sleep assertion, as of the last
+    /// reconcile. Refreshed on the poll loop's interval, so it can trail the
+    /// death of the backing child (an external kill, or a backend that spawns
+    /// then fails, as on WSL2 with no logind) by up to that interval. Requires
+    /// both a retained inhibitor slot and an available backend, so a slot
+    /// lingering under the unavailable latch does not report held.
+    pub currently_held: bool,
+    /// Whether a real OS backend is still believed able to hold the assertion
+    /// on this host. Optimistic: `true` means no failure has latched yet, not
+    /// that the backend was verified working. It is never actively probed, so
+    /// while the toggle is off the backend is never exercised and this stays
+    /// `true` even on a host where it would fail. `false` once a failure
+    /// latches, and false on unsupported platforms.
+    pub backend_available: bool,
+}
+
+/// Fold the reconciler snapshot bits and the live backend-availability read into
+/// the reported status. `currently_held` gates the retained slot on the backend
+/// being available, so the unavailable latch (which keeps a doomed slot around
+/// to suppress respawns) and the no-op platform backend never report held.
+fn derive_sleep_inhibit_status(
+    prevent_sleep_enabled: bool,
+    slot_present: bool,
+    backend_available: bool,
+) -> SleepInhibitStatus {
+    SleepInhibitStatus {
+        prevent_sleep_enabled,
+        currently_held: slot_present && backend_available,
+        backend_available,
+    }
+}
+
 #[derive(Serialize)]
 pub struct ServerAbout {
     pub version: String,
@@ -1234,27 +1312,16 @@ pub struct ServerAbout {
     pub auth_mode: &'static str,
     pub read_only: bool,
     pub behind_tunnel: bool,
+    /// CityHall client mode (`AOE_CITYHALL_MODE`). Drives the web
+    /// dashboard's locked-down end-user client: composer + structured
+    /// view only, name-only session creation, theme-only settings, and
+    /// no terminal / diff / project-management surfaces. See #7.
+    pub cityhall_mode: bool,
     pub profile: String,
     /// Resolved value of `acp.show_tool_durations` from the active
     /// profile's config. Drives the per-tool elapsed-time label in the
     /// web UI; cross-device since it lives in config.toml.
     pub acp_show_tool_durations: bool,
-    /// Resolved value of `acp.queue_drain_mode` from the active
-    /// profile's config. Selects how the web composer drains client-side
-    /// queued prompts on Stopped: `combined` (default) joins them with
-    /// blank lines into a single follow-up; `serial` fires them one at a
-    /// time. Cross-device since it lives in config.toml. See #1031.
-    pub acp_queue_drain_mode: String,
-    /// Resolved value of `acp.max_concurrent_resumes` from the
-    /// active profile's config. Upper bound on parallel acp worker
-    /// spawns/attaches the reconciler runs on `aoe serve` cold start.
-    /// Surfaced so the settings UI shows the current value. See #1088.
-    pub acp_max_concurrent_resumes: u32,
-    /// Resolved value of `acp.force_end_turn_threshold_secs` from
-    /// the active profile's config. Seconds of streaming inactivity
-    /// after which the acp web UI offers a "Force end turn" button
-    /// to unstick a missed-Stopped spinner. See #1100.
-    pub acp_force_end_turn_threshold_secs: u32,
     /// Resolved value of `acp.replay_events` from the active
     /// profile's config. Per-session retention cap on the acp
     /// event log; 0 means unlimited. The web client mirrors this on
@@ -1275,6 +1342,8 @@ pub struct ServerAbout {
     /// installed PWAs (which have no refresh affordance) pick up new
     /// dashboard code after the binary updates.
     pub web_build_id: Option<&'static str>,
+    /// Read-only runtime state of the daemon's sleep-inhibit reconciler.
+    pub sleep_inhibit: SleepInhibitStatus,
 }
 
 pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> {
@@ -1284,10 +1353,15 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         crate::server::resolve_auth_mode(&state.token_manager, &state.login_manager).await;
     let acp_cfg = crate::session::profile_config::resolve_config_or_warn(&state.profile).acp;
     let acp_show_tool_durations = acp_cfg.show_tool_durations;
-    let acp_queue_drain_mode = acp_cfg.queue_drain_mode.as_str().to_string();
-    let acp_max_concurrent_resumes = acp_cfg.max_concurrent_resumes;
-    let acp_force_end_turn_threshold_secs = acp_cfg.force_end_turn_threshold_secs;
     let acp_replay_events = acp_cfg.replay_events;
+    let snapshot = state
+        .sleep_inhibit_snapshot
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let sleep_inhibit = derive_sleep_inhibit_status(
+        snapshot & crate::server::SLEEP_INHIBIT_SNAPSHOT_ENABLED != 0,
+        snapshot & crate::server::SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT != 0,
+        crate::process::sleep_inhibit_backend_available(),
+    );
     Json(ServerAbout {
         version: env!("CARGO_PKG_VERSION").to_string(),
         auth_required,
@@ -1295,11 +1369,9 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
         auth_mode,
         read_only: state.read_only,
         behind_tunnel: state.behind_tunnel,
+        cityhall_mode: state.cityhall_mode,
         profile: state.profile.clone(),
         acp_show_tool_durations,
-        acp_queue_drain_mode,
-        acp_max_concurrent_resumes,
-        acp_force_end_turn_threshold_secs,
         acp_replay_events,
         build_flavor: if cfg!(debug_assertions) {
             "debug"
@@ -1307,6 +1379,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
             "release"
         },
         web_build_id: crate::server::web_build_id(),
+        sleep_inhibit,
     })
 }
 
@@ -1315,10 +1388,7 @@ pub async fn get_about(State(state): State<Arc<AppState>>) -> Json<ServerAbout> 
 /// Web-facing snapshot of `update::check_for_update`. `update_check_mode`
 /// mirrors `updates.update_check_mode` so the frontend can hide its banner
 /// (mode = `off`) or skip nagging while a background install runs
-/// (mode = `auto`) without separately fetching settings.
-/// `web_poll_interval_minutes` echoes the configured frontend re-poll cadence
-/// so the dashboard doesn't need a second settings round-trip. See #984 and
-/// #1140.
+/// (mode = `auto`) without separately fetching settings. See #984 and #1140.
 #[derive(Serialize)]
 pub struct UpdateStatusResponse {
     pub update_check_mode: crate::session::config::UpdateCheckMode,
@@ -1326,7 +1396,6 @@ pub struct UpdateStatusResponse {
     pub latest_version: Option<String>,
     pub update_available: bool,
     pub release_url: Option<String>,
-    pub web_poll_interval_minutes: u64,
     /// Set when the GitHub check failed (e.g. rate-limited, offline).
     /// Frontend keeps polling on its normal cadence; the banner stays
     /// hidden until a successful poll. The error is exposed so the
@@ -1351,7 +1420,6 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             latest_version: None,
             update_available: false,
             release_url: None,
-            web_poll_interval_minutes: cfg.updates.web_poll_interval_minutes,
             error: None,
             dismissed_version: cfg.app_state.dismissed_update_version.clone(),
         });
@@ -1374,7 +1442,6 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
                 },
                 update_available: info.available,
                 release_url,
-                web_poll_interval_minutes: cfg.updates.web_poll_interval_minutes,
                 error: None,
                 dismissed_version: cfg.app_state.dismissed_update_version.clone(),
             })
@@ -1385,7 +1452,6 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             latest_version: None,
             update_available: false,
             release_url: None,
-            web_poll_interval_minutes: cfg.updates.web_poll_interval_minutes,
             error: Some(e.to_string()),
             dismissed_version: cfg.app_state.dismissed_update_version.clone(),
         }),
@@ -1411,6 +1477,10 @@ pub async fn create_profile(
             ),
         )
             .into_response();
+    }
+    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1456,6 +1526,10 @@ pub async fn delete_profile(
             ),
         )
             .into_response();
+    }
+    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
     }
     if let Err(e) = validate_profile_name(&name) {
         return (
@@ -1510,6 +1584,10 @@ pub async fn rename_profile(
             ),
         )
             .into_response();
+    }
+    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1569,6 +1647,10 @@ pub async fn default_profile(
             ),
         )
             .into_response();
+    }
+    // Profiles are hidden entirely in CityHall (no picker, no CRUD UI).
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1648,6 +1730,41 @@ pub async fn get_profile_settings(
     }
 }
 
+/// Leaf paths CityHall mode may write via the profile-settings PATCH: only the
+/// curated trash cluster the Sessions tab exposes. Everything else is closed so
+/// the endpoint (which must stay open for those toggles) cannot double as an
+/// arbitrary profile-override writer. See #7.
+const CITYHALL_PROFILE_LEAVES: &[&str] = &[
+    "session.delete_to_trash",
+    "session.confirm_delete",
+    "session.trash_retention_days",
+];
+
+/// Walk a sparse settings patch and return the first dotted leaf path not in
+/// [`CITYHALL_PROFILE_LEAVES`], or `None` when every leaf is permitted.
+fn first_non_cityhall_profile_leaf(patch: &serde_json::Value) -> Option<String> {
+    fn walk(prefix: &str, v: &serde_json::Value) -> Option<String> {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, child) in map {
+                    let path = if prefix.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{prefix}.{k}")
+                    };
+                    if let Some(bad) = walk(&path, child) {
+                        return Some(bad);
+                    }
+                }
+                None
+            }
+            _ if CITYHALL_PROFILE_LEAVES.contains(&prefix) => None,
+            _ => Some(prefix.to_string()),
+        }
+    }
+    walk("", patch)
+}
+
 pub async fn update_profile_settings(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
@@ -1679,6 +1796,21 @@ pub async fn update_profile_settings(
     // so a bundled patch keeps its safe leaves and silently drops the
     // local-only ones; they can never become a profile override (#1692).
     strip_local_only(&mut body);
+    // CityHall mode keeps this endpoint open for the curated Sessions trash
+    // toggles, but nothing else: reject any leaf outside that allowlist so the
+    // open endpoint cannot double as an arbitrary profile-override writer (#7).
+    if state.cityhall_mode {
+        if let Some(bad) = first_non_cityhall_profile_leaf(&body) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "cityhall_mode",
+                    "message": format!("Field '{bad}' is not writable in CityHall mode"),
+                })),
+            )
+                .into_response();
+        }
+    }
     // Resolve elevation up front via the shared resolver: login disabled
     // means always elevated, a loopback-trusted caller is elevated per the
     // #1168 carve-out (#2610), otherwise only an elevated session may write
@@ -1702,28 +1834,30 @@ pub async fn update_profile_settings(
         let mut body = body;
         let logging_patch = body.as_object_mut().and_then(|obj| obj.remove("logging"));
         if let Some(patch) = logging_patch {
-            let global = crate::session::Config::load_or_warn();
-            let mut current = serde_json::to_value(&global)?;
-            if let Some(current_obj) = current.as_object_mut() {
-                match current_obj.get_mut("logging") {
-                    Some(existing) => {
-                        if let (Some(existing_obj), Some(new_obj)) =
-                            (existing.as_object_mut(), patch.as_object())
-                        {
-                            for (k, v) in new_obj {
-                                existing_obj.insert(k.clone(), v.clone());
+            let global = crate::session::update_config(|global| -> anyhow::Result<()> {
+                let mut current = serde_json::to_value(&*global)?;
+                if let Some(current_obj) = current.as_object_mut() {
+                    match current_obj.get_mut("logging") {
+                        Some(existing) => {
+                            if let (Some(existing_obj), Some(new_obj)) =
+                                (existing.as_object_mut(), patch.as_object())
+                            {
+                                for (k, v) in new_obj {
+                                    existing_obj.insert(k.clone(), v.clone());
+                                }
+                            } else {
+                                current_obj.insert("logging".to_string(), patch);
                             }
-                        } else {
+                        }
+                        None => {
                             current_obj.insert("logging".to_string(), patch);
                         }
                     }
-                    None => {
-                        current_obj.insert("logging".to_string(), patch);
-                    }
                 }
-            }
-            let global: crate::session::Config = serde_json::from_value(current)?;
-            crate::session::save_config(&global)?;
+                *global = serde_json::from_value(current)?;
+                Ok(())
+            })
+            .and_then(|inner| inner.map(|()| crate::session::Config::load_or_warn()))?;
             if let Ok(app_dir) = crate::session::get_app_dir() {
                 crate::logging::apply_persisted_config(
                     &global.logging.default_level,
@@ -1863,6 +1997,68 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use std::collections::HashMap;
+
+    #[test]
+    fn derive_sleep_inhibit_status_gates_held_on_backend() {
+        // First three rows are reconciler-reachable states; the last two are
+        // not reachable from the writer (toggle off releases the slot) but pin
+        // the pure gate, proving `currently_held` excludes prevent_sleep_enabled.
+        // (prevent_sleep_enabled, slot_present, backend_available) -> currently_held
+        let cases = [
+            // supported host actively holding the assertion
+            ((true, true, true), true),
+            // toggle on but every session idle past grace: slot released
+            ((true, false, true), false),
+            // backend latched unavailable (helper missing / WSL2) or no-op
+            // platform: is_held_alive keeps the slot to suppress respawns, yet
+            // no real assertion is held
+            ((true, true, false), false),
+            // gate guard: enabled must not force held when the backend is down
+            ((false, true, false), false),
+            // gate guard: held tracks slot AND backend, never prevent_sleep_enabled
+            ((false, true, true), true),
+        ];
+        for ((enabled, slot, avail), held) in cases {
+            let s = derive_sleep_inhibit_status(enabled, slot, avail);
+            assert_eq!(
+                s.currently_held, held,
+                "enabled={enabled} slot={slot} avail={avail}"
+            );
+            assert_eq!(s.prevent_sleep_enabled, enabled);
+            assert_eq!(s.backend_available, avail);
+        }
+    }
+
+    #[test]
+    fn cityhall_profile_leaf_allows_only_the_curated_trash_cluster() {
+        // Every curated leaf, on its own and bundled, is permitted.
+        assert_eq!(
+            first_non_cityhall_profile_leaf(&serde_json::json!({
+                "session": {
+                    "delete_to_trash": true,
+                    "confirm_delete": false,
+                    "trash_retention_days": 30
+                }
+            })),
+            None
+        );
+        // An empty patch is a no-op, not a violation.
+        assert_eq!(
+            first_non_cityhall_profile_leaf(&serde_json::json!({"session": {}})),
+            None
+        );
+        // Any leaf outside the allowlist is reported by its dotted path.
+        assert_eq!(
+            first_non_cityhall_profile_leaf(&serde_json::json!({
+                "session": {"delete_to_trash": true, "yolo_mode": true}
+            })),
+            Some("session.yolo_mode".to_string())
+        );
+        assert_eq!(
+            first_non_cityhall_profile_leaf(&serde_json::json!({"theme": {"name": "x"}})),
+            Some("theme.name".to_string())
+        );
+    }
 
     #[test]
     fn skip_git_probe_avoids_protected_home_folders() {

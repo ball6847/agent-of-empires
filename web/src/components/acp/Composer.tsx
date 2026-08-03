@@ -20,6 +20,7 @@ import { AtSign, ChevronUp, Paperclip, Pencil, Slash, Square, X } from "lucide-r
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
 import { SessionConfigControls } from "./SessionConfigControls";
+import { Tooltip } from "../Tooltip";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 import {
   clearPendingSwitchAgent,
@@ -33,7 +34,8 @@ import type {
   PromptCapabilities,
   QueuedPrompt,
 } from "../../lib/acpTypes";
-import { getDraft, setDraft } from "../../lib/acpDrafts";
+import { clearDraft, clearDraftAttachments, getDraft, setDraft } from "../../lib/acpDrafts";
+import { isIOS, isStandalone } from "../../lib/platform";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useAgentProfile } from "../../lib/agentProfileContext";
@@ -41,6 +43,10 @@ import { resolveModeChannel } from "../../lib/modeChannel";
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
 import { nextRecallTarget, recallBannerInfo, type RecallCursor, type RecallNav } from "./recallNav";
+import { PluginComposerActions } from "../plugin/PluginSlots";
+import { composerDraftOperation, type ComposerDraftOperation } from "../plugin/composerDraftOperation";
+import { usePluginUiEntries } from "../../lib/pluginUiContext";
+import { sessionEntries } from "../../lib/pluginUi";
 
 export {
   DICTATION_BURST_TIMEOUT_MS,
@@ -156,20 +162,38 @@ export function decideBeforeInputAction(
   return "newline";
 }
 
+/** Height (px) of the iOS software-keyboard accessory bar (the predictive /
+ *  AutoFill strip that sits on top of the keys). On an installed iOS PWA the
+ *  layout viewport shrinks for the keys but not this strip, so it floats over
+ *  the bottom of the page and covers the composer's Send button. We reserve
+ *  this much space below the composer footer to lift Send clear of it. Value is
+ *  the standard iOS accessory-bar height; a device tweak may refine it. */
+export const IOS_ACCESSORY_BAR_PX = 44;
+
 /** Wrapper class + inline style for the composer's outer <div>. When the
  *  soft keyboard is open we drop the bottom padding and apply a negative
  *  bottom margin equal to the App root's safe-area-inset-bottom so the
  *  composer sits flush with the top of the keyboard instead of leaving a
  *  visible gap (the home-indicator inset is physically occluded by the
- *  keyboard anyway). Extracted as a pure helper so the layout decision
- *  can be unit-tested without mounting the whole composer. See #1143. */
-export function composerWrapperLayout(opts: { keyboardOpen: boolean }): {
+ *  keyboard anyway). `accessoryBarPx` adds bottom padding that lifts the footer
+ *  above the iOS accessory bar (see IOS_ACCESSORY_BAR_PX); it is 0 off iOS-PWA.
+ *  Extracted as a pure helper so the layout decision can be unit-tested without
+ *  mounting the whole composer. See #1143. */
+export function composerWrapperLayout(opts: { keyboardOpen: boolean; accessoryBarPx?: number }): {
   className: string;
   style: React.CSSProperties | undefined;
 } {
+  if (!opts.keyboardOpen) {
+    return { className: "border-t border-surface-800 bg-surface-900 px-4 pt-3 pb-3", style: undefined };
+  }
+  const clearance = opts.accessoryBarPx ?? 0;
   return {
-    className: ["border-t border-surface-800 bg-surface-900 px-4 pt-3", opts.keyboardOpen ? "pb-0" : "pb-3"].join(" "),
-    style: opts.keyboardOpen ? { marginBottom: "calc(-1 * env(safe-area-inset-bottom))" } : undefined,
+    className: "border-t border-surface-800 bg-surface-900 px-4 pt-3 pb-0",
+    // Inline paddingBottom overrides pb-0 when we need accessory-bar clearance.
+    style: {
+      marginBottom: "calc(-1 * env(safe-area-inset-bottom))",
+      ...(clearance > 0 ? { paddingBottom: clearance } : {}),
+    },
   };
 }
 
@@ -383,6 +407,13 @@ export function Composer({
   // drop our own bottom padding while the keyboard is open. See #1143.
   const { keyboardOpen } = useMobileKeyboard();
 
+  // On an installed iOS PWA the keyboard's accessory bar (predictive / AutoFill
+  // strip) floats over the bottom of the page and covers Send, because the
+  // layout viewport shrinks for the keys but not that strip. Reserve clearance
+  // for it there; regular iOS Safari lifts the whole composer via keyboardHeight
+  // already, so this stays PWA-only to avoid a double gap. See #1143.
+  const iosPwa = useMemo(() => isIOS() && isStandalone(), []);
+
   // Touch-primary device flag for the Enter-key decision matrix.
   // Re-evaluated on `(pointer: coarse)` / `(any-pointer: fine)`
   // changes so plugging in a Bluetooth keyboard on an iPad flips
@@ -574,18 +605,70 @@ export function Composer({
         return;
       }
     }
-    void sendFromTextarea(taRef, composerRuntime, enqueuePrompt, supportedPendingAttachments, () =>
+    void sendFromTextarea(taRef, composerRuntime, enqueuePrompt, sessionId, supportedPendingAttachments, () =>
       setPendingAttachments([]),
     );
   }, [
     composerRuntime,
     enqueuePrompt,
+    sessionId,
     setPendingAttachments,
     supportedPendingAttachments,
     queuedPrompts,
     editQueuedPrompt,
     applyRecall,
   ]);
+  const getPluginComposerSnapshot = useCallback(() => {
+    const ta = taRef.current;
+    const text = composerRuntime.getState().text;
+    const fallbackPos = text.length;
+    return {
+      text,
+      selectionStart: ta?.selectionStart ?? fallbackPos,
+      selectionEnd: ta?.selectionEnd ?? ta?.selectionStart ?? fallbackPos,
+    };
+  }, [composerRuntime]);
+  const applyPluginDraftOperation = useCallback(
+    (operation: ComposerDraftOperation) => {
+      const ta = taRef.current;
+      if (!ta) {
+        if (operation.kind === "set-text") composerRuntime.setText(operation.text);
+        else composerRuntime.setText(`${composerRuntime.getState().text}${operation.text}`);
+        return;
+      }
+      if (operation.kind === "set-text") {
+        composerRuntime.setText(operation.text);
+        requestAnimationFrame(() => {
+          const el = taRef.current;
+          if (!el) return;
+          el.focus();
+          const len = operation.text.length;
+          el.setSelectionRange(len, len);
+          el.style.height = "auto";
+          el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+        });
+        return;
+      }
+      insertRawTextAtCaret(ta, operation.text, operation.kind === "replace-selection");
+    },
+    [composerRuntime],
+  );
+  const pluginUiEntries = usePluginUiEntries();
+  const pluginComposerEntries = useMemo(
+    () => sessionEntries(pluginUiEntries, "composer-action", sessionId),
+    [pluginUiEntries, sessionId],
+  );
+  const seenPluginDraftOpsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    for (const entry of pluginComposerEntries) {
+      const draft = composerDraftOperation(entry);
+      if (!draft) continue;
+      const key = `${entry.plugin_id}:${entry.id}:${draft.id}`;
+      if (seenPluginDraftOpsRef.current.has(key)) continue;
+      seenPluginDraftOpsRef.current.add(key);
+      applyPluginDraftOperation(draft.operation);
+    }
+  }, [applyPluginDraftOperation, pluginComposerEntries]);
 
   // Manual agent switch dialog. Opened from the sidebar row context menu
   // (see WorkspaceSidebar's "Switch agent" item) via the cross-component
@@ -746,7 +829,10 @@ export function Composer({
   // desktop, so no coarse-pointer gate is needed here.
   useFocusTerminalTarget("composer", taRef);
 
-  const wrapperLayout = composerWrapperLayout({ keyboardOpen });
+  const wrapperLayout = composerWrapperLayout({
+    keyboardOpen,
+    accessoryBarPx: iosPwa ? IOS_ACCESSORY_BAR_PX : 0,
+  });
   return (
     <div className={wrapperLayout.className} style={wrapperLayout.style}>
       <div
@@ -1088,6 +1174,7 @@ export function Composer({
 
               <div data-testid="composer-actions" className="flex shrink-0 items-center gap-2">
                 <UsageHint usage={sessionUsage} />
+                <PluginComposerActions sessionId={sessionId} getSnapshot={getPluginComposerSnapshot} />
                 {turnActive ? (
                   <>
                     <StopButton />
@@ -1245,6 +1332,26 @@ export function insertAtCaret(ref: React.RefObject<HTMLTextAreaElement | null>, 
   const pos = before.length + needsSpace.length + text.length;
   ta.focus();
   ta.setSelectionRange(pos, pos);
+}
+
+function insertRawTextAtCaret(ta: HTMLTextAreaElement, text: string, replaceSelection: boolean) {
+  const start = ta.selectionStart ?? ta.value.length;
+  const end = replaceSelection ? (ta.selectionEnd ?? start) : start;
+  const next = ta.value.slice(0, start) + text + ta.value.slice(end);
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+  setter?.call(ta, next);
+  ta.dispatchEvent(
+    new InputEvent("input", {
+      bubbles: true,
+      inputType: "insertText",
+      data: text,
+    }),
+  );
+  const pos = start + text.length;
+  ta.focus();
+  ta.setSelectionRange(pos, pos);
+  ta.style.height = "auto";
+  ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
 }
 
 function extDescription(path: string): string | undefined {
@@ -1451,21 +1558,23 @@ function UsageHint({ usage }: { usage: AcpState["sessionUsage"] }) {
   const usedLabel = formatTokens(usage.used);
   const sizeLabel = formatTokens(usage.size);
   const cost = usage.cost ? formatCost(usage.cost.amount, usage.cost.currency) : null;
-  const title =
-    `Context: ${usage.used.toLocaleString()} / ${usage.size.toLocaleString()} tokens (${pct}%)` +
-    (cost ? ` · session cost ${cost}` : "");
+  const explanation =
+    `Context window: ${usage.used.toLocaleString()} of ${usage.size.toLocaleString()} tokens used (${pct}%). ` +
+    `Color warns as the window fills.` +
+    (cost ? ` ${cost} is cumulative session spend since the last /clear or /compact.` : "");
   return (
-    <span
-      className={`hidden sm:inline-flex items-center gap-1 text-[11px] tabular-nums ${tone}`}
-      title={title}
-      aria-label={title}
-    >
-      <span>
-        {usedLabel}/{sizeLabel}
+    <Tooltip text={explanation} multiline>
+      <span
+        className={`hidden sm:inline-flex items-center gap-1 text-[11px] tabular-nums ${tone}`}
+        aria-label={explanation}
+      >
+        <span>
+          {usedLabel}/{sizeLabel}
+        </span>
+        <span className="opacity-70">({pct}%)</span>
+        {cost ? <span className="opacity-70">· {cost}</span> : null}
       </span>
-      <span className="opacity-70">({pct}%)</span>
-      {cost ? <span className="opacity-70">· {cost}</span> : null}
-    </span>
+    </Tooltip>
   );
 }
 
@@ -1601,6 +1710,7 @@ function sendFromTextarea(
   taRef: React.RefObject<HTMLTextAreaElement | null>,
   composerRuntime: ReturnType<typeof useComposerRuntime>,
   enqueuePrompt: (text: string, attachments?: PromptAttachmentInput[]) => void | Promise<void>,
+  sessionId: string,
   attachments: PromptAttachmentInput[] = [],
   clearAttachments?: () => void,
 ): void {
@@ -1611,6 +1721,11 @@ function sendFromTextarea(
   if (!text && attachments.length === 0) return;
   void enqueuePrompt(text, attachments.length > 0 ? attachments : undefined);
   composerRuntime.setText("");
+  // Clear the persisted draft synchronously, not via the 250ms debounced
+  // flush: a remount racing a resume/queue re-render otherwise restores the
+  // just-sent text from localStorage. See #3094 / #3087.
+  clearDraft(sessionId);
+  clearDraftAttachments(sessionId);
   clearAttachments?.();
   // Manually reset the textarea height; auto-grow runs on input events
   // and we cleared the value without firing one.

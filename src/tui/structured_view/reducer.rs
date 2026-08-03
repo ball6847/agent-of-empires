@@ -20,9 +20,11 @@
 //!   layer can offer the "paste a context primer" affordance.
 
 use crate::acp::approvals::ApprovalDecision;
-use crate::acp::elicitations::{ElicitationAnswer, ElicitationOutcome};
+use crate::acp::elicitations::{ElicitationAnswer, ElicitationOutcome, ElicitationQuestion};
 use crate::acp::protocol::AcpBroadcastFrame;
-use crate::acp::state::{AvailableCommand, Event, PlanStepStatus, ToolOutputBlock};
+use crate::acp::state::{
+    AvailableCommand, DiffPreview, Event, ModeInfo, PlanStepStatus, SessionUsage, ToolOutputBlock,
+};
 
 /// Render the structured completion payload as a single text block for the
 /// native TUI, which can't display images/audio inline. Media variants
@@ -52,6 +54,11 @@ fn summarize_output_blocks(blocks: &[ToolOutputBlock]) -> String {
 #[derive(Debug, Clone)]
 pub struct AcpTranscript {
     pub session_id: String,
+    /// Friendly session title hydrated from `/api/sessions`.
+    pub session_title: Option<String>,
+    /// Resolved ACP registry key shown in the header. Updated when the backend
+    /// switches mid-session.
+    pub agent_name: Option<String>,
     pub rows: Vec<ActivityRow>,
     pub pending_approvals: Vec<PendingApproval>,
     /// Pending `AskUserQuestion` elicitations. The native TUI does not
@@ -64,6 +71,9 @@ pub struct AcpTranscript {
     /// Latest mode id the agent reported. `None` until the agent
     /// emits `ModesAvailable` / `CurrentModeChanged`.
     pub current_mode: Option<String>,
+    /// Permission modes the agent advertised (`ModesAvailable`). Drives
+    /// the `m` mode picker; empty when the agent never announced any.
+    pub available_modes: Vec<ModeInfo>,
     /// Slash commands the agent has advertised. Drives the composer's
     /// `/` picker (followup #1018).
     pub available_commands: Vec<AvailableCommand>,
@@ -78,6 +88,14 @@ pub struct AcpTranscript {
     /// by `/replay` after a `reset()`. The composer reads it to decide
     /// whether Enter sends now or parks the prompt in the local queue.
     pub turn_active: bool,
+    /// Latest context-window usage / cost snapshot the agent reported.
+    /// Rendered as a token meter in the status line, mirroring the web
+    /// composer's usage chip.
+    pub usage: Option<SessionUsage>,
+    /// Latest plan snapshot. Kept separate from the append-only transcript so
+    /// repeated progress updates render as one sticky summary instead of a
+    /// growing stack of near-identical checklists.
+    pub current_plan: Vec<PlanLine>,
     /// Set when the WS layer reports `{"kind":"lagged"}`; the view
     /// layer should clear and rehydrate via HTTP /replay.
     pub lagged: bool,
@@ -104,7 +122,6 @@ pub enum ActivityRow {
     AgentMessage(String),
     ToolCall(ToolCallRow),
     Approval(ApprovalRow),
-    Plan(Vec<PlanLine>),
     /// The user's answers to an AskUserQuestion / elicitation form, kept
     /// in the transcript so the picked answer survives the card closing.
     /// See #2209.
@@ -125,6 +142,10 @@ pub struct ToolCallRow {
     /// value set at `ToolCallStarted` is authoritative for the row.
     pub kind: String,
     pub args: String,
+    /// Structured per-file diffs the agent attached to the call (edit /
+    /// apply_patch tools). When non-empty the renderer prefers these over
+    /// the compact diff derived from `old_string`/`new_string` args.
+    pub diffs: Vec<DiffPreview>,
     pub completed: Option<ToolCompletion>,
 }
 
@@ -140,6 +161,8 @@ pub struct ToolCompletion {
 pub struct ApprovalRow {
     pub nonce: String,
     pub title: String,
+    pub kind: String,
+    pub args: String,
     pub destructive: bool,
     pub decision: Option<ApprovalDecision>,
 }
@@ -158,6 +181,12 @@ pub struct PendingApproval {
 #[derive(Debug, Clone)]
 pub struct PendingElicitation {
     pub nonce: String,
+    /// Human-readable prompt (the question text, or a lead-in for a
+    /// multi-question form).
+    pub message: String,
+    /// The form's fields, kept so the TUI can answer single-select
+    /// questions natively via the `a` picker.
+    pub questions: Vec<ElicitationQuestion>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -171,14 +200,19 @@ impl AcpTranscript {
     pub fn new(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
+            session_title: None,
+            agent_name: None,
             rows: Vec::new(),
             pending_approvals: Vec::new(),
             pending_elicitations: Vec::new(),
             status_text: None,
             current_mode: None,
+            available_modes: Vec::new(),
             available_commands: Vec::new(),
             context_primer_pending: false,
             turn_active: false,
+            usage: None,
+            current_plan: Vec::new(),
             lagged: false,
             last_seq: 0,
             pending_message_idx: None,
@@ -192,7 +226,11 @@ impl AcpTranscript {
     /// rehydrate via HTTP /replay.
     pub fn reset(&mut self) {
         let session_id = std::mem::take(&mut self.session_id);
+        let session_title = self.session_title.take();
+        let agent_name = self.agent_name.take();
         *self = Self::new(session_id);
+        self.session_title = session_title;
+        self.agent_name = agent_name;
     }
 
     /// Optimistically clear an approval card by nonce after the resolve
@@ -247,8 +285,8 @@ impl AcpTranscript {
 
     fn apply_event(&mut self, event: &Event) {
         match event {
-            // Session title is shown in the session list/header, not the
-            // activity transcript; the daemon applies it to Instance.title.
+            // The daemon applies this legacy suggestion to Instance.title.
+            // The authoritative current title is hydrated from /api/sessions.
             Event::SessionTitleSuggested { .. } => {}
             Event::AgentMessageChunk { text } => {
                 if let Some(idx) = self.pending_message_idx {
@@ -304,6 +342,7 @@ impl AcpTranscript {
                     name: tool_call.name.clone(),
                     kind: tool_call.kind.clone(),
                     args: tool_call.args_preview.clone(),
+                    diffs: tool_call.diffs.clone(),
                     completed: None,
                 };
                 self.rows.push(ActivityRow::ToolCall(row));
@@ -314,6 +353,7 @@ impl AcpTranscript {
                 tool_call_id,
                 title,
                 args_preview,
+                diffs,
                 ..
             } => {
                 if let Some(&idx) = self.tool_idx.get(tool_call_id) {
@@ -327,6 +367,12 @@ impl AcpTranscript {
                             if !a.is_empty() {
                                 row.args = a.clone();
                             }
+                        }
+                        // `Some` replaces the diff list wholesale (per ACP,
+                        // content is a replacement); `None` leaves the
+                        // initial frame's diffs untouched. See #1721.
+                        if let Some(d) = diffs {
+                            row.diffs = d.clone();
                         }
                     }
                 }
@@ -388,6 +434,8 @@ impl AcpTranscript {
                 let row = ApprovalRow {
                     nonce: nonce.clone(),
                     title: approval.tool_call.name.clone(),
+                    kind: approval.tool_call.kind.clone(),
+                    args: approval.tool_call.args_preview.clone(),
                     destructive: approval.destructive,
                     decision: None,
                 };
@@ -407,18 +455,21 @@ impl AcpTranscript {
             }
             Event::ElicitationRequested { elicitation } => {
                 self.flush_pending_chunk();
-                // The rich answer form is web-only; the native TUI shows a
-                // notice and offers skip/cancel via the composer keys so the
-                // turn never hangs for a TUI-only user. See #web-elicitation.
+                // Single-select questions are answerable natively via the
+                // `a` picker; anything richer (free text, multi-select,
+                // numbers) still points at the web form. The view layer
+                // decides which hint applies from `questions`.
                 self.rows.push(ActivityRow::Note {
                     kind: NoteKind::Info,
                     text: format!(
-                        "Agent asked a question: {}\nAnswer it in the web dashboard (press o), or skip / cancel.",
+                        "Agent asked a question: {}\nPress a to answer, s to skip, c to cancel (o opens the web form).",
                         elicitation.message
                     ),
                 });
                 self.pending_elicitations.push(PendingElicitation {
                     nonce: elicitation.nonce.0.clone(),
+                    message: elicitation.message.clone(),
+                    questions: elicitation.questions.clone(),
                 });
             }
             Event::ElicitationResolved {
@@ -452,7 +503,7 @@ impl AcpTranscript {
             }
             Event::PlanUpdated { plan } => {
                 self.flush_pending_chunk();
-                let lines: Vec<PlanLine> = plan
+                self.current_plan = plan
                     .steps
                     .iter()
                     .map(|s| PlanLine {
@@ -460,7 +511,6 @@ impl AcpTranscript {
                         status: s.status.clone(),
                     })
                     .collect();
-                self.rows.push(ActivityRow::Plan(lines));
             }
             Event::TodoListUpdated { todos: _ } => {
                 // TUI MVP omits the parallel todo list; agents almost
@@ -535,6 +585,16 @@ impl AcpTranscript {
                         .into(),
                 });
             }
+            Event::ConversationSummary { text, .. } => {
+                // aoe-generated recap of the conversation so far (see #2808).
+                // Render it as an informational callout in the transcript;
+                // it carries no model/session state to mutate.
+                self.flush_pending_chunk();
+                self.rows.push(ActivityRow::Note {
+                    kind: NoteKind::Info,
+                    text: format!("summary of conversation so far:\n{text}"),
+                });
+            }
             Event::AcpSessionAssigned { acp_session_id } => {
                 // Bookkeeping event; not surfaced to the user.
                 let _ = acp_session_id;
@@ -543,9 +603,11 @@ impl AcpTranscript {
                 self.available_commands = commands.clone();
             }
             Event::ModesAvailable {
-                current_mode_id, ..
+                current_mode_id,
+                modes,
             } => {
                 self.current_mode = Some(current_mode_id.clone());
+                self.available_modes = modes.clone();
             }
             Event::CurrentModeChanged { current_mode_id } => {
                 self.current_mode = Some(current_mode_id.clone());
@@ -570,18 +632,32 @@ impl AcpTranscript {
             }
             Event::RateLimitAutoResumed { resets_at } => {
                 // Timeline breadcrumb: the reconciler auto-resumed the
-                // worker after the rate-limit reset elapsed. Surface it so
+                // worker after the rate-limit park elapsed. Surface it so
                 // the transcript explains why the agent came back on its
-                // own. See #1722.
+                // own. See #1722. The timestamp is when the resume fired,
+                // not a reset the agent reported: it is reset plus grace
+                // when one was reported and a retry interval when none was,
+                // so don't word it as a reset (#3152).
                 self.flush_pending_chunk();
                 self.rows.push(ActivityRow::Note {
                     kind: NoteKind::Info,
-                    text: format!("auto-resumed after rate-limit reset ({resets_at})"),
+                    text: format!("auto-resumed at {resets_at} after rate-limit park"),
+                });
+            }
+            Event::UsageUpdated { usage } => {
+                // Latest snapshot wins; the agent typically resends after
+                // each turn. Rendered as the status-line token meter.
+                self.usage = Some(usage.clone());
+            }
+            Event::ModeSwitchFailed { mode_id, reason } => {
+                self.flush_pending_chunk();
+                self.rows.push(ActivityRow::Note {
+                    kind: NoteKind::Error,
+                    text: format!("mode switch to \"{mode_id}\" failed: {reason}"),
                 });
             }
             Event::DiffEmitted { .. }
             | Event::RateLimit { .. }
-            | Event::UsageUpdated { .. }
             | Event::RawAgentUpdate { .. }
             // Background async sub-agents surface in the web panel; the
             // native structured view has no panel yet, so these are
@@ -593,12 +669,14 @@ impl AcpTranscript {
             | Event::MonitorArmed { .. }
             | Event::CancelRequested { .. }
             | Event::PromptCapabilities { .. }
-            | Event::AgentSwitched { .. }
-            | Event::ModeSwitchFailed { .. }
             | Event::ConfigOptionsUpdated { .. }
             | Event::ConfigOptionSwitchFailed { .. } => {
                 // Surface as info notes for now; richer renderers are
                 // followup work tracked in the plan's "out of scope".
+            }
+            Event::AgentSwitched { to, .. } => {
+                self.agent_name = Some(to.clone());
+                self.current_plan.clear();
             }
         }
     }
@@ -868,10 +946,10 @@ mod tests {
         t.apply(&frame(1, Event::ElicitationRequested { elicitation }));
         assert_eq!(t.pending_elicitations.len(), 1);
         assert_eq!(t.pending_elicitations[0].nonce, "e-1");
-        // The TUI surfaces a notice row pointing at the web dashboard.
+        // The TUI surfaces a notice row with the answer/skip/cancel keys.
         assert!(matches!(
             t.rows.last(),
-            Some(ActivityRow::Note { text, .. }) if text.contains("web dashboard")
+            Some(ActivityRow::Note { text, .. }) if text.contains("Press a to answer")
         ));
         t.apply(&frame(
             2,
@@ -1028,7 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_update_creates_plan_row() {
+    fn plan_update_replaces_sticky_plan_snapshot() {
         let mut t = AcpTranscript::new("s-1");
         let plan = Plan {
             plan_id: "p-1".into(),
@@ -1041,7 +1119,9 @@ mod tests {
             }],
         };
         t.apply(&frame(1, Event::PlanUpdated { plan }));
-        assert!(matches!(&t.rows[0], ActivityRow::Plan(lines) if lines.len() == 1));
+        assert!(t.rows.is_empty());
+        assert_eq!(t.current_plan.len(), 1);
+        assert_eq!(t.current_plan[0].title, "Step one");
     }
 
     #[test]
@@ -1131,6 +1211,87 @@ mod tests {
         assert!(t.turn_active);
         t.reset();
         assert!(!t.turn_active, "reset drops derived turn state for replay");
+    }
+
+    #[test]
+    fn tool_call_update_replaces_diffs_wholesale_and_none_preserves() {
+        let mut t = AcpTranscript::new("s-1");
+        let mut tc = tool("t-1", "Edit");
+        tc.diffs = vec![DiffPreview {
+            path: "a.rs".into(),
+            old_text: Some("old".into()),
+            new_text: Some("new".into()),
+            created_at: Utc::now(),
+        }];
+        t.apply(&frame(1, Event::ToolCallStarted { tool_call: tc }));
+        // A text-only update (diffs: None) must not erase the initial diffs.
+        t.apply(&frame(
+            2,
+            Event::ToolCallUpdated {
+                tool_call_id: "t-1".into(),
+                title: Some("Edit a.rs".into()),
+                args_preview: None,
+                started_at: None,
+                diffs: None,
+            },
+        ));
+        match &t.rows[0] {
+            ActivityRow::ToolCall(row) => {
+                assert_eq!(row.diffs.len(), 1);
+                assert_eq!(row.diffs[0].path, "a.rs");
+            }
+            _ => panic!("expected ToolCall"),
+        }
+        // A Some(..) update replaces the list wholesale (#1721).
+        t.apply(&frame(
+            3,
+            Event::ToolCallUpdated {
+                tool_call_id: "t-1".into(),
+                title: None,
+                args_preview: None,
+                started_at: None,
+                diffs: Some(vec![DiffPreview {
+                    path: "b.rs".into(),
+                    old_text: None,
+                    new_text: Some("fresh".into()),
+                    created_at: Utc::now(),
+                }]),
+            },
+        ));
+        match &t.rows[0] {
+            ActivityRow::ToolCall(row) => {
+                assert_eq!(row.diffs.len(), 1);
+                assert_eq!(row.diffs[0].path, "b.rs");
+            }
+            _ => panic!("expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn usage_updated_stores_latest_snapshot() {
+        let mut t = AcpTranscript::new("s-1");
+        assert!(t.usage.is_none());
+        t.apply(&frame(
+            1,
+            Event::UsageUpdated {
+                usage: SessionUsage {
+                    used: 1_000,
+                    size: 200_000,
+                    cost: None,
+                },
+            },
+        ));
+        t.apply(&frame(
+            2,
+            Event::UsageUpdated {
+                usage: SessionUsage {
+                    used: 5_000,
+                    size: 200_000,
+                    cost: None,
+                },
+            },
+        ));
+        assert_eq!(t.usage.as_ref().map(|u| u.used), Some(5_000));
     }
 
     #[test]

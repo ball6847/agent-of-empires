@@ -337,6 +337,10 @@ pub fn create_workspace(
                     worktree_path: plan.worktree_subdir.to_string_lossy().to_string(),
                     main_repo_path: plan.main_repo_path.to_string_lossy().to_string(),
                     managed_by_aoe: true,
+                    // The builder always creates the branch it names, so branch
+                    // and worktree ownership coincide for a repo present at
+                    // creation. Only `attach_project` can set this.
+                    branch_preexisting: false,
                 });
             }
             Err(msg) => errors.push(msg),
@@ -534,11 +538,16 @@ pub fn build_instance(
             // Single worktree mode (existing logic)
             let path = PathBuf::from(&params.path);
             if !GitWorktree::is_git_repo(&path) {
-                bail!(
+                // Typed error (not a bare `bail!` string) so the web handler's
+                // whitelist forwards an actionable message instead of the
+                // opaque "Failed to create session". The context keeps the
+                // fuller tip for callers that surface the anyhow chain (CLI,
+                // TUI).
+                return Err(anyhow::Error::new(GitError::NotAGitRepo).context(format!(
                     "Worktree mode requires a git repository, but this path is not one: {}\n\
                      Tip: start an in-place session (no worktree) here, or point at a git repository.",
                     path.display()
-                );
+                )));
             }
             let main_repo_path_raw = GitWorktree::find_main_repo(&path)?;
             let main_repo_path = main_repo_path_raw
@@ -826,6 +835,112 @@ pub fn cleanup_instance(
     let _ = instance.kill();
 }
 
+/// Structured-view (ACP) helpers for the TUI create paths. The web create
+/// path does the equivalent inline in `src/server/api/sessions.rs` (it also
+/// handles explicit agent / model / import fields the TUI wizard doesn't
+/// expose), and the CLI in `src/cli/add.rs` with bail-vs-downgrade semantics
+/// keyed on how explicit the user's flag was. Keep the three in sync.
+#[cfg(feature = "serve")]
+pub mod structured {
+    use super::Instance;
+
+    /// True when `tool` can back a structured-view session: it resolves in
+    /// the ACP agent registry, or the resolved config declares a parsable
+    /// `[session.agent_acp_cmd]` command for it. Mirrors the server create
+    /// path's capability re-validation; deliberately NOT the aoe-agent
+    /// fallback (`pick_acp_agent_name`), which would make every tool look
+    /// capable.
+    pub fn tool_acp_capable(tool: &str, config: &crate::session::Config) -> bool {
+        crate::acp::agent_registry::AgentRegistry::with_defaults()
+            .get(tool)
+            .is_some()
+            || config
+                .session
+                .agent_acp_cmd
+                .get(tool)
+                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
+    }
+
+    /// Pre-create validation for an explicit structured-view choice from the
+    /// new-session wizard, run BEFORE any worktree / scratch / container is
+    /// provisioned so a refusal can't orphan resources (same ordering as the
+    /// CLI's precondition). Returns a user-facing message on refusal.
+    ///
+    /// The adapter-on-PATH check only runs when the user has no command
+    /// override for the tool: an override swaps the binary the spawn will
+    /// actually exec (see #1910), and second-guessing it here could refuse a
+    /// working setup. With an override, a genuinely missing adapter surfaces
+    /// as the structured view's startup-error banner instead.
+    pub fn validate_structured_choice(
+        tool: &str,
+        command_override: &str,
+        config: &crate::session::Config,
+    ) -> Result<(), String> {
+        if !tool_acp_capable(tool, config) {
+            return Err(format!(
+                "tool `{tool}` is not ACP-capable: it has no agent registry entry and no \
+                 [session.agent_acp_cmd] command. Run `aoe acp doctor` to see configured \
+                 agents, or turn Structured off for a terminal session."
+            ));
+        }
+        if !command_override.trim().is_empty() {
+            return Ok(());
+        }
+        let registry = crate::acp::agent_registry::AgentRegistry::with_defaults();
+        let spec = match registry.get(tool) {
+            Some(spec) => spec.clone(),
+            None => match config.session.agent_acp_cmd.get(tool) {
+                Some(cmd) => crate::acp::AgentSpec::from_acp_cmd(tool, cmd)
+                    .map_err(|e| format!("invalid [session.agent_acp_cmd] for `{tool}`: {e}"))?,
+                None => unreachable!("tool_acp_capable implies a resolvable spec"),
+            },
+        };
+        if !crate::cli::acp::command_present(&spec.command) {
+            let hint = crate::acp::install_hints::install_hint_for(&spec.command)
+                .unwrap_or("install via your package manager and retry");
+            return Err(format!(
+                "ACP adapter `{}` is not installed or not on $PATH. Install: {hint}. \
+                 Or run `aoe acp doctor --fix`, or turn Structured off for a terminal session.",
+                spec.command
+            ));
+        }
+        Ok(())
+    }
+
+    /// Apply a validated structured-view choice to a freshly-built instance:
+    /// set the persisted view and pin the per-agent default model, the same
+    /// post-build step the web create handler runs. Re-validates capability
+    /// defensively (downgrading to terminal with a warning) so a caller that
+    /// skipped [`validate_structured_choice`] can't persist a structured
+    /// session no agent can serve.
+    pub fn apply_structured_choice(instance: &mut Instance) {
+        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+            &instance.source_profile,
+            std::path::Path::new(&instance.project_path),
+        );
+        if !tool_acp_capable(&instance.tool, &config) {
+            tracing::warn!(
+                target: "session.create",
+                session = %instance.id,
+                tool = %instance.tool,
+                "structured view requested for non-ACP tool; keeping terminal view"
+            );
+            return;
+        }
+        instance.view = crate::session::View::Structured;
+        // Pin the per-agent default model so the composer shows it and the
+        // session stays on it (mirrors the CLI and web create paths). The
+        // wizard sets no explicit model, so the default is the only input.
+        let defaults = config.acp.acp_defaults_for(&instance.tool);
+        instance.agent_model = crate::session::config::resolve_spawn_model_effort(
+            defaults,
+            instance.agent_model.take(),
+            None,
+        )
+        .0;
+    }
+}
+
 /// Resolve the session title: use the provided title, then an explicit worktree
 /// branch name, then fall back to a random civilization name.
 pub(crate) fn resolve_title(
@@ -946,7 +1061,12 @@ pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
     // `foo.lock`).
     out = out
         .split('/')
-        .map(|seg| seg.strip_suffix(".lock").unwrap_or(seg))
+        .map(|mut seg| {
+            while let Some(stripped) = seg.strip_suffix(".lock") {
+                seg = stripped;
+            }
+            seg
+        })
         .collect::<Vec<_>>()
         .join("/");
     while matches!(out.chars().last(), Some('-' | '.' | '/')) {
@@ -955,8 +1075,9 @@ pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
     while matches!(out.chars().next(), Some('-' | '.' | '/')) {
         out.remove(0);
     }
-    // A lone '@' is also rejected by git as a complete ref name.
-    if out.is_empty() || out == "@" {
+    // A lone '@' and the symbolic ref HEAD are also rejected by git as
+    // complete ref names.
+    if out.is_empty() || out == "@" || out == "HEAD" {
         "session".to_string()
     } else {
         out
@@ -1261,14 +1382,19 @@ mod tests {
             git_sanitize_branch_name("feat/release.lock/v2"),
             "feat/release/v2"
         );
+        assert_eq!(git_sanitize_branch_name("foo.lock.lock"), "foo");
+        assert_eq!(
+            git_sanitize_branch_name("feat/release.lock.lock/v2.lock.lock"),
+            "feat/release/v2"
+        );
     }
 
     #[test]
-    fn test_git_sanitize_branch_name_rejects_bare_at_sign() {
-        // git-check-ref-format also rejects the single character "@" as a
-        // complete ref name; fall back to "session" rather than producing
-        // a name libgit2 will refuse.
+    fn test_git_sanitize_branch_name_rejects_special_complete_refs() {
+        // git-check-ref-format also rejects special complete ref names; fall
+        // back to "session" rather than producing a name libgit2 will refuse.
         assert_eq!(git_sanitize_branch_name("@"), "session");
+        assert_eq!(git_sanitize_branch_name("HEAD"), "session");
     }
 
     #[test]
@@ -1934,6 +2060,38 @@ mod tests {
             err.to_string()
                 .contains("Cannot combine --scratch with worktree mode"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_worktree_on_non_git_path_returns_typed_not_a_git_repo() {
+        // A worktree requested on a plain (non-git) folder must fail with the
+        // typed GitError::NotAGitRepo, not a bare `bail!` string. The web
+        // handler only forwards an actionable message for whitelisted typed
+        // GitError variants, so a string bail would surface the opaque
+        // "Failed to create session" instead.
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("config.toml"), "").unwrap();
+
+        let project = tempfile::tempdir().unwrap();
+        let mut params = custom_agent_params(project.path(), "claude");
+        params.tool = "claude".to_string();
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("feat".to_string());
+
+        let err = match build_instance(params, &[], &[], "default") {
+            Ok(_) => panic!("worktree on a non-git path must error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.chain()
+                .filter_map(|c| c.downcast_ref::<crate::git::error::GitError>())
+                .any(|g| matches!(g, crate::git::error::GitError::NotAGitRepo)),
+            "expected a typed GitError::NotAGitRepo in the chain, got: {err:#}"
         );
     }
 }

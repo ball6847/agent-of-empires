@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use reqwest::{header, StatusCode};
 use thiserror::Error;
 
@@ -21,13 +22,51 @@ use crate::plugin::ui_state::UiSnapshot;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Subset of the daemon's `GET /api/about` payload the structured view client
-/// reads. The full `ServerAbout` carries many more fields; serde drops
-/// the rest.
+/// Percent-encode set for a single URL path segment. A well-formed fqid
+/// (`plugin.<id>.<command>`, dotted lowercase) is left intact so it round-trips
+/// to the same string server-side, while structurally dangerous bytes (`/`,
+/// `?`, `#`, `%`, space, controls) are escaped so a malformed id can never
+/// break out of its path segment.
+const PATH_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'/')
+    .add(b'?')
+    .add(b'#')
+    .add(b'%')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'\\')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
 #[derive(serde::Deserialize)]
-struct AboutResponse {
+struct SessionsEnvelope<T> {
+    sessions: Vec<T>,
+}
+
+/// One active plugin command as the daemon reports it (`GET
+/// /api/plugins/commands`), the source of truth the structured view resolves
+/// keybinds against: for a session on a remote daemon the plugin may not be
+/// installed on the TUI's own machine, so its local registry cannot resolve or
+/// execute it. Mirrors the server's `PluginCommandView`; only the execution
+/// fields are kept.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PluginCommandView {
+    pub fqid: String,
+    pub plugin_id: String,
     #[serde(default)]
-    acp_queue_drain_mode: String,
+    pub keybinds: Vec<String>,
+    #[serde(default)]
+    pub action: Option<aoe_plugin_api::ClientAction>,
+}
+
+#[derive(serde::Deserialize)]
+struct PluginCommandsEnvelope {
+    commands: Vec<PluginCommandView>,
 }
 
 /// Page size requested by [`HttpClient::replay_paged`]. Stays at or
@@ -188,23 +227,6 @@ impl HttpClient {
         Ok(())
     }
 
-    /// `GET /api/about`. Returns the daemon's resolved
-    /// `acp.queue_drain_mode`, which the TUI structured view needs because it
-    /// may attach to a remote daemon whose config differs from the local
-    /// machine's. Unknown / unparseable values fall back to the default.
-    pub async fn queue_drain_mode(
-        &self,
-    ) -> Result<crate::session::config::QueueDrainMode, HttpError> {
-        let url = format!("{}/api/about", self.endpoint.base_url);
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_status(res, "<about>").await?;
-        let about = res.json::<AboutResponse>().await?;
-        Ok(
-            crate::session::config::QueueDrainMode::parse(&about.acp_queue_drain_mode)
-                .unwrap_or_default(),
-        )
-    }
-
     /// `GET /api/plugins/ui-state`. The daemon-wide plugin UI snapshot
     /// (host-rendered slots + notifications) the web dashboard polls; the
     /// native structured view renders the TUI-applicable subset (#2402).
@@ -217,10 +239,122 @@ impl HttpClient {
         Ok(res.json::<UiSnapshot>().await?)
     }
 
+    /// `GET /api/plugins/commands`. The daemon's active plugin commands with
+    /// their keybinds and client actions. The structured view resolves plugin
+    /// chords against this rather than the TUI's local registry, so a session on
+    /// a remote daemon can drive plugins installed only there. Global, like
+    /// `plugin_ui_state`.
+    pub async fn plugin_commands(&self) -> Result<Vec<PluginCommandView>, HttpError> {
+        let url = format!("{}/api/plugins/commands", self.endpoint.base_url);
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_global_status(res).await?;
+        Ok(res.json::<PluginCommandsEnvelope>().await?.commands)
+    }
+
+    /// `POST /api/plugins/commands/{fqid}/invoke`. Dispatch an action-less
+    /// plugin command to its worker as a fire-and-forget notification (the TUI
+    /// twin of the web palette's invoke). Global, like `plugin_ui_state`; the
+    /// daemon validates the command and session. `fqid` has no slashes, so it
+    /// is a single path segment.
+    pub async fn invoke_plugin_command(
+        &self,
+        fqid: &str,
+        session_id: &str,
+    ) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/plugins/commands/{}/invoke",
+            self.endpoint.base_url,
+            utf8_percent_encode(fqid, PATH_SEGMENT)
+        );
+        let body = serde_json::json!({ "session_id": session_id });
+        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
+        check_global_status(res).await?;
+        Ok(())
+    }
+
+    /// `POST /api/plugins/{id}/enabled`. Toggling through the daemon (rather
+    /// than writing config locally) lets its plugin host reconcile workers
+    /// live: enabling launches the worker, disabling tears it down. Global,
+    /// like `plugin_ui_state`.
+    pub async fn set_plugin_enabled(
+        &self,
+        plugin_id: &str,
+        enabled: bool,
+    ) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/plugins/{}/enabled",
+            self.endpoint.base_url, plugin_id
+        );
+        let res = self
+            .auth(self.http.post(&url))
+            .json(&serde_json::json!({ "enabled": enabled }))
+            .send()
+            .await?;
+        check_global_status(res).await?;
+        Ok(())
+    }
+
     /// `POST /api/sessions/{id}/acp/cancel`.
     pub async fn cancel(&self, session_id: &str) -> Result<(), HttpError> {
         let url = format!(
             "{}/api/sessions/{}/acp/cancel",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.post(&url)).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
+    /// `POST /api/sessions/{id}/smart-rename`: on-demand "Auto-name now" for a
+    /// structured session. The daemon forces past the `smart_rename`-disabled
+    /// gate and runs the one-shot detached; a 2xx means "started", not
+    /// "renamed" (the new title arrives over the structured-view WS).
+    pub async fn smart_rename(&self, session_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/smart-rename",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.post(&url)).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
+    /// `POST /api/sessions/{id}/acp/mode`: set the active session
+    /// permission mode (an ACP `session/set_mode` round-trip). The new
+    /// mode echoes back over the WebSocket as `CurrentModeChanged`;
+    /// a rejection surfaces as `ModeSwitchFailed`.
+    pub async fn set_mode(&self, session_id: &str, mode_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/mode",
+            self.endpoint.base_url, session_id
+        );
+        let body = serde_json::json!({ "mode_id": mode_id });
+        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
+    /// `POST /api/sessions/{id}/acp/enable`: switch a terminal-mode
+    /// session to the structured view. The daemon tears down the tmux
+    /// pane, persists `view = Structured`, and its reconciler spawns the
+    /// ACP worker. Idempotent when the session is already structured.
+    pub async fn acp_enable(&self, session_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/enable",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.post(&url)).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
+    /// `POST /api/sessions/{id}/acp/disable`: switch a structured-view
+    /// session back to a tmux terminal. The daemon stops the worker and
+    /// persists `view = Terminal`; the next attach spawns the pane.
+    /// Idempotent when the session is already terminal.
+    pub async fn acp_disable(&self, session_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/disable",
             self.endpoint.base_url, session_id
         );
         let res = self.auth(self.http.post(&url)).send().await?;
@@ -310,7 +444,23 @@ impl HttpClient {
         let url = format!("{}/api/sessions", self.endpoint.base_url);
         let res = self.auth(self.http.get(&url)).send().await?;
         let res = check_status(res, "<sessions>").await?;
-        Ok(res.json::<Vec<T>>().await?)
+        Ok(res.json::<SessionsEnvelope<T>>().await?.sessions)
+    }
+
+    /// Session title, resolved ACP agent, and path roots used by the native
+    /// structured view. Kept as one list fetch so opening the view does not add
+    /// another request on top of the existing path hydration.
+    pub async fn session_view_info(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::acp::session_paths::SessionViewInfo, HttpError> {
+        let sessions = self
+            .list_sessions::<crate::acp::session_paths::SessionViewInfo>()
+            .await?;
+        sessions
+            .into_iter()
+            .find(|session| session.paths.id == session_id)
+            .ok_or_else(|| HttpError::SessionNotFound(session_id.to_string()))
     }
 
     /// Lightweight reachability probe used by `require_daemon` (when
@@ -337,7 +487,7 @@ impl HttpClient {
     }
 
     fn auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.endpoint.token {
+        match self.endpoint.resolved_token() {
             Some(token) => builder.header(header::AUTHORIZATION, format!("Bearer {token}")),
             None => builder,
         }
@@ -421,26 +571,60 @@ mod tests {
     use crate::acp::client::discovery::Source;
 
     fn endpoint(base: &str, token: Option<&str>) -> DaemonEndpoint {
-        DaemonEndpoint {
-            base_url: base.to_string(),
-            token: token.map(str::to_string),
-            source: Source::Env,
-        }
+        DaemonEndpoint::new(base.to_string(), token.map(str::to_string), Source::Env)
     }
 
     #[test]
     fn auth_sets_bearer_when_token_present() {
         let client = HttpClient::new(endpoint("http://127.0.0.1:8080", Some("tok"))).unwrap();
-        // Smoke-check by reading endpoint back; full header inspection
-        // requires a live request and lives in the integration tests
-        // alongside the axum mock.
-        assert_eq!(client.endpoint.token.as_deref(), Some("tok"));
+        let request = client
+            .auth(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.headers().get(header::AUTHORIZATION).unwrap(),
+            "Bearer tok"
+        );
+    }
+
+    #[test]
+    fn auth_uses_rotated_token_for_local_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("serve.token");
+        let rotated = "b".repeat(64);
+        std::fs::write(&token_path, &rotated).unwrap();
+        let endpoint = DaemonEndpoint::new(
+            "http://127.0.0.1:8080".into(),
+            Some("a".repeat(64)),
+            Source::LocalDaemon,
+        )
+        .with_local_token_path(token_path);
+        let client = HttpClient::new(endpoint).unwrap();
+
+        let request = client
+            .auth(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .build()
+            .unwrap();
+        let expected = format!("Bearer {rotated}");
+        assert_eq!(
+            request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            expected
+        );
     }
 
     #[test]
     fn auth_skips_bearer_when_no_token() {
         let client = HttpClient::new(endpoint("http://127.0.0.1:8080", None)).unwrap();
-        assert!(client.endpoint.token.is_none());
+        let request = client
+            .auth(client.http.get("http://127.0.0.1:8080/api/sessions"))
+            .build()
+            .unwrap();
+        assert!(request.headers().get(header::AUTHORIZATION).is_none());
     }
 
     // Regression test for #1525. The startup toast on a 401 from the
@@ -475,7 +659,7 @@ mod tests {
         assert!(matches!(
             classify_resolve_error(
                 StatusCode::NOT_FOUND,
-                "session has no running cockpit",
+                "session has no running structured view",
                 "abc-123",
                 "s-1"
             ),

@@ -188,7 +188,8 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         bail!("Path is not a directory: {}", path.display());
     }
 
-    if (!args.extra_repos.is_empty() || !args.projects.is_empty()) && args.worktree_branch.is_none()
+    if (!args.extra_repos.is_empty() || !args.projects.is_empty())
+        && explicit_worktree_branch(&args).is_none()
     {
         bail!("--repo/--project requires --worktree to specify a branch\nTip: aoe add /path --project repoB -w branch-name");
     }
@@ -277,7 +278,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // Fork intent appends. Reject these up front (before any resource creation)
     // rather than launch a fork that can't find its parent. See PR review.
     if args.fork_from.is_some() {
-        if args.worktree_branch.is_some() || args.create_branch {
+        if explicit_worktree_branch(&args).is_some() || args.create_branch {
             bail!(
                 "`--fork-from` cannot be combined with --worktree or --new-branch: a fork must run \
                  in the parent's working directory to resume its conversation."
@@ -398,12 +399,13 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         None
     };
 
-    if let Some(branch_raw) = &args.worktree_branch {
+    if let Some(branch_raw) = explicit_worktree_branch(&args) {
         use crate::git::GitWorktree;
         use crate::session::WorktreeInfo;
         use chrono::Utc;
 
-        let branch = branch_raw.trim();
+        let branch_owned = builder::git_sanitize_branch_name(branch_raw);
+        let branch = branch_owned.as_str();
         let init_submodules = config.worktree.init_submodules && !args.no_submodules;
 
         if !all_extra_repos.is_empty() {
@@ -804,6 +806,25 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 instance.view = crate::session::View::Terminal;
             }
         }
+
+        // Pin the structured-view model AFTER the adapter check above, which may
+        // have downgraded the session to terminal. Only a session that stays
+        // structured persists the per-agent default: agent_model is ACP-only, so
+        // a terminal fallback must not retain an ACP-derived default. Routed
+        // through the shared resolver so an explicit --model wins and is trimmed
+        // identically to the web create path; an explicit --model on a
+        // downgraded session is left untouched. `agent_name` is the same key the
+        // spawn resolves defaults against (see pick_agent_for_tool). Effort has
+        // no Instance field, so the spawn path resolves the default effort.
+        if instance.is_structured() {
+            let defaults = config.acp.acp_defaults_for(&agent_name);
+            instance.agent_model = crate::session::config::resolve_spawn_model_effort(
+                defaults,
+                instance.agent_model.take(),
+                None,
+            )
+            .0;
+        }
     }
 
     // Apply the fork seed validated earlier (before worktree/scratch creation):
@@ -1157,6 +1178,17 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
                 let tmux_session = crate::tmux::Session::new(&instance.id, &instance.title)?;
                 tmux_session.attach()?;
+
+                // The poller ran throughout the attached session but the CLI
+                // never drained it, dropping the observed id on detach. Drain it
+                // now (short bound: it is almost always already queued).
+                let file_watch = crate::file_watch::FileWatchService::noop();
+                crate::session::sync::capture_launched_session_id_blocking(
+                    &mut instance,
+                    &file_watch,
+                    crate::session::sync::CLI_ATTACHED_SESSION_ID_CAPTURE_TIMEOUT,
+                    true,
+                );
             }
             Err(e) => {
                 if let Err(rollback_err) = storage.update(|all_instances, _groups| {
@@ -1204,8 +1236,8 @@ fn resolve_session_title(args: &AddArgs, instances: &[Instance]) -> Result<Strin
     if let Some(title) = &args.title {
         return Ok(title.trim().to_string());
     }
-    let default_title = if let Some(ref branch) = args.worktree_branch {
-        branch.trim().to_string()
+    let default_title = if let Some(branch) = explicit_worktree_branch(args) {
+        branch.to_string()
     } else {
         let existing_titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
         civilizations::generate_random_title(&existing_titles)
@@ -1215,6 +1247,13 @@ fn resolve_session_title(args: &AddArgs, instances: &[Instance]) -> Result<Strin
     } else {
         Ok(default_title)
     }
+}
+
+fn explicit_worktree_branch(args: &AddArgs) -> Option<&str> {
+    args.worktree_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
 }
 
 fn prompt_session_title(default_title: &str) -> Result<String> {

@@ -86,6 +86,11 @@ pub async fn clone_repo(
         )
             .into_response();
     }
+    // Cloning writes to $HOME and fetches from the network; the CityHall "Clone
+    // URL" action is hidden in the UI, so close the endpoint too.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Json(body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
@@ -237,8 +242,14 @@ pub struct BranchInfo {
 }
 
 pub async fn list_branches(
+    State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<BranchesQuery>,
 ) -> impl IntoResponse {
+    // Probes an arbitrary filesystem path for git branches; not reachable from
+    // the CityHall name-only wizard, so close it to crafted requests too.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let include_remote = query.include_remote;
     let result = tokio::task::spawn_blocking(move || {
         let path = std::path::Path::new(&query.path);
@@ -294,6 +305,45 @@ pub async fn list_branches(
         Ok(Err(msg)) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "not_a_repo", "message": msg})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "internal", "message": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct IsRepoQuery {
+    pub path: String,
+}
+
+/// Reports whether `path` is a git repository, using the same
+/// `GitWorktree::is_git_repo` gate the session builder enforces (`builder.rs`
+/// single-worktree path). The new-session wizard probes this to disable the
+/// worktree toggle for a plain folder. Returns 200 `{ "is_git_repo": bool }`;
+/// a transient failure surfaces as a non-200 so the client can stay optimistic
+/// rather than misreport a real repo as a non-repo.
+pub async fn is_git_repo(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<IsRepoQuery>,
+) -> impl IntoResponse {
+    // Probes an arbitrary filesystem path; not reachable from the CityHall
+    // name-only wizard, so close it to crafted requests too.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        crate::git::GitWorktree::is_git_repo(std::path::Path::new(&query.path))
+    })
+    .await;
+
+    match result {
+        Ok(is_git_repo) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "is_git_repo": is_git_repo })),
         )
             .into_response(),
         Err(e) => (

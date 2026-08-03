@@ -96,11 +96,27 @@ pub fn profile_has_overrides(config: &ProfileConfig) -> bool {
     config.description.is_some() || !config.overrides.is_empty()
 }
 
+/// Force the config values CityHall client mode depends on when
+/// `AOE_CITYHALL_MODE` is set. These are hidden from the CityHall settings UI,
+/// so pinning them at config-resolution time is the single place they are set:
+/// a high worker ceiling and worktree sessions enabled by default. Idempotent;
+/// a no-op when the flag is unset. See #7. (Worktree path templates are left at
+/// their defaults; sensible CityHall paths are TBD with the container work.)
+pub fn apply_cityhall_overrides(config: &mut Config) {
+    if std::env::var_os("AOE_CITYHALL_MODE").is_none() {
+        return;
+    }
+    config.acp.max_concurrent_workers = 50;
+    config.worktree.enabled = true;
+}
+
 /// Load effective config for a profile (global + profile overrides merged)
 pub fn resolve_config(profile: &str) -> Result<Config> {
     let global = Config::load()?;
     let profile_config = load_profile_config(profile)?;
-    Ok(merge_configs(global, &profile_config))
+    let mut config = merge_configs(global, &profile_config);
+    apply_cityhall_overrides(&mut config);
+    Ok(config)
 }
 
 /// Like [`resolve_config`], but logs a warning on failure and returns defaults
@@ -113,7 +129,9 @@ pub fn resolve_config_or_warn(profile: &str) -> Config {
                 "Failed to load config for profile '{}', using defaults: {e}",
                 profile
             );
-            Config::default()
+            let mut config = Config::default();
+            apply_cityhall_overrides(&mut config);
+            config
         }
     }
 }
@@ -182,6 +200,26 @@ pub fn validate_port_mapping_format(mapping: &str) -> Result<(), String> {
     }
 }
 
+/// Validate a container network mode (`sandbox.network`). Empty (unset),
+/// `none`, `bridge`, or a named network matching Docker's network-name grammar
+/// are accepted. `host` is rejected outright because sharing the host network
+/// namespace defeats sandbox isolation, and the `container:`/`ns:` namespace
+/// forms are rejected by the name grammar (they contain a colon).
+pub fn validate_network_format(network: &str) -> Result<(), String> {
+    if network.is_empty() {
+        return Ok(());
+    }
+    if network.eq_ignore_ascii_case("host") {
+        return Err("host network mode defeats sandbox isolation and is not allowed".to_string());
+    }
+    let re = regex::Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*$").unwrap();
+    if re.is_match(network) {
+        Ok(())
+    } else {
+        Err("Must be 'none', 'bridge', or a network name".to_string())
+    }
+}
+
 /// Validate Docker memory limit format (e.g., "512m", "2g")
 pub fn validate_memory_limit(limit: &str) -> Result<(), String> {
     if limit.is_empty() {
@@ -220,6 +258,24 @@ mod tests {
     }
 
     #[test]
+    fn validate_network_accepts_empty_none_bridge_and_named() {
+        assert!(validate_network_format("").is_ok());
+        assert!(validate_network_format("none").is_ok());
+        assert!(validate_network_format("bridge").is_ok());
+        assert!(validate_network_format("egress-proxy").is_ok());
+        assert!(validate_network_format("my_net.1").is_ok());
+    }
+
+    #[test]
+    fn validate_network_rejects_host_and_namespace_forms() {
+        assert!(validate_network_format("host").is_err());
+        assert!(validate_network_format("HOST").is_err());
+        assert!(validate_network_format("container:abc").is_err());
+        assert!(validate_network_format("ns:/var/run/netns/x").is_err());
+        assert!(validate_network_format("has space").is_err());
+    }
+
+    #[test]
     fn test_profile_config_default() {
         let config = ProfileConfig::default();
         assert!(config.description.is_none());
@@ -247,7 +303,6 @@ mod tests {
         let toml = r#"
             [updates]
             update_check_mode = "off"
-            check_interval_hours = 48
 
             [sandbox]
             enabled_by_default = true
@@ -256,7 +311,6 @@ mod tests {
         let config: ProfileConfig = toml::from_str(toml).unwrap();
         let ov = serde_json::to_value(&config).unwrap();
         assert_eq!(ov["updates"]["update_check_mode"], json!("off"));
-        assert_eq!(ov["updates"]["check_interval_hours"], json!(48));
         assert_eq!(ov["sandbox"]["enabled_by_default"], json!(true));
     }
 
@@ -278,16 +332,16 @@ mod tests {
         use crate::session::config::UpdateCheckMode;
         let global = Config::default();
         let profile = profile_from(json!({
-            "updates": {"update_check_mode": "off", "check_interval_hours": 48},
+            "updates": {"update_check_mode": "off"},
             "worktree": {"enabled": true},
         }));
 
         let merged = merge_configs(global, &profile);
 
         assert_eq!(merged.updates.update_check_mode, UpdateCheckMode::Off);
-        assert_eq!(merged.updates.check_interval_hours, 48);
-        // notify_in_cli should retain global default since not overridden
-        assert!(merged.updates.notify_in_cli);
+        // auto_update_plugins should retain the global default since it is
+        // not overridden.
+        assert!(!merged.updates.auto_update_plugins);
         assert!(merged.worktree.enabled);
     }
 
@@ -296,10 +350,10 @@ mod tests {
         let mut global = Config::default();
         global.status_hooks.enabled = false;
         global.status_hooks.on_waiting = Some("global-waiting".to_string());
-        global.status_hooks.debounce_ms = 100;
+        global.status_hooks.on_idle = Some("global-idle".to_string());
 
         let profile = profile_from(json!({
-            "status_hooks": {"enabled": true, "debounce_ms": 500, "on_waiting": "profile-waiting"}
+            "status_hooks": {"enabled": true, "on_waiting": "profile-waiting"}
         }));
 
         let merged = merge_configs(global, &profile);
@@ -308,7 +362,39 @@ mod tests {
             merged.status_hooks.on_waiting.as_deref(),
             Some("profile-waiting")
         );
-        assert_eq!(merged.status_hooks.debounce_ms, 500);
+        assert_eq!(merged.status_hooks.on_idle.as_deref(), Some("global-idle"));
+    }
+
+    #[test]
+    fn test_merge_configs_with_agent_status_map_overrides() {
+        let mut global = Config::default();
+        global
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .status_map
+            .insert("Stop".to_string(), crate::agents::HookStatus::Idle);
+        global
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .status_map
+            .insert("PreToolUse".to_string(), crate::agents::HookStatus::Running);
+
+        let profile = profile_from(json!({
+            "agents": {"claude": {"status_map": {"Stop": "error"}}}
+        }));
+
+        let merged = merge_configs(global, &profile);
+        let status_map = &merged.agents["claude"].status_map;
+        assert_eq!(
+            status_map.get("PreToolUse"),
+            Some(&crate::agents::HookStatus::Running)
+        );
+        assert_eq!(
+            status_map.get("Stop"),
+            Some(&crate::agents::HookStatus::Error)
+        );
     }
 
     #[test]
@@ -645,14 +731,14 @@ mod tests {
         let profile = profile_from(json!({"acp": {
             "default_agent": "claude-code",
             "max_concurrent_workers": 9,
-            "replay_bytes": 1024,
+            "replay_events": 1024,
             "node_path": "/opt/node",
         }}));
 
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.acp.default_agent, "claude-code");
         assert_eq!(merged.acp.max_concurrent_workers, 9);
-        assert_eq!(merged.acp.replay_bytes, 1024);
+        assert_eq!(merged.acp.replay_events, 1024);
         assert_eq!(merged.acp.node_path, "/opt/node");
         // Not overridden: inherits global default.
         assert!(merged.acp.show_tool_durations);
@@ -680,5 +766,25 @@ mod tests {
             serde_json::to_value(&global).unwrap(),
             serde_json::to_value(&generic).unwrap(),
         );
+    }
+
+    // #7: CityHall overrides pin the worker ceiling and worktree default, but
+    // only when AOE_CITYHALL_MODE is set. Serial because it toggles a process
+    // env var.
+    #[test]
+    #[serial_test::serial]
+    fn cityhall_overrides_gate_on_the_env_flag() {
+        std::env::remove_var("AOE_CITYHALL_MODE");
+        let mut off = Config::default();
+        off.worktree.enabled = false;
+        apply_cityhall_overrides(&mut off);
+        assert!(!off.worktree.enabled, "no override without the flag");
+
+        std::env::set_var("AOE_CITYHALL_MODE", "1");
+        let mut on = Config::default();
+        apply_cityhall_overrides(&mut on);
+        std::env::remove_var("AOE_CITYHALL_MODE");
+        assert_eq!(on.acp.max_concurrent_workers, 50);
+        assert!(on.worktree.enabled);
     }
 }

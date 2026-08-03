@@ -1,5 +1,5 @@
 # aoe-sandbox: Docker image for Agent of Empires sandbox sessions
-# This image provides Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Kiro CLI, and Qwen Code in an isolated environment
+# This image provides Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, OMP, Kiro CLI, and Qwen Code in an isolated environment
 
 FROM ubuntu:26.04
 
@@ -29,6 +29,9 @@ WORKDIR /root
 # Install Claude Code CLI (official installer)
 RUN curl -fsSL https://claude.ai/install.sh | bash
 ENV PATH="/root/.local/bin:${PATH}"
+
+# Install Oh My Pi (OMP) using its official prebuilt-binary installer
+RUN curl -fsSL https://omp.sh/install | sh
 
 # Install OpenCode
 RUN curl -fsSL https://opencode.ai/install | bash
@@ -70,6 +73,14 @@ RUN curl -fsSL https://cli.kiro.dev/install | bash
 # Install Qwen Code (Alibaba / QwenLM)
 RUN npm install -g @qwen-code/qwen-code
 
+# Install Kimi Code (Moonshot AI). Ships its own native ACP server
+# (`kimi acp`), so no separate adapter is needed below. Install to
+# /usr/local (binary at /usr/local/bin/kimi) rather than the default
+# ~/.kimi-code/bin: the aoe sandbox bind-mounts the host's ~/.kimi-code
+# config over /root/.kimi-code, which would otherwise shadow the binary.
+RUN curl -fsSL https://code.kimi.com/kimi-code/install.sh \
+    | KIMI_INSTALL_DIR=/usr/local KIMI_NO_MODIFY_PATH=1 bash
+
 # Install ACP adapters used by `aoe`'s structured view mode when the session is
 # sandboxed. The structured view runner `docker exec`s these by their bare binary
 # name (see `src/acp/agent_registry.rs`); if they aren't present in
@@ -95,9 +106,11 @@ RUN mkdir -p /root/.claude \
     /root/.cursor \
     /root/.copilot \
     /root/.pi \
+    /root/.omp \
     /root/.factory \
     /root/.kiro \
     /root/.qwen \
+    /root/.kimi-code \
     /root/.ssh
 
 # Allow Claude Code to use --dangerously-skip-permissions as root

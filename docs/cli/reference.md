@@ -9,6 +9,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe agents`↴](#aoe-agents)
 * [`aoe init`↴](#aoe-init)
 * [`aoe list`↴](#aoe-list)
+* [`aoe ps`↴](#aoe-ps)
 * [`aoe logs`↴](#aoe-logs)
 * [`aoe log-level`↴](#aoe-log-level)
 * [`aoe remove`↴](#aoe-remove)
@@ -25,15 +26,18 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session set-worktree-name`↴](#aoe-session-set-worktree-name)
 * [`aoe session capture`↴](#aoe-session-capture)
 * [`aoe session current`↴](#aoe-session-current)
+* [`aoe session add-project`↴](#aoe-session-add-project)
 * [`aoe session set-session-id`↴](#aoe-session-set-session-id)
 * [`aoe session set-base`↴](#aoe-session-set-base)
 * [`aoe session snooze`↴](#aoe-session-snooze)
 * [`aoe session unsnooze`↴](#aoe-session-unsnooze)
 * [`aoe session favorite`↴](#aoe-session-favorite)
 * [`aoe session unfavorite`↴](#aoe-session-unfavorite)
+* [`aoe session color`↴](#aoe-session-color)
 * [`aoe session archive`↴](#aoe-session-archive)
 * [`aoe session unarchive`↴](#aoe-session-unarchive)
 * [`aoe session restore`↴](#aoe-session-restore)
+* [`aoe session import`↴](#aoe-session-import)
 * [`aoe session list-trash`↴](#aoe-session-list-trash)
 * [`aoe session empty-trash`↴](#aoe-session-empty-trash)
 * [`aoe group`↴](#aoe-group)
@@ -58,6 +62,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe profile delete`↴](#aoe-profile-delete)
 * [`aoe profile rename`↴](#aoe-profile-rename)
 * [`aoe profile default`↴](#aoe-profile-default)
+* [`aoe profile show`↴](#aoe-profile-show)
 * [`aoe project`↴](#aoe-project)
 * [`aoe project list`↴](#aoe-project-list)
 * [`aoe project add`↴](#aoe-project-add)
@@ -121,6 +126,7 @@ Run without arguments to launch the TUI dashboard.
 * `agents` — List supported agents and their install status
 * `init` — Initialize .agent-of-empires/config.toml in a repository
 * `list` — List all sessions
+* `ps` — Show a substrate-agnostic runtime view of in-flight sessions (tmux agent panes and ACP structured-view workers), one row each
 * `logs` — View the configured AoE log file with a pretty viewer
 * `log-level` — Get or set the running daemon's log filter at runtime. Pass a bare level (debug/info/...) for the safe expansion, or `--filter <expr>` for raw EnvFilter syntax. `--get` prints the current filter. Changes are ephemeral and lost on daemon restart
 * `remove` — Remove a session
@@ -224,6 +230,21 @@ List all sessions
 
 * `--json` — Output as JSON
 * `--all` — List sessions from all profiles
+
+
+
+## `aoe ps`
+
+Show a substrate-agnostic runtime view of in-flight sessions (tmux agent panes and ACP structured-view workers), one row each
+
+**Usage:** `aoe ps [OPTIONS]`
+
+###### **Options:**
+
+* `--json` — Output as JSON
+* `--tmux` — Show only tmux-backed sessions
+* `--acp` — Show only ACP (structured-view) workers
+* `--dead` — Include dead sessions and orphaned substrate entries (hidden by default)
 
 
 
@@ -343,15 +364,18 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `set-worktree-name` — Edit a managed worktree session's workdir directory name (and, optionally, its git branch). Moves the worktree directory in place; the session must not be running. See #1723
 * `capture` — Capture tmux pane output
 * `current` — Auto-detect current session
+* `add-project` — Attach another repo to an existing session, so an agent that turns out to need a second repo can keep working in the same conversation instead of the session being recreated. Creates a worktree for the repo and restarts the agent so it can see it; the conversation is kept. See #3103
 * `set-session-id` — Set the resume target for a session (pin a conversation or force a one-shot fresh start)
 * `set-base` — Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
 * `snooze` — Snooze a session for a duration (temporary archive, auto wakes)
 * `unsnooze` — Wake a snoozed session immediately
-* `favorite` — Mark a session as a favorite. Favorited rows pin to the top of their status tier in the Attention sort and render with a leading `* ` glyph plus bold + underline
+* `favorite` — Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row renders with a leading `*` marker plus bold and underline wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
 * `unfavorite` — Clear the favorite flag on a session
+* `color` — Set (or clear) a per-session color label, rendered as a colored dot in the web sidebar for at-a-glance status signaling. Intended for a running agent to flag its own state, e.g. `aoe session color $(aoe session current -q) red`. Colors: `red` (needs attention), `amber` (working), `green` (done); `none` clears it
 * `archive` — Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 * `unarchive` — Unarchive a session (restores it to its tier in the Attention sort)
 * `restore` — Restore a trashed session, returning it to its prior bucket with its transcript and metadata intact. See #2489
+* `import` — Import existing Claude Code sessions from disk. Scans the given path(s) (default: current directory) for Claude Code conversations whose working directory is at or under a path, and creates an AoE session for each: a terminal/tmux session that resumes the conversation with `claude --resume <id>` (default), or a structured-view session with `--structured`
 * `list-trash` — List the sessions currently in the trash
 * `empty-trash` — Permanently purge every trashed session in the profile (irreversible)
 
@@ -496,6 +520,23 @@ Auto-detect current session
 
 
 
+## `aoe session add-project`
+
+Attach another repo to an existing session, so an agent that turns out to need a second repo can keep working in the same conversation instead of the session being recreated. Creates a worktree for the repo and restarts the agent so it can see it; the conversation is kept. See #3103
+
+**Usage:** `aoe session add-project [OPTIONS] <IDENTIFIER> <PROJECT>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+* `<PROJECT>` — Repo to attach: a path, or the name of a registered project (`aoe project list`)
+
+###### **Options:**
+
+* `--attach-existing-branch` — Check out a branch that already exists in the repo being attached instead of refusing. A same-named branch in another repo can hold unrelated commits, so this is off by default. When set, aoe records the branch as not its own and leaves it in place when the session is deleted
+
+
+
 ## `aoe session set-session-id`
 
 Set the resume target for a session (pin a conversation or force a one-shot fresh start)
@@ -556,7 +597,7 @@ Wake a snoozed session immediately
 
 ## `aoe session favorite`
 
-Mark a session as a favorite. Favorited rows pin to the top of their status tier in the Attention sort and render with a leading `* ` glyph plus bold + underline
+Mark a session as a favorite. With `session.favorites_first` on (the default), favorited rows pin to the top of their sibling scope in every sort order; with it off, they pin within their status tier in the Attention sort only. Either way the row renders with a leading `*` marker plus bold and underline wherever the pin applies. Snoozing a favorite suspends the pin until it wakes
 
 **Usage:** `aoe session favorite <IDENTIFIER>`
 
@@ -575,6 +616,19 @@ Clear the favorite flag on a session
 ###### **Arguments:**
 
 * `<IDENTIFIER>` — Session ID or title
+
+
+
+## `aoe session color`
+
+Set (or clear) a per-session color label, rendered as a colored dot in the web sidebar for at-a-glance status signaling. Intended for a running agent to flag its own state, e.g. `aoe session color $(aoe session current -q) red`. Colors: `red` (needs attention), `amber` (working), `green` (done); `none` clears it
+
+**Usage:** `aoe session color <IDENTIFIER> <COLOR>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+* `<COLOR>` — Color label: `red` (needs attention), `amber` (working), `green` (done), or `none`/`clear` to remove the label
 
 
 
@@ -615,6 +669,27 @@ Restore a trashed session, returning it to its prior bucket with its transcript 
 ###### **Arguments:**
 
 * `<IDENTIFIER>` — Session ID or title
+
+
+
+## `aoe session import`
+
+Import existing Claude Code sessions from disk. Scans the given path(s) (default: current directory) for Claude Code conversations whose working directory is at or under a path, and creates an AoE session for each: a terminal/tmux session that resumes the conversation with `claude --resume <id>` (default), or a structured-view session with `--structured`
+
+**Usage:** `aoe session import [OPTIONS] [PATHS]...`
+
+###### **Arguments:**
+
+* `<PATHS>` — Directories to scan. Only Claude sessions whose recorded working directory is at or under one of these are imported. Defaults to the current directory. Cannot be combined with `--all`
+
+###### **Options:**
+
+* `--all` — Import every discoverable Claude session, ignoring the path filter
+* `--structured` — Import as structured-view sessions (rendered in the web dashboard and the structured TUI view) instead of terminal/tmux sessions. Structured sessions replay their transcript under `aoe serve`
+* `--group <GROUP>` — Place imported sessions under this session group
+* `--launch` — Start terminal sessions immediately after importing (spawns the tmux pane running `claude --resume <id>`). Ignored for structured imports
+* `--dry-run` — List what would be imported without creating anything
+* `-y`, `--yes` — Skip the confirmation prompt when importing more than one session
 
 
 
@@ -856,6 +931,7 @@ Manage profiles (separate workspaces)
 * `delete` — Delete a profile
 * `rename` — Rename a profile
 * `default` — Show or set default profile
+* `show` — Show profile-derived values for scripts
 
 
 
@@ -913,6 +989,19 @@ Show or set default profile
 ###### **Arguments:**
 
 * `<NAME>` — Profile name (optional, shows current if not provided)
+
+
+
+## `aoe profile show`
+
+Show profile-derived values for scripts
+
+**Usage:** `aoe profile show [OPTIONS]`
+
+###### **Options:**
+
+* `--status-map <AGENT>` — Print the resolved status map for an agent
+* `--json` — Emit JSON output
 
 
 
@@ -1265,7 +1354,10 @@ Start a web dashboard for remote session access
 
 * `--no-auth` — Disable authentication (only allowed with localhost binding). Alias for --auth=none
 * `--behind-proxy` — Mark this server as sitting behind a reverse proxy that terminates TLS upstream. Sets cookies as `; Secure` and trusts the `X-Forwarded-For` / `cf-connecting-ip` headers from loopback peers. Does NOT auto-spawn a tunnel (unlike --remote). Required when --auth=passphrase or --auth=none is combined with a non-loopback bind
+* `--allowed-host <HOST>` — Extra `Host` header value to accept (repeatable). The DNS-rebinding gate trusts loopback, any routable IP literal (LAN/tailnet IPs can't be rebound), and a non-wildcard `--host` by default; add a HOSTNAME or mDNS name here when serving behind a reverse proxy, a custom tunnel, or by name when binding `0.0.0.0` (access by IP needs no flag). Auto-injected tunnel hosts (`--remote`) need no flag
+* `--allowed-origin <ORIGIN>` — Extra browser `Origin` to accept (repeatable, full origin `scheme://host[:port]`, e.g. `https://aoe.example.com:8443`). Needed only for a reverse proxy on a nonstandard port; standard 80/443 origins for `--allowed-host` entries are derived automatically
 * `--read-only` — Read-only mode: view terminals but cannot send keystrokes
+* `--cityhall` — CityHall client mode: a locked-down, composer-first dashboard for non-technical users (structured view only; no terminal/diff/project management). Equivalent to `AOE_CITYHALL_MODE=1`; the flag is what the daemon replays to its restart child so the mode survives `aoe update` and `aoe serve --restart`. See #7
 * `--remote` — Expose the dashboard over a public HTTPS tunnel. Prefers Tailscale Funnel when `tailscale` is installed and logged in (stable `.ts.net` URL, installable PWAs survive restarts). Falls back to a Cloudflare quick tunnel otherwise (fresh URL on every restart)
 * `--tunnel-name <TUNNEL_NAME>` — Use a named Cloudflare Tunnel (requires prior `cloudflared tunnel create`). Takes precedence over Tailscale auto-detection
 * `--no-tailscale` — Skip Tailscale Funnel auto-detection and go straight to Cloudflare. Useful if you have Tailscale installed for unrelated reasons
@@ -1274,7 +1366,7 @@ Start a web dashboard for remote session access
 * `--stop` — Stop a running daemon
 * `--status` — Print the running daemon's PID, mode, URLs, and log path. Exits non-zero when no daemon is running. Useful for shell scripts that want to know whether a daemon is up without parsing `ps`.
 
-   `--status` is read-only and incompatible with every flag that would change daemon state (`--stop`, `--daemon`, `--remote`) or the bind config of a fresh daemon (`--no-auth`, `--auth`, `--behind-proxy`, `--read-only`, `--passphrase`, `--port`, `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`). Clap reports the misuse instead of silently ignoring the extras.
+   `--status` is read-only and incompatible with every flag that would change daemon state (`--stop`, `--daemon`, `--remote`) or the bind config of a fresh daemon (`--no-auth`, `--auth`, `--behind-proxy`, `--read-only`, `--passphrase`, `--port`, `--tunnel-name`, `--no-tailscale`, `--tunnel-url`, `--open`, `--allowed-host`, `--allowed-origin`). Clap reports the misuse instead of silently ignoring the extras.
 * `--passphrase <PASSPHRASE>` — Require a passphrase for login (second-factor auth). Can also be set via AOE_SERVE_PASSPHRASE environment variable
 * `--open` — Open the dashboard URL in the default browser once the server is ready. Ignored under --daemon, --remote, SSH (SSH_CONNECTION/SSH_TTY), or when no display server is reachable on Linux/BSD
 * `--restart` — Restart a running `aoe serve` daemon, replaying the host, port, mode, and auth it was launched with (read from `serve.launch`). The passphrase is recalled from `serve.passphrase` or `AOE_SERVE_PASSPHRASE` before the old daemon is stopped, so a passphrase-protected daemon is never left down. Incompatible with the flags that would change the daemon's bind config: that config comes from the persisted launch state
@@ -1329,7 +1421,12 @@ Verify the structured view can start: Node runtime, configured agents, provider 
 ###### **Options:**
 
 * `--json` — Emit machine-readable JSON instead of a human report
-* `--fix` — Attempt safe remediations: install missing claude-code-acp adapter, verify aoe-agent presence, etc. (Reserved for future release; the flag exists so scripts can opt in early.)
+* `--fix` — Attempt safe remediations: download the bundled Node runtime if none is present, then install the pinned npm ACP adapter into the data dir with that Node's own npm (no global install, no sudo). Installs claude-agent-acp by default; each adapter is a separate several-hundred-MB tree, so pick others with --adapter
+* `--adapter <ADAPTER>` — Adapter to install with --fix (repeatable). Defaults to claude-agent-acp. One of: claude-agent-acp, codex-acp, pi-acp
+
+  Possible values: `claude-agent-acp`, `codex-acp`, `pi-acp`
+
+* `--all-adapters` — Install every pinned adapter with --fix instead of just the default one
 
 
 

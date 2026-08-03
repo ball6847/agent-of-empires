@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
+import { expect } from "@playwright/test";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -185,6 +186,51 @@ export async function listSessions(
 }
 
 /**
+ * Poll `GET /api/sessions` until the given session's `view` reaches
+ * `expected`. The sessions list is a cache the daemon reconciles on a
+ * 2s tick, so a disk snapshot taken just before an endpoint's write
+ * can briefly clobber the in-memory view before self-correcting; a
+ * bare `expect(sessions.find(...).view === expected)` on the very
+ * next `listSessions()` after a view-mutating endpoint is the flake
+ * shape. The endpoint's own response body remains the authoritative
+ * synchronous check; use this helper for reads that go back through
+ * the sessions list.
+ *
+ * The server omits the `view` field for `Terminal` sessions (serde
+ * `skip_serializing_if`); this helper treats a missing field on a
+ * present session as `"terminal"` so callers pass one of two
+ * symmetric string values. A missing session (unknown or deleted id)
+ * is not coerced: the callback throws, and since `expect.poll`
+ * propagates a thrown callback immediately (only a failed matcher is
+ * retried), this fails fast on a bad or never-created id rather than
+ * false-passing `.toBe("terminal")`.
+ */
+export async function waitForView(
+  baseUrl: string,
+  sessionId: string,
+  expected: "structured" | "terminal",
+  timeout = 10_000,
+): Promise<void> {
+  await expect
+    .poll(
+      async () => {
+        const sessions = await listSessions(baseUrl);
+        const session = sessions.find((s) => s.id === sessionId);
+        if (session === undefined) {
+          throw new Error(`session ${sessionId} not found in listSessions`);
+        }
+        return session.view ?? "terminal";
+      },
+      {
+        timeout,
+        intervals: [100, 200, 400],
+        message: `session ${sessionId} view should converge to ${expected}`,
+      },
+    )
+    .toBe(expected);
+}
+
+/**
  * Returns a `seedFn` for `spawnAoeServe` that:
  *   1. git-inits a fresh project dir under the isolated HOME.
  *   2. runs `aoe add <projectDir> -t <title> -c <tool>` against the same env.
@@ -259,16 +305,28 @@ export function tmuxSocketPath(home: string): string {
  * Resolve where the daemon will write `serve.token` (and other serve.*
  * state files) under the test's isolated filesystem tree. Mirrors the
  * Rust `get_app_dir_path` logic at `src/session/mod.rs:83`: Linux uses
- * `$XDG_CONFIG_HOME/agent-of-empires[-dev]`, macOS/Windows uses
- * `$HOME/.agent-of-empires[-dev]`. Debug builds carry the `-dev`
+ * `$XDG_CONFIG_HOME/agent-of-empires[-dev]`. Debug builds carry the `-dev`
  * suffix, derived from the binary path the same way as `tmuxPrefixFor`.
+ *
+ * macOS/Windows go through `session::macos_app_dir` (#1948), whose precedence
+ * is: the XDG path if it exists, else the legacy `~/.agent-of-empires` if that
+ * exists, else the XDG path whenever `XDG_CONFIG_HOME` is set, else legacy.
+ * The harness always sets `XDG_CONFIG_HOME` on an isolated tree, so a fresh
+ * test home resolves to the XDG path, NOT the legacy one. Returning the legacy
+ * path unconditionally here pointed specs at a directory the daemon never
+ * touches, which reads as a passing no-op on macOS while CI (Linux) took the
+ * correct branch.
  */
 export function appDirFor(home: string, xdg: string, binaryPath: string): string {
   const suffix = binaryPath.includes("/target/debug/") ? "-dev" : "";
+  const xdgDir = join(xdg, `agent-of-empires${suffix}`);
   if (process.platform === "linux") {
-    return join(xdg, `agent-of-empires${suffix}`);
+    return xdgDir;
   }
-  return join(home, `.agent-of-empires${suffix}`);
+  const legacy = join(home, `.agent-of-empires${suffix}`);
+  if (existsSync(xdgDir)) return xdgDir;
+  if (existsSync(legacy)) return legacy;
+  return xdg ? xdgDir : legacy;
 }
 
 /**
@@ -422,13 +480,25 @@ function writeFakeAcpShim(
   for (const [key, value] of Object.entries(extraEnv ?? {})) {
     scriptLines.push(`export ${key}=${JSON.stringify(value)}`);
   }
-  for (const name of ["claude", "claude-agent-acp", "aoe-agent", "opencode"]) {
+  for (const name of ["claude", "claude-agent-acp", "aoe-agent", "opencode", "codex", "codex-acp"]) {
     // The agent_compat gate keys its version floor off the spawned binary
     // name. When the fake stands in for opencode it must report opencode's
     // handshake (name + a version at or above the opencode floor), or the
     // gate rejects it and the opencode live specs fail; FAKE_ACP_IMPERSONATE
     // tells fakeAcpAgent.mjs which identity to present.
-    const perName = name === "opencode" ? [...scriptLines, "export FAKE_ACP_IMPERSONATE=opencode"] : scriptLines;
+    //
+    // `codex` (the native CLI) is shimmed alongside `codex-acp` (the ACP
+    // adapter the supervisor actually spawns) because the wizard's agent
+    // picker only renders agents whose native binary is detected on PATH
+    // (`AvailableTools::detect` -> `DetectionMethod::Which("codex")`). Without
+    // a `codex` shim the picker button never appears and codex-selecting specs
+    // time out, even though the ACP spawn resolves `codex-acp`.
+    const perName =
+      name === "opencode"
+        ? [...scriptLines, "export FAKE_ACP_IMPERSONATE=opencode"]
+        : name === "codex-acp" || name === "codex"
+          ? [...scriptLines, "export FAKE_ACP_IMPERSONATE=codex"]
+          : scriptLines;
     const script = `#!/bin/bash\n${perName.join("\n")}\nexec node ${JSON.stringify(fakeAgentJs)} "$@"\n`;
     const path = join(binDir, name);
     writeFileSync(path, script);

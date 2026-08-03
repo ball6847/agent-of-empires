@@ -153,7 +153,10 @@ applies on reload and when the backend switches agents mid-turn.
 
 When the active backend hits its rate limit, aoe parks the session rather than
 respawning into the same limit. The dashboard shows a banner with the reset
-time and a primary **Continue in another agent** CTA. Clicking it opens a picker
+time and a primary **Continue in another agent** CTA. Agents do not always
+report a reset time; when none was reported the banner shows the agent's own
+wording instead of a clock, which usually names the reset ("resets 4am
+(Europe/Paris)"). Clicking it opens a picker
 of the structured view ACP registry (claude / codex / opencode / gemini / vibe
 / pi / aoe-agent by default, plus anything you've added), preselects `codex`
 when installed, switches on confirm, and pre-fills the composer with a recap of
@@ -169,12 +172,14 @@ default):
 ```toml
 [acp]
 rate_limit_auto_resume = true
-rate_limit_auto_resume_grace_secs = 15   # cushion added to the reported reset time
 ```
 
-Both keys are editable in the structured view settings (TUI and web dashboard,
-under "Advanced") and can be overridden per profile. The reset time survives an
-`aoe serve` restart. The manual "Continue in another agent" and reconnect paths
+The setting is editable in the structured view settings (TUI and web
+dashboard) and can be overridden per profile. Resume fires once the reported
+reset time plus a fixed 15-second cushion passes, and the reset time survives
+an `aoe serve` restart. With no reported reset time, resume retries an hour
+after the park; if the limit has not cleared the session re-parks and the next
+retry is another hour out. The manual "Continue in another agent" and reconnect paths
 stay available regardless of the setting.
 
 ### Switching agents manually
@@ -322,6 +327,17 @@ model still won't see those turns. See
 [#1101](https://github.com/agent-of-empires/agent-of-empires/issues/1101).
 
 The slash-command palette and mode picker stay populated across a `/clear`.
+
+For claude and codex, a clear starts a genuinely new agent conversation rather
+than clearing the existing one in place, so it survives a worker restart: if the
+session later idles out or the daemon restarts, the next prompt resumes the
+post-clear conversation instead of starting from nothing. The trade-off is that
+a clear is refused while background sub-agents or tool calls are still draining,
+because switching conversations mid-drain would file their remaining output
+under the new one. Wait for that work to finish, then send the clear again. A
+clear can also fail outright if starting the new conversation fails, for
+instance when an MCP server will not re-initialize; the existing conversation is
+left untouched when that happens, so no divider appears and nothing is lost.
 
 A `/clear` queued mid-turn (or any agent's clear alias, e.g. codex / opencode
 `/new`) fires as its own send when the turn ends. An ordering like `foo`,

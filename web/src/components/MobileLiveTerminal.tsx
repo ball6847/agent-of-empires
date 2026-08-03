@@ -1,7 +1,7 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
-import { ansiToLines, wrapLine } from "../lib/liveTermLines";
+import { LineParseCache, findCursorCharIndex, splitUrls, textWidth, wrapLine } from "../lib/liveTermLines";
 import { wheelNotches } from "../lib/liveMouse";
 import { writeClipboard } from "../lib/clipboard";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
@@ -13,7 +13,9 @@ import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
 // and this component renders them as real DOM text inside a NATIVELY
 // scrolling container. There is no tmux copy-mode, no wheel synthesis,
 // no momentum re-implementation, and the agent keeps running while the
-// user reads.
+// user reads. (The alt-screen forward mode below is the one exception:
+// its scrollback lives inside the app, so touch drags are synthesized
+// into wheel notches, with gain and a decaying momentum tail.)
 //
 // Reading model (mirrors the TUI's "capture window follows the scroll
 // offset", adapted for a network hop):
@@ -53,8 +55,14 @@ const LINE_RATIO = 1.2;
 const RESIZE_DEBOUNCE_MS = 150;
 /** How long the meaningful-row scroll anchor must stay lower before it
  *  shrinks, so a spinner toggling the lowest non-blank row can't flutter the
- *  viewport. Comfortably longer than an agent's redraw cadence. */
-const SHRINK_DELAY_MS = 600;
+ *  viewport. Must clear the worst-case gap between two spinner-ON captures, not
+ *  just the agent's redraw period: a spinner-on frame resets the timer, but
+ *  under a stalled live stream (busy CI, slow network) consecutive captures can
+ *  all land in the brief spinner-off window, and a delay only slightly above
+ *  the redraw cadence would then trim mid-oscillation and bounce the block back
+ *  on the next grow. 1.5s leaves ample margin while still snapping trailing
+ *  blanks up within ~a second of an agent going quiet. */
+const SHRINK_DELAY_MS = 1500;
 /** Live-edge capture window in screenfuls: the visible screen plus this much
  *  scrollback kept loaded ABOVE it, so a scroll-up lands on real content
  *  instead of the blank history spacer (which otherwise only fills on a
@@ -63,9 +71,38 @@ const SHRINK_DELAY_MS = 600;
  *  below the server's fast-cadence window bound (screen * 4) so live echo
  *  stays at the tight interval. */
 const LIVE_WINDOW_SCREENS = 2;
+/** Forward-mode touch scroll gain: pane lines scrolled per line-height of
+ *  finger travel. 1:1 read as sluggish in the field: there is no local
+ *  direct-manipulation feel to preserve (content only moves on the network
+ *  round trip), and with the soft keyboard up the strip of glass available
+ *  for the gesture is short, so covering a transcript took a dozen swipes.
+ *  Applied to touch drags and their momentum tail only; desktop wheel deltas
+ *  pass through 1:1 (the trackpad supplies its own momentum). */
+const FORWARD_TOUCH_GAIN = 2;
+/** Release velocity (px/ms) below which a forward-mode drag ends with no
+ *  momentum, so a deliberate slow drag stops where the finger stops. */
+const FLICK_MIN_VELOCITY = 0.3;
+/** Release-velocity cap (px/ms). Real flicks top out around 3-4 px/ms;
+ *  synthetic touch streams (e2e) arrive back-to-back with ~1ms deltas whose
+ *  raw px/ms is absurd (the AGENTS.md touch-recipe gotcha), and the cap is
+ *  what keeps both worlds behaving the same. */
+const FLICK_MAX_VELOCITY = 4;
+/** The finger must have moved this recently (ms) at lift for momentum to
+ *  start; a drag-hold-release stops dead, like a native scroller. */
+const FLICK_MAX_PAUSE_MS = 80;
+/** Sliding window (ms) over which the release velocity is measured. */
+const FLICK_VELOCITY_WINDOW_MS = 100;
+/** Per-millisecond exponential decay of momentum velocity, matching
+ *  UIScrollView's normal deceleration rate so a flick coasts ~1-2s. */
+const MOMENTUM_DECAY_PER_MS = 0.998;
+/** Momentum ends when velocity decays below this (px/ms). */
+const MOMENTUM_STOP_VELOCITY = 0.05;
 
 export interface MobileLiveTerminalProps {
   frame: LiveFrame | null;
+  /** Arm the parent view's gesture-bound clipboard write before an agent
+   *  selection release crosses the WebSocket. */
+  armAgentClipboard?: () => void;
   connected: boolean;
   active: boolean;
   /** True while the user reads scrollback (off the live edge); the
@@ -78,6 +115,10 @@ export interface MobileLiveTerminalProps {
   enterReading: (rows: number) => void;
   returnToLive: (rows: number) => void;
   sendData: (data: string) => void;
+  /** Upload a clipboard image pasted into the pane and resolve to the path
+   *  the tmux pane can read (host path, or the container mount for sandboxed
+   *  sessions), or null on failure. See #2678. */
+  uploadPastedImage: (file: File) => Promise<string | null>;
   /** Forward a wheel notch to a full-screen mouse app (alternate screen).
    *  Used instead of capture-window scrolling when the frame reports the
    *  pane is such an app. */
@@ -107,6 +148,19 @@ export interface MobileLiveTerminalProps {
    *  prompt sits just above the keyboard. The paired host/container shells are
    *  ordinary terminals, so they top-align like a normal bash window. */
   bottomAlign: boolean;
+  /** True while the soft keyboard occludes the visual viewport (from
+   *  useMobileKeyboard's occlusion measure, not input focus: the occlusion is
+   *  what shrinks the container, regardless of which element is focused).
+   *  Gates the sizing latch so a pane that first measures with the keyboard
+   *  up never ships keyboard-shrunk rows to tmux. Always false on desktop. */
+  keyboardOpen: boolean;
+}
+
+// Backslash-escape whitespace and backslashes in a pasted image path, matching
+// what terminal drag-and-drop produces, so a path under a directory with spaces
+// (e.g. "Agent of Empires") is parsed as a single token by the CLI agent.
+function escapePastePath(p: string): string {
+  return p.replace(/[\\ \t]/g, (c) => `\\${c}`);
 }
 
 function segStyle(style: AnsiStyle): CSSProperties | undefined {
@@ -131,56 +185,200 @@ function segStyle(style: AnsiStyle): CSSProperties | undefined {
 // Screenshot-friendly; no behavior changes.
 const LIVE_DEBUG = typeof location !== "undefined" && new URLSearchParams(location.search).has("livedebug");
 
-// Hollow-box cursor drawn AS A CELL inside the text flow, the way a real
-// terminal (and the desktop xterm view) renders it, rather than a separate
-// absolutely-positioned block whose pixel row we reconstruct from cursor.y and
-// line-height. Tying it to the actual rendered cell means it cannot drift off
-// its row (wrapping, row-height, offset assumptions). `outline` instead of
-// `border` so the box does not reflow the line by a pixel.
-const CURSOR_CELL_STYLE: CSSProperties = {
+// Cursor drawn AS A CELL inside the text flow, the way a real terminal
+// renders it, rather than a separate absolutely-positioned block whose pixel
+// row we reconstruct from cursor.y and line-height. Tying it to the actual
+// rendered cell means it cannot drift off its row (wrapping, row-height,
+// offset assumptions). Filled (solid background, inverted text) while the
+// hidden input has focus, matching every terminal's focused-cursor
+// convention; hollow `outline` while blurred so the box does not reflow the
+// line by a pixel.
+const CURSOR_CELL_STYLE_FOCUSED: CSSProperties = {
+  backgroundColor: "var(--term-cursor, #f59e0b)",
+  color: "var(--term-bg, #1c1c1f)",
+};
+const CURSOR_CELL_STYLE_BLURRED: CSSProperties = {
   outline: "1px solid var(--term-cursor, #f59e0b)",
   outlineOffset: "-1px",
 };
 
-const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursorCol: number | null }) {
+interface KeyboardLayoutReader {
+  get: (code: string) => string | undefined;
+}
+
+function layoutLetterForCode(layoutMap: KeyboardLayoutReader | null, code: string, shiftKey: boolean): string | null {
+  const mapped = layoutMap?.get(code);
+  if (!mapped || mapped.length !== 1 || !/^[a-z]$/i.test(mapped)) return null;
+  const letter = mapped.toLowerCase();
+  return shiftKey ? letter.toUpperCase() : letter;
+}
+
+function altPrintableMetaKey(
+  e: { key: string; code: string; shiftKey: boolean },
+  layoutMap: KeyboardLayoutReader | null,
+): string | null {
+  if (e.key === "Dead") return null;
+  const code = e.key.length === 1 ? e.key.charCodeAt(0) : 0;
+  const printable = code >= 0x20 && code <= 0x7e ? e.key : null;
+  if (printable) return printable;
+  // macOS Option+letter can surface as a composed symbol, such as
+  // Option+V yielding "√". Prefer the browser's logical layout map when
+  // present (AZERTY KeyQ -> "a"), then fall back to the physical letter.
+  // The physical-key fallback is letter-only; digits and punctuation rely on
+  // `e.key` being ASCII-printable above.
+  if (!/^Key[A-Z]$/.test(e.code)) return null;
+  const mapped = layoutLetterForCode(layoutMap, e.code, e.shiftKey);
+  if (mapped) return mapped;
+  const letter = e.code.slice(3);
+  return e.shiftKey ? letter : letter.toLowerCase();
+}
+
+// Shift+Enter (and Ctrl+Enter) insert a soft newline instead of submitting,
+// matching native Claude Code and the standard macOS text-entry convention
+// (#2316). The browser can read the modifier here even though a bare terminal
+// can't, so we translate it to ESC+CR (\x1b\r), the same sequence Option/Alt+
+// Enter sends and that CLI agents read as "insert newline". Plain Enter and the
+// other chords still submit. Supersedes the Shift+Enter-submits mapping from
+// #2765.
+function liveEnterSequence(e: { key: string; ctrlKey: boolean; shiftKey: boolean; altKey: boolean; metaKey: boolean }) {
+  if (e.key !== "Enter") return null;
+  if ((e.shiftKey || e.ctrlKey) && !e.altKey && !e.metaKey) return "\x1b\r";
+  return "\r";
+}
+
+interface TerminalKeyLike {
+  key: string;
+  shiftKey: boolean;
+  altKey: boolean;
+  ctrlKey: boolean;
+  metaKey: boolean;
+}
+
+function xtermModifierParam(e: Pick<TerminalKeyLike, "shiftKey" | "altKey" | "ctrlKey">): number | null {
+  const modifier = 1 + Number(e.shiftKey) + 2 * Number(e.altKey) + 4 * Number(e.ctrlKey);
+  return modifier === 1 ? null : modifier;
+}
+
+function navigationKeySequence(e: TerminalKeyLike): string | null {
+  if (e.metaKey) return null;
+
+  const modifier = xtermModifierParam(e);
+  switch (e.key) {
+    case "ArrowUp":
+      return modifier == null ? "\x1b[A" : `\x1b[1;${modifier}A`;
+    case "ArrowDown":
+      return modifier == null ? "\x1b[B" : `\x1b[1;${modifier}B`;
+    case "ArrowRight":
+      return modifier == null ? "\x1b[C" : `\x1b[1;${modifier}C`;
+    case "ArrowLeft":
+      return modifier == null ? "\x1b[D" : `\x1b[1;${modifier}D`;
+    case "Home":
+      return modifier == null ? "\x1b[H" : `\x1b[1;${modifier}H`;
+    case "End":
+      return modifier == null ? "\x1b[F" : `\x1b[1;${modifier}F`;
+    case "Insert":
+      return modifier == null ? "\x1b[2~" : `\x1b[2;${modifier}~`;
+    case "Delete":
+      return modifier == null ? "\x1b[3~" : `\x1b[3;${modifier}~`;
+    case "PageUp":
+      return modifier == null ? "\x1b[5~" : `\x1b[5;${modifier}~`;
+    case "PageDown":
+      return modifier == null ? "\x1b[6~" : `\x1b[6;${modifier}~`;
+    default:
+      return null;
+  }
+}
+
+function specialKeySequence(e: TerminalKeyLike): string | null {
+  switch (e.key) {
+    case "Enter":
+      return liveEnterSequence(e);
+    case "Backspace":
+      return e.altKey && !e.ctrlKey && !e.metaKey ? "\x1b\x7f" : "\x7f";
+    case "Tab":
+      return e.shiftKey ? "\x1b[Z" : "\t";
+    case "Escape":
+      return "\x1b";
+    default:
+      return navigationKeySequence(e);
+  }
+}
+
+// Wrap http(s) URLs in a segment's text as clickable anchors, so agent output
+// (PR links, localhost dev servers, docs) opens in one tap instead of a
+// manual select-copy-paste (#2685). Plain text returns as-is.
+function linkify(text: string): ReactNode {
+  const parts = splitUrls(text);
+  if (parts.length === 1 && parts[0]!.url == null) return text;
+  return parts.map((p, i) =>
+    p.url ? (
+      <a key={i} href={p.url} target="_blank" rel="noopener noreferrer" className="underline cursor-pointer">
+        {p.text}
+      </a>
+    ) : (
+      p.text
+    ),
+  );
+}
+
+export const Row = memo(function Row({
+  segs,
+  cursorCol,
+  focused = false,
+}: {
+  segs: AnsiSegment[];
+  cursorCol: number | null;
+  focused?: boolean;
+}) {
+  const cursorStyle = focused ? CURSOR_CELL_STYLE_FOCUSED : CURSOR_CELL_STYLE_BLURRED;
   if (cursorCol == null) {
     if (segs.length === 0) return <div> </div>; // keep empty rows at full height
     return (
       <div>
         {segs.map((seg, i) => (
           <span key={i} style={segStyle(seg.style)}>
-            {seg.text}
+            {linkify(seg.text)}
           </span>
         ))}
       </div>
     );
   }
+  // The cursor row (live input line) keeps the delicate cell-split logic below
+  // and is not linkified; agent-output URLs live in the cursorCol == null rows.
   // Render the row with the single cell at `cursorCol` boxed. Walk segments by
-  // column; split the one that straddles the cursor.
+  // terminal cell width, not UTF-16 code units, since `cursorCol` is a real
+  // cell count from tmux and CJK/wide glyphs take two cells but one code
+  // unit (#2665); split the segment that straddles the cursor.
   const out: ReactNode[] = [];
   let col = 0;
   let placed = false;
   let key = 0;
   for (const seg of segs) {
     const t = seg.text;
-    if (!placed && cursorCol >= col && cursorCol < col + t.length) {
-      const off = cursorCol - col;
-      if (off > 0) {
+    const idx = placed ? null : findCursorCharIndex(t, cursorCol - col);
+    if (idx != null) {
+      const chars = [...t];
+      if (idx > 0) {
         out.push(
           <span key={key++} style={segStyle(seg.style)}>
-            {t.slice(0, off)}
+            {chars.slice(0, idx).join("")}
           </span>,
         );
       }
       out.push(
-        <span key={key++} data-live-cursor style={{ ...segStyle(seg.style), ...CURSOR_CELL_STYLE }}>
-          {t[off]}
+        <span
+          key={key++}
+          data-live-cursor
+          className={focused ? "animate-term-cursor-blink" : undefined}
+          style={{ ...segStyle(seg.style), ...cursorStyle }}
+        >
+          {chars[idx]}
         </span>,
       );
-      if (off + 1 < t.length) {
+      if (idx + 1 < chars.length) {
         out.push(
           <span key={key++} style={segStyle(seg.style)}>
-            {t.slice(off + 1)}
+            {chars.slice(idx + 1).join("")}
           </span>,
         );
       }
@@ -192,14 +390,19 @@ const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursor
         </span>,
       );
     }
-    col += t.length;
+    col += textWidth(t);
   }
   if (!placed) {
     // Cursor sits past the row's text (blank input cell): pad to the column
     // and box a space.
     if (cursorCol > col) out.push(<span key="pad">{" ".repeat(cursorCol - col)}</span>);
     out.push(
-      <span key="cursor" data-live-cursor style={CURSOR_CELL_STYLE}>
+      <span
+        key="cursor"
+        data-live-cursor
+        className={focused ? "animate-term-cursor-blink" : undefined}
+        style={cursorStyle}
+      >
         {" "}
       </span>,
     );
@@ -209,6 +412,7 @@ const Row = memo(function Row({ segs, cursorCol }: { segs: AnsiSegment[]; cursor
 
 export function MobileLiveTerminal({
   frame,
+  armAgentClipboard,
   connected,
   active,
   reading,
@@ -217,7 +421,8 @@ export function MobileLiveTerminal({
   setCadence,
   enterReading,
   returnToLive,
-  sendData,
+  sendData: sendDataRaw,
+  uploadPastedImage,
   forwardWheel,
   forwardButton,
   ctrlActiveRef,
@@ -225,6 +430,7 @@ export function MobileLiveTerminal({
   inputRef,
   onInputFocusChange,
   bottomAlign,
+  keyboardOpen,
 }: MobileLiveTerminalProps) {
   const { settings, update } = useWebSettings();
   // The live view now renders on desktop too, so it honors the right font-size
@@ -240,6 +446,10 @@ export function MobileLiveTerminal({
   // ignored) font-family value.
   const termFontFamily = (settings.terminalFontFamily ?? "").trim().replace(/"/g, "");
   const fontFamily = termFontFamily ? `"${termFontFamily}", var(--font-mono)` : undefined;
+  // Drives the cursor cell's filled-vs-hollow style; separate from the
+  // `onInputFocusChange` bubble-up, which only drives the parent's chrome
+  // ring (see LiveTerminalView).
+  const [focused, setFocused] = useState(false);
   const [fontSize, setFontSize] = useState(() => configuredFontSize);
   // Adopt the persisted setting when it changes (settings panel, or the
   // pointer class flipping which font key applies) via the adjust-state-
@@ -252,6 +462,27 @@ export function MobileLiveTerminal({
   }
   const scrollerRef = useRef<HTMLDivElement>(null);
   const measureRef = useRef<HTMLSpanElement>(null);
+  const keyboardLayoutRef = useRef<KeyboardLayoutReader | null>(null);
+  useEffect(() => {
+    const keyboard = (
+      navigator as Navigator & {
+        keyboard?: { getLayoutMap?: () => Promise<KeyboardLayoutReader> };
+      }
+    ).keyboard;
+    let cancelled = false;
+    keyboard
+      ?.getLayoutMap?.()
+      .then((layoutMap) => {
+        if (!cancelled) keyboardLayoutRef.current = layoutMap;
+      })
+      .catch(() => {
+        // Firefox/Safari do not expose Keyboard Layout Map; the physical
+        // Key* fallback below preserves the previous behavior there.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const lineH = fontSize * LINE_RATIO;
   // Real rendered glyph advance, measured off a hidden span INSIDE the
@@ -408,23 +639,43 @@ export function MobileLiveTerminal({
     }
     geomRef.current = { target, clientHeight: el.clientHeight, scrollTop: el.scrollTop };
   }, [liveScrollTarget]);
-  const lines = useMemo(() => (frame ? ansiToLines(frame.content) : []), [frame]);
+  // Frame-to-frame parse cache: unchanged lines keep their segment-array
+  // identity across streamed frames, so the wrap cache below and the
+  // memoized Row components skip all untouched rows. Re-deriving the whole
+  // window per frame (and handing every row fresh objects) was the main
+  // scroll-jank driver on multi-thousand-line reading windows. Held in a
+  // state initializer (never set) rather than a ref so the render-time
+  // read is legal; re-running on the same frame converges (see the class).
+  const [parseCache] = useState(() => new LineParseCache());
+  const lines = useMemo(() => (frame ? parseCache.lines(frame.content) : []), [frame, parseCache]);
   // Columns this viewer renders at. Normally the pane is exactly this
   // wide and wrapping is the identity; when another writer resizes the
   // window wider (see the server-side drift re-assert), wrapping keeps
   // the frame readable instead of clipping at the right edge.
   const [renderCols, setRenderCols] = useState(0);
+  // Wrap results keyed on the line's segment-array identity (stable across
+  // frames thanks to LineParseCache), so only changed lines re-wrap and
+  // unchanged visual rows keep THEIR identity too, which is what lets
+  // memo(Row) skip them. State initializer, not a ref, for the same
+  // render-read legality as the parse cache above.
+  const [wrapCache] = useState(() => new WeakMap<AnsiSegment[], { cols: number; rows: AnsiSegment[][] }>());
   const visual = useMemo(() => {
     const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
     const rows: AnsiSegment[][] = [];
     // Visual row index where each pane line starts (for cursor math).
     const lineStartRow: number[] = new Array(lines.length);
     for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!;
+      let wrapped = wrapCache.get(line);
+      if (!wrapped || wrapped.cols !== cols) {
+        wrapped = { cols, rows: wrapLine(line, cols) };
+        wrapCache.set(line, wrapped);
+      }
       lineStartRow[i] = rows.length;
-      for (const row of wrapLine(lines[i]!, cols)) rows.push(row);
+      for (const row of wrapped.rows) rows.push(row);
     }
     return { rows, lineStartRow };
-  }, [lines, renderCols]);
+  }, [lines, renderCols, wrapCache]);
   const screenRows = frame?.rows ?? 0;
   const history = frame?.history ?? 0;
   const fetchedHistory = Math.max(0, lines.length - screenRows);
@@ -520,6 +771,7 @@ export function MobileLiveTerminal({
   const syncView = useCallback(() => {
     const el = scrollerRef.current;
     if (!el) return;
+    if (el.scrollLeft !== 0) el.scrollLeft = 0;
     setView((prev) =>
       prev.top === el.scrollTop && prev.height === el.clientHeight
         ? prev
@@ -560,13 +812,33 @@ export function MobileLiveTerminal({
     return el.scrollTop >= liveScrollTarget(el) - lineH * 1.5;
   }, [lineH, liveScrollTarget]);
 
+  // Scroll events arrive per scrolled pixel; a `view` state update (a React
+  // render) for each one competes with the compositor mid-flick. One update
+  // per painted frame is all the virtualization window needs, since it
+  // already carries a full viewport of overscan on both sides. The
+  // layout-effect syncView after a pin stays synchronous (pre-paint).
+  const viewSyncRafRef = useRef(0);
+  const scheduleViewSync = useCallback(() => {
+    if (viewSyncRafRef.current !== 0) return;
+    viewSyncRafRef.current = requestAnimationFrame(() => {
+      viewSyncRafRef.current = 0;
+      syncView();
+    });
+  }, [syncView]);
+  useEffect(
+    () => () => {
+      cancelAnimationFrame(viewSyncRafRef.current);
+    },
+    [],
+  );
+
   // Last scrollTop seen by onScroll, to read the scroll DIRECTION (our pin
   // filters itself out by landing exactly on the target).
   const onScrollLastTopRef = useRef(0);
   const onScroll = useCallback(() => {
     // Forward mode pins the live edge (overflow hidden); the wheel goes to
     // the app, so there is no scrollback reading state to enter.
-    syncView();
+    scheduleViewSync();
     if (forwardModeRef.current) return;
     const el = scrollerRef.current;
     if (!el) return;
@@ -588,7 +860,7 @@ export function MobileLiveTerminal({
     if (el.scrollHeight - el.clientHeight - el.scrollTop < 2 && !movingUp) {
       liveDetachedRef.current = false;
     }
-  }, [atBottom, enterReading, returnToLive, syncView]);
+  }, [atBottom, enterReading, returnToLive, scheduleViewSync]);
 
   const jumpToLatest = useCallback(() => {
     const el = scrollerRef.current;
@@ -630,15 +902,23 @@ export function MobileLiveTerminal({
 
   // Translate an accumulated pixel delta (positive = toward newer/down)
   // into forwarded wheel notches, one per text row, carrying the leftover.
+  // `touchCell` reports the wheel at the pane's vertical middle row instead
+  // of the finger's cell: position-aware apps (Claude Code) hit-test the
+  // row and ignore wheels over their pinned input box, which shrank the
+  // usable gesture area to the sliver of transcript above it. A finger drag
+  // has no hover semantics to preserve (unlike the desktop pointer), so
+  // anywhere on the pane means "scroll the transcript"; the middle row is
+  // inside it for any plausible layout. The column keeps the finger's x.
   const forwardWheelDelta = useCallback(
-    (deltaPx: number, clientX: number, clientY: number) => {
+    (deltaPx: number, clientX: number, clientY: number, touchCell = false) => {
       wheelAccumRef.current += deltaPx;
       const { notches, remainder } = wheelNotches(wheelAccumRef.current, lineH || 16, 8);
       wheelAccumRef.current = remainder;
       if (notches === 0) return;
       const { col, row } = pointerCell(clientX, clientY);
+      const wheelRow = touchCell ? Math.max(1, Math.round(rowsRef.current / 2)) : row;
       const up = notches < 0;
-      for (let i = 0; i < Math.abs(notches); i++) forwardWheel(up, mouseSgrRef.current, col, row);
+      for (let i = 0; i < Math.abs(notches); i++) forwardWheel(up, mouseSgrRef.current, col, wheelRow);
     },
     [lineH, pointerCell, forwardWheel],
   );
@@ -651,6 +931,66 @@ export function MobileLiveTerminal({
       forwardWheelDelta(e.deltaY * factor, e.clientX, e.clientY);
     },
     [lineH, forwardWheelDelta],
+  );
+
+  // --- forward-mode touch momentum -----------------------------------------
+  // Capture mode gets flick inertia from the browser's native scroller;
+  // forward mode has no scroller (overflow hidden), so a bare drag stopped
+  // dead at finger-lift and reading an alt-screen transcript took a dozen
+  // swipes. Reintroduce the missing physics: sample the drag, and on lift
+  // coast a decaying velocity through the same forwardWheelDelta path.
+  // Recent finger positions for the release-velocity estimate, pruned to
+  // FLICK_VELOCITY_WINDOW_MS.
+  const flickSamplesRef = useRef<Array<{ x: number; y: number; t: number }>>([]);
+  // In-flight momentum. Identity-guarded: a stale rAF step from a superseded
+  // or stopped coast bails when it no longer owns this ref.
+  const momentumRef = useRef<{ v: number; lastT: number; x: number; y: number; raf: number } | null>(null);
+  const stopMomentum = useCallback(() => {
+    const m = momentumRef.current;
+    if (m) cancelAnimationFrame(m.raf);
+    momentumRef.current = null;
+  }, []);
+  useEffect(() => stopMomentum, [stopMomentum]);
+  const startMomentum = useCallback(
+    (velocity: number, clientX: number, clientY: number) => {
+      stopMomentum();
+      const state = { v: velocity, lastT: performance.now(), x: clientX, y: clientY, raf: 0 };
+      momentumRef.current = state;
+      const step = (now: number) => {
+        if (momentumRef.current !== state) return;
+        if (!forwardModeRef.current) {
+          momentumRef.current = null;
+          return;
+        }
+        // Clamp a janky or backgrounded frame's gap so one late tick can't
+        // teleport the transcript.
+        const dt = Math.min(64, Math.max(0, now - state.lastT));
+        state.lastT = now;
+        // Same sign convention as the drag: finger-space delta, negated.
+        forwardWheelDelta(-state.v * dt * FORWARD_TOUCH_GAIN, state.x, state.y, true);
+        state.v *= Math.pow(MOMENTUM_DECAY_PER_MS, dt);
+        if (Math.abs(state.v) < MOMENTUM_STOP_VELOCITY) {
+          momentumRef.current = null;
+          return;
+        }
+        state.raf = requestAnimationFrame(step);
+      };
+      state.raf = requestAnimationFrame(step);
+    },
+    [stopMomentum, forwardWheelDelta],
+  );
+  // Typed input interrupts the coast. Without this, keystrokes sent in the
+  // coast's 1-2s tail interleave with the wheel storm and the app is busy
+  // redrawing scroll frames instead of echoing them (reported as "I start
+  // typing and nothing shows up for a bit"). Every input path in this
+  // component (keydown, beforeinput, composition, paste) funnels through
+  // here, so wrapping once covers them all; a no-op outside a coast.
+  const sendData = useCallback(
+    (data: string) => {
+      stopMomentum();
+      sendDataRaw(data);
+    },
+    [sendDataRaw, stopMomentum],
   );
 
   // Mouse button (click/drag) forwarding for a full-screen mouse app, the
@@ -695,7 +1035,14 @@ export function MobileLiveTerminal({
       if (e.pointerType !== "mouse" || forwardBtnRef.current == null) return;
       e.preventDefault();
       const { col, row } = pointerCell(e.clientX, e.clientY);
-      forwardButton(forwardBtnRef.current, true, false, mouseSgrRef.current, col, row);
+      const button = forwardBtnRef.current;
+      // OpenCode and other full-screen agents emit OSC 52 after the release
+      // that completes a selection. Arm while the browser still considers
+      // this a user gesture; the WebSocket event resolves the write later.
+      if (button === 0) {
+        armAgentClipboard?.();
+      }
+      forwardButton(button, true, false, mouseSgrRef.current, col, row);
       forwardBtnRef.current = null;
       lastForwardCellRef.current = null;
       try {
@@ -704,7 +1051,7 @@ export function MobileLiveTerminal({
         // Capture may never have been taken (see onPointerDown).
       }
     },
-    [pointerCell, forwardButton],
+    [pointerCell, forwardButton, armAgentClipboard],
   );
 
   // --- pinch zoom (two-finger) ---------------------------------------------
@@ -716,6 +1063,10 @@ export function MobileLiveTerminal({
   const onTouchStart = useCallback(
     (e: React.TouchEvent) => {
       touchActiveRef.current = true;
+      // A touch anywhere halts an in-flight momentum coast, the native
+      // touch-to-stop convention.
+      stopMomentum();
+      flickSamplesRef.current = [];
       if (e.touches.length === 2) {
         pinchRef.current = {
           startDist: Math.hypot(
@@ -729,8 +1080,10 @@ export function MobileLiveTerminal({
         touchScrollStartYRef.current = null;
       } else if (e.touches.length === 1 && forwardModeRef.current) {
         // Single-finger drag drives the app's wheel in forward mode.
-        touchForwardYRef.current = e.touches[0]!.clientY;
+        const t0 = e.touches[0]!;
+        touchForwardYRef.current = t0.clientY;
         wheelAccumRef.current = 0;
+        flickSamplesRef.current = [{ x: t0.clientX, y: t0.clientY, t: performance.now() }];
       } else if (e.touches.length === 1) {
         // Taking hold of the scroller to drag. Detach from the live tail NOW so
         // the pin cannot snap the view back to the bottom mid-drag: iOS fires
@@ -741,7 +1094,7 @@ export function MobileLiveTerminal({
         touchScrollStartYRef.current = e.touches[0]!.clientY;
       }
     },
-    [fontSize],
+    [fontSize, stopMomentum],
   );
   const onTouchMove = useCallback(
     (e: React.TouchEvent) => {
@@ -758,14 +1111,21 @@ export function MobileLiveTerminal({
         return;
       }
       if (e.touches.length === 1 && forwardModeRef.current && touchForwardYRef.current != null) {
-        // Stop the (overflow-hidden) container / page from scrolling and
-        // translate the drag into wheel notches. Finger moving DOWN reveals
-        // older content = wheel up, so the delta is negated.
-        e.preventDefault();
-        const y = e.touches[0]!.clientY;
+        // Translate the drag into wheel notches. Finger moving DOWN reveals
+        // older content = wheel up, so the delta is negated (and geared up by
+        // the touch gain). No preventDefault: React's delegated touch
+        // listeners are passive, so it would be a console-warning no-op; the
+        // page pan is suppressed by touch-action: none on the scroller
+        // instead (see the style below).
+        const t0 = e.touches[0]!;
+        const y = t0.clientY;
         const dy = y - touchForwardYRef.current;
         touchForwardYRef.current = y;
-        forwardWheelDelta(-dy, e.touches[0]!.clientX, y);
+        const now = performance.now();
+        const samples = flickSamplesRef.current;
+        samples.push({ x: t0.clientX, y, t: now });
+        while (samples.length > 1 && now - samples[0]!.t > FLICK_VELOCITY_WINDOW_MS) samples.shift();
+        forwardWheelDelta(-dy * FORWARD_TOUCH_GAIN, t0.clientX, y, true);
         return;
       }
       if (e.touches.length === 1 && !forwardModeRef.current && touchScrollStartYRef.current != null) {
@@ -787,6 +1147,20 @@ export function MobileLiveTerminal({
   const onTouchEnd = useCallback(
     (e: React.TouchEvent) => {
       if (e.touches.length === 0) {
+        // Lift after a forward-mode drag: launch momentum if the finger was
+        // still moving. Velocity is read over the recent-sample window, so a
+        // drag that paused before lifting (stale last sample) coasts nowhere.
+        if (forwardModeRef.current && touchForwardYRef.current != null) {
+          const samples = flickSamplesRef.current;
+          const first = samples[0];
+          const last = samples[samples.length - 1];
+          if (first && last && last.t > first.t && performance.now() - last.t <= FLICK_MAX_PAUSE_MS) {
+            const raw = (last.y - first.y) / (last.t - first.t);
+            const v = Math.max(-FLICK_MAX_VELOCITY, Math.min(FLICK_MAX_VELOCITY, raw));
+            if (Math.abs(v) >= FLICK_MIN_VELOCITY) startMomentum(v, last.x, last.y);
+          }
+        }
+        flickSamplesRef.current = [];
         touchActiveRef.current = false;
         touchForwardYRef.current = null;
         touchScrollStartYRef.current = null;
@@ -811,7 +1185,7 @@ export function MobileLiveTerminal({
         }, 400);
       }
     },
-    [fontKey, fontSize, update, returnToLive, atBottom],
+    [fontKey, fontSize, update, returnToLive, atBottom, startMomentum],
   );
   // touchcancel is NOT touchend: iOS fires it when it promotes the drag to
   // native scrolling, with the finger usually STILL down. Treat it as "stop
@@ -823,6 +1197,10 @@ export function MobileLiveTerminal({
     touchActiveRef.current = false;
     touchForwardYRef.current = null;
     touchScrollStartYRef.current = null;
+    // A cancelled touch never coasts (native convention); just drop the
+    // samples. Any momentum from a PREVIOUS flick was already stopped on
+    // this touch's start.
+    flickSamplesRef.current = [];
     // A pinch that changed the font size still persists, exactly like a clean
     // end; only the scroll-settle (re-attach to live) is skipped on cancel.
     if (pinchRef.current) {
@@ -860,14 +1238,27 @@ export function MobileLiveTerminal({
       const width = el.clientWidth;
       const height = el.clientHeight;
       if (width <= 0 || height <= 0) return;
+      const cols = Math.floor(width / charW);
       const latch = latchRef.current;
-      if (Math.abs(width - latch.width) > 1) {
+      const widthChanged = Math.abs(width - latch.width) > 1;
+      // While the keyboard occludes the viewport, the measured height is
+      // the shrunk one. Seeding the latch from it (first mount with the
+      // keyboard up, rotation mid-cycle) would ship keyboard-shrunk rows
+      // to tmux, the exact thing the latch exists to prevent; defer the
+      // seed until the keyboard closes (the height change re-fires the
+      // observer, and the keyboardOpen flip re-runs this effect as a
+      // belt). Columns don't depend on height, so the render width still
+      // updates and drifted frames wrap correctly while deferred.
+      if (keyboardOpen && (widthChanged || latch.maxHeight === 0)) {
+        if (cols >= 20) setRenderCols(cols);
+        return;
+      }
+      if (widthChanged) {
         latch.width = width;
         latch.maxHeight = height;
       } else if (height > latch.maxHeight) {
         latch.maxHeight = height;
       }
-      const cols = Math.floor(width / charW);
       const rows = Math.floor(latch.maxHeight / lineH);
       // Implausibly small means a hidden/mid-transition container; never
       // ship that to tmux.
@@ -891,7 +1282,7 @@ export function MobileLiveTerminal({
       ro.disconnect();
       if (timer) clearTimeout(timer);
     };
-  }, [active, charW, lineH, sendResize, setWindow, pinIfWasAtBottom]);
+  }, [active, charW, lineH, sendResize, setWindow, pinIfWasAtBottom, keyboardOpen]);
 
   // Cadence: fast only while this pane is the active, visible surface AND
   // at the live edge. Reading scrollback drops to idle: the window is
@@ -986,28 +1377,7 @@ export function MobileLiveTerminal({
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (composingRef.current || e.nativeEvent.isComposing) return;
-      const seq = (() => {
-        switch (e.key) {
-          case "Enter":
-            return "\r";
-          case "Backspace":
-            return "\x7f";
-          case "Tab":
-            return e.shiftKey ? "\x1b[Z" : "\t";
-          case "Escape":
-            return "\x1b";
-          case "ArrowUp":
-            return "\x1b[A";
-          case "ArrowDown":
-            return "\x1b[B";
-          case "ArrowRight":
-            return "\x1b[C";
-          case "ArrowLeft":
-            return "\x1b[D";
-          default:
-            return null;
-        }
-      })();
+      const seq = specialKeySequence(e);
       if (seq) {
         e.preventDefault();
         sendData(seq);
@@ -1041,13 +1411,55 @@ export function MobileLiveTerminal({
     [sendData],
   );
 
-  const onPaste = useCallback(
-    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+  const onKeyDownCapture = useCallback(
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (composingRef.current || e.nativeEvent.isComposing) return;
+      if (!e.altKey || e.ctrlKey || e.metaKey) return;
+      // Capture printable Alt chords before browser accelerators can claim
+      // shortcuts like Alt+V. Special keys are handled by the normal keydown
+      // path; only printable chords become terminal Meta sequences.
+      const metaKey = altPrintableMetaKey(e, keyboardLayoutRef.current);
+      if (!metaKey) return;
       e.preventDefault();
-      const text = e.clipboardData.getData("text/plain");
-      if (text) sendData(`\x1b[200~${text}\x1b[201~`);
+      e.stopPropagation();
+      sendData(`\x1b${metaKey}`);
     },
     [sendData],
+  );
+
+  const onPaste = useCallback(
+    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      // Read clipboard data synchronously: `clipboardData` is not guaranteed
+      // to survive an await in every browser.
+      const text = e.clipboardData.getData("text/plain");
+      const imageFiles = Array.from(e.clipboardData.items ?? [])
+        .filter((it) => it.kind === "file")
+        .map((it) => it.getAsFile())
+        .filter((f): f is File => f != null && f.type.startsWith("image/"));
+
+      e.preventDefault();
+
+      if (imageFiles.length === 0) {
+        // Bracketed paste so agents treat embedded newlines as pasted text.
+        if (text) sendData(`\x1b[200~${text}\x1b[201~`);
+        return;
+      }
+
+      // The browser drops non-text clipboard payloads, so an image cannot be
+      // typed into the pane. Upload each blob to the host, then paste the
+      // file path(s) the CLI agent reads to attach them. See #2678.
+      void (async () => {
+        const paths = (await Promise.all(imageFiles.map((f) => uploadPastedImage(f)))).filter(
+          (p): p is string => p != null,
+        );
+        const parts = [text.trim(), ...paths.map(escapePastePath)].filter((s) => s.length > 0);
+        if (parts.length === 0) return;
+        // Leading and trailing spaces keep the path from gluing onto queued
+        // text or the user's next keystroke. No newline: never auto-submit.
+        sendData(`\x1b[200~ ${parts.join(" ")} \x1b[201~`);
+      })();
+    },
+    [sendData, uploadPastedImage],
   );
 
   const onCompositionStart = useCallback(() => {
@@ -1070,24 +1482,62 @@ export function MobileLiveTerminal({
   // reading scrollback the spacer model keeps above-viewport pixels invariant
   // so the position holds as the agent streams; trimming there would change
   // scrollHeight under the reader and snap the viewport.
-  const visibleRowCount = reading ? visual.rows.length : renderRowCount;
+  const visibleRowCount = reading ? visual.rows.length : Math.min(renderRowCount, visual.rows.length);
 
-  // Virtualization window over [0, visibleRowCount): the rows whose document
-  // position (effectiveSpacerLines + i) * lineH falls within the viewport, plus
-  // one viewport of overscan each side so a fast flick does not outrun the
-  // re-render. Off-window rows become top/bottom padding of identical height.
-  // height == 0 (pre-measure / jsdom) renders everything, the safe default.
-  let winStart = 0;
-  let winEnd = visibleRowCount;
+  // Virtualization windows over [0, visibleRowCount): the rows whose document
+  // positions fall within the viewport, plus one viewport of overscan each side
+  // so a fast flick does not outrun the re-render. Always keep the live tail
+  // mounted too: a bottom scroll can flip out of reading before React observes
+  // the final scrollTop, and the capture may be either spacer-backed or a full
+  // history frame. In both cases the transition must have real rows to paint.
+  let mountedRanges: Array<{ start: number; end: number }> = [{ start: 0, end: visibleRowCount }];
   if (view.height > 0 && lineH > 0) {
     const overscan = Math.ceil(view.height / lineH);
     const firstVisible = Math.floor(view.top / lineH) - effectiveSpacerLines;
     const lastVisible = Math.ceil((view.top + view.height) / lineH) - effectiveSpacerLines;
-    winStart = Math.max(0, Math.min(visibleRowCount, firstVisible - overscan));
-    winEnd = Math.max(winStart, Math.min(visibleRowCount, lastVisible + overscan));
+    const viewportRange = {
+      start: Math.max(0, Math.min(visibleRowCount, firstVisible - overscan)),
+      end: Math.max(0, Math.min(visibleRowCount, lastVisible + overscan)),
+    };
+    mountedRanges = [
+      viewportRange,
+      {
+        start: Math.max(0, visibleRowCount - overscan * 2),
+        end: visibleRowCount,
+      },
+    ];
   }
-  const topPadLines = effectiveSpacerLines + winStart;
-  const bottomPadLines = visibleRowCount - winEnd;
+  mountedRanges = mountedRanges
+    .filter((range) => range.end > range.start)
+    .sort((a, b) => a.start - b.start)
+    .reduce<Array<{ start: number; end: number }>>((ranges, range) => {
+      const prev = ranges[ranges.length - 1];
+      if (prev && range.start <= prev.end) {
+        prev.end = Math.max(prev.end, range.end);
+      } else {
+        ranges.push({ ...range });
+      }
+      return ranges;
+    }, []);
+  const mounted = mountedRanges.reduce<{
+    nextStart: number;
+    blocks: Array<{ padLines: number; start: number; end: number }>;
+  }>(
+    (acc, range, rangeIndex) => ({
+      nextStart: range.end,
+      blocks: [
+        ...acc.blocks,
+        {
+          padLines: rangeIndex === 0 ? effectiveSpacerLines + range.start : range.start - acc.nextStart,
+          start: range.start,
+          end: range.end,
+        },
+      ],
+    }),
+    { nextStart: 0, blocks: [] },
+  );
+  const bottomPadLines =
+    mounted.blocks.length === 0 ? effectiveSpacerLines + visibleRowCount : visibleRowCount - mounted.nextStart;
 
   return (
     <div className="absolute inset-0" data-live-terminal>
@@ -1119,7 +1569,7 @@ export function MobileLiveTerminal({
         // honest and the exposed strip shows the wrapper's matching --term-bg,
         // reading as terminal inner-padding.
         className={`absolute inset-x-0 top-0 bottom-[8px] font-mono flex flex-col ${
-          forwardMode ? "overflow-hidden" : "overflow-y-auto overflow-x-hidden"
+          forwardMode ? "overflow-hidden" : "overflow-y-auto overflow-x-clip"
         }`}
         style={{
           fontSize: `${fontSize}px`,
@@ -1134,6 +1584,19 @@ export function MobileLiveTerminal({
           fontVariantLigatures: "none",
           fontFeatureSettings: '"liga" 0, "calt" 0',
           overscrollBehavior: "contain",
+          // Forward mode has no native scrolling (overflow hidden): a drag
+          // becomes forwarded wheel notches in onTouchMove. Suppressing the
+          // browser's own pan must happen HERE, declaratively: React
+          // registers its delegated touchstart/touchmove/wheel listeners as
+          // passive, so a preventDefault inside onTouchMove never reaches
+          // the browser. Without this the pan falls through the
+          // non-scrollable terminal to the page, and whenever the layout
+          // viewport is taller than the visual one (soft keyboard open,
+          // Safari URL bar) iOS pans the whole page while the forwarded
+          // wheel scrolls the app, the double-scroll clunk. touch-action:
+          // none stops the browser from starting any pan or zoom for
+          // touches on the terminal; JS still receives every touch event.
+          touchAction: forwardMode ? "none" : undefined,
           // Do NOT set `-webkit-overflow-scrolling: touch` here. It promotes
           // this opaque scroll region to a composited layer that macOS/iOS
           // Safari rasterizes at 1x, making the DOM terminal text look
@@ -1164,10 +1627,29 @@ export function MobileLiveTerminal({
             opt out (`bottomAlign=false`) so a near-empty bash prompt sits at
             the top like a normal terminal. */}
         <div className={`relative whitespace-pre ${bottomAlign ? "mt-auto" : ""}`} data-live-content>
-          {topPadLines > 0 && <div style={{ height: `${topPadLines * lineH}px` }} aria-hidden="true" />}
-          {visual.rows.slice(winStart, winEnd).map((segs, j) => {
-            const i = winStart + j;
-            return <Row key={i} segs={segs} cursorCol={i === cursorRow ? live.col : null} />;
+          {mounted.blocks.map(({ padLines, start, end }) => {
+            return (
+              <Fragment key={`${start}-${end}`}>
+                {padLines > 0 && <div style={{ height: `${padLines * lineH}px` }} aria-hidden="true" />}
+                {visual.rows.slice(start, end).map((segs, j) => {
+                  const i = start + j;
+                  // Keyed by ABSOLUTE buffer position (spacer + window row),
+                  // which is invariant as the agent appends: history grows by
+                  // k, the capture window slides by k, and a given content
+                  // line keeps spacer+index. With a viewport-relative key an
+                  // append shifted every row onto a new key and re-rendered
+                  // the entire mounted slice per streamed frame.
+                  return (
+                    <Row
+                      key={effectiveSpacerLines + i}
+                      segs={segs}
+                      cursorCol={i === cursorRow ? live.col : null}
+                      focused={i === cursorRow && focused}
+                    />
+                  );
+                })}
+              </Fragment>
+            );
           })}
           {bottomPadLines > 0 && <div style={{ height: `${bottomPadLines * lineH}px` }} aria-hidden="true" />}
         </div>
@@ -1220,12 +1702,20 @@ export function MobileLiveTerminal({
         // a ghost caret floating over the terminal. caret-color is the
         // documented off switch; color guards select-all artifacts.
         style={{ fontSize: "16px", caretColor: "transparent", color: "transparent" }}
-        onFocus={() => onInputFocusChange(true)}
-        onBlur={() => onInputFocusChange(false)}
+        onFocus={() => {
+          setFocused(true);
+          onInputFocusChange(true);
+        }}
+        onBlur={() => {
+          setFocused(false);
+          onInputFocusChange(false);
+        }}
         autoCapitalize="off"
         autoCorrect="off"
         autoComplete="off"
         spellCheck={false}
+        // Capture phase claims Alt+letter before browser accelerators.
+        onKeyDownCapture={onKeyDownCapture}
         onKeyDown={onKeyDown}
         onPaste={onPaste}
         onCompositionStart={onCompositionStart}

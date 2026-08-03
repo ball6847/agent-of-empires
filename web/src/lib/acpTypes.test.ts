@@ -180,6 +180,41 @@ describe("applyEvent / UserPromptSent", () => {
     expect(state.inFlightTool).toBeNull();
   });
 
+  it("preserves the wire tool name in raw_name when a later update overwrites name with a title (#3070)", () => {
+    // opencode's `task` subagent arrives as name:"task", then a
+    // ToolCallUpdated sets a human title. name becomes the title, but
+    // raw_name must stay "task" so classification keys on wire identity.
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        ToolCallStarted: {
+          tool_call: {
+            id: "tc-task",
+            name: "task",
+            kind: "think",
+            args_preview: "{}",
+            started_at: new Date().toISOString(),
+          },
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallUpdated: {
+          tool_call_id: "tc-task",
+          title: "Trace clear session resets",
+          args_preview: JSON.stringify({ description: "Trace clear session resets", prompt: "Research only" }),
+        },
+      },
+    });
+    const row = state.activity.find((a) => a.kind === "tool_start" && a.toolCallId === "tc-task");
+    expect(row?.tool?.name).toBe("Trace clear session resets");
+    expect(row?.tool?.raw_name).toBe("task");
+  });
+
   it("carries structured media output from ToolCallCompleted.output", () => {
     // #1818: a completion can ship images/audio/resources that the text
     // concat drops. The reducer must attach the structured blocks to the
@@ -783,6 +818,66 @@ describe("applyEvent / ACP session id lifecycle", () => {
     expect(state.contextPrimerAvailable).toBeNull();
   });
 
+  it("codex /new driven reset drops the context tracker to the post-reset baseline (#2979)", () => {
+    // The server-side reset for a codex `/new` publishes UserPromptSent +
+    // SessionCleared, then the live worker's fresh session/new emits
+    // SessionContextReset + AcpSessionAssigned + Stopped(session_reset).
+    // The tracker must not hold the pre-/new usage across that boundary,
+    // and the fresh session's first UsageUpdated is the new baseline.
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { UsageUpdated: { usage: { used: 75000, size: 200000 } } },
+    });
+    expect(state.sessionUsage?.used).toBe(75000);
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { UserPromptSent: { text: "/new" } },
+    });
+    expect(state.turnActive).toBe(true);
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: "SessionCleared",
+    });
+    expect(state.sessionUsage).toBeNull();
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 4,
+      event: {
+        SessionContextReset: { reason: "conversation cleared; the agent started a fresh session" },
+      },
+    });
+    // The fresh ACP session restarts agent-side accounting at zero, so
+    // the per-clear cost baseline no longer maps onto incoming values.
+    expect(state.sessionUsage).toBeNull();
+    expect(state.usageBaseline).toBeNull();
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 5,
+      event: { AcpSessionAssigned: { acp_session_id: "fresh-uuid" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 6,
+      event: { Stopped: { reason: "session_reset" } },
+    });
+    // The clear command's synthetic turn is closed; composer unlocks.
+    expect(state.turnActive).toBe(false);
+    // The reset boundary counts as the turn's output: no spurious
+    // "Command produced no output." row under the divider.
+    expect(state.activity.some((r) => r.kind === "empty_output")).toBe(false);
+    // The fresh session's first usage report is the post-reset baseline,
+    // not the pre-/new 75k the tracker used to hold (#2979).
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 7,
+      event: { UsageUpdated: { usage: { used: 1200, size: 200000 } } },
+    });
+    expect(state.sessionUsage?.used).toBe(1200);
+  });
+
   it("UserPromptSent clears contextPrimerAvailable (one-shot affordance)", () => {
     let state = applyEvent(emptyAcpState(), {
       session_id: "s-1",
@@ -1366,6 +1461,38 @@ describe("applyEvent / ConversationCompacted", () => {
       seq: 3,
       event: "ConversationCompacted",
     });
+    expect(next.contextPrimerAvailable).toBeNull();
+  });
+});
+
+describe("applyEvent / ConversationSummary (#2808)", () => {
+  it("appends a summary row carrying the generated text", () => {
+    const next = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 12,
+      event: { ConversationSummary: { text: "- did the thing\n- next: wire the UI", summarized_until_seq: 11 } },
+    });
+    expect(next.activity).toHaveLength(1);
+    expect(next.activity[0]).toMatchObject({
+      id: "summary-12",
+      kind: "summary",
+      text: "- did the thing\n- next: wire the UI",
+    });
+  });
+
+  it("does not touch usage or the primer banner", () => {
+    const seeded: AcpState = {
+      ...emptyAcpState(),
+      sessionUsage: { used: 100, size: 200_000 },
+    };
+    const next = applyEvent(seeded, {
+      session_id: "s-1",
+      seq: 5,
+      event: { ConversationSummary: { text: "recap", summarized_until_seq: 4 } },
+    });
+    // Unlike /compact, a summary is a transcript artifact and changes no
+    // session state.
+    expect(next.sessionUsage).toEqual({ used: 100, size: 200_000 });
     expect(next.contextPrimerAvailable).toBeNull();
   });
 });
@@ -2964,5 +3091,110 @@ describe("applyEvent / elicitation", () => {
     });
     expect(state.activity.some((r) => r.toolCallId === "tc-ask")).toBe(false);
     expect(state.inFlightTool).toBeNull();
+  });
+});
+
+describe("applyEvent / UsageUpdated context-window latch (upstream #596 bandaid)", () => {
+  function usageFrame(seq: number, used: number, size: number): AcpFrame {
+    return {
+      session_id: "s-1",
+      seq,
+      event: { UsageUpdated: { usage: { used, size } } },
+    };
+  }
+  function modelFrame(seq: number, currentValue: string): AcpFrame {
+    return {
+      session_id: "s-1",
+      seq,
+      event: {
+        ConfigOptionsUpdated: {
+          options: [
+            {
+              id: "model",
+              name: "Model",
+              category: "model",
+              current_value: currentValue,
+              options: [],
+            },
+          ],
+        },
+      },
+    };
+  }
+
+  it("latches the largest window and ignores the mid-turn 200k downgrade", () => {
+    let state = applyEvent(emptyAcpState(), usageFrame(1, 10_000, 200_000));
+    expect(state.sessionUsage?.size).toBe(200_000);
+    // authoritative 1M arrives at turn end
+    state = applyEvent(state, usageFrame(2, 20_000, 1_000_000));
+    expect(state.sessionUsage?.size).toBe(1_000_000);
+    // next turn's mid-stream frame downgrades to 200k; latch holds 1M,
+    // but `used` still tracks the incoming value
+    state = applyEvent(state, usageFrame(3, 30_000, 200_000));
+    expect(state.sessionUsage?.size).toBe(1_000_000);
+    expect(state.sessionUsage?.used).toBe(30_000);
+  });
+
+  it("resets the latch on a context boundary (SessionCleared)", () => {
+    let state = applyEvent(emptyAcpState(), usageFrame(1, 20_000, 1_000_000));
+    expect(state.sessionUsage?.size).toBe(1_000_000);
+    state = applyEvent(state, { session_id: "s-1", seq: 2, event: "SessionCleared" });
+    expect(state.sessionUsage).toBeNull();
+    state = applyEvent(state, usageFrame(3, 5_000, 200_000));
+    expect(state.sessionUsage?.size).toBe(200_000);
+  });
+
+  it("resets the latch when the model changes", () => {
+    let state = applyEvent(emptyAcpState(), modelFrame(1, "sonnet"));
+    state = applyEvent(state, usageFrame(2, 20_000, 1_000_000));
+    expect(state.sessionUsage?.size).toBe(1_000_000);
+    // switch to a smaller-window model; the prior 1M latch must not stick
+    state = applyEvent(state, modelFrame(3, "haiku"));
+    expect(state.sessionUsage).toBeNull();
+    state = applyEvent(state, usageFrame(4, 5_000, 200_000));
+    expect(state.sessionUsage?.size).toBe(200_000);
+  });
+});
+
+describe("applyEvent / rate-limit banner clears on resume-to-life", () => {
+  const info = {
+    status: "rate_limited",
+    resets_at: "2026-07-23T15:40:00Z",
+    kind: "rate_limit",
+  };
+  const rateLimitFrame = (seq: number): AcpFrame => ({
+    session_id: "s-1",
+    seq,
+    event: { RateLimit: { info } },
+  });
+
+  it("clears rateLimit on the next UserPromptSent (resumed via a plain prompt)", () => {
+    // Reproduces #3028: a rate-limited turn parks the banner, the session
+    // resumes via a prompt (or a draining queued follow-up), yet the
+    // banner never went away because UserPromptSent didn't clear it.
+    let state = applyEvent(emptyAcpState(), rateLimitFrame(1));
+    expect(state.rateLimit).toEqual(info);
+    state = applyEvent(state, frame(2, "continue"));
+    expect(state.rateLimit).toBeNull();
+  });
+
+  it("clears rateLimit on a fresh AcpSessionAssigned (a new worker healed the park)", () => {
+    let state = applyEvent(emptyAcpState(), rateLimitFrame(1));
+    expect(state.rateLimit).toEqual(info);
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { AcpSessionAssigned: { acp_session_id: "acp-1" } },
+    });
+    expect(state.rateLimit).toBeNull();
+  });
+
+  it("re-derives rateLimit === null on replay when a turn resumed after the park", () => {
+    // The "stuck 4h later" symptom is replay: reconnect reapplies the
+    // event log, so the post-park UserPromptSent must clear the banner
+    // every time the state is rebuilt, not just on the live dispatch.
+    const log: AcpFrame[] = [rateLimitFrame(1), frame(2, "continue")];
+    const replayed = log.reduce(applyEvent, emptyAcpState());
+    expect(replayed.rateLimit).toBeNull();
   });
 });

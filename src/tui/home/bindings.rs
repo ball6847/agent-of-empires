@@ -35,17 +35,18 @@ pub enum ActionId {
     ToolPicker,
     SearchStart,
     SearchNext,
-    SearchPrev,
     NewSession,
     NewFromSelection,
     NewFromProject,
     AttachTerminal,
     ToggleView,
     SendMessage,
+    RespondToPermission,
     Stop,
     Delete,
     Rename,
     SetWorktreeName,
+    AddProject,
     Diff,
     Serve,
     Settings,
@@ -78,6 +79,11 @@ pub enum ActionId {
     /// Fork the selected session into a new independent session that resumes
     /// its conversation context (palette + context menu only; no chord).
     Fork,
+    /// Run the agent-driven "Auto-name now" one-shot for the selected
+    /// still-default-named session, on demand and even when auto-rename-on-start
+    /// is disabled (#3039). Terminal sessions rename locally; structured
+    /// sessions go through the daemon.
+    AutoName,
 }
 
 /// A single chord. `ctrl` requires the Control modifier; Shift is implicit in
@@ -117,6 +123,11 @@ pub enum Context {
     Always,
     TerminalView,
     AttentionSort,
+    /// Favorites are actionable: either the Attention sort is active, where
+    /// favorite is a within-tier tiebreak, or `session.favorites_first` is on,
+    /// where it pins in every sort order. With neither, toggling a favorite
+    /// would have no visible effect, so the key stays inert.
+    FavoritesUsable,
     SearchActive,
     /// The cursor is on a real (non-synthetic) project header in project view.
     ProjectGroupSelected,
@@ -180,6 +191,9 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::Always => true,
         Context::TerminalView => ctx.view_mode == ViewMode::Terminal,
         Context::AttentionSort => ctx.sort_order == SortOrder::Attention,
+        Context::FavoritesUsable => {
+            ctx.sort_order == SortOrder::Attention || crate::session::favorites_first()
+        }
         Context::SearchActive => ctx.has_search,
         Context::ProjectGroupSelected => ctx.project_group_selected,
         Context::UnreadEnabled => crate::session::unread_enabled(),
@@ -246,6 +260,18 @@ pub fn resolve_action(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<Resolve
     None
 }
 
+/// Whether a plugin-declared keybind string (e.g. `Ctrl+Shift+G`) matches this
+/// key event. The structured view resolves daemon-provided command keybinds
+/// through this rather than the local registry, so it parses the raw chord
+/// string here. A chord string that does not parse never matches.
+///
+/// Only the structured view (serve-gated) executes plugin commands, so this is
+/// unused in a bare-core build; gate it to avoid a dead-code warning there.
+#[cfg(feature = "serve")]
+pub fn keybind_matches(key_str: &str, key: &KeyEvent) -> bool {
+    parse_chord(key_str).is_some_and(|chord| chord_matches(&chord, key))
+}
+
 /// The active plugins' declared keybinds, parsed into `(chord, action)`. A
 /// keybind whose key string does not parse is skipped (its conflict-free state
 /// is surfaced by `aoe plugin info`).
@@ -300,13 +326,11 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
             c.to_ascii_lowercase()
         };
         KeyCode::Char(c)
-    } else if let Some(n) = key
-        .strip_prefix(['F', 'f'])
-        .and_then(|n| n.parse::<u8>().ok())
-    {
-        KeyCode::F(n)
     } else {
-        return None;
+        let n = key
+            .strip_prefix(['F', 'f'])
+            .and_then(|n| n.parse::<u8>().ok())?;
+        KeyCode::F(n)
     };
     Some(Chord { code, ctrl })
 }
@@ -346,18 +370,13 @@ fn format_chord(c: &Chord) -> String {
 // one (search-cycle vs new, etc.) come first so they win when their guard holds.
 pub static BINDINGS: &[Binding] = &[
     // --- search cycle (only while matches are active; both modes) ---
+    // Only bare `n` cycles (forward, wrapping). `N`/Shift+N stays a new-session
+    // key in every state so a committed search never shadows it (#3038); the
+    // forward wrap keeps every match reachable, so there is no reverse binding.
     Binding {
         id: ActionId::SearchNext,
         non_strict: &[k('n')],
         strict: &[k('n')],
-        context: Context::SearchActive,
-        help: None,
-        palette: None,
-    },
-    Binding {
-        id: ActionId::SearchPrev,
-        non_strict: &[k('N')],
-        strict: &[k('N')],
         context: Context::SearchActive,
         help: None,
         palette: None,
@@ -367,10 +386,10 @@ pub static BINDINGS: &[Binding] = &[
         id: ActionId::ToggleFavorite,
         non_strict: &[k('f')],
         strict: &[k('F')],
-        context: Context::AttentionSort,
+        context: Context::FavoritesUsable,
         help: Some(HelpMeta {
             section: HelpSection::Attention,
-            desc: "Toggle favorite (Attention sort)",
+            desc: "Toggle favorite (pin to top)",
         }),
         palette: Some(PaletteMeta {
             title: "Toggle favorite",
@@ -556,17 +575,33 @@ pub static BINDINGS: &[Binding] = &[
         }),
     },
     Binding {
+        id: ActionId::RespondToPermission,
+        non_strict: &[k('a')],
+        strict: &[k('A')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Respond to permission prompt",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Respond to permission prompt",
+            keywords: &["allow", "deny", "approve", "permission"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
+    Binding {
         id: ActionId::Stop,
         non_strict: &[k('x')],
         strict: &[k('X')],
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Actions,
-            desc: "Stop session",
+            desc: "Stop session / kill terminal (by view)",
         }),
         palette: Some(PaletteMeta {
-            title: "Stop session",
-            keywords: &["kill", "end", "halt"],
+            title: "Stop session / kill terminal",
+            keywords: &["kill", "end", "halt", "terminal"],
             group: PaletteGroup::Actions,
             serve_only: false,
         }),
@@ -615,6 +650,24 @@ pub static BINDINGS: &[Binding] = &[
         palette: Some(PaletteMeta {
             title: "Edit worktree workdir name",
             keywords: &["worktree", "workdir", "directory", "branch", "rename"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
+    Binding {
+        id: ActionId::AddProject,
+        // No default key: the action is occasional and the obvious letters are
+        // taken. Reachable from the command palette and the context menu.
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Add another project to this session",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Add project to this session",
+            keywords: &["repo", "attach", "worktree", "multi-repo", "workspace"],
             group: PaletteGroup::Actions,
             serve_only: false,
         }),
@@ -894,6 +947,25 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    // The mnemonic keys (a/A, n/N, r/R, t/T) are all taken and the home
+    // keyspace is saturated (see Fork above), so "Auto-name now" lands on the
+    // free v/V pair. Gated to a still-default-named session inside the handler.
+    Binding {
+        id: ActionId::AutoName,
+        non_strict: &[k('v')],
+        strict: &[k('V')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Auto-name session now (agent one-shot)",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Auto-name now",
+            keywords: &["rename", "title", "name", "auto", "smart", "generate"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
 ];
 
 /// Stable palette/test id for an action (matches the legacy `builtin_commands`
@@ -906,10 +978,12 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::AttachTerminal => "attach-terminal",
         ActionId::ToggleView => "toggle-view",
         ActionId::SendMessage => "send-message",
+        ActionId::RespondToPermission => "respond-to-permission",
         ActionId::Stop => "stop",
         ActionId::Delete => "delete",
         ActionId::Rename => "rename",
         ActionId::SetWorktreeName => "set-worktree-name",
+        ActionId::AddProject => "add-project",
         ActionId::Diff => "diff",
         ActionId::Serve => "serve",
         ActionId::Settings => "settings",
@@ -929,13 +1003,13 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToolPicker => "tool-picker",
         ActionId::SearchStart => "search",
         ActionId::SearchNext => "search-next",
-        ActionId::SearchPrev => "search-prev",
         ActionId::Update => "update",
         ActionId::ToggleContainer => "toggle-container",
         ActionId::ToggleProjectPin => "toggle-project-pin",
         ActionId::Tips => "tips",
         ActionId::Plugins => "plugins",
         ActionId::Fork => "fork",
+        ActionId::AutoName => "auto-name",
     }
 }
 
@@ -958,6 +1032,52 @@ mod tests {
 
     fn ctrl_key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// Serial: the favorites-first gate is a process-wide flag, so a parallel
+    /// test that applies config would race with these.
+    #[test]
+    #[serial_test::serial]
+    fn favorite_key_follows_favorites_first_outside_attention() {
+        let original = crate::session::favorites_first();
+        let c = ctx();
+        assert_eq!(
+            c.sort_order,
+            SortOrder::Newest,
+            "precondition: not Attention"
+        );
+
+        crate::session::set_favorites_first(true);
+        assert_eq!(
+            resolve(&key('f'), false, &c),
+            Some(ActionId::ToggleFavorite),
+            "favorites-first on: 'f' must work outside the Attention sort"
+        );
+
+        crate::session::set_favorites_first(false);
+        assert_ne!(
+            resolve(&key('f'), false, &c),
+            Some(ActionId::ToggleFavorite),
+            "favorites-first off: 'f' stays inert outside the Attention sort"
+        );
+
+        crate::session::set_favorites_first(original);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn favorite_key_resolves_in_attention_sort_even_with_flag_off() {
+        let original = crate::session::favorites_first();
+        crate::session::set_favorites_first(false);
+
+        let mut c = ctx();
+        c.sort_order = SortOrder::Attention;
+        assert_eq!(
+            resolve(&key('f'), false, &c),
+            Some(ActionId::ToggleFavorite)
+        );
+
+        crate::session::set_favorites_first(original);
     }
 
     #[test]
@@ -1146,31 +1266,61 @@ mod tests {
         }
     }
 
+    // #3038: a committed search must never shadow Shift+N. Only bare `n` cycles
+    // (forward); every `N`/Shift+N chord stays a new-session action whether or
+    // not a search is committed.
     #[test]
-    fn search_cycle_overrides_new_session_when_active() {
+    fn committed_search_cycles_n_but_never_shadows_shift_new_session() {
         let mut c = ctx();
         c.has_search = true;
-        for strict in [false, true] {
-            assert_eq!(resolve(&key('n'), strict, &c), Some(ActionId::SearchNext));
-            assert_eq!(resolve(&key('N'), strict, &c), Some(ActionId::SearchPrev));
-        }
-        // Without an active search, the same keys are new-session actions.
+        // Bare `n` cycles forward through matches in both modes.
+        assert_eq!(resolve(&key('n'), false, &c), Some(ActionId::SearchNext));
+        assert_eq!(resolve(&key('n'), true, &c), Some(ActionId::SearchNext));
+        // Shift+N stays a new-session action even while a search is live:
+        // NewFromSelection in non-strict, NewSession in strict.
+        assert_eq!(
+            resolve(&key('N'), false, &c),
+            Some(ActionId::NewFromSelection)
+        );
+        assert_eq!(resolve(&key('N'), true, &c), Some(ActionId::NewSession));
+
+        // Without a committed search, the same keys keep their new-session
+        // meaning; `n` is only borrowed for cycling while matches exist.
         c.has_search = false;
         assert_eq!(resolve(&key('n'), false, &c), Some(ActionId::NewSession));
+        assert_eq!(
+            resolve(&key('N'), false, &c),
+            Some(ActionId::NewFromSelection)
+        );
         assert_eq!(resolve(&key('N'), true, &c), Some(ActionId::NewSession));
+        assert_eq!(
+            resolve(&ctrl_key('n'), true, &c),
+            Some(ActionId::NewFromSelection)
+        );
     }
 
     #[test]
+    #[serial_test::serial]
     fn context_guards_gate_attention_and_terminal_actions() {
-        // Favorite/snooze only resolve in Attention sort.
+        // Snooze only resolves in the Attention sort. Favorite resolves there
+        // too, but it has a second opening (`session.favorites_first`), so pin
+        // that off to isolate the Attention-only half of its guard; the flag
+        // itself is covered by
+        // `favorite_key_follows_favorites_first_outside_attention`.
+        let original = crate::session::favorites_first();
+        crate::session::set_favorites_first(false);
+
         let mut c = ctx();
         assert_eq!(resolve(&key('f'), false, &c), None);
+        assert_eq!(resolve(&key('h'), false, &c), None);
         c.sort_order = SortOrder::Attention;
         assert_eq!(
             resolve(&key('f'), false, &c),
             Some(ActionId::ToggleFavorite)
         );
         assert_eq!(resolve(&key('h'), false, &c), Some(ActionId::ToggleSnooze));
+
+        crate::session::set_favorites_first(original);
 
         // Container toggle only resolves in Terminal view.
         let mut c = ctx();

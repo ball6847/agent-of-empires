@@ -124,40 +124,72 @@ const CLAUDE_INTERRUPT_MARKER: &str = "what should claude do instead";
 ///   2. The live token counter ("(4s · ↓ 88 tokens)") that only renders
 ///      while a turn is generating.
 ///   3. The spinner+verb shape ("✶ Working…") on a recent line.
+///   4. The parked background-agent wait line ("✻ Waiting for 1 background
+///      agent to finish").
 ///
 /// The `…` in shape (3) is what distinguishes active from completed lines.
 /// Claude renders active verbs as gerunds with a trailing `…` (`Working…`)
 /// and past-tense completions without one (`Worked for 1m 52s`), so we
-/// don't need a separate past-tense verb list.
+/// don't need a separate past-tense verb list. Shape (4) is the one active
+/// state rendered without an ellipsis; it gets its own structural match.
 pub fn detect_claude_status(content: &str) -> Status {
-    // Claude often leaves the bottom of the pane blank (cursor parked below
-    // the spinner line, or a small response in a tall pane), so we filter
-    // empty lines first and look at the last 30 non-empty lines. Matches
-    // the pattern used by detect_opencode_status and friends.
-    let non_empty: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    with_claude_recent_pane(content, |recent, recent_joined, recent_lower| {
+        // A blocking prompt has to outrank the spinner. Claude keeps its live
+        // "Working…" line rendered *below* a permission prompt or
+        // AskUserQuestion menu while it waits for the user, so a session on
+        // this pane fallback (hooks disabled, or the sandbox hook-dir
+        // bind-mount failed) would otherwise match the spinner and report
+        // Running the whole time it is blocked. See #1913.
+        if let Some(rule) = claude_blocking_prompt_rule(recent, recent_lower) {
+            tracing::trace!(target: "tmux.status", "claude pane detector: Waiting ({rule})");
+            return Status::Waiting;
+        }
+
+        if claude_pane_has_running_signal(recent, recent_joined, recent_lower) {
+            tracing::trace!(target: "tmux.status", "claude pane detector: Running (running_signal)");
+            return Status::Running;
+        }
+
+        tracing::trace!(target: "tmux.status", "claude pane detector: Idle (no_signal)");
+        Status::Idle
+    })
+}
+
+/// Build the recent-window view every Claude pane detector shares (strip
+/// ANSI, keep the last 30 non-empty lines, precompute the joined and
+/// lowercased forms) and hand it to `f` as `(recent, joined, lower)`.
+///
+/// Claude often leaves the bottom of the pane blank (cursor parked below the
+/// spinner line, or a small response in a tall pane), so empty lines are
+/// filtered before taking the window; matches the pattern used by
+/// `detect_opencode_status` and friends. Building the window in one place
+/// keeps the detectors in lockstep and lets `reconcile_claude_hook_status`
+/// scan a capture once instead of re-deriving it per check.
+fn with_claude_recent_pane<T>(raw_content: &str, f: impl FnOnce(&[&str], &str, &str) -> T) -> T {
+    let clean = strip_ansi(raw_content);
+    let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
     let recent: Vec<&str> = non_empty.iter().rev().take(30).rev().copied().collect();
     let recent_joined = recent.join("\n");
     let recent_lower = recent_joined.to_lowercase();
-
-    // A blocking approval prompt has to outrank the spinner. Claude keeps its
-    // live "Working…" line rendered *below* the permission prompt while it
-    // waits for the user, so a sandboxed session (whose in-container hook
-    // status the host can't read, see `claude_poll_fn_sandboxed`) would
-    // otherwise match the spinner and report Running the whole time it is
-    // blocked. See #1913.
-    if claude_has_approval_prompt(&recent, &recent_lower) {
-        return Status::Waiting;
-    }
-
-    if claude_pane_has_running_signal(&recent, &recent_joined, &recent_lower) {
-        return Status::Running;
-    }
-
-    Status::Idle
+    f(&recent, &recent_joined, &recent_lower)
 }
 
-/// True when the recent pane lines show that a turn is actively generating:
-/// the interrupt hint, the live token counter, or the spinner+verb shape.
+/// Which blocking-prompt rule matches the recent pane lines, if any. The rule
+/// name feeds status-decision tracing so a wrong-state report can be resolved
+/// by grepping debug.log for which detector fired.
+fn claude_blocking_prompt_rule(recent: &[&str], recent_lower: &str) -> Option<&'static str> {
+    if claude_has_approval_prompt(recent, recent_lower) {
+        return Some("approval_prompt");
+    }
+    if claude_has_ask_user_question(recent) {
+        return Some("ask_user_question");
+    }
+    None
+}
+
+/// True when the recent pane lines show that a turn is actively generating or
+/// the session is otherwise still working: the interrupt hint, the live token
+/// counter, the spinner+verb shape, or the parked background-agent wait line.
 /// `recent_joined` and `recent_lower` are the join/lowercased-join of `recent`,
 /// passed in so callers that already computed them don't redo the work.
 fn claude_pane_has_running_signal(
@@ -165,7 +197,14 @@ fn claude_pane_has_running_signal(
     recent_joined: &str,
     recent_lower: &str,
 ) -> bool {
-    if recent_lower.contains("esc to interrupt") || recent_lower.contains("ctrl+c to interrupt") {
+    // The interrupt hints are checked on a whitespace-collapsed join as well:
+    // a narrow pane word-wraps the footer, and a break inside the hint
+    // ("... · esc\n  to interrupt · ...") would otherwise hide the running
+    // signal while the parked markers on the other footer fragment survive,
+    // flipping an active turn to Idle. False joins across unrelated lines
+    // only bias toward Running, the safe direction.
+    let collapsed = collapse_ascii_whitespace(recent_lower);
+    if collapsed.contains("esc to interrupt") || collapsed.contains("ctrl+c to interrupt") {
         return true;
     }
     if has_claude_live_token_counter(recent_joined) {
@@ -173,12 +212,20 @@ fn claude_pane_has_running_signal(
     }
     recent
         .iter()
-        .any(|line| claude_line_is_active_spinner(line))
+        .any(|line| claude_line_is_active_spinner(line) || claude_line_is_background_wait(line))
 }
 
 /// Detect the live token counter Claude Code prints during generation,
-/// e.g. `(4s · ↓ 88 tokens)`. The `s · ↓ N tokens` substring is unique to
-/// the active counter; an idle pane never contains it.
+/// e.g. `(4s · ↓ 88 tokens)`. The parenthesized `s · ↓ N tokens)` shape is
+/// unique to the active counter on the spinner line.
+///
+/// The background-agents strip below the input footer renders unparenthesized
+/// counters (`1m 14s · ↓ 40.4k tokens`) and stays on screen, frozen at its
+/// final values, after the agent completes and the session is fully idle.
+/// Matching it would pin a parked session on Running (the bug #2909 fixed),
+/// so two structural requirements exclude it: the count must be a plain
+/// integer (no `40.4k` decimal/suffix forms) and `tokens` must be followed by
+/// the counter's closing paren, which strip rows never have.
 fn has_claude_live_token_counter(content: &str) -> bool {
     let mut search = content;
     while let Some(pos) = search.find("s · ↓") {
@@ -191,8 +238,13 @@ fn has_claude_live_token_counter(content: &str) -> bool {
                 break;
             }
         }
-        if digits_end > 0 && after[digits_end..].trim_start().starts_with("tokens") {
-            return true;
+        if digits_end > 0 {
+            let tail = after[digits_end..].trim_start();
+            if let Some(after_tokens) = tail.strip_prefix("tokens") {
+                if after_tokens.trim_start().starts_with(')') {
+                    return true;
+                }
+            }
         }
         // Advance past this match so we don't loop on the same position.
         search = &search[pos + "s · ↓".len()..];
@@ -201,10 +253,12 @@ fn has_claude_live_token_counter(content: &str) -> bool {
 }
 
 /// Match the `<frame> <Verb…>` shape on a single pane line. The ellipsis must
-/// be inside the first word after the frame char so we match `Working…` but
-/// not past-tense completions (`Worked for 1m 52s`, no `…`) or rendered
-/// markdown bullets (`* Cooked an amazing dish today…`, `…` is several words
-/// in).
+/// be inside the first or second word after the frame char: single-verb lines
+/// end it on word one (`Working…`), and compaction ends it on word two
+/// (`✢ Compacting conversation… (17s)`, captured from 2.1.211). Later words
+/// don't count, so past-tense completions (`Worked for 1m 52s`, no `…`) and
+/// rendered markdown bullets (`* Cooked an amazing dish today…`, `…` several
+/// words in) stay rejected.
 fn claude_line_is_active_spinner(line: &str) -> bool {
     let trimmed = line.trim_start();
     let mut chars = trimmed.chars();
@@ -219,10 +273,172 @@ fn claude_line_is_active_spinner(line: &str) -> bool {
         return false;
     }
 
-    let first_word_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-    let first_word = &rest[..first_word_end];
-    let starts_uppercase = first_word.chars().next().is_some_and(|c| c.is_uppercase());
-    starts_uppercase && first_word.contains('…')
+    let mut words = rest.split_whitespace();
+    let Some(first_word) = words.next() else {
+        return false;
+    };
+    if !first_word.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return false;
+    }
+    first_word.contains('…') || words.next().is_some_and(|w| w.contains('…'))
+}
+
+/// Match the parked background-agent wait line: `✻ Waiting for 1 background
+/// agent to finish`. The main REPL is between turns while background agents
+/// run, so the pane shows the idle input box with this status line above it,
+/// but the session is still working. It has no ellipsis in the first word, so
+/// `claude_line_is_active_spinner` misses it; without a dedicated match the
+/// pane reads as parked-idle and the reconciler flip-flops the session between
+/// Idle (age-gated downgrade during tool gaps) and Running (each background
+/// agent PreToolUse rewrites the status file).
+///
+/// The full `Waiting for <N> background agent(s) to finish` structure is
+/// required, not just a substring: Claude prefixes assistant prose with `●`
+/// and renders markdown bullets as `*` (both in `CLAUDE_SPINNER_CHARS`), so a
+/// loose match on response text like "● Waiting for background agent results"
+/// would pin an idle session on Running with no recovery path. The digit
+/// count and the exact `to finish` tail are what ordinary prose lacks.
+fn claude_line_is_background_wait(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !CLAUDE_SPINNER_CHARS.contains(&first) {
+        return false;
+    }
+    let rest = chars.as_str().trim().to_lowercase();
+    let Some(count_and_tail) = rest.strip_prefix("waiting for ") else {
+        return false;
+    };
+    let digits_end = count_and_tail
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(count_and_tail.len());
+    if digits_end == 0 {
+        return false;
+    }
+    let tail = count_and_tail[digits_end..].trim_start();
+    tail.starts_with("background agent") && tail.ends_with("to finish")
+}
+
+/// Match the past-tense turn-completion line Claude renders directly above
+/// the input box when a turn ends: `✻ Cooked for 49s`, `✻ Baked for 10s ·
+/// 1 shell still running`, `✻ Worked for 1m 52s`. Shape: a spinner frame
+/// char, a capitalized verb without the active `…`, then `for <duration>`
+/// where the duration is a digits+unit token (`49s`, `1m`), not a bare count.
+/// The unit requirement keeps rendered markdown bullets in streamed prose
+/// (`* Thanks for 2 examples`; `*` is a spinner frame char) from reading as
+/// parked evidence. The verb itself is not matched against a list: Claude's
+/// whimsical completion verbs aren't enumerable, and a false negative here
+/// pins a parked hookless session on Running, the costlier direction for
+/// this matcher. The background-agent wait line (`✻ Waiting for 1 background
+/// agent to finish`) shares the `for <digit>` skeleton but means the session
+/// is still working, so it is explicitly excluded.
+fn claude_line_is_completed_turn(line: &str) -> bool {
+    if claude_line_is_background_wait(line) {
+        return false;
+    }
+    let trimmed = line.trim_start();
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !CLAUDE_SPINNER_CHARS.contains(&first) {
+        return false;
+    }
+    let mut words = chars.as_str().split_whitespace();
+    let Some(verb) = words.next() else {
+        return false;
+    };
+    if !verb.chars().next().is_some_and(|c| c.is_uppercase()) || verb.contains('…') {
+        return false;
+    }
+    words.next() == Some("for") && words.next().is_some_and(claude_word_is_duration)
+}
+
+/// A duration token from the completion line's `for <duration>` tail: one or
+/// more digits followed by an `s`/`m`/`h` unit (`49s`, `1m`, `2h`).
+fn claude_word_is_duration(word: &str) -> bool {
+    let digits_end = word
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(word.len());
+    digits_end > 0 && matches!(&word[digits_end..], "s" | "m" | "h")
+}
+
+/// What the input box's unsubmitted typed text says about the pane. The pane
+/// state is statically ambiguous between running and parked: typed text
+/// repurposes Esc to "clear input", so Claude (verified on 2.1.212) drops the
+/// footer's `esc to interrupt` hint, and no spinner line renders while
+/// response prose streams, leaving an actively working session with zero
+/// running signals. The parked variant of the same pane differs only by the
+/// past-tense completion line (or the Esc-interrupt banner) sitting directly
+/// above the input box, so that evidence is what splits `Parked` from
+/// `Ambiguous`.
+///
+/// Ghost suggestion text also occupies the `❯` line (#2919), but it only
+/// renders after a finished turn, i.e. with the completion line above the box
+/// (see `test_claude_ready_prompt_footer_variants`), so it reads `Parked`;
+/// only text over a still-streaming transcript is `Ambiguous`.
+enum TypedPromptVerdict {
+    /// No unsubmitted typed text: the `❯` line is absent, empty, or a
+    /// numbered menu. The other pane markers decide on their own.
+    NoTypedText,
+    /// Typed text with parked evidence directly above the input box:
+    /// positive evidence the turn is over. This is a parked marker in its
+    /// own right, since typed text simultaneously defeats the bare-`❯`
+    /// marker and (on footers without a recognized idle suffix) leaves
+    /// `claude_pane_shows_ready_prompt` with nothing else to match, which
+    /// pinned a stale `running` hook write on Running with no recovery.
+    Parked,
+    /// Typed text over a transcript with no parked evidence: hold the last
+    /// observed state rather than guessing.
+    Ambiguous,
+}
+
+fn claude_typed_prompt_verdict(recent: &[&str]) -> TypedPromptVerdict {
+    let Some(prompt_idx) = recent.iter().rposition(|l| l.trim_start().starts_with('❯')) else {
+        return TypedPromptVerdict::NoTypedText;
+    };
+    let prompt_line = recent[prompt_idx].trim_start();
+    let typed = prompt_line.trim_start_matches('❯').trim();
+    if typed.is_empty() || claude_line_is_numbered_choice(prompt_line) {
+        return TypedPromptVerdict::NoTypedText;
+    }
+    // Walk up past the input box's top separator and any `⎿ Tip:` rows to the
+    // last transcript line.
+    let above = recent[..prompt_idx].iter().rev().find(|l| {
+        let t = l.trim();
+        let is_separator = !t.is_empty() && t.chars().all(|c| c == '─');
+        let is_tip = t.starts_with('⎿') && t.contains("Tip:");
+        !(is_separator || is_tip)
+    });
+    let Some(above) = above else {
+        // Nothing above the typed prompt carries parked evidence either.
+        return TypedPromptVerdict::Ambiguous;
+    };
+    if claude_line_is_completed_turn(above)
+        || above.to_lowercase().contains(CLAUDE_INTERRUPT_MARKER)
+    {
+        TypedPromptVerdict::Parked
+    } else {
+        TypedPromptVerdict::Ambiguous
+    }
+}
+
+/// A Claude pane whose only verdict would be "parked" but whose input box
+/// holds unsubmitted typed text with no parked evidence above it (see
+/// `TypedPromptVerdict::Ambiguous`). Used by the hookless status fallback to
+/// hold an already-observed Running instead of flapping a working session to
+/// Idle the moment the user pre-types their next prompt.
+pub(crate) fn claude_pane_is_ambiguous_typed_prompt(raw_content: &str) -> bool {
+    with_claude_recent_pane(raw_content, |recent, recent_joined, recent_lower| {
+        claude_blocking_prompt_rule(recent, recent_lower).is_none()
+            && !claude_pane_has_running_signal(recent, recent_joined, recent_lower)
+            && matches!(
+                claude_typed_prompt_verdict(recent),
+                TypedPromptVerdict::Ambiguous
+            )
+    })
 }
 
 /// Claude renders a blocking approval prompt when a tool needs the user's
@@ -235,6 +451,42 @@ fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
     let has_question = recent_lower.contains("do you want to")
         || recent_lower.contains("would you like to proceed");
     has_question
+        && recent
+            .iter()
+            .any(|line| claude_line_is_numbered_choice(line))
+}
+
+/// Claude's `AskUserQuestion` tool renders an interactive selection UI: an
+/// author-written question, a numbered `❯ N.` menu, and a footer that always
+/// leads with `Enter to select · ↑/↓ to navigate` (both the single-question
+/// `... · Esc to cancel` and the multi-question `... · Tab to switch questions
+/// · Esc to cancel` variants). Unlike a tool-permission prompt it carries no
+/// fixed "Do you want to" / "Would you like to proceed" phrasing, the question
+/// is arbitrary turn text, so `claude_has_approval_prompt` misses it and the
+/// `PreToolUse` `running` write sticks, pinning a session that is blocked on the
+/// user at Running. This is the Claude analogue of the codex `request_user_input`
+/// radio prompt handled by `reconcile_codex_hook_status`.
+///
+/// The footer is the positive marker: `enter to select` paired with the `↑/↓`
+/// navigate hint is unique to this selection UI and absent from a permission
+/// prompt (whose footer is `Esc to cancel · Tab to amend`). Pairing it with a
+/// numbered choice mirrors `claude_has_approval_prompt`'s two-signal guard so a
+/// rendered markdown list in prose can't match on the footer text alone.
+///
+/// The footer match is anchored to the start of a single trimmed line, for the
+/// same reason `claude_pane_shows_ready_prompt` anchors the mode-cycle footer
+/// glyph: panes merely echoing the footer text (a diff of this file, this
+/// repo's own test fixtures in Read/grep output, quoted docs) carry a prefix
+/// on the echoed line (line numbers, `+`, `⎿`, `>`), so they don't read as a
+/// live prompt. The trade-off is a pane too narrow to hold the footer on one
+/// line falls back to the running signal, i.e. pre-detector behavior, with
+/// the hook-side `waiting_tools` write as the primary layer there.
+fn claude_has_ask_user_question(recent: &[&str]) -> bool {
+    let has_select_footer = recent.iter().any(|line| {
+        let trimmed = line.trim_start().to_lowercase();
+        trimmed.starts_with("enter to select") && trimmed.contains("to navigate")
+    });
+    has_select_footer
         && recent
             .iter()
             .any(|line| claude_line_is_numbered_choice(line))
@@ -253,17 +505,6 @@ fn claude_line_is_numbered_choice(line: &str) -> bool {
     matches!(chars.next(), Some('1'..='9')) && matches!(chars.next(), Some('.'))
 }
 
-/// Strip ANSI and scan the recent pane lines for an approval prompt. Shares
-/// the same recent-window shape as `detect_claude_status`; this entry point
-/// exists for callers that hold raw (un-stripped) `capture-pane -e` output.
-fn claude_pane_has_approval_prompt(raw_content: &str) -> bool {
-    let clean = strip_ansi(raw_content);
-    let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
-    let recent: Vec<&str> = non_empty.iter().rev().take(30).rev().copied().collect();
-    let recent_lower = recent.join("\n").to_lowercase();
-    claude_has_approval_prompt(&recent, &recent_lower)
-}
-
 /// Claude has parked at the prompt after the user cancelled a turn with Esc.
 /// That path fires neither `Stop` nor an `idle_prompt` notification (verified
 /// against Claude Code 2.1.193: the `idle_prompt` timer is armed by turn
@@ -272,43 +513,328 @@ fn claude_pane_has_approval_prompt(raw_content: &str) -> bool {
 /// *and* the absence of any active-turn signal so that a fresh turn started
 /// right after the interrupt (banner still in scrollback, spinner now showing)
 /// still reads as Running.
-fn claude_pane_shows_interrupted_turn(raw_content: &str) -> bool {
-    let clean = strip_ansi(raw_content);
-    let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
-    let recent: Vec<&str> = non_empty.iter().rev().take(30).rev().copied().collect();
-    let recent_joined = recent.join("\n");
-    let recent_lower = recent_joined.to_lowercase();
+fn claude_pane_shows_interrupted_turn(
+    recent: &[&str],
+    recent_joined: &str,
+    recent_lower: &str,
+) -> bool {
     recent_lower.contains(CLAUDE_INTERRUPT_MARKER)
-        && !claude_pane_has_running_signal(&recent, &recent_joined, &recent_lower)
+        && !claude_pane_has_running_signal(recent, recent_joined, recent_lower)
+}
+
+/// How long a `running` hook write must have been standing before a pane that
+/// looks parked at the idle prompt is trusted over it. The idle ready-prompt
+/// pane is identical whether Claude just finished a turn (the hook missed the
+/// idle write, file stuck on `running`) or the user just submitted a prompt and
+/// the spinner hasn't rendered yet. The two are told apart by age: the
+/// start-of-turn gap resolves within ~1s (a running-mapped hook just wrote the
+/// file), while a stuck value has been standing since the turn's last tool
+/// call.
+///
+/// The threshold is sized for cost asymmetry, not just the render gap. A false
+/// downgrade flaps a working session to Idle (the original 6s gate did this on
+/// every >6s tool gap while a background-agent wait pane went unrecognized,
+/// #2909 regression); a late one only means a silently-finished session shows
+/// Running a bit longer. The ready-prompt detector string-matches a
+/// third-party TUI that changes between releases, so keep wide margin against
+/// the next unrecognized running state.
+const IDLE_RECONCILE_MIN_RUNNING_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The mode names Claude's mode-cycle footer leads with. 2.1.211 renders each
+/// with a `(shift+tab to cycle)` suffix; newer builds drop the suffix when
+/// extra footer segments (a statusline, background-task counts,
+/// `← for agents`) are appended, so the mode name itself is the stable marker.
+const CLAUDE_MODE_FOOTER_MODES: &[&str] = &[
+    "accept edits on",
+    "plan mode on",
+    "auto mode on",
+    "bypass permissions on",
+];
+
+/// One of Claude's idle input-box footers is on screen: manual mode's
+/// `? for shortcuts`, or a mode-cycle footer line, matched by its
+/// `(shift+tab to cycle)` suffix or by a mode name from
+/// `CLAUDE_MODE_FOOTER_MODES` (the suffix check stays for any future mode
+/// name not in the list). The mode-cycle marker is anchored to a line
+/// starting with the footer's `⏵`/`⏸` glyph rather than matched as a bare
+/// substring, so panes merely echoing the footer text (a `git diff` of this
+/// file, quoted docs, this repo's own test fixtures in tool output) don't
+/// read as parked. The footer text is identical while running and while
+/// parked: the running variant only appends `esc to interrupt`, which the
+/// running-signal check catches first.
+fn claude_has_idle_footer(recent: &[&str], recent_lower: &str) -> bool {
+    if recent_lower.contains("? for shortcuts") {
+        return true;
+    }
+    recent.iter().any(|line| {
+        let trimmed = line.trim_start();
+        if !(trimmed.starts_with('⏵') || trimmed.starts_with('⏸')) {
+            return false;
+        }
+        let lower = trimmed.to_lowercase();
+        lower.contains("shift+tab to cycle")
+            || CLAUDE_MODE_FOOTER_MODES.iter().any(|m| lower.contains(m))
+    })
+}
+
+/// Claude has finished a turn and parked at the idle ready prompt, but no idle
+/// hook fired (the "silent tool stop" path: a tool result followed by no text
+/// fires neither `Stop` nor `idle_prompt`), so the status file is stuck on
+/// `running`. The positive marker is Claude's empty input prompt (a bare `❯`
+/// line, distinct from a numbered `❯ 1.` menu), one of its input-box footers
+/// (`claude_has_idle_footer`), or unsubmitted typed text whose transcript
+/// line above is parked evidence (`TypedPromptVerdict::Parked`), combined
+/// with the absence of any active-turn signal. Requiring a positive
+/// ready-prompt marker (not merely "no spinner") keeps a blank or mid-redraw
+/// capture from reading as Idle.
+///
+/// The footer marker exists because ghost suggestion text (a pre-filled
+/// follow-up rendered on the `❯` line within a couple seconds of turn end)
+/// defeats the bare-prompt marker, so silent stops stayed stuck on Running
+/// without it. The typed-prompt marker exists because typed text defeats the
+/// bare-prompt marker the same way while the visible footer may carry no
+/// recognized idle suffix at all; the completion line (or interrupt banner)
+/// directly above the input box is then the only parked evidence on screen.
+///
+/// Ambiguous typed text (no parked evidence above it) vetoes the other
+/// markers: typing suppresses the `esc to interrupt` hint (Esc now clears the
+/// input), and no spinner renders while prose streams, so a mid-turn pane
+/// with typed text carries the mode-cycle footer and no running signal,
+/// identical to the parked pane except for the completion line above the box.
+/// Without the veto, pre-typing the next prompt flipped a working session to
+/// Idle.
+fn claude_pane_shows_ready_prompt(
+    recent: &[&str],
+    recent_joined: &str,
+    recent_lower: &str,
+) -> bool {
+    let has_empty_prompt = recent.iter().any(|line| line.trim() == "❯");
+    let typed_prompt = claude_typed_prompt_verdict(recent);
+    (has_empty_prompt
+        || claude_has_idle_footer(recent, recent_lower)
+        || matches!(typed_prompt, TypedPromptVerdict::Parked))
+        && !matches!(typed_prompt, TypedPromptVerdict::Ambiguous)
+        && !claude_pane_has_running_signal(recent, recent_joined, recent_lower)
 }
 
 /// When Claude's status hook reports Running, the pane is consulted to catch two
 /// cases the hook stream can't express on its own:
 ///
-/// 1. A blocking approval prompt: Claude keeps its live spinner rendered below
-///    the prompt and re-emits running-mapped hook events (`PreToolUse`,
-///    `UserPromptSubmit`) while it waits, so the last hook write stays
-///    `running` even though the agent is blocked on the user. Downgrade to
-///    Waiting. See #1913.
+/// 1. A blocking prompt the user must answer: a tool-permission approval prompt
+///    or an `AskUserQuestion` selection UI. Claude keeps its live spinner
+///    rendered below the prompt and re-emits running-mapped hook events
+///    (`PreToolUse`, `UserPromptSubmit`) while it waits, so the last hook write
+///    stays `running` even though the agent is blocked on the user. Downgrade to
+///    Waiting. See #1913 (permission prompt) and `claude_has_ask_user_question`.
 /// 2. An Esc-interrupted turn: cancelling a turn fires no `Stop` and no
 ///    `idle_prompt`, so the status file sticks on `running` indefinitely.
 ///    Downgrade to Idle when the pane shows the interrupt banner and no
 ///    active-turn signal.
+/// 3. A completed turn whose idle hook never fired (the "silent tool stop":
+///    a tool result with no following text fires neither `Stop` nor
+///    `idle_prompt`). The pane parks at the idle ready prompt with no
+///    active-turn signal, but that is also how a just-started turn looks
+///    before its spinner renders, so this downgrade is gated on the `running`
+///    write having been standing for `IDLE_RECONCILE_MIN_RUNNING_AGE`.
+///    `running_age` is how long ago the status file was last written (its mtime
+///    elapsed); `None` (age unavailable) is treated as not-yet-stale so we
+///    never downgrade on missing evidence.
 ///
 /// Otherwise trust the hook. Mirrors `reconcile_codex_hook_status`'s
 /// positive-evidence approach so an active turn whose pane hasn't rendered a
-/// spinner yet keeps Running rather than flickering Idle.
-pub(crate) fn reconcile_claude_hook_status(hook_status: Status, raw_content: &str) -> Status {
+/// spinner yet keeps Running rather than flickering Idle. A `Waiting` hook that
+/// went stale (an Esc-cancelled prompt) is handled separately and agent-
+/// agnostically by `reconcile_waiting_hook`.
+pub(crate) fn reconcile_claude_hook_status(
+    hook_status: Status,
+    raw_content: &str,
+    running_age: Option<std::time::Duration>,
+) -> Status {
     if hook_status != Status::Running {
         return hook_status;
     }
-    if claude_pane_has_approval_prompt(raw_content) {
+    with_claude_recent_pane(raw_content, |recent, recent_joined, recent_lower| {
+        if let Some(rule) = claude_blocking_prompt_rule(recent, recent_lower) {
+            tracing::debug!(target: "tmux.status",
+                "claude reconciler: hook Running downgraded to Waiting ({rule})");
+            return Status::Waiting;
+        }
+        if claude_pane_shows_interrupted_turn(recent, recent_joined, recent_lower) {
+            tracing::debug!(target: "tmux.status",
+                "claude reconciler: hook Running downgraded to Idle (esc_interrupt)");
+            return Status::Idle;
+        }
+        if running_age.is_some_and(|age| age >= IDLE_RECONCILE_MIN_RUNNING_AGE)
+            && claude_pane_shows_ready_prompt(recent, recent_joined, recent_lower)
+        {
+            tracing::debug!(target: "tmux.status",
+                "claude reconciler: hook Running downgraded to Idle \
+                 (stale_running_ready_prompt, age {:?})",
+                running_age);
+            return Status::Idle;
+        }
+        hook_status
+    })
+}
+
+/// Reconcile a hook that reports `Waiting` against the live pane, for any agent.
+///
+/// Several agents write `waiting` to the status file directly from a hook the
+/// moment a blocking prompt appears: Claude (`AskUserQuestion` `PreToolUse` and
+/// the `permission_prompt` `Notification`), Codex (`PermissionRequest`), Cursor
+/// and Qwen (`permission_prompt` `Notification`), and Gemini (`ToolPermission`
+/// `Notification`). The write that clears it (`PostToolUse` /
+/// `ElicitationResult` -> `running`) only fires when the tool runs to
+/// completion. If the user Esc-cancels the prompt the tool never runs, no
+/// clearing hook fires, and the status file sticks on `waiting` until the next
+/// prompt is submitted, pinning the session yellow. This is the `Waiting`
+/// analogue of the Esc-interrupt gap `reconcile_claude_hook_status` handles for
+/// `Running`.
+///
+/// Re-run the agent's own pane detector, which is built to recognize exactly
+/// that agent's blocking prompt: while the prompt is still on screen the
+/// detector re-reports `Waiting` and we keep it; once it is gone the detector's
+/// `Running` (a turn resumed) or `Idle` (parked at the prompt) verdict replaces
+/// the stale wait. An empty capture carries no evidence, so keep `Waiting`
+/// there rather than let a blank or mid-redraw frame flip a live prompt to Idle.
+/// The detector is the same one the hook-disabled path already trusts, so this
+/// adds no new false-positive surface, only the un-stick.
+pub(crate) fn reconcile_waiting_hook(agent: &str, raw_content: &str) -> Status {
+    if raw_content.trim().is_empty() {
         return Status::Waiting;
     }
-    if claude_pane_shows_interrupted_turn(raw_content) {
-        return Status::Idle;
+    match detect_status_from_content(raw_content, agent) {
+        // Prompt still on screen: the wait is real, keep it.
+        Status::Waiting => Status::Waiting,
+        // Prompt gone (Esc-cancelled, or answered with a missed clearing hook):
+        // the detector's fresh read of the pane wins over the stale hook.
+        other => {
+            tracing::debug!(target: "tmux.status",
+                "{agent} reconciler: stale hook Waiting reconciled to {other:?} (prompt gone)");
+            other
+        }
     }
-    hook_status
+}
+
+/// Reconcile an `idle` hook write against the live pane for Claude.
+///
+/// Claude's idle writers are not all ordered with its running writers. `Stop`
+/// hooks are awaited before the next prompt is processed, but `Notification`
+/// hooks are fire-and-forget: when a queued prompt submits the moment a turn
+/// ends, the `idle_prompt` notification's async `idle` write can land *after*
+/// `UserPromptSubmit`'s `running` write, leaving the status file on `idle`
+/// while the new turn is already generating. No running-mapped hook fires
+/// again until the turn's first `PreToolUse`, so during a long thinking or
+/// prose stretch the session shows Idle for tens of seconds. This is the
+/// `Idle` analogue of the stale-`waiting` race `reconcile_waiting_hook`
+/// handles.
+///
+/// The pane is the tie-breaker, using only line-anchored positive evidence: a
+/// live spinner+verb line (`✶ Working…`) or the background-agent wait line
+/// upgrades to Running, and a blocking prompt upgrades to Waiting (the same
+/// lost-write race applies to the `permission_prompt` notification). Anything
+/// else, including an empty capture, keeps the hook's `idle`.
+///
+/// This deliberately does NOT reuse `claude_pane_has_running_signal`, whose
+/// bare-substring interrupt-hint and token-counter checks are biased toward
+/// Running because they back a hook that already said `running`, where holding
+/// Running is the safe direction. Here the hook said `idle`, and the cost
+/// asymmetry flips: pane text merely *echoing* those substrings (a diff of
+/// this file, this repo's own test fixtures in Read output, quoted docs) would
+/// pin a genuinely parked session on Running with no recovery until the text
+/// scrolls away, while a missed upgrade only means the pre-fix bounded
+/// staleness (the next PreToolUse rewrites the file). The two anchored line
+/// shapes resist echoes structurally: echoed lines carry a prefix (line
+/// numbers, `+`, `⎿`, quotes), so they fail the leading-frame-char match. The
+/// legitimate signals survive the narrowing: the interrupt hint and token
+/// counter only render on the spinner line itself, so a live turn that shows
+/// either also shows the anchored spinner shape.
+///
+/// The caller gates this on the session having last been observed Running or
+/// Waiting: parked sessions (the dominant steady state) never pay the pane
+/// capture, and the reconciliation disarms once a genuine turn end is
+/// accepted.
+pub(crate) fn reconcile_claude_idle_hook_status(raw_content: &str) -> Status {
+    with_claude_recent_pane(raw_content, |recent, _recent_joined, recent_lower| {
+        if let Some(rule) = claude_blocking_prompt_rule(recent, recent_lower) {
+            tracing::debug!(target: "tmux.status",
+                "claude reconciler: hook Idle upgraded to Waiting ({rule})");
+            return Status::Waiting;
+        }
+        if recent
+            .iter()
+            .any(|line| claude_line_is_active_spinner(line) || claude_line_is_background_wait(line))
+        {
+            tracing::debug!(target: "tmux.status",
+                "claude reconciler: hook Idle upgraded to Running (live spinner line)");
+            return Status::Running;
+        }
+        Status::Idle
+    })
+}
+
+/// Content-free structural fingerprint of a Claude pane, for status-transition
+/// diagnostics: which of the positive markers the detectors and reconcilers
+/// key on are present in the recent window. Logged on every observed session
+/// status transition (`session.status_change`), so an intermittent wrong-state
+/// report carries enough evidence to identify the detector rule involved
+/// without needing the flake reproduced under trace logging. Deliberately
+/// emits marker names only, never pane text, so no conversation content lands
+/// in the log at the default `info` level.
+pub(crate) fn claude_pane_marker_fingerprint(raw_content: &str) -> String {
+    if raw_content.trim().is_empty() {
+        return "empty_capture".to_string();
+    }
+    with_claude_recent_pane(raw_content, |recent, recent_joined, recent_lower| {
+        let mut markers: Vec<&str> = Vec::new();
+        if recent
+            .iter()
+            .any(|line| claude_line_is_active_spinner(line))
+        {
+            markers.push("spinner");
+        }
+        let collapsed = collapse_ascii_whitespace(recent_lower);
+        if collapsed.contains("esc to interrupt") || collapsed.contains("ctrl+c to interrupt") {
+            markers.push("esc_hint");
+        }
+        if has_claude_live_token_counter(recent_joined) {
+            markers.push("token_counter");
+        }
+        if recent
+            .iter()
+            .any(|line| claude_line_is_background_wait(line))
+        {
+            markers.push("bg_wait");
+        }
+        if let Some(rule) = claude_blocking_prompt_rule(recent, recent_lower) {
+            markers.push(rule);
+        }
+        if recent.iter().any(|line| line.trim() == "❯") {
+            markers.push("empty_prompt");
+        }
+        if claude_has_idle_footer(recent, recent_lower) {
+            markers.push("idle_footer");
+        }
+        if recent
+            .iter()
+            .any(|line| claude_line_is_completed_turn(line))
+        {
+            markers.push("completed_turn");
+        }
+        if recent_lower.contains(CLAUDE_INTERRUPT_MARKER) {
+            markers.push("interrupt_banner");
+        }
+        match claude_typed_prompt_verdict(recent) {
+            TypedPromptVerdict::Parked => markers.push("typed_prompt_parked"),
+            TypedPromptVerdict::Ambiguous => markers.push("typed_prompt_ambiguous"),
+            TypedPromptVerdict::NoTypedText => {}
+        }
+        if markers.is_empty() {
+            "no_markers".to_string()
+        } else {
+            markers.join("+")
+        }
+    })
 }
 
 pub fn detect_opencode_status(raw_content: &str) -> Status {
@@ -1039,21 +1565,11 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
         .join("\n");
     let last_lines_lower = last_lines.to_lowercase();
 
-    if has_any_spinner(&lines) {
-        return Status::Running;
-    }
-
-    if last_lines_lower.contains("thinking")
-        || last_lines_lower.contains("working")
-        || last_lines_lower.contains("esc to interrupt")
-        || last_lines_lower.contains("ctrl+c to interrupt")
-        // Copilot's live footer reads `◎ Working ... esc cancel`; key on the
-        // interrupt hint too so a verb change doesn't drop the Running signal.
-        || last_lines_lower.contains("esc cancel")
-    {
-        return Status::Running;
-    }
-
+    // Terminal states are checked before Running. capture-pane grabs 50 lines of
+    // scrollback (`-S -50`), and Copilot leaves a finished turn's `◎ Working esc
+    // cancel` footer and spinner glyphs in that history. A completed turn whose
+    // live footer is the approval or ready prompt must win over those stale
+    // lines, otherwise the session spins forever (#2815).
     if contains_approval_prompt(
         &last_lines_lower,
         &[
@@ -1081,52 +1597,158 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
         return Status::Waiting;
     }
 
-    Status::Idle
-}
-
-/// Pi coding agent status detection via tmux pane parsing.
-/// Pi always auto-approves tool use (no approval gates), so we only detect
-/// Running vs Idle/Waiting-for-input states.
-pub fn detect_pi_status(raw_content: &str) -> Status {
-    let content = raw_content.to_lowercase();
-    let lines: Vec<&str> = content.lines().collect();
-    let non_empty_lines: Vec<&str> = lines
+    // Running signals only count on the live footer, the bottom few non-empty
+    // lines where Copilot renders its status footer and input box. Scanning the
+    // whole capture would latch onto a completed turn's `◎ Working`/spinner line
+    // still sitting in scrollback and never let go (#2815).
+    let footer: Vec<&str> = non_empty_lines
         .iter()
-        .filter(|l| !l.trim().is_empty())
+        .rev()
+        .take(3)
+        .rev()
         .copied()
         .collect();
+    let footer_lower = footer.join("\n");
 
-    let last_lines: String = non_empty_lines
-        .iter()
-        .rev()
-        .take(30)
-        .rev()
-        .copied()
-        .collect::<Vec<&str>>()
-        .join("\n");
-    let last_lines_lower = last_lines.to_lowercase();
-
-    if has_any_spinner(&lines) {
+    if has_any_spinner(&footer) {
         return Status::Running;
     }
 
-    if last_lines_lower.contains("esc to interrupt")
-        || last_lines_lower.contains("ctrl+c to interrupt")
+    if footer_lower.contains("thinking")
+        || footer_lower.contains("working")
+        || footer_lower.contains("esc to interrupt")
+        || footer_lower.contains("ctrl+c to interrupt")
+        // Copilot's live footer reads `◎ Working ... esc cancel`; key on the
+        // interrupt hint too so a verb change doesn't drop the Running signal.
+        || footer_lower.contains("esc cancel")
     {
         return Status::Running;
     }
 
-    // Check for input prompt before activity indicators: words like
-    // "reading" or "writing" linger in scrollback after the agent finishes.
+    Status::Idle
+}
+
+/// Pi coding agent status detection via tmux pane parsing.
+///
+/// Pi has no status hooks (`hook_config: None`), so this pane detector is the
+/// only status signal, and it always auto-approves tool use (no approval
+/// gates), so we only distinguish Running from Idle/Waiting-for-input.
+///
+/// Pi renders its live status as a spinner+verb line (`⠹ Working...`) sitting
+/// directly above its input box (two `────` rules), with a
+/// `<pct>%/<ctx>k (auto)  <model> • <thinking>` status line at the very
+/// bottom. When a turn finishes that spinner line is removed and pi renders no
+/// `>` prompt at rest, so the pane's only difference from the running frame is
+/// the absent spinner line.
+///
+/// That is why the Running signal is scoped to the footer (the last few
+/// non-empty lines) rather than the whole capture: a finished turn's response
+/// prose routinely contains activity words ("now working on #443", "reading
+/// the file") and a scrollback frame can still hold a spinner glyph, so
+/// scanning the last 30 lines for those substrings pinned the session on
+/// Running forever. This mirrors the footer-only approach already used by
+/// `detect_omp_status` and `detect_copilot_status`.
+pub fn detect_pi_status(raw_content: &str) -> Status {
+    let clean = strip_ansi(raw_content);
+    let non_empty_lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    // The `⠹ Working...` status line sits ~5 non-empty lines above the bottom
+    // (above the input box's two rules, the cwd line, and the status line), so
+    // the footer window must reach it while staying tight enough to exclude the
+    // bulk of a finished turn's response prose.
+    let footer: Vec<&str> = non_empty_lines
+        .iter()
+        .rev()
+        .take(6)
+        .rev()
+        .copied()
+        .collect();
+    let footer_lower = footer.join("\n").to_lowercase();
+
+    // A spinner glyph in the footer is pi's primary running signal; prose never
+    // contains braille spinner chars, so this is the reliable positive marker.
+    if has_any_spinner(&footer) {
+        return Status::Running;
+    }
+
+    if footer_lower.contains("esc to interrupt") || footer_lower.contains("ctrl+c to interrupt") {
+        return Status::Running;
+    }
+
+    // A parked input prompt outranks the activity-word fallback below: custom
+    // wrappers / older builds show a `pi>` or bare `>` prompt at rest, and an
+    // activity word lingering just above it must not flip that back to Running.
     if matches_input_prompt(&non_empty_lines, 5, &["pi>"]) {
         return Status::Waiting;
     }
 
-    let activity_indicators = ["thinking", "working", "reading", "writing", "executing"];
-    for indicator in &activity_indicators {
-        if last_lines_lower.contains(indicator) {
-            return Status::Running;
-        }
+    // Reduced-motion / no-spinner fallback: a footer line that *starts* with a
+    // live activity verb (`Working...`) is a status line, not narration buried
+    // mid-sentence. `has_live_activity_word` anchors to the line start and
+    // rejects completion markers, so a finished "...now working on #443" prose
+    // line (which does not start with the verb) stays Idle.
+    if footer
+        .iter()
+        .any(|line| has_live_activity_word(&line.to_lowercase()))
+    {
+        return Status::Running;
+    }
+
+    Status::Idle
+}
+
+/// Oh My Pi status detection via its live footer.
+///
+/// OMP keeps a bordered prompt visible both while running and while idle. The
+/// active loader is the distinguishing signal: `Working… ⟦esc⟧` with a spinner
+/// sits immediately above the prompt. Restrict spinner matching to the final
+/// three non-empty lines so a completed turn's loader in scrollback cannot pin
+/// the session on Running.
+pub fn detect_omp_status(raw_content: &str) -> Status {
+    let clean = strip_ansi(raw_content);
+    let non_empty_lines: Vec<&str> = clean
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+
+    let footer: Vec<&str> = non_empty_lines
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .copied()
+        .collect();
+    let footer_lower = footer.join("\n").to_lowercase();
+    if has_any_spinner(&footer)
+        && (footer_lower.contains("working") || footer_lower.contains("⟦esc⟧"))
+    {
+        return Status::Running;
+    }
+
+    let approval_footer: String = non_empty_lines
+        .iter()
+        .rev()
+        .take(8)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+    if approval_footer.contains("allow tool:")
+        && approval_footer.contains("approve")
+        && approval_footer.contains("deny")
+    {
+        return Status::Waiting;
+    }
+
+    let has_header = footer
+        .iter()
+        .any(|line| line.trim_start().starts_with("╭── π"));
+    let has_input = footer
+        .iter()
+        .any(|line| line.trim_start().starts_with("╰─"));
+    if has_header && has_input {
+        return Status::Waiting;
     }
 
     Status::Idle
@@ -1299,6 +1921,13 @@ pub fn detect_settl_status(_content: &str) -> Status {
     Status::Idle
 }
 
+/// Kimi Code status is detected via hooks (`[[hooks]]` in config.toml), not
+/// tmux pane parsing. This stub exists so the agent registry has a valid
+/// function pointer.
+pub fn detect_kimi_status(_content: &str) -> Status {
+    Status::Idle
+}
+
 pub fn detect_gemini_status(raw_content: &str) -> Status {
     let content = raw_content.to_lowercase();
     let lines: Vec<&str> = content.lines().collect();
@@ -1417,108 +2046,6 @@ pub fn detect_qwen_status(raw_content: &str) -> Status {
 /// Kimi uses a Rich-based TUI that renders "Thinking" labels with animated
 /// bullets, dots spinners during composition, and approval modals for tool
 /// confirmations.
-pub fn detect_kimi_status(raw_content: &str) -> Status {
-    let content = raw_content.to_lowercase();
-    let lines: Vec<&str> = content.lines().collect();
-    let non_empty_lines: Vec<&str> = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .copied()
-        .collect();
-
-    let last_lines: String = non_empty_lines
-        .iter()
-        .rev()
-        .take(30)
-        .rev()
-        .copied()
-        .collect::<Vec<&str>>()
-        .join("\n");
-    let last_lines_lower = last_lines.to_lowercase();
-
-    // Only look at the last ~15 non-empty lines for running signals.
-    // Earlier lines are scrollback from previous turns and must not leak
-    // into the current state.
-    let recent_lines: Vec<&str> = non_empty_lines.iter().rev().take(15).copied().collect();
-
-    // PRIORITY 1: Waiting — interactive panels take precedence over everything.
-    // When a question or approval panel is visible, the user must respond before
-    // the agent can continue. Stale "Using ..." or braille spinners from
-    // earlier in the turn must not mask the waiting state.
-    if last_lines_lower.contains("▲/▼ select")
-        || last_lines_lower.contains("◄/► switch question")
-        || last_lines_lower.contains("↵ confirm")
-    {
-        return Status::Waiting;
-    }
-
-    for line in &recent_lines {
-        let trimmed = line.trim();
-        // Kimi renders options inside Rich panels, so the line may start with a
-        // border character like "│" rather than the arrow itself.
-        if trimmed.contains("→ [")
-            && (trimmed.contains("1]")
-                || trimmed.contains("2]")
-                || trimmed.contains("3]")
-                || trimmed.contains("4]")
-                || trimmed.contains("5]")
-                || trimmed.contains("6]"))
-        {
-            return Status::Waiting;
-        }
-        // Multi-select questions use "[x] Option" for checked items.
-        // The trailing space after [x] keeps it distinct from normal text.
-        if trimmed.starts_with("[") && trimmed.contains("[x] ") {
-            return Status::Waiting;
-        }
-    }
-
-    // PRIORITY 2: Running — signals from the current turn only.
-    if last_lines_lower.contains("esc to interrupt")
-        || last_lines_lower.contains("ctrl+c to interrupt")
-    {
-        return Status::Running;
-    }
-
-    if has_any_spinner(&recent_lines) || has_any_moon_spinner(&recent_lines) {
-        return Status::Running;
-    }
-
-    // Specific live-spinner labels that never appear in normal conversation text.
-    let activity_indicators = [
-        "thinking...",
-        "composing...",
-        "connecting to mcp servers...",
-        "compacting...",
-    ];
-    for indicator in &activity_indicators {
-        if last_lines_lower.contains(indicator) {
-            return Status::Running;
-        }
-    }
-
-    // Kimi's "Thinking" indicator shows animated bullets and a live token
-    // counter (e.g. "Thinking .   12s · 1,234 tokens · 45 tok/s").
-    // We only match when the token-counter shapes are present so that normal
-    // sentences like "I was thinking about..." do not falsely trigger Running.
-    for line in &recent_lines {
-        let line_lower = line.to_lowercase();
-        if line_lower.contains("thinking")
-            && (line_lower.contains("s ·") || line_lower.contains("tok/s"))
-        {
-            return Status::Running;
-        }
-    }
-
-    // Live token-rate pulse (e.g. "5 tok/s") — only shown while actively
-    // streaming reasoning tokens.
-    if last_lines_lower.contains("tok/s") {
-        return Status::Running;
-    }
-
-    Status::Idle
-}
-
 pub fn detect_antigravity_status(raw_content: &str) -> Status {
     let content = raw_content.to_lowercase();
     let lines: Vec<&str> = content.lines().collect();
@@ -1869,6 +2396,89 @@ enter to select · esc to cancel";
     }
 
     #[test]
+    fn test_detect_claude_status_waiting_on_ask_user_question() {
+        // Regression: Claude's AskUserQuestion tool renders a selection UI while
+        // blocked on the user, but the question is author-written (no "Do you
+        // want to" phrasing), so the permission-prompt detector misses it and
+        // the session reports Running the whole time it is waiting. The
+        // "Enter to select · ↑/↓ to navigate" footer is the marker.
+        let content = "\
+  PREMISE GATE (your call, not auto-decided).
+  So which shape do you actually want?
+
+  ❯ 1. Static plugin (comparator stays core)
+    2. True-worker extraction (as first scoped)
+    3. Don't extract; ship the valuable byproducts
+
+  Enter to select · ↑/↓ to navigate · Esc to cancel";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_multi_question_ask_user_question() {
+        // The multi-question footer variant carries the extra "Tab to switch
+        // questions" / "n to add notes" hints; it must still read as Waiting.
+        let content = "\
+  How should the encryption key be managed?
+
+  ❯ 1. Require OTARI_SECRET_KEY
+    2. Auto-generate KEK to a file
+    3. Auto-generate KEK in DB
+
+  Enter to select · ↑/↓ to navigate · n to add notes · Tab to switch questions · Esc to cancel";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_waiting_on_ask_user_question() {
+        // The hook reports Running (PreToolUse for AskUserQuestion fired) but the
+        // pane is parked on the selection UI. The reconciler must downgrade to
+        // Waiting. ANSI is preserved to exercise the strip path.
+        let pane = "\x1b[1m  Which approach do you prefer?\x1b[0m\n\
+\x1b[1m❯ 1. First\x1b[0m\n    2. Second\n\n\
+  Enter to select · ↑/↓ to navigate · Esc to cancel";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane, None),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_detect_claude_status_running_when_pane_echoes_fixture_footer() {
+        // A Read/grep of this repo's own test fixtures (or a diff of this
+        // file) echoes the AskUserQuestion footer into the pane while a turn
+        // is live, alongside prose that quotes a numbered choice. Echoed
+        // footer lines carry a prefix (line numbers, `+`, `⎿`), so the footer
+        // match is anchored to the start of the trimmed line and must not
+        // fire; the live spinner wins. Same hardening rationale as the
+        // mode-cycle footer anchoring in claude_pane_shows_ready_prompt.
+        let content = "\
+● The fixture renders these options:
+  ❯ 1. Static plugin (comparator stays core)
+    2. True-worker extraction
+  and then the footer line:
+  ⎿ 2052   Enter to select · ↑/↓ to navigate · Esc to cancel
+
+✶ Herding… (12s · ↓ 1234 tokens)
+  esc to interrupt";
+        assert_eq!(detect_claude_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_claude_status_running_not_confused_by_select_footer_prose() {
+        // The select footer must not be mistaken for a live prompt when it only
+        // appears as quoted text (e.g. this file's own fixtures shown in tool
+        // output) with an active spinner running below it: the footer needs a
+        // real numbered choice AND the spinner still wins if there is none.
+        let content = "\
+  The footer reads \"Enter to select · ↑/↓ to navigate\" while parked.
+
+✶ Working… (4s · ↓ 88 tokens)
+  esc to interrupt";
+        assert_eq!(detect_claude_status(content), Status::Running);
+    }
+
+    #[test]
     fn test_detect_claude_status_running_not_confused_by_numbered_prose() {
         // A numbered list in assistant prose must not be mistaken for an
         // approval prompt: without a "do you want to" / "would you like to
@@ -1893,7 +2503,7 @@ enter to select · esc to cancel";
   ❯ 1. Yes\n    2. No\n\n  Esc to cancel · Tab to amend\n\
 \x1b[38;5;174m✶\x1b[0m Herding… (53s · ↓ 7.0k tokens)";
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, pane),
+            reconcile_claude_hook_status(Status::Running, pane, None),
             Status::Waiting
         );
     }
@@ -1902,23 +2512,220 @@ enter to select · esc to cancel";
     fn test_reconcile_claude_hook_status_keeps_running_without_prompt() {
         let pane = "✶ Working… (4s · ↓ 88 tokens)\n  esc to interrupt";
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, pane),
+            reconcile_claude_hook_status(Status::Running, pane, None),
             Status::Running
         );
     }
 
     #[test]
     fn test_reconcile_claude_hook_status_passes_non_running_through() {
-        // A Notification(permission_prompt) hook that does fire writes
-        // Waiting directly; the reconciler must not second-guess it, and an
-        // Idle/Waiting hook is trusted as-is even with no pane evidence.
+        // The Running-path reconciler only touches Running; a stale Waiting hook
+        // is handled by reconcile_waiting_hook instead, so here Waiting/Idle are
+        // passed straight through even with contradicting pane text.
         assert_eq!(
-            reconcile_claude_hook_status(Status::Waiting, ""),
+            reconcile_claude_hook_status(Status::Waiting, "", None),
             Status::Waiting
         );
         assert_eq!(
-            reconcile_claude_hook_status(Status::Idle, "Do you want to proceed?\n1. Yes"),
+            reconcile_claude_hook_status(Status::Idle, "Do you want to proceed?\n1. Yes", None),
             Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_waiting_hook_blank_pane_keeps_waiting() {
+        // No evidence either way: a blank or whitespace-only capture must not
+        // flip a live prompt to Idle. Keep the hook's Waiting.
+        assert_eq!(reconcile_waiting_hook("claude", ""), Status::Waiting);
+        assert_eq!(reconcile_waiting_hook("claude", "   \n\n"), Status::Waiting);
+    }
+
+    #[test]
+    fn test_reconcile_claude_idle_hook_running_pane_upgrades_to_running() {
+        // The boundary race: a queued prompt submits the moment a turn ends,
+        // and the fire-and-forget `idle_prompt` notification lands its `idle`
+        // write after `UserPromptSubmit`'s `running`. The pane shows the new
+        // turn's live spinner, so the fresh idle must read as Running.
+        let pane = "✶ Working… (4s · ↓ 88 tokens)\n  esc to interrupt";
+        assert_eq!(reconcile_claude_idle_hook_status(pane), Status::Running);
+    }
+
+    #[test]
+    fn test_reconcile_claude_idle_hook_blocking_prompt_upgrades_to_waiting() {
+        // Same race shape for the permission_prompt notification: the pane
+        // shows a blocking approval prompt while the file says idle.
+        let pane = "\
+  Do you want to proceed?\n\
+  ❯ 1. Yes\n    2. No\n\n  Esc to cancel · Tab to amend";
+        assert_eq!(reconcile_claude_idle_hook_status(pane), Status::Waiting);
+    }
+
+    #[test]
+    fn test_reconcile_claude_idle_hook_parked_pane_keeps_idle() {
+        // Genuine turn end: completion line above the ready prompt, no live
+        // signal. The hook's idle is accepted.
+        let pane = "✻ Worked for 1m 52s\n❯\n  ? for shortcuts";
+        assert_eq!(reconcile_claude_idle_hook_status(pane), Status::Idle);
+        // An empty capture carries no evidence either way; keep the hook.
+        assert_eq!(reconcile_claude_idle_hook_status("  \n \n"), Status::Idle);
+    }
+
+    #[test]
+    fn test_reconcile_claude_idle_hook_resists_echoed_running_text() {
+        // A parked session whose last tool output echoed running-signal text
+        // (a diff of this repo's own detector, quoted docs) must keep the
+        // hook's idle. Echoed lines carry a prefix (line numbers, `+`,
+        // quotes), so the anchored spinner-line match rejects them; the loose
+        // interrupt-hint and token-counter substrings would have pinned this
+        // pane on Running with no recovery until the text scrolled away.
+        let pane = "\
+●  Read(src/tmux/status_detection.rs)\n\
+  ⎿  2472:        let pane = \"✶ Working… (4s · ↓ 88 tokens)\\n  esc to interrupt\";\n\
+  ⎿  +    if collapsed.contains(\"esc to interrupt\") {\n\
+✻ Worked for 12s\n\
+❯\n\
+  ? for shortcuts";
+        assert_eq!(reconcile_claude_idle_hook_status(pane), Status::Idle);
+    }
+
+    #[test]
+    fn test_claude_pane_marker_fingerprint_running() {
+        let pane = "\
+● Sure, let me look at that.\n\
+✶ Working… (4s · ↓ 88 tokens)\n\
+  esc to interrupt\n";
+        assert_eq!(
+            claude_pane_marker_fingerprint(pane),
+            "spinner+esc_hint+token_counter"
+        );
+    }
+
+    #[test]
+    fn test_claude_pane_marker_fingerprint_parked() {
+        let pane = "\
+✻ Worked for 1m 52s\n\
+❯\n\
+  ? for shortcuts\n";
+        assert_eq!(
+            claude_pane_marker_fingerprint(pane),
+            "empty_prompt+idle_footer+completed_turn"
+        );
+        // Typed text over a completion line: the parked typed-prompt marker.
+        let typed = "\
+✻ Worked for 1m 52s\n\
+❯ half-typed next prompt\n\
+  ? for shortcuts\n";
+        assert_eq!(
+            claude_pane_marker_fingerprint(typed),
+            "idle_footer+completed_turn+typed_prompt_parked"
+        );
+    }
+
+    #[test]
+    fn test_claude_pane_marker_fingerprint_empty_and_bare() {
+        assert_eq!(claude_pane_marker_fingerprint("   \n  \n"), "empty_capture");
+        assert_eq!(
+            claude_pane_marker_fingerprint("plain prose only"),
+            "no_markers"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_waiting_hook_claude_cleared_on_esc_cancel() {
+        // Regression from #2937: Claude's PreToolUse writes `waiting` for
+        // AskUserQuestion, but Esc-cancelling the question fires no PostToolUse
+        // (the tool never completes), so the hook file sticks on `waiting`. Once
+        // the selection UI is gone and the pane shows the interrupt banner with
+        // no active-turn signal, the detector reads Idle and the stale wait
+        // clears. Before the fix the Waiting hook was trusted as-is and left the
+        // session stuck yellow. ANSI is preserved to exercise the strip path.
+        let pane = "\x1b[1m> Tell me about the weather\x1b[0m\n\
+● I'll pull that up.\n\n\
+What should Claude do instead?\n❯\n  ? for shortcuts";
+        assert_eq!(reconcile_waiting_hook("claude", pane), Status::Idle);
+    }
+
+    #[test]
+    fn test_reconcile_waiting_hook_claude_cleared_at_ready_prompt() {
+        // Same stale-`waiting` gap, cancel dropped straight back to the idle
+        // ready prompt. The parked `❯` plus the idle footer, no running signal,
+        // reads as Idle.
+        let pane = "● Done for now.\n\n❯\n  ? for shortcuts";
+        assert_eq!(reconcile_waiting_hook("claude", pane), Status::Idle);
+    }
+
+    #[test]
+    fn test_reconcile_waiting_hook_claude_resumed_turn_reads_running() {
+        // The user cancelled the question and Claude started generating again
+        // before the poll: the live spinner means Running, not a stale wait.
+        let pane = "✶ Working… (4s · ↓ 88 tokens)\n  esc to interrupt";
+        assert_eq!(reconcile_waiting_hook("claude", pane), Status::Running);
+    }
+
+    #[test]
+    fn test_reconcile_waiting_hook_claude_keeps_waiting_while_question_on_screen() {
+        // The AskUserQuestion selection UI is still parked on the pane: the
+        // detector re-reports Waiting, so the wait survives (answering a real
+        // question is unaffected).
+        let pane = "\x1b[1m  Which approach do you prefer?\x1b[0m\n\
+❯ 1. First\n    2. Second\n\n\
+  Enter to select · ↑/↓ to navigate · Esc to cancel";
+        assert_eq!(reconcile_waiting_hook("claude", pane), Status::Waiting);
+    }
+
+    #[test]
+    fn test_reconcile_waiting_hook_claude_keeps_waiting_while_approval_on_screen() {
+        let pane = "\x1b[1m  Do you want to proceed?\x1b[0m\n\
+  ❯ 1. Yes\n    2. No\n\n  Esc to cancel · Tab to amend";
+        assert_eq!(reconcile_waiting_hook("claude", pane), Status::Waiting);
+    }
+
+    #[test]
+    fn test_reconcile_waiting_hook_codex_cleared_and_kept() {
+        // Codex writes `waiting` from PermissionRequest; Esc-denying it fires no
+        // PostToolUse. Prompt gone -> detector reads Idle and clears; prompt
+        // still up -> Waiting kept.
+        assert_eq!(reconcile_waiting_hook("codex", "file saved"), Status::Idle);
+        assert_eq!(
+            reconcile_waiting_hook("codex", "approve changes?"),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_reconcile_waiting_hook_cursor_cleared_and_kept() {
+        // Cursor writes `waiting` from a permission_prompt Notification. After
+        // cancel it parks at the follow-up prompt (Idle); while the approval is
+        // up it stays Waiting.
+        assert_eq!(
+            reconcile_waiting_hook("cursor", "→ add a follow-up"),
+            Status::Idle
+        );
+        let prompt = "Run this command?\n\n> Allow this command\n  Deny\n\n\
+enter to select · esc to cancel";
+        assert_eq!(reconcile_waiting_hook("cursor", prompt), Status::Waiting);
+    }
+
+    #[test]
+    fn test_reconcile_waiting_hook_qwen_cleared_and_kept() {
+        // Qwen writes `waiting` from a permission_prompt Notification.
+        assert_eq!(
+            reconcile_waiting_hook("qwen", "random output text"),
+            Status::Idle
+        );
+        assert_eq!(
+            reconcile_waiting_hook("qwen", "Allow this tool to run?"),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_reconcile_waiting_hook_gemini_cleared_and_kept() {
+        // Gemini writes `waiting` from a ToolPermission Notification.
+        assert_eq!(reconcile_waiting_hook("gemini", "file saved"), Status::Idle);
+        assert_eq!(
+            reconcile_waiting_hook("gemini", "approve changes?"),
+            Status::Waiting
         );
     }
 
@@ -1933,7 +2740,7 @@ enter to select · esc to cancel";
         let pane = "\x1b[2m  ⎿  Interrupted · What should Claude do instead?\x1b[0m\n\n\
 \x1b[1m❯ \x1b[0m\n\n  ? for shortcuts · ← for agents";
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, pane),
+            reconcile_claude_hook_status(Status::Running, pane, None),
             Status::Idle
         );
     }
@@ -1947,20 +2754,562 @@ enter to select · esc to cancel";
 ● Picking up where we left off\n\
 ✶ Herding… (3s · ↓ 42 tokens)\n  esc to interrupt";
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, pane),
+            reconcile_claude_hook_status(Status::Running, pane, None),
             Status::Running
         );
     }
 
     #[test]
-    fn test_reconcile_claude_hook_status_trusts_running_without_interrupt_banner() {
+    fn test_reconcile_claude_hook_status_trusts_fresh_running_at_idle_prompt() {
         // No interrupt banner and no active-turn signal yet: the gap right
-        // after UserPromptSubmit before the spinner renders. We trust the
-        // hook's Running rather than flickering Idle on missing pane evidence
-        // (mirrors the conservative codex reconciler).
+        // after UserPromptSubmit before the spinner renders. The `running`
+        // write is fresh (well under the stale threshold), so we trust the
+        // hook's Running rather than flickering Idle on the idle-looking pane.
         let pane = "❯ \n\n  ? for shortcuts · ← for agents";
         assert_eq!(
-            reconcile_claude_hook_status(Status::Running, pane),
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(1))
+            ),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_idle_on_stale_running_at_idle_prompt() {
+        // The "silent tool stop": a tool result with no following text parked
+        // Claude at the idle prompt firing neither Stop nor idle_prompt, so the
+        // file is stuck on `running`. The pane shows the idle ready prompt with
+        // no active-turn signal and the write has been standing well past the
+        // threshold, so the reconciler recovers to Idle.
+        let pane = "\x1b[1m❯ \x1b[0m\n\n  ? for shortcuts · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_keeps_running_on_background_agent_wait() {
+        // Captured from Claude Code 2.1.211: the main REPL parked at the input
+        // box while a background agent works. The wait line has no ellipsis
+        // and the agents-strip token counter is k-suffixed, so neither older
+        // running-signal check matched; the pane must still read as working
+        // even with the `running` write standing far past the age gate
+        // (background tool gaps routinely exceed it). See #2909 regression.
+        let pane = "\
+● Agent(Summarize tmux module pub fns)\n\
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)\n\
+● The background agent is running. I'll wait for its completion notification.\n\
+✻ Waiting for 1 background agent to finish\n\
+──────────────────────────────\n\
+❯ \n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents · ↓ to manage\n\
+  ● main\n\
+  ◯ general-purpose  Summarize tmux module pub fns    19s · ↓ 36.4k tokens";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(300))
+            ),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_idle_after_background_agent_finished() {
+        // Same session after the agent completed and the turn ended: the
+        // agents strip stays on screen frozen at its final counters
+        // (`1m 14s · ↓ 40.4k tokens`) and the status slot shows the past-tense
+        // completion line. A stale `running` write must still downgrade to
+        // Idle; the frozen strip must not count as a live token counter.
+        let pane = "\
+  The agent flagged two things worth noting about the module surface.\n\
+✻ Churned for 1m 40s\n\
+──────────────────────────────\n\
+❯ \n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents · ↓ to manage\n\
+  ● main\n\
+  ◯ general-purpose  Summarize tmux module pub fns    1m 14s · ↓ 40.4k tokens";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_ignores_prose_background_wait_mention() {
+        // Assistant prose is prefixed with `●` (a spinner frame char), so a
+        // response line mentioning a background-agent wait must not read as
+        // the wait status line; that would pin an idle session on Running
+        // with no recovery path. The structural match (digit count + "to
+        // finish" tail) rejects it.
+        let pane = "\
+● Waiting for background agent results before summarizing.\n\
+* Waiting for 2 background agents to finish before merging\n\
+❯ \n\
+  ? for shortcuts · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_idle_with_frozen_integer_strip_counter() {
+        // A quick background agent can finish under 1k downloaded tokens, so
+        // the frozen agents strip shows a plain-integer count that would look
+        // exactly like the live counter without the closing-paren
+        // requirement. The parked session must still downgrade to Idle.
+        let pane = "\
+✻ Churned for 12s\n\
+──────────────────────────────\n\
+❯ \n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents · ↓ to manage\n\
+  ● main\n\
+  ◯ general-purpose  Quick lookup    19s · ↓ 728 tokens";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_age_gate_boundary() {
+        // The gate is inclusive: at the threshold the ready-prompt pane
+        // downgrades, one second under it keeps Running. Derived from the
+        // constant so a future retune keeps the boundary semantics tested.
+        let pane = "❯ \n\n  ? for shortcuts · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(IDLE_RECONCILE_MIN_RUNNING_AGE)
+            ),
+            Status::Idle
+        );
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(IDLE_RECONCILE_MIN_RUNNING_AGE - std::time::Duration::from_secs(1))
+            ),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_detect_claude_status_background_agent_panes() {
+        // The hookless fallback path (sandboxed sessions, custom --cmd
+        // wrappers) shares claude_pane_has_running_signal: the wait pane is
+        // Running, the finished pane with the frozen strip is Idle.
+        let waiting = "\
+✻ Waiting for 1 background agent to finish\n\
+❯ \n\
+  ◯ general-purpose  Summarize tmux module pub fns    19s · ↓ 36.4k tokens";
+        assert_eq!(detect_claude_status(waiting), Status::Running);
+
+        let finished = "\
+✻ Churned for 1m 40s\n\
+❯ \n\
+  ◯ general-purpose  Summarize tmux module pub fns    1m 14s · ↓ 40.4k tokens";
+        assert_eq!(detect_claude_status(finished), Status::Idle);
+    }
+
+    #[test]
+    fn test_claude_line_is_background_wait_variants() {
+        assert!(claude_line_is_background_wait(
+            "✻ Waiting for 1 background agent to finish"
+        ));
+        assert!(claude_line_is_background_wait(
+            "✶ Waiting for 2 background agents to finish"
+        ));
+        assert!(claude_line_is_background_wait(
+            "  · Waiting for 12 background agents to finish"
+        ));
+        // No spinner frame char.
+        assert!(!claude_line_is_background_wait(
+            "Waiting for 1 background agent to finish"
+        ));
+        // Prose: no digit count.
+        assert!(!claude_line_is_background_wait(
+            "● Waiting for background agent results"
+        ));
+        // Prose: trailing words after "to finish" break the exact tail.
+        assert!(!claude_line_is_background_wait(
+            "* Waiting for 2 background agents to finish before merging"
+        ));
+        assert!(!claude_line_is_background_wait(""));
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_idle_in_bypass_mode_with_ghost_text() {
+        // Captured from Claude Code 2.1.211 in bypass-permissions mode after a
+        // finished turn: ghost suggestion text occupies the `❯` line (so the
+        // bare-prompt marker misses) and the bypass footer has no
+        // `? for shortcuts`. The mode-cycle footer is the parked marker; a
+        // stale `running` write must still recover to Idle.
+        let pane = "\
+✻ Churned for 1m 40s\n\
+──────────────────────────────\n\
+❯ Explain how the vt.rs VtChannel is shared across viewers\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_running_with_typed_text_while_streaming() {
+        // Captured from Claude Code 2.1.212 mid-turn with unsubmitted text in
+        // the input box: typing repurposes Esc to "clear input" so the footer
+        // drops `esc to interrupt`, and prose streaming renders no spinner
+        // line, leaving zero running signals while the agent works. The
+        // mode-cycle footer alone must not read as parked here; the stale
+        // `running` write has to survive.
+        let pane = "\
+  signals onto a single channel. Applied to terminals, the idea was seductive: what if a\n\
+  single physical terminal could host several independent logical sessions, each behaving\n\
+  as though it had the machine to itself?\n\
+──────────────────────────────\n\
+❯ this is some unsubmitted text i am typing while the agent works\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_idle_with_typed_text_after_turn_end() {
+        // The parked variant of the typed-text pane (also captured from
+        // 2.1.212): identical footer and prompt line, but the past-tense
+        // completion line above the input box is positive parked evidence, so
+        // the stale `running` write still recovers to Idle.
+        let pane = "\
+✻ Cooked for 49s\n\
+──────────────────────────────\n\
+❯ this is some unsubmitted text i am typing while the agent works\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_claude_line_is_completed_turn() {
+        assert!(claude_line_is_completed_turn("✻ Cooked for 49s"));
+        assert!(claude_line_is_completed_turn(
+            "✻ Baked for 10s · 1 shell still running"
+        ));
+        assert!(claude_line_is_completed_turn("✻ Worked for 1m 52s"));
+        // Active spinner: ellipsis on the verb.
+        assert!(!claude_line_is_completed_turn(
+            "· Undulating… (14s · ↓ 144 tokens)"
+        ));
+        // Background-agent wait shares the `for <digit>` skeleton but means
+        // the session is still working.
+        assert!(!claude_line_is_completed_turn(
+            "✻ Waiting for 1 background agent to finish"
+        ));
+        // No spinner frame char.
+        assert!(!claude_line_is_completed_turn("Worked for 1m 52s"));
+        assert!(!claude_line_is_completed_turn(""));
+        // Rendered markdown bullets in streamed prose (`*` is a spinner frame
+        // char) must not read as parked evidence: the `for` tail needs a
+        // digits+unit duration, not a bare count or an ordinary word.
+        assert!(!claude_line_is_completed_turn("* Thanks for 2 examples"));
+        assert!(!claude_line_is_completed_turn(
+            "* Tested for 3 edge cases in the parser"
+        ));
+        assert!(!claude_line_is_completed_turn(
+            "● Asked for permission twice"
+        ));
+    }
+
+    #[test]
+    fn test_claude_pane_is_ambiguous_typed_prompt() {
+        // Streaming with typed text: ambiguous, hold.
+        let streaming = "\
+  prose still being generated by the model\n\
+──────────────────────────────\n\
+❯ half-typed next prompt\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(claude_pane_is_ambiguous_typed_prompt(streaming));
+        // Completion line above the box: parked, not ambiguous.
+        let parked = "\
+✻ Cooked for 49s\n\
+──────────────────────────────\n\
+❯ half-typed next prompt\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(!claude_pane_is_ambiguous_typed_prompt(parked));
+        // Esc-interrupt banner above the box: parked.
+        let interrupted = "\
+⎿  Interrupted · What should Claude do instead?\n\
+❯ half-typed next prompt\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(!claude_pane_is_ambiguous_typed_prompt(interrupted));
+        // Bare prompt: the existing parked markers decide, no ambiguity.
+        let bare = "\
+  some prose\n\
+❯ \n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(!claude_pane_is_ambiguous_typed_prompt(bare));
+        // Numbered approval menu on the `❯` line is a blocking prompt, not
+        // typed text.
+        let menu = "\
+Do you want to proceed?\n\
+❯ 1. Yes\n\
+  2. No\n\
+  ⏸ plan mode on (shift+tab to cycle)";
+        assert!(!claude_pane_is_ambiguous_typed_prompt(menu));
+        // A live running signal wins over the ambiguity.
+        let running = "\
+✽ Crunching… (19s · ↓ 166 tokens)\n\
+──────────────────────────────\n\
+❯ half-typed next prompt\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+        assert!(!claude_pane_is_ambiguous_typed_prompt(running));
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_running_in_bypass_mode_while_active() {
+        // The running variant of the same footer appends `esc to interrupt`,
+        // so an active bypass-mode turn must not read as parked even though
+        // the mode-cycle footer marker is present and the write is stale.
+        let pane = "\
+✽ Crunching… (19s · ↓ 166 tokens)\n\
+  ⎿  Tip: Use /memory to view and manage Claude memory\n\
+──────────────────────────────\n\
+❯ \n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_waiting_outranks_mode_cycle_footer() {
+        // An approval prompt pane can also carry the mode-cycle footer. The
+        // Waiting downgrade must win over the ready-prompt downgrade even
+        // with a stale `running` write, so a blocked question is never
+        // reported as Idle.
+        let pane = "\
+Do you want to proceed?\n\
+❯ 1. Yes\n\
+  2. No\n\
+──────────────────────────────\n\
+  ⏸ plan mode on (shift+tab to cycle) · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_stale_running_typed_prompt_over_completion_line() {
+        // Regression for a session pinned on Running: the turn ended but no
+        // idle hook fired, and the parked pane offered neither of the old
+        // positive markers. Typed unsubmitted text defeats the bare-`❯`
+        // marker, and this newer footer drops `(shift+tab to cycle)` (extra
+        // segments take its place), so the stale `running` write was trusted
+        // forever. The completion line directly above the typed prompt is
+        // the parked evidence; pane captured verbatim from the hung session.
+        let parked = "\
+✻ Sautéed for 39s · 1 monitor still running\n\
+──────────────────────────────\n\
+❯ stop the monitor\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage";
+        // The same box over a still-streaming transcript stays ambiguous:
+        // the footer alone must not downgrade a pre-typed working session.
+        let streaming = "\
+  prose still being generated by the model\n\
+──────────────────────────────\n\
+❯ stop the monitor\n\
+──────────────────────────────\n\
+  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage";
+        let cases = [(parked, Status::Idle), (streaming, Status::Running)];
+        for (pane, expected) in cases {
+            assert_eq!(
+                reconcile_claude_hook_status(
+                    Status::Running,
+                    pane,
+                    Some(std::time::Duration::from_secs(120))
+                ),
+                expected,
+                "pane:\n{pane}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_claude_ready_prompt_footer_variants() {
+        // Parked footers captured from 2.1.211 by cycling shift+tab, plus
+        // the newer variant that drops the shift+tab suffix for extra
+        // segments; each pane has ghost suggestion text defeating the
+        // bare-prompt marker. Every variant must read as parked end-to-end
+        // AND match the footer marker itself (the ghost-text pane also
+        // carries the typed-prompt parked marker, so only the direct check
+        // pins the footer matcher); an echoed footer (diff/tool output, so
+        // the line doesn't start with the footer glyph) and the running
+        // footer variant must not.
+        for footer in [
+            "  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents",
+            "  ⏸ plan mode on (shift+tab to cycle) · ← for agents",
+            "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents",
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+            "  ⏸ manual mode on · ? for shortcuts · ← for agents",
+            "  ⏵⏵ bypass permissions on · PR #444 · 1 monitor · ← for agents · ↓ to manage",
+        ] {
+            let pane = format!("✻ Churned for 10s\n❯ ghost suggestion text\n{footer}");
+            assert!(
+                with_claude_recent_pane(&pane, claude_pane_shows_ready_prompt),
+                "expected parked for footer: {footer}"
+            );
+            assert!(
+                with_claude_recent_pane(footer, |recent, _, lower| claude_has_idle_footer(
+                    recent, lower
+                )),
+                "expected idle-footer match for: {footer}"
+            );
+        }
+        let echoed = "\
++  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents\n\
+❯ ghost suggestion text";
+        assert!(!with_claude_recent_pane(
+            echoed,
+            claude_pane_shows_ready_prompt
+        ));
+        let running = "\
+❯ ghost suggestion text\n\
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents";
+        assert!(!with_claude_recent_pane(
+            running,
+            claude_pane_shows_ready_prompt
+        ));
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_running_during_compaction() {
+        // Compaction renders its ellipsis on the second word
+        // (`✢ Compacting conversation… (17s)`, captured from 2.1.211) and
+        // fires no hooks, so the `running` write goes stale while it runs.
+        // The spinner match must keep the session Running even when the
+        // wrapped footer splits the `esc to interrupt` hint across lines.
+        let pane = "\
+✢ Compacting conversation… (17s)\n\
+❯ \n\
+  ⏵⏵ auto mode on (shift+tab to cycle) · esc\n\
+  to interrupt · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_running_with_wrapped_interrupt_hint() {
+        // A narrow pane word-wraps the footer; a break inside the interrupt
+        // hint must not hide the running signal while the mode-cycle marker
+        // survives intact on its fragment (that combination flipped an
+        // active turn to Idle before the whitespace-collapsed hint check).
+        let pane = "\
+❯ \n\
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc\n\
+  to interrupt · ← for agents";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_stale_running_keeps_running_while_active() {
+        // A long tool run can leave the `running` write stale (mtime old)
+        // while the turn is genuinely active. The live active-turn signal must
+        // still win over the age gate; only an idle-looking pane downgrades.
+        let pane = "✶ Working… (90s · ↓ 4.1k tokens)\n  esc to interrupt";
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                pane,
+                Some(std::time::Duration::from_secs(120))
+            ),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_stale_running_keeps_running_on_blank_pane() {
+        // Stale write but no positive idle marker (a blank / mid-redraw
+        // capture). Absence of a spinner is not enough; without the ready
+        // prompt we trust the hook rather than flicker Idle.
+        assert_eq!(
+            reconcile_claude_hook_status(
+                Status::Running,
+                "   \n\n  ",
+                Some(std::time::Duration::from_secs(120))
+            ),
             Status::Running
         );
     }
@@ -2959,6 +4308,32 @@ run this command? (y/n)
     }
 
     #[test]
+    fn test_detect_copilot_status_stale_working_in_scrollback() {
+        // #2815: capture-pane returns 50 lines of scrollback, so a finished
+        // turn's `◎ Working esc cancel` footer and a frozen spinner glyph
+        // linger above the live idle footer. The turn is done; status must read
+        // Waiting, not spin forever on the stale lines.
+        let pane = "> summarize the readme\n\
+                    ◎ Working esc cancel    MAI-Code-1-Flash\n\
+                    Here is the summary. ⠋\n\
+                    It covers setup and usage.\n\
+                    More detail follows here.\n\
+                    ┃\n\
+                    / commands · ? help · tab next tab";
+        assert_eq!(detect_copilot_status(pane), Status::Waiting);
+
+        // Same stale scrollback, but the live footer is a bare ready prompt
+        // (footer text drifted / no full three-token footer). Still done.
+        let pane_prompt = "> summarize the readme\n\
+                           ◎ Working esc cancel\n\
+                           Here is the summary.\n\
+                           It covers setup and usage.\n\
+                           More detail follows here.\n\
+                           >";
+        assert_eq!(detect_copilot_status(pane_prompt), Status::Waiting);
+    }
+
+    #[test]
     fn test_detect_pi_status_running() {
         assert_eq!(detect_pi_status("generating ⠋"), Status::Running);
         assert_eq!(detect_pi_status("loading ⠹"), Status::Running);
@@ -2986,6 +4361,95 @@ run this command? (y/n)
     fn test_detect_pi_status_idle() {
         assert_eq!(detect_pi_status("file saved"), Status::Idle);
         assert_eq!(detect_pi_status("random output text"), Status::Idle);
+    }
+
+    /// Pi's live running frame: a braille spinner + `Working...` line sits just
+    /// above the input box (two `────` rules), with the `%/Nk (auto)` status
+    /// line at the very bottom. Captured from pi 0.82 driving a real turn.
+    const PI_RUNNING_PANE: &str = "\
+Twelve is a dozen.\n\
+⠏ Working...\n\
+────────────────────────────────────────\n\
+────────────────────────────────────────\n\
+/tmp\n\
+0.0%/272k (auto)                    gpt-5.5 • medium\n";
+
+    /// Pi parked after finishing a turn whose response prose contains the word
+    /// "working" (an agent narrating "now working on #443"). Pi renders no `>`
+    /// prompt at rest, so the old activity-word substring scan over the last 30
+    /// lines matched "working" and pinned the session on Running forever.
+    /// Captured shape from pi 0.82 idle footer.
+    const PI_FINISHED_PANE_WITH_ACTIVITY_PROSE: &str = "\
+I'll launch an aoe session to fix #443.\n\
+The agent is now working on #443, extending the SSRF gate to the write path.\n\
+You can monitor progress with aoe session logs.\n\
+────────────────────────────────────────\n\
+\n\
+────────────────────────────────────────\n\
+/Users/nbrake/scm/otari-workspace/otari-worktrees/orchestrator\n\
+↑45k ↓11k $0.009 9.6%/500k (auto)                    gpt-5.5 • medium\n";
+
+    #[test]
+    fn test_detect_pi_status_running_spinner_footer() {
+        assert_eq!(detect_pi_status(PI_RUNNING_PANE), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_pi_status_finished_with_activity_prose_is_not_running() {
+        // Regression for the "stuck on Running" bug: a finished pi turn whose
+        // response prose contains an activity word must NOT read as Running.
+        assert_eq!(
+            detect_pi_status(PI_FINISHED_PANE_WITH_ACTIVITY_PROSE),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_detect_omp_status_running() {
+        let pane = "Reply with OK only.\n\
+                    ⠋ Working… ⟦esc⟧\n\
+                    ╭── π  > GPT-5.6 Sol ─╮\n\
+                    ╰─                   ─╯";
+        assert_eq!(detect_omp_status(pane), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_omp_status_running_over_stale_approval() {
+        let pane = "Allow tool: bash\n\
+                    Approve\n\
+                    Deny\n\
+                    ⠋ Working… ⟦esc⟧\n\
+                    ╭── π  > GPT-5.6 Sol ─╮\n\
+                    ╰─                   ─╯";
+        assert_eq!(detect_omp_status(pane), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_omp_status_waiting() {
+        let pane = "OK\n\
+                    ╭── π  > GPT-5.6 Sol ─╮\n\
+                    ╰─                   ─╯";
+        assert_eq!(detect_omp_status(pane), Status::Waiting);
+        assert_eq!(
+            detect_omp_status("Allow tool: bash\nApprove\nDeny"),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_detect_omp_status_ignores_stale_loader() {
+        let pane = "⠋ Working… ⟦esc⟧\n\
+                    Completed response.\n\
+                    Additional output.\n\
+                    OK\n\
+                    ╭── π  > GPT-5.6 Sol ─╮\n\
+                    ╰─                   ─╯";
+        assert_eq!(detect_omp_status(pane), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_omp_status_idle_without_prompt() {
+        assert_eq!(detect_omp_status("plain command output"), Status::Idle);
     }
 
     #[test]
@@ -3129,6 +4593,13 @@ run this command? (y/n)
     }
 
     #[test]
+    fn test_detect_kimi_status_is_stub() {
+        // Kimi uses hook-based detection; the stub always returns Idle
+        assert_eq!(detect_kimi_status("anything"), Status::Idle);
+        assert_eq!(detect_kimi_status(""), Status::Idle);
+    }
+
+    #[test]
     fn test_detect_qwen_status_running() {
         assert_eq!(
             detect_qwen_status("processing request\nesc to interrupt"),
@@ -3175,184 +4646,6 @@ run this command? (y/n)
     fn test_detect_qwen_status_idle() {
         assert_eq!(detect_qwen_status("file saved"), Status::Idle);
         assert_eq!(detect_qwen_status("random output text"), Status::Idle);
-    }
-
-    #[test]
-    fn test_detect_kimi_status_running() {
-        // Interrupt hint
-        assert_eq!(
-            detect_kimi_status("processing request\nesc to interrupt"),
-            Status::Running
-        );
-        // Braille spinner (Rich "dots" spinner on tool calls / composing)
-        assert_eq!(
-            detect_kimi_status("⠋ Thinking about your request"),
-            Status::Running
-        );
-        assert_eq!(detect_kimi_status("⠧ Reading file.rs"), Status::Running);
-        assert_eq!(
-            detect_kimi_status("⠋ Using grep (pattern)"),
-            Status::Running
-        );
-        // Moon spinner (turn active but no content produced yet)
-        assert_eq!(detect_kimi_status("🌑 "), Status::Running);
-        assert_eq!(detect_kimi_status("🌕 "), Status::Running);
-        // Specific live-spinner labels
-        assert_eq!(detect_kimi_status("Thinking..."), Status::Running);
-        assert_eq!(detect_kimi_status("Composing..."), Status::Running);
-        assert_eq!(
-            detect_kimi_status("Connecting to MCP servers..."),
-            Status::Running
-        );
-        assert_eq!(detect_kimi_status("Compacting..."), Status::Running);
-        // Thinking indicator with live token counter
-        assert_eq!(
-            detect_kimi_status("Thinking  ..  2s · 12 tokens · 5 tok/s"),
-            Status::Running
-        );
-    }
-
-    #[test]
-    fn test_detect_kimi_status_idle_no_false_positive_from_activity_words() {
-        // Regression: broad activity words in normal output must NOT trigger Running.
-        assert_eq!(
-            detect_kimi_status("I was thinking about your question"),
-            Status::Idle
-        );
-        assert_eq!(
-            detect_kimi_status("Executing the plan step by step"),
-            Status::Idle
-        );
-        assert_eq!(detect_kimi_status("Processing the data now"), Status::Idle);
-        assert_eq!(
-            detect_kimi_status("Using this approach works well"),
-            Status::Idle
-        );
-        assert_eq!(
-            detect_kimi_status("In the context of this problem"),
-            Status::Idle
-        );
-        assert_eq!(
-            detect_kimi_status("Running command: cargo test"),
-            Status::Idle
-        );
-        assert_eq!(
-            detect_kimi_status("context: 12.3% (1.2k/128k)"),
-            Status::Idle
-        );
-    }
-
-    #[test]
-    fn test_detect_kimi_status_waiting_approval_panel() {
-        // Kimi approval panel uses "→ [N]" cursor and "▲/▼ select" hint
-        let approval_panel = "\
-approval
-
-→ [1] Approve once
-  [2] Approve for this session
-  [3] Reject
-
-▲/▼ select  1/2/3/4 choose  ↵ confirm";
-        assert_eq!(detect_kimi_status(approval_panel), Status::Waiting);
-    }
-
-    #[test]
-    fn test_detect_kimi_status_waiting_question_panel() {
-        // Kimi question panel uses "→ [N]" cursor and "◄/► switch question" hint
-        let question_panel = "\
-question
-
-? Pick a fruit:
-
-→ [1] Apple
-  [2] Banana
-  [3] Orange
-
-◄/► switch question  ▲/▼ select  ↵ submit  esc exit";
-        assert_eq!(detect_kimi_status(question_panel), Status::Waiting);
-    }
-
-    #[test]
-    fn test_detect_kimi_status_waiting_arrow_cursor_alone() {
-        // Bare "→ [N]" should also flip to Waiting
-        assert_eq!(
-            detect_kimi_status("→ [1] Yes\n  [2] No\n  [3] Maybe"),
-            Status::Waiting
-        );
-    }
-
-    #[test]
-    fn test_detect_kimi_status_waiting_with_rich_border() {
-        // Rich panels draw a "│" border before the content, so the cursor is
-        // not at the start of the captured line.
-        let panel = "\
-│ → [1] A programming language
-│       e.g., Rust, quantum computing
-│   [2] A creative skill
-│   [3] A physical discipline
-│   [4] A practical life skill
-│   [5] Other";
-        assert_eq!(detect_kimi_status(panel), Status::Waiting);
-    }
-
-    #[test]
-    fn test_detect_kimi_status_waiting_multi_select() {
-        // Multi-select questions show [x] for checked items alongside [ ].
-        let multi = "\
-question
-
-? Pick your favourites:
-
-[x] Apple
-[ ] Banana
-[x] Cherry
-[ ] Durian";
-        assert_eq!(detect_kimi_status(multi), Status::Waiting);
-    }
-
-    #[test]
-    fn test_detect_kimi_status_waiting_overrides_stale_running_scrollback() {
-        // Regression: "Using Ask" with a braille spinner in scrollback above a
-        // question panel must be detected as Waiting, not Running.
-        let pane = "\
-⠋ Composing... 2s · 12 tokens
-⠋ Using Ask
-
-? What would you like to know?
-
-→ [1] Yes
-  [2] No
-
-◄/► switch question  ▲/▼ select  ↵ submit  esc exit";
-        assert_eq!(detect_kimi_status(pane), Status::Waiting);
-    }
-
-    #[test]
-    fn test_detect_kimi_status_idle_no_false_positive_from_approve() {
-        // Regression: "approve" / "allow" in normal output must NOT trigger Waiting.
-        assert_eq!(
-            detect_kimi_status("I will approve the changes for you"),
-            Status::Idle
-        );
-        assert_eq!(
-            detect_kimi_status("This will allow you to continue"),
-            Status::Idle
-        );
-        assert_eq!(detect_kimi_status("run command? (y/n)"), Status::Idle);
-        assert_eq!(
-            detect_kimi_status("Select:\n❯ 1. Option A\n  2. Option B"),
-            Status::Idle
-        );
-    }
-
-    #[test]
-    fn test_detect_kimi_status_idle() {
-        assert_eq!(detect_kimi_status("file saved"), Status::Idle);
-        assert_eq!(detect_kimi_status("random output text"), Status::Idle);
-        assert_eq!(
-            detect_kimi_status("Thought for 12s · 1,234 tokens"),
-            Status::Idle
-        );
     }
 
     #[test]

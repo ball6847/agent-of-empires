@@ -22,11 +22,12 @@
 //! restart at worst causes a re-attach instead of a clean attach.
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+use crate::util::now_secs;
 
 // Generic worker-subprocess plumbing now lives in `process::worker`; the
 // registry is the ACP consumer of it. Re-exported so the names referenced
@@ -126,13 +127,6 @@ impl WorkerRecord {
             detached_at: None,
         }
     }
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Directory holding worker JSON files, log files, and the per-session
@@ -283,6 +277,9 @@ pub fn delete(session_id: &str) -> Result<()> {
     }
     if let Ok(p) = socket_path_for(session_id) {
         let _ = std::fs::remove_file(&p);
+        // Sibling control socket (Phase A of #1054); best-effort, absent
+        // for runners that predate the control channel.
+        let _ = std::fs::remove_file(crate::process::worker::control_socket_sibling(&p));
     }
     if let Ok(p) = log_path_for(session_id) {
         if matches!(std::fs::metadata(&p), Ok(m) if m.len() == 0) {
@@ -328,7 +325,7 @@ pub fn mark_detached(session_id: &str) {
 /// of `session/new` on reattach.
 pub fn update_stored_acp_session_id(session_id: &str, acp_id: Option<&str>) {
     if let Ok(Some(mut rec)) = load(session_id) {
-        rec.stored_acp_session_id = acp_id.map(|s| s.to_string());
+        rec.stored_acp_session_id = acp_id.filter(|s| !s.is_empty()).map(|s| s.to_string());
         if let Err(e) = save(&rec) {
             debug!(
                 target: "acp.registry",
@@ -428,10 +425,30 @@ pub fn pid_source_for(session_id: &str) -> Option<u32> {
 /// killpg and leak surviving descendants. `killpg` ignores ESRCH, so an
 /// already-empty group is a harmless no-op. See #1689.
 pub fn terminate(session_id: &str) {
-    if let Some(pid) = pid_source_for(session_id) {
+    let terminated_pid = pid_source_for(session_id);
+    if let Some(pid) = terminated_pid {
         crate::process::worker::terminate_process_group(pid);
     }
-    delete(session_id).ok();
+    // Generation-aware cleanup: only remove the entry and socket if they
+    // still belong to the runner we just signalled. A replacement runner
+    // can bind the socket and `save` a new record (with a different pid)
+    // before we reach this line; deleting then would strand the successor,
+    // whose own watchdog would see "missing" and cascade. If the record is
+    // gone, unreadable, or still carries the terminated pid, the files are
+    // ours to clear.
+    match load(session_id) {
+        Ok(Some(rec)) if Some(rec.pid) != terminated_pid => {
+            debug!(
+                target: "acp.registry",
+                session = %session_id,
+                current_pid = rec.pid,
+                "skipping cleanup; registry entry now belongs to a replacement runner"
+            );
+        }
+        _ => {
+            delete(session_id).ok();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -663,6 +680,30 @@ mod tests {
             save(&rec).unwrap();
             let loaded = load("sess-sp").unwrap().unwrap();
             assert_eq!(loaded.source_profile.as_deref(), Some("personal"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn empty_stored_acp_session_id_normalizes_to_none() {
+        with_temp_home(|| {
+            let rec = WorkerRecord::new(
+                "sess-empty-acp".into(),
+                1,
+                PathBuf::from("/tmp/sess-empty-acp.sock"),
+                "aoe-agent".into(),
+                "aoe-agent".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                Some("initial-acp".into()),
+                None,
+            );
+            save(&rec).unwrap();
+            update_stored_acp_session_id("sess-empty-acp", Some(""));
+            let loaded = load("sess-empty-acp").unwrap().unwrap();
+            assert_eq!(loaded.stored_acp_session_id, None);
         });
     }
 

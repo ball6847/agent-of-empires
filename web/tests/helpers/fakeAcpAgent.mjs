@@ -14,8 +14,9 @@
 //                          `session/request_permission` JSON-RPC
 //                          REQUEST; the fake awaits the client's
 //                          response before continuing the turn.
-//   session/set_mode    -> emit current_mode_update (also accepts the
-//                          legacy camelCase `session/setMode`)
+//   session/set_mode    -> change mode; most fixtures also emit
+//                          current_mode_update (accepts the legacy
+//                          camelCase `session/setMode` too)
 //   session/cancel      -> notification (no response); sets a per-
 //                          session cancel flag that the in-flight
 //                          session/prompt loop polls so the prompt
@@ -47,7 +48,7 @@
 // exhausted, subsequent prompts get the default happy-path turn.
 
 import { createInterface } from "node:readline";
-import { readFileSync, existsSync, appendFileSync } from "node:fs";
+import { readFileSync, existsSync, appendFileSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 
 // Silently swallow EPIPE/EBADF on stdout/stderr writes. The fake is a
@@ -132,13 +133,30 @@ function loadScript() {
 }
 
 const script = loadScript();
-let turnCursor = 0;
+
+// Turn cursor is per-process by default. When FAKE_ACP_TURN_STATE points at a
+// file, persist the cursor there so it survives a respawn: a resume-after-
+// rate-limit spawns a fresh fake process, and a test that needs the resumed
+// turn to differ from the parked one (e.g. rate-limit -> resume -> continue)
+// must not restart at turn 0. Opt-in so every other test keeps the simple
+// per-process behavior.
+const TURN_STATE_PATH = process.env.FAKE_ACP_TURN_STATE;
+let turnCursor = (() => {
+  if (!TURN_STATE_PATH || !existsSync(TURN_STATE_PATH)) return 0;
+  const n = Number.parseInt(readFileSync(TURN_STATE_PATH, "utf8").trim(), 10);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+})();
 
 function nextTurn() {
-  if (turnCursor < script.turns.length) {
-    return script.turns[turnCursor++];
+  const turn = turnCursor < script.turns.length ? script.turns[turnCursor++] : DEFAULT_TURN;
+  if (TURN_STATE_PATH) {
+    try {
+      writeFileSync(TURN_STATE_PATH, String(turnCursor));
+    } catch (err) {
+      process.stderr.write(`[fakeAcpAgent] failed to persist turn cursor: ${err}\n`);
+    }
   }
-  return DEFAULT_TURN;
+  return turn;
 }
 
 function send(obj) {
@@ -222,26 +240,60 @@ const DEFAULT_PERMISSION_OPTIONS = [
 // "cancelled" instead of running the rest of the scripted updates.
 const cancelFlags = new Map();
 
-// OpenCode-shaped mode advertisement (#1764). When
-// FAKE_ACP_MODE_VIA_CONFIG_OPTION is set, the fake advertises its modes
-// ONLY as a `category:"mode"` config option (no ACP SessionModeState
-// `modes` field) and rejects any mode value outside this list, exactly
-// like `opencode acp`. Lets a test prove the structured view picker reads the
-// config-option channel and never offers a phantom "default" mode.
+// Config-option mode fixtures. A truthy
+// FAKE_ACP_MODE_VIA_CONFIG_OPTION uses OpenCode's config-only channel;
+// the `codex` value advertises Codex's current modes through both mode
+// channels. This covers manual picker routing (#1764) and startup
+// auto-approve channel precedence.
 const OPENCODE_MODE_CHOICES = [
   { value: "build", name: "Build" },
   { value: "plan", name: "Plan" },
 ];
-const opencodeModeBySession = new Map();
+const CODEX_MODE_CHOICES = [
+  {
+    value: "read-only",
+    name: "Read-only",
+    description: "Requires approval to edit files and run commands.",
+  },
+  {
+    value: "agent",
+    name: "Agent",
+    description: "Read and edit files, and run commands.",
+  },
+  {
+    value: "agent-full-access",
+    name: "Agent (full access)",
+    description: "Edit outside the workspace and use network access.",
+  },
+];
+const modeBySession = new Map();
 
-function makeOpencodeModeOption(currentValue) {
+function modeFixture() {
+  if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION === "codex") {
+    return {
+      choices: CODEX_MODE_CHOICES,
+      defaultValue: "agent",
+      includeSessionModes: true,
+    };
+  }
+  if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION) {
+    return {
+      choices: OPENCODE_MODE_CHOICES,
+      defaultValue: "build",
+      includeSessionModes: false,
+    };
+  }
+  return null;
+}
+
+function makeModeOption(currentValue, fixture) {
   return {
     id: "mode",
     name: "Session Mode",
     category: "mode",
     type: "select",
     currentValue,
-    options: OPENCODE_MODE_CHOICES,
+    options: fixture.choices,
   };
 }
 
@@ -278,12 +330,28 @@ function buildSessionConfigOptions(sessionId) {
       ],
     },
   ];
-  if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION) {
-    const current = opencodeModeBySession.get(sessionId) ?? "build";
-    opencodeModeBySession.set(sessionId, current);
-    configOptions.push(makeOpencodeModeOption(current));
+  const fixture = modeFixture();
+  if (fixture) {
+    const current = modeBySession.get(sessionId) ?? fixture.defaultValue;
+    modeBySession.set(sessionId, current);
+    configOptions.push(makeModeOption(current, fixture));
   }
   return configOptions;
+}
+
+function buildSessionModes(sessionId) {
+  const fixture = modeFixture();
+  if (!fixture?.includeSessionModes) return undefined;
+  const current = modeBySession.get(sessionId) ?? fixture.defaultValue;
+  modeBySession.set(sessionId, current);
+  return {
+    availableModes: fixture.choices.map(({ value, name, description }) => ({
+      id: value,
+      name,
+      ...(description ? { description } : {}),
+    })),
+    currentModeId: current,
+  };
 }
 
 async function emitSessionUpdates(sessionId, updates) {
@@ -411,7 +479,7 @@ const INITIALIZE_RESULT = {
 };
 
 // The same fake is shimmed under several binary names (claude /
-// claude-agent-acp / aoe-agent / opencode). The agent_compat gate keys
+// claude-agent-acp / aoe-agent / opencode / codex-acp). The agent_compat gate keys
 // its policy off the binary the supervisor spawned, so when this process
 // stands in for opencode it must report opencode's own name and a version
 // at or above the opencode floor (OPENCODE_MIN_VERSION in
@@ -422,6 +490,9 @@ function resolveAgentInfo() {
   if (process.env.FAKE_ACP_IMPERSONATE === "opencode") {
     // Keep at (or above) the agent_compat opencode floor (>=1.16.0).
     return { name: "OpenCode", version: "1.16.0" };
+  }
+  if (process.env.FAKE_ACP_IMPERSONATE === "codex") {
+    return { name: "@agentclientprotocol/codex-acp", version: "1.1.4" };
   }
   return INITIALIZE_RESULT.agentInfo;
 }
@@ -532,6 +603,8 @@ async function handleRequest(msg) {
       const result = { sessionId };
       const configOptions = buildSessionConfigOptions(sessionId);
       if (configOptions) result.configOptions = configOptions;
+      const modes = buildSessionModes(sessionId);
+      if (modes) result.modes = modes;
       sendResult(id, result);
       // Test hook for the import flow (#2276): on session/load, replay a
       // deterministic transcript chunk the way claude-agent-acp re-emits
@@ -588,6 +661,8 @@ async function handleRequest(msg) {
       const result = { sessionId: forkedId };
       const configOptions = buildSessionConfigOptions(forkedId);
       if (configOptions) result.configOptions = configOptions;
+      const modes = buildSessionModes(forkedId);
+      if (modes) result.modes = modes;
       sendResult(id, result);
       return;
     }
@@ -599,14 +674,22 @@ async function handleRequest(msg) {
       // rename doesn't silently regress this fake.
       const sessionId = params?.sessionId;
       const modeId = params?.modeId;
-      if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION && !OPENCODE_MODE_CHOICES.some((m) => m.value === modeId)) {
-        // OpenCode rejects set_mode for any id outside its real mode
-        // list (this is the "mode not found" the trapped user hit).
+      const fixture = modeFixture();
+      if (fixture && !fixture.choices.some((m) => m.value === modeId)) {
+        // Reject values outside the active adapter fixture's real list.
         sendError(id, -32000, `mode not found: ${modeId}`);
         return;
       }
       sendResult(id, {});
       if (sessionId && modeId) {
+        if (fixture?.includeSessionModes) {
+          // codex-acp changes its internal mode but returns no follow-up
+          // current_mode_update. Keep the config snapshot stale until the
+          // next config response, reproducing the dual-channel bug without
+          // pretending the legacy request itself failed.
+          modeBySession.set(sessionId, modeId);
+          return;
+        }
         // Emit the ACP-correct variant so the supervisor translates to
         // a server-side Event::CurrentModeChanged for the reducer.
         await emitSessionUpdates(sessionId, [{ sessionUpdate: "current_mode_update", currentModeId: modeId }]);
@@ -629,15 +712,15 @@ async function handleRequest(msg) {
         sendError(id, -32000, process.env.FAKE_ACP_REJECT_CONFIG_OPTION);
         return;
       }
-      if (process.env.FAKE_ACP_MODE_VIA_CONFIG_OPTION && configId === "mode") {
-        // OpenCode-shaped mode switch via the config-option channel.
-        if (!OPENCODE_MODE_CHOICES.some((m) => m.value === value)) {
+      const fixture = modeFixture();
+      if (fixture && configId === "mode") {
+        if (!fixture.choices.some((m) => m.value === value)) {
           sendError(id, -32000, `mode not found: ${value}`);
           return;
         }
         const sessionId = params?.sessionId;
-        if (sessionId) opencodeModeBySession.set(sessionId, value);
-        sendResult(id, { configOptions: [makeOpencodeModeOption(value)] });
+        if (sessionId) modeBySession.set(sessionId, value);
+        sendResult(id, { configOptions: [makeModeOption(value, fixture)] });
         return;
       }
       const configOptions =
@@ -683,14 +766,19 @@ async function handleRequest(msg) {
       if (sessionId) cancelFlags.set(sessionId, false);
       // Rate-limit park: a turn with `rateLimit` returns session/prompt as
       // a JSON-RPC error carrying the fingerprint aoe's
-      // classify_rate_limit_error reads (errorKind "rate_limit" plus a
-      // resets_at), instead of a normal stopReason. The structured view worker
-      // then emits a typed RateLimit event and parks the session. See
-      // #1281 / #1715. A cancel mid-turn still wins over the park.
+      // classify_rate_limit_error reads, instead of a normal stopReason. The
+      // structured view worker then emits a typed RateLimit event and parks
+      // the session. See #1281 / #1715. A cancel mid-turn still wins over
+      // the park.
+      //
+      // `errorKind` is the whole payload, matching claude-agent-acp
+      // (`errorKindData` returns only that). A reset time reaches aoe solely
+      // through a `usage_update`'s `_meta._claude/rateLimit` with
+      // `status: "rejected"`, so a turn that needs one puts it in `updates`.
+      // See #3152.
       if (!wasCancelled && turn.rateLimit) {
         sendError(id, -32000, turn.rateLimit.message ?? "rate limit reached", {
           errorKind: "rate_limit",
-          resets_at: turn.rateLimit.resets_at,
         });
         return;
       }

@@ -36,6 +36,70 @@ pub fn app_dir_in(home: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// HOME isolation guard
+// ---------------------------------------------------------------------------
+
+/// RAII guard: points `HOME`/`XDG_CONFIG_HOME` at the harness's tempdir
+/// for the test process and restores the prior values on `Drop`.
+/// Without the restore, a later test could inherit this test's
+/// (by-then-dropped) tempdir path.
+///
+/// Callers MUST be `#[serial]` (default key). Most of this binary is
+/// `#[parallel]`, and `serial_test` guarantees a default-key `#[serial]` test
+/// never overlaps a default-key `#[parallel]` one, which is what keeps the
+/// process-global env mutation below from racing a concurrent reader. Marking a
+/// `HomeGuard` caller `#[parallel]`, or moving it to a named `#[serial(key)]`
+/// group, breaks that guarantee and reintroduces the data race.
+///
+/// Tests that only need an isolated `$HOME` for *subprocesses* do not need this
+/// guard at all: `TuiTestHarness` passes `HOME`, `XDG_CONFIG_HOME`, and
+/// `AOE_TMUX_SOCKET` explicitly on every `Command` it spawns. The guard is only
+/// for tests that call library code reading those vars in-process.
+#[must_use = "HomeGuard restores env vars on Drop; bind it, don't discard it, or isolation ends immediately"]
+pub struct HomeGuard {
+    prev_home: Option<std::ffi::OsString>,
+    prev_xdg: Option<std::ffi::OsString>,
+}
+
+impl HomeGuard {
+    /// Snapshots the current `HOME`/`XDG_CONFIG_HOME` before overriding them,
+    /// so `Drop` can restore the caller's real environment.
+    pub fn new(home: &Path) -> Self {
+        let prev_home = std::env::var_os("HOME");
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: env mutation. Every caller is #[serial] on the default key,
+        // which serial_test never runs concurrently with the #[parallel]
+        // (default key) tests that make up the rest of this binary, so no
+        // concurrent reader/writer exists.
+        unsafe { std::env::set_var("HOME", home) };
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", home.join(".config")) };
+        Self {
+            prev_home,
+            prev_xdg,
+        }
+    }
+}
+
+impl Drop for HomeGuard {
+    fn drop(&mut self) {
+        /// Restores `key` to its prior value, or removes it if it was
+        /// previously unset.
+        fn restore_or_remove(key: &str, prev: Option<std::ffi::OsString>) {
+            // SAFETY: same invariant as HomeGuard::new; the caller being #[serial]
+            // on the default key guards this.
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        restore_or_remove("HOME", self.prev_home.take());
+        restore_or_remove("XDG_CONFIG_HOME", self.prev_xdg.take());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // tmux availability guard
 // ---------------------------------------------------------------------------
 
@@ -87,12 +151,34 @@ pub(crate) use require_node;
 // ---------------------------------------------------------------------------
 
 /// Bind a TCP listener to an ephemeral port, drop it, and return the port.
-/// Tiny TOCTOU window before the daemon binds, but acceptable for a serial
-/// test.
+///
+/// There is an unavoidable TOCTOU window between dropping the listener and the
+/// daemon binding. The OS will not hand the same port to two *live* listeners,
+/// but this drops its listener immediately, so two calls close together could
+/// otherwise return the same number. That was harmless when every test in this
+/// binary was `#[serial]`; now that most are `#[parallel]`, two concurrent tests
+/// racing for one port would produce a confusing "address already in use" in
+/// whichever daemon lost. Remembering what we have already issued closes the
+/// in-process half of the race; the ephemeral bind still covers ports taken by
+/// unrelated processes.
 #[cfg(feature = "serve")]
 pub fn pick_free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    l.local_addr().expect("local_addr").port()
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static ISSUED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    let issued = ISSUED.get_or_init(|| Mutex::new(HashSet::new()));
+
+    for _ in 0..64 {
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+            l.local_addr().expect("local_addr").port()
+        };
+        if issued.lock().expect("issued ports mutex").insert(port) {
+            return port;
+        }
+    }
+    panic!("could not find an unissued ephemeral port after 64 attempts");
 }
 
 /// Poll until the daemon accepts a TCP connection on `port`. The parent
@@ -348,6 +434,21 @@ last_seen_version = "{}"
     /// propagate process env). Also sets the runner-socket timeout high
     /// so a contended CI box doesn't trip the spawn deadline.
     pub fn install_acp_shim(&mut self, fake_acp_script: &Path) {
+        self.install_acp_shim_inner(fake_acp_script, None);
+    }
+
+    /// Install the shared fake ACP agent and record the environment every
+    /// adapter invocation starts with, one file per pid under `capture_dir`.
+    /// The capture happens inside the adapter shim, after daemon-side env
+    /// filtering and the detached-runner handoff, so it proves what reaches a
+    /// real structured worker rather than inspecting a half-built `Command`.
+    /// Per-pid files (not one shared path) keep any additional shim
+    /// invocation from overwriting the worker's capture.
+    pub fn install_acp_shim_capturing_env(&mut self, fake_acp_script: &Path, capture_dir: &Path) {
+        self.install_acp_shim_inner(fake_acp_script, Some(capture_dir));
+    }
+
+    fn install_acp_shim_inner(&mut self, fake_acp_script: &Path, capture_dir: Option<&Path>) {
         let bin = self.home_dir.path().join("acp-bin");
         std::fs::create_dir_all(&bin).expect("create acp-bin dir");
         let fake_agent =
@@ -365,11 +466,18 @@ last_seen_version = "{}"
         } else {
             ""
         };
+        let capture_line = capture_dir
+            .map(|dir| {
+                let dir = dir.display();
+                format!("mkdir -p \"{dir}\"\nenv | sort > \"{dir}/$$\"\n")
+            })
+            .unwrap_or_default();
         let script = format!(
-            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\n{}exec node \"{}\" \"$@\"\n",
+            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\n{}{}exec node \"{}\" \"$@\"\n",
             fake_acp_script.display(),
             debug_log.display(),
             fork_fail_line,
+            capture_line,
             fake_agent.display(),
         );
         for name in ["claude", "claude-agent-acp", "aoe-agent"] {
@@ -480,6 +588,41 @@ last_seen_version = "{}"
         std::thread::sleep(Duration::from_millis(delay));
     }
 
+    /// Create a detached tmux session named `name` running `cmd` on the
+    /// harness socket, carrying the same environment [`spawn`](Self::spawn)
+    /// uses.
+    ///
+    /// Tests that stand up an agent tmux session *before* `spawn_tui` (so TUI
+    /// startup sees it as already running) must go through this rather than
+    /// calling `tmux` directly. A tmux server's global environment is fixed by
+    /// whichever client first starts it, and `HOME`, `XDG_CONFIG_HOME`, and
+    /// `AOE_TMUX_SOCKET` are not in tmux's `update-environment` list, so a
+    /// later client cannot override them. A bare `Command::new("tmux")`
+    /// pre-create therefore pins the *real* environment onto the server and
+    /// `spawn`'s env is silently ignored: the TUI reads the real `$HOME`
+    /// (no seeded `config.toml` or `sessions.json`, so a first-run intro over
+    /// an empty list) and talks to the wrong tmux socket.
+    pub fn tmux_new_detached(&self, name: &str, cmd: &str) {
+        let output = Command::new("tmux")
+            .arg("-S")
+            .arg(&self.socket_path)
+            .args(["new-session", "-d", "-s", name, "-x", "80", "-y", "24"])
+            .arg(cmd)
+            .env("HOME", self.home_dir.path())
+            .env("XDG_CONFIG_HOME", self.home_dir.path().join(".config"))
+            .env("PATH", self.env_path())
+            .env("TERM", "xterm-256color")
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .output()
+            .expect("failed to run tmux new-session");
+
+        assert!(
+            output.status.success(),
+            "tmux new-session failed for {name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     /// Send one or more tmux key names (e.g. "Enter", "Escape", "q", "C-c").
     pub fn send_keys(&self, keys: &str) {
         assert!(self.spawned, "must call spawn_tui() or spawn() first");
@@ -576,6 +719,21 @@ last_seen_version = "{}"
     /// if the default timeout (10s) is exceeded.
     pub fn wait_for(&self, text: &str) {
         self.wait_for_timeout(text, Duration::from_secs(10));
+    }
+
+    /// Wait for the TUI to reach its ready home screen (the ` aoe ` banner)
+    /// after startup.
+    ///
+    /// On a freshly-isolated `$HOME` the harness has no `.schema_version`, so
+    /// the process runs every pending data migration from `v0` behind a
+    /// `◐ Running data migrations...` spinner before the banner paints. That
+    /// first-run work can outlast the default 10s `wait_for` on a slow or
+    /// loaded CI box, so tests that probe the banner right after `spawn_tui`
+    /// should use this instead of `wait_for(" aoe ")`; the longer budget only
+    /// covers the one-time migration gap and does not relax the default for
+    /// the many fast, steady-state waits that follow.
+    pub fn wait_for_ready(&self) {
+        self.wait_for_timeout(" aoe ", Duration::from_secs(30));
     }
 
     /// Like `wait_for` but with a custom timeout.
@@ -781,13 +939,18 @@ last_seen_version = "{}"
         }
     }
 
-    fn kill_session(&self) {
+    /// Tear down the whole tmux server on this test's private socket. Unlike
+    /// `kill-session -t <name>`, this also reaps every extra session the test
+    /// spawned on the same socket (tool, terminal, container-terminal, and
+    /// pre-created agent sessions), so no session and no server process, plus
+    /// the child agents/`sleep`s they hold, leak past the test. The socket is
+    /// unique per test (`home_dir/tmux.sock`), so this can never touch another
+    /// test's server. Best-effort: a missing server is not an error.
+    fn kill_server(&self) {
         let _ = Command::new("tmux")
             .arg("-S")
             .arg(&self.socket_path)
-            .arg("kill-session")
-            .arg("-t")
-            .arg(&self.session_name)
+            .arg("kill-server")
             .output();
     }
 }
@@ -802,9 +965,13 @@ impl Drop for TuiTestHarness {
             let _ = self.run_cli(&["acp", "stop", "--all"]);
             let _ = self.run_cli(&["serve", "--stop"]);
         }
-        if self.spawned {
-            self.kill_session();
-        }
+        // Kill the entire per-test tmux server, not just the primary session:
+        // tests also create tool / terminal / pre-created agent sessions on
+        // this same private socket, and `spawn` may never have been called
+        // (e.g. a CLI-only test that pre-creates sessions via
+        // `tmux_new_detached`). Tearing down the server reaps them all and
+        // stops the run from accumulating orphaned tmux servers.
+        self.kill_server();
 
         // Convert recording to GIF if one was produced.
         if let Some(cast_path) = &self.cast_path {

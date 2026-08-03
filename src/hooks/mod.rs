@@ -28,7 +28,7 @@ pub(crate) use dir_guard::{
 };
 pub use status_file::{
     cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_status,
-    read_hook_urgent,
+    read_hook_status_age, read_hook_urgent,
 };
 pub(crate) use targets::{
     has_aoe_marker, iter_hook_targets, iter_hook_targets_in, HookTarget, HookTargetKind,
@@ -287,11 +287,15 @@ fn resolve_config_dir_override(var: &str, host_env: &[String]) -> Option<String>
 /// (no field could expand today, but a future change to the path format
 /// could re-expose it).
 fn hook_command(status: &str, target: HookInstallTarget) -> String {
-    let base = match target {
+    hook_command_with_base(status, &hook_base_for_target(target), target)
+}
+
+/// The status-file base directory the generated command bakes in, per target.
+fn hook_base_for_target(target: HookInstallTarget) -> String {
+    match target {
         HookInstallTarget::Host => dir_guard::hook_base_path().display().to_string(),
         HookInstallTarget::Sandbox => HOOK_STATUS_BASE_IN_CONTAINER.to_string(),
-    };
-    hook_command_with_base(status, &base, target)
+    }
 }
 
 #[cfg(test)]
@@ -299,7 +303,88 @@ pub(crate) fn canonical_status_command(status: &str, target: HookInstallTarget) 
     hook_command(status, target)
 }
 
+/// Select the status-writer command for a resolved event: the tool-gated
+/// variant when `waiting_tools` can change the outcome, the plain writer
+/// otherwise. A Waiting-status event skips the gate even with tools declared,
+/// because the gate only ever rewrites the status to `waiting`; emitting a
+/// command that inspects stdin for a no-op would be pure overhead.
+fn status_command_for_event(
+    status: crate::agents::HookStatus,
+    waiting_tools: &[String],
+    target: HookInstallTarget,
+) -> String {
+    if waiting_tools.is_empty() || status == crate::agents::HookStatus::Waiting {
+        hook_command(status.as_str(), target)
+    } else {
+        hook_command_waiting_tools(status.as_str(), waiting_tools, target)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn canonical_status_command_for_event(
+    status: crate::agents::HookStatus,
+    waiting_tools: &[String],
+    target: HookInstallTarget,
+) -> String {
+    status_command_for_event(status, waiting_tools, target)
+}
+
+/// Build the status-writer command for an event with `waiting_tools`: the
+/// payload's `tool_name` decides between the event's default status and
+/// `waiting`. Used for Claude's `PreToolUse`, where an `AskUserQuestion` call
+/// blocks on the user for the tool's entire execution and would otherwise
+/// leave the status file stuck on `running` (no Waiting-mapped hook fires
+/// while the question is on screen).
+///
+/// The match is a substring check for the compact-JSON key
+/// (`"tool_name":"AskUserQuestion"`) on the hook's stdin. Occurrences of that
+/// text inside `tool_input` strings (e.g. an Edit call on this repo's own
+/// source) cannot false-positive: inside a JSON string value the quotes are
+/// backslash-escaped, so the exact byte sequence differs. If the agent ever
+/// stops delivering stdin or reformats the payload, the `case` falls through
+/// to the event's default status, which is today's behavior, with the pane
+/// reconciler as backstop.
+fn hook_command_waiting_tools(
+    default_status: &str,
+    waiting_tools: &[String],
+    target: HookInstallTarget,
+) -> String {
+    hook_command_waiting_tools_with_base(
+        default_status,
+        waiting_tools,
+        &hook_base_for_target(target),
+        target,
+    )
+}
+
+fn hook_command_waiting_tools_with_base(
+    default_status: &str,
+    waiting_tools: &[String],
+    base: &str,
+    target: HookInstallTarget,
+) -> String {
+    let patterns: Vec<String> = waiting_tools
+        .iter()
+        .map(|tool| format!("*\\\"tool_name\\\":\\\"{tool}\\\"*"))
+        .collect();
+    let write = format!(
+        "IN=$(cat 2>/dev/null); S={default_status}; \
+         case \"$IN\" in {patterns}) S=waiting ;; esac; \
+         printf %s \"$S\" > \"$D/status\" 2>/dev/null; ",
+        patterns = patterns.join("|")
+    );
+    hook_command_with_write(&write, base, target)
+}
+
 fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -> String {
+    hook_command_with_write(
+        &format!("printf {status} > \"$D/status\" 2>/dev/null; "),
+        base,
+        target,
+    )
+}
+
+fn hook_command_with_write(write: &str, base: &str, target: HookInstallTarget) -> String {
     let parent_check = match target {
         HookInstallTarget::Host => {
             // mkdir -p $B is the wipe-recovery primitive for the
@@ -339,7 +424,7 @@ fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -
          set -- $LS; M=\"$1\"; \
          case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
          {owner_recheck}\
-         printf {status} > \"$D/status\" 2>/dev/null; \
+         {write}\
          exit 0 # {AOE_HOOK_MARKER}'"
     )
 }
@@ -456,23 +541,30 @@ pub(super) fn is_aoe_hook_command(cmd: &str) -> bool {
 /// `idle_prompt` → idle). Each becomes its own matcher block appended to that
 /// event name's array, so they coexist instead of the later one clobbering the
 /// earlier.
-fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarget) -> Value {
+fn build_aoe_hooks(
+    events: impl AsRef<[crate::agents::ResolvedHookEvent]>,
+    target: HookInstallTarget,
+) -> Value {
     let mut hooks_obj = serde_json::Map::new();
-    for event in events {
+    for event in events.as_ref() {
         let mut commands: Vec<String> = Vec::new();
         if event.session_id_capture {
             commands.push(hook_command_session_id(target));
         }
         if let Some(status) = event.status {
-            commands.push(hook_command(status, target));
+            commands.push(status_command_for_event(
+                status,
+                &event.waiting_tools,
+                target,
+            ));
         }
         if commands.is_empty() {
             continue;
         }
 
         let mut entry = serde_json::Map::new();
-        if let Some(m) = event.matcher {
-            entry.insert("matcher".to_string(), Value::String(m.to_string()));
+        if let Some(m) = &event.matcher {
+            entry.insert("matcher".to_string(), Value::String(m.clone()));
         }
         let hook_entries: Vec<Value> = commands
             .into_iter()
@@ -485,7 +577,7 @@ fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarge
             .collect();
         entry.insert("hooks".to_string(), Value::Array(hook_entries));
         match hooks_obj
-            .entry(event.name.to_string())
+            .entry(event.name.clone())
             .or_insert_with(|| Value::Array(Vec::new()))
         {
             Value::Array(groups) => groups.push(Value::Object(entry)),
@@ -530,7 +622,7 @@ fn remove_aoe_entries(matchers: &mut Vec<Value>) {
 /// If the file doesn't exist, it will be created with just the hooks.
 pub fn install_hooks(
     settings_path: &Path,
-    events: &[crate::agents::HookEvent],
+    events: impl AsRef<[crate::agents::ResolvedHookEvent]>,
     target: HookInstallTarget,
 ) -> Result<()> {
     with_config_lock(settings_path, "json.lock", || {
@@ -546,7 +638,7 @@ pub fn install_hooks(
 
         let before = settings.clone();
 
-        let aoe_hooks = build_aoe_hooks(events, target);
+        let aoe_hooks = build_aoe_hooks(events.as_ref(), target);
 
         if !settings.get("hooks").is_some_and(|h| h.is_object()) {
             settings
@@ -563,13 +655,25 @@ pub fn install_hooks(
         let aoe_hooks_obj = aoe_hooks
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("Internal error: built hooks is not a JSON object"))?;
+        let empty_events: Vec<String> = settings_hooks
+            .iter_mut()
+            .filter_map(|(event_name, existing)| {
+                let arr = existing.as_array_mut()?;
+                remove_aoe_entries(arr);
+                arr.is_empty().then(|| event_name.clone())
+            })
+            .collect();
+        for event_name in empty_events {
+            settings_hooks.remove(&event_name);
+        }
+
         for (event_name, aoe_matchers) in aoe_hooks_obj {
-            if let Some(existing) = settings_hooks.get_mut(event_name) {
-                if let Some(arr) = existing.as_array_mut() {
-                    remove_aoe_entries(arr);
-                    if let Some(new_arr) = aoe_matchers.as_array() {
-                        arr.extend(new_arr.iter().cloned());
-                    }
+            if let Some(existing) = settings_hooks
+                .get_mut(event_name)
+                .and_then(|existing| existing.as_array_mut())
+            {
+                if let Some(new_arr) = aoe_matchers.as_array() {
+                    existing.extend(new_arr.iter().cloned());
                 }
             } else {
                 settings_hooks.insert(event_name.clone(), aoe_matchers.clone());
@@ -616,7 +720,7 @@ pub(super) const CODEX_HOOK_EVENT_NAMES: &[&str] = &[
 #[cfg(test)]
 pub(crate) fn install_codex_hooks(
     config_path: &Path,
-    events: &[crate::agents::HookEvent],
+    events: impl AsRef<[crate::agents::ResolvedHookEvent]>,
     target: HookInstallTarget,
 ) -> Result<()> {
     install_codex_hooks_with_preserved_state(config_path, events, None, target)
@@ -660,7 +764,7 @@ pub(crate) fn restore_codex_hooks_state(config_path: &Path, state: toml_edit::It
 
 pub(crate) fn install_codex_hooks_with_preserved_state(
     config_path: &Path,
-    events: &[crate::agents::HookEvent],
+    events: impl AsRef<[crate::agents::ResolvedHookEvent]>,
     preserved_state: Option<toml_edit::Item>,
     target: HookInstallTarget,
 ) -> Result<()> {
@@ -679,7 +783,7 @@ pub(crate) fn install_codex_hooks_with_preserved_state(
             }
         }
         remove_codex_aoe_hooks(&mut config)?;
-        merge_codex_hooks(&mut config, events, target)?;
+        merge_codex_hooks(&mut config, events.as_ref(), target)?;
 
         if config.to_string() == before {
             tracing::debug!(target: "hooks.install",
@@ -821,7 +925,7 @@ fn ensure_codex_event_array<'a>(
 
 fn merge_codex_hooks(
     config: &mut toml_edit::DocumentMut,
-    events: &[crate::agents::HookEvent],
+    events: &[crate::agents::ResolvedHookEvent],
     target: HookInstallTarget,
 ) -> Result<()> {
     let hooks = ensure_codex_hooks_table(config)?;
@@ -831,7 +935,7 @@ fn merge_codex_hooks(
             continue;
         };
 
-        let event_array = ensure_codex_event_array(hooks, event.name)?;
+        let event_array = ensure_codex_event_array(hooks, &event.name)?;
         event_array.push(codex_matcher_group(event, status, target));
     }
 
@@ -839,18 +943,21 @@ fn merge_codex_hooks(
 }
 
 fn codex_matcher_group(
-    event: &crate::agents::HookEvent,
-    status: &str,
+    event: &crate::agents::ResolvedHookEvent,
+    status: crate::agents::HookStatus,
     target: HookInstallTarget,
 ) -> toml_edit::Table {
     let mut group = toml_edit::Table::new();
-    if let Some(matcher) = event.matcher {
-        group.insert("matcher", toml_edit::value(matcher));
+    if let Some(matcher) = &event.matcher {
+        group.insert("matcher", toml_edit::value(matcher.as_str()));
     }
 
     let mut handler = toml_edit::Table::new();
     handler.insert("type", toml_edit::value("command"));
-    handler.insert("command", toml_edit::value(hook_command(status, target)));
+    handler.insert(
+        "command",
+        toml_edit::value(hook_command(status.as_str(), target)),
+    );
 
     let mut handlers = toml_edit::ArrayOfTables::new();
     handlers.push(handler);
@@ -993,6 +1100,124 @@ pub fn uninstall_codex_hooks(config_path: &Path) -> Result<bool> {
     Ok(modified)
 }
 
+/// Disable Gemini's folder-trust confirmation by merging
+/// `security.folderTrust.enabled = false` into its `settings.json`.
+///
+/// In a YOLO-mode sandboxed session the container is ephemeral, so Gemini
+/// re-prompts to trust the working directory on every launch even though the
+/// user already opted out of approvals. Merging this flag suppresses the
+/// prompt (issue #472). Any other keys the user (or AoE's hook installer) has
+/// written to the same file are preserved, and an unwritable/malformed file is
+/// treated as empty rather than propagated as an error, mirroring the hook
+/// installers above.
+pub fn disable_gemini_folder_trust(settings_path: &Path) -> Result<()> {
+    with_config_lock(settings_path, "json.lock", || {
+        let mut settings: Value = if settings_path.exists() {
+            let content = std::fs::read_to_string(settings_path)?;
+            serde_json::from_str(&content).unwrap_or_else(|e| {
+                tracing::warn!(target: "hooks.install", "Failed to parse {}: {}", settings_path.display(), e);
+                serde_json::json!({})
+            })
+        } else {
+            serde_json::json!({})
+        };
+
+        let before = settings.clone();
+
+        let root = settings
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Settings file root is not a JSON object"))?;
+        let security = root
+            .entry("security")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !security.is_object() {
+            *security = Value::Object(serde_json::Map::new());
+        }
+        let folder_trust = security
+            .as_object_mut()
+            .expect("ensured object above")
+            .entry("folderTrust")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !folder_trust.is_object() {
+            *folder_trust = Value::Object(serde_json::Map::new());
+        }
+        folder_trust
+            .as_object_mut()
+            .expect("ensured object above")
+            .insert("enabled".to_string(), Value::Bool(false));
+
+        if settings == before {
+            return Ok(());
+        }
+
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let formatted = serde_json::to_string_pretty(&settings)?;
+        crate::session::atomic_write_following_symlinks(settings_path, formatted.as_bytes())?;
+        tracing::info!(target: "hooks.install",
+            "Disabled Gemini folder trust in {}", settings_path.display());
+        Ok(())
+    })
+}
+
+/// Mark `project_path` as trusted in Codex's `config.toml` by merging
+/// `[projects."<project_path>"].trust_level = "trusted"`.
+///
+/// Codex keys folder trust on the absolute working directory, so
+/// `project_path` must be the path Codex sees as its cwd (inside a sandbox
+/// that is the in-container worktree path, not the host path). Used for
+/// YOLO-mode sandboxed sessions so the ephemeral container does not re-prompt
+/// for folder trust (issue #472). Runs under the same lock as the Codex hook
+/// installers so it cannot interleave with a concurrent hook rewrite, and
+/// preserves every other key in the file, including an existing `[projects.*]`
+/// block.
+pub fn trust_codex_project(config_path: &Path, project_path: &str) -> Result<()> {
+    with_codex_config_lock(config_path, || {
+        let mut config = read_codex_config(config_path)?;
+        let before = config.to_string();
+
+        let root = config.as_table_mut();
+        if !root.contains_key("projects") {
+            let mut projects = toml_edit::Table::new();
+            // Implicit so an empty `[projects]` header is never emitted; only
+            // the per-project `[projects."<path>"]` sub-table renders.
+            projects.set_implicit(true);
+            root.insert("projects", toml_edit::Item::Table(projects));
+        }
+        let projects = root
+            .get_mut("projects")
+            .and_then(|item| item.as_table_mut())
+            .ok_or_else(|| anyhow::anyhow!("Codex projects key is not a TOML table"))?;
+
+        if !projects
+            .get(project_path)
+            .is_some_and(|item| item.is_table())
+        {
+            projects.insert(
+                project_path,
+                toml_edit::Item::Table(toml_edit::Table::new()),
+            );
+        }
+        let project = projects
+            .get_mut(project_path)
+            .and_then(|item| item.as_table_mut())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Codex projects.{project_path} entry is not a TOML table")
+            })?;
+        project.insert("trust_level", toml_edit::value("trusted"));
+
+        if config.to_string() == before {
+            return Ok(());
+        }
+
+        write_codex_config(config_path, &config)?;
+        tracing::info!(target: "hooks.install",
+            "Marked {} trusted in Codex config {}", project_path, config_path.display());
+        Ok(())
+    })
+}
+
 /// Remove all AoE hooks from an agent's `settings.json` file.
 ///
 /// Strips AoE hook entries while preserving user-defined hooks. If an event
@@ -1059,12 +1284,11 @@ pub fn uninstall_hooks(settings_path: &Path) -> Result<bool> {
     })
 }
 
-/// settl hook events and the AoE status they map to.
-const SETTL_HOOKS: &[(&str, &str)] = &[
-    ("TurnStarted", "running"),
-    ("WaitingForHuman", "waiting"),
-    ("GameWon", "idle"),
-];
+fn default_sidecar_events(agent_name: &str) -> Vec<crate::agents::ResolvedHookEvent> {
+    let agent = crate::agents::get_agent(agent_name).expect("sidecar agent is registered");
+    crate::agents::resolved_sidecar_hook_events(agent, &crate::session::config::Config::default())
+        .expect("default sidecar hook events resolve")
+}
 
 /// Install AoE status hooks into a settl TOML config file (typically
 /// `~/.settl/config.toml`).
@@ -1078,6 +1302,15 @@ const SETTL_HOOKS: &[(&str, &str)] = &[
 /// Idempotent on disk: when the on-disk file already encodes the same
 /// AoE-managed hook subtree, it is not rewritten (same inode, same bytes).
 pub fn install_settl_hooks(config_path: &Path, target: HookInstallTarget) -> Result<()> {
+    let events = default_sidecar_events("settl");
+    install_settl_hooks_with_events(config_path, target, &events)
+}
+
+pub fn install_settl_hooks_with_events(
+    config_path: &Path,
+    target: HookInstallTarget,
+    events: &[crate::agents::ResolvedHookEvent],
+) -> Result<()> {
     with_config_lock(config_path, "toml.lock", || {
         let mut config: toml::Value = if config_path.exists() {
             let content = std::fs::read_to_string(config_path)?;
@@ -1109,12 +1342,15 @@ pub fn install_settl_hooks(config_path: &Path, target: HookInstallTarget) -> Res
                 .is_some_and(is_aoe_hook_command)
         });
 
-        for (event, status) in SETTL_HOOKS {
+        for event in events {
+            let Some(status) = event.status else {
+                continue;
+            };
             let mut entry = toml::map::Map::new();
-            entry.insert("event".into(), toml::Value::String((*event).into()));
+            entry.insert("event".into(), toml::Value::String(event.name.clone()));
             entry.insert(
                 "command".into(),
-                toml::Value::String(hook_command(status, target)),
+                toml::Value::String(hook_command(status.as_str(), target)),
             );
             hooks_arr.push(toml::Value::Table(entry));
         }
@@ -1174,17 +1410,183 @@ pub fn uninstall_settl_hooks(config_path: &Path) -> Result<bool> {
     })
 }
 
-/// Hermes hook events and the AoE status they map to. Hermes uses an
-/// event-keyed YAML schema (`hooks: { event_name: [ {command, ...} ] }`),
-/// not the flat array settl uses.
-const HERMES_HOOKS: &[(&str, &str)] = &[
-    ("pre_llm_call", "running"),
-    ("pre_tool_call", "running"),
-    ("post_llm_call", "idle"),
-    ("pre_approval_request", "waiting"),
-    ("post_approval_response", "running"),
-    ("on_session_end", "idle"),
-];
+/// Install AoE status hooks into Kimi Code's runtime `config.toml`
+/// (typically `~/.kimi-code/config.toml`).
+///
+/// Kimi stores hooks as a flat `[[hooks]]` array of tables, each
+/// `{ event, command }` (matcher/timeout optional). It shares that shape
+/// with settl, but the same file also holds Kimi's provider, model, and
+/// OAuth settings (login populates it), so this installer edits the
+/// document with `toml_edit` to preserve the surrounding tables, comments,
+/// and formatting rather than reserialising the whole file the way the
+/// settl installer does. That preservation is why `SidecarFormat::KimiToml`
+/// is distinct from `SidecarFormat::SettlToml`.
+///
+/// Idempotent on disk: when the file already encodes the same AoE-managed
+/// hooks, it is not rewritten (same bytes).
+pub fn install_kimi_hooks(config_path: &Path, target: HookInstallTarget) -> Result<()> {
+    let events = default_sidecar_events("kimi");
+    install_kimi_hooks_with_events(config_path, target, &events)
+}
+
+pub fn install_kimi_hooks_with_events(
+    config_path: &Path,
+    target: HookInstallTarget,
+    events: &[crate::agents::ResolvedHookEvent],
+) -> Result<()> {
+    with_config_lock(config_path, "toml.lock", || {
+        let mut config = if config_path.exists() {
+            let content = std::fs::read_to_string(config_path)?;
+            content
+                .parse::<toml_edit::DocumentMut>()
+                .with_context(|| format!("Failed to parse {}", config_path.display()))?
+        } else {
+            toml_edit::DocumentMut::new()
+        };
+
+        let before = config.to_string();
+
+        let hooks = ensure_kimi_hooks_array(&mut config)?;
+        // Drop any prior AoE-managed entries (marker in the command), then
+        // re-add the current set. Non-AoE entries the user added are kept.
+        hooks.retain(|entry| {
+            !entry
+                .get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(is_aoe_hook_command)
+        });
+
+        for event in events {
+            let Some(status) = event.status else {
+                continue;
+            };
+            let mut entry = toml_edit::Table::new();
+            entry.insert("event", toml_edit::value(event.name.as_str()));
+            entry.insert(
+                "command",
+                toml_edit::value(hook_command(status.as_str(), target)),
+            );
+            hooks.push(entry);
+        }
+
+        if config.to_string() == before {
+            tracing::debug!(target: "hooks.install",
+                "AoE hooks in {} already up to date; skipping write",
+                config_path.display());
+            return Ok(());
+        }
+
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        crate::session::atomic_write_following_symlinks(
+            config_path,
+            config.to_string().as_bytes(),
+        )?;
+
+        tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", config_path.display());
+        Ok(())
+    })
+}
+
+/// Ensure the document's top-level `hooks` key is an array of tables and
+/// return it. Tolerates an absent key (creates it) and an inline array
+/// (`hooks = [{...}]`, which Kimi accepts as equivalent to `[[hooks]]`):
+/// each inline entry is migrated into a standard table so existing user
+/// hooks are preserved. Refuses to clobber any other existing shape (e.g. a
+/// `hooks` scalar or table) so a malformed or unexpected config is left
+/// intact rather than overwritten.
+fn ensure_kimi_hooks_array(
+    config: &mut toml_edit::DocumentMut,
+) -> Result<&mut toml_edit::ArrayOfTables> {
+    let root = config.as_table_mut();
+    if !root.contains_key("hooks") {
+        root.insert(
+            "hooks",
+            toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
+        );
+    }
+
+    let item = root
+        .get_mut("hooks")
+        .ok_or_else(|| anyhow::anyhow!("hooks key was not created"))?;
+    if !item.is_array_of_tables() {
+        if let Some(array) = item.as_array() {
+            // Migrate an inline `hooks = [{...}]` array into `[[hooks]]`,
+            // carrying every inline-table entry over as a standard table so
+            // user-authored hooks survive. If any element is not an inline
+            // table it is not a shape we understand, so fail before touching
+            // the document rather than silently dropping the user's entry.
+            let mut migrated = toml_edit::ArrayOfTables::new();
+            for value in array.iter() {
+                let inline = value.as_inline_table().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Kimi hooks inline array has a non-table entry; leaving config untouched"
+                    )
+                })?;
+                let mut table = toml_edit::Table::new();
+                for (key, val) in inline.iter() {
+                    table.insert(key, toml_edit::value(val.clone()));
+                }
+                migrated.push(table);
+            }
+            *item = toml_edit::Item::ArrayOfTables(migrated);
+        } else {
+            return Err(anyhow::anyhow!("Kimi hooks key is not an array of tables"));
+        }
+    }
+
+    item.as_array_of_tables_mut()
+        .ok_or_else(|| anyhow::anyhow!("Kimi hooks key is not an array of tables"))
+}
+
+/// Remove AoE hooks from Kimi Code's `config.toml`, preserving the rest of
+/// the document. Returns whether anything changed.
+pub fn uninstall_kimi_hooks(config_path: &Path) -> Result<bool> {
+    if !config_path.exists() {
+        return Ok(false);
+    }
+
+    with_config_lock(config_path, "toml.lock", || {
+        let content = std::fs::read_to_string(config_path)?;
+        let mut config = content.parse::<toml_edit::DocumentMut>().unwrap_or_else(|e| {
+            tracing::warn!(target: "hooks.uninstall", "Failed to parse {}: {}", config_path.display(), e);
+            toml_edit::DocumentMut::new()
+        });
+
+        let Some(hooks) = config
+            .as_table_mut()
+            .get_mut("hooks")
+            .and_then(|item| item.as_array_of_tables_mut())
+        else {
+            return Ok(false);
+        };
+
+        let before = hooks.len();
+        hooks.retain(|entry| {
+            !entry
+                .get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(is_aoe_hook_command)
+        });
+
+        if hooks.len() == before {
+            return Ok(false);
+        }
+
+        // Drop an emptied `hooks` array so uninstall leaves no residue.
+        if hooks.is_empty() {
+            config.as_table_mut().remove("hooks");
+        }
+
+        crate::session::atomic_write_following_symlinks(
+            config_path,
+            config.to_string().as_bytes(),
+        )?;
+        tracing::info!(target: "hooks.uninstall", "Removed AoE hooks from {}", config_path.display());
+        Ok(true)
+    })
+}
 
 /// Install AoE status hooks into Hermes's `config.yaml`.
 ///
@@ -1207,6 +1609,15 @@ const HERMES_HOOKS: &[(&str, &str)] = &[
 /// Idempotent on disk: when the YAML config and the allowlist already
 /// encode the same AoE state, neither is rewritten (same inode, same bytes).
 pub fn install_hermes_hooks(config_path: &Path, target: HookInstallTarget) -> Result<()> {
+    let events = default_sidecar_events("hermes");
+    install_hermes_hooks_with_events(config_path, target, &events)
+}
+
+pub fn install_hermes_hooks_with_events(
+    config_path: &Path,
+    target: HookInstallTarget,
+    events: &[crate::agents::ResolvedHookEvent],
+) -> Result<()> {
     with_config_lock(config_path, "yaml.lock", || {
         let mut config: serde_yaml::Value = if config_path.exists() {
             let content = std::fs::read_to_string(config_path)?;
@@ -1235,8 +1646,11 @@ pub fn install_hermes_hooks(config_path: &Path, target: HookInstallTarget) -> Re
         }
         let hooks_map = hooks_value.as_mapping_mut().expect("ensured mapping above");
 
-        for (event, status) in HERMES_HOOKS {
-            let event_key = serde_yaml::Value::String((*event).to_string());
+        for event in events {
+            let Some(status) = event.status else {
+                continue;
+            };
+            let event_key = serde_yaml::Value::String(event.name.clone());
             let entries = hooks_map
                 .entry(event_key)
                 .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()));
@@ -1256,7 +1670,7 @@ pub fn install_hermes_hooks(config_path: &Path, target: HookInstallTarget) -> Re
             let mut entry = serde_yaml::Mapping::new();
             entry.insert(
                 serde_yaml::Value::String("command".into()),
-                serde_yaml::Value::String(hook_command(status, target)),
+                serde_yaml::Value::String(hook_command(status.as_str(), target)),
             );
             arr.push(serde_yaml::Value::Mapping(entry));
         }
@@ -1266,7 +1680,8 @@ pub fn install_hermes_hooks(config_path: &Path, target: HookInstallTarget) -> Re
         let config_dir = config_path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("config path has no parent"))?;
-        let (allowlist_path, allowlist_formatted) = render_hermes_allowlist(config_dir, target)?;
+        let (allowlist_path, allowlist_formatted) =
+            render_hermes_allowlist(config_dir, target, events)?;
         // Byte-compare (vs the structural YAML compare above) is sound:
         // render_hermes_allowlist preserves approved_at on (event, command)
         // collision and serde_json::to_string_pretty is deterministic, so
@@ -1389,6 +1804,7 @@ pub fn uninstall_hermes_hooks(config_path: &Path) -> Result<bool> {
 fn render_hermes_allowlist(
     config_dir: &Path,
     target: HookInstallTarget,
+    events: &[crate::agents::ResolvedHookEvent],
 ) -> Result<(std::path::PathBuf, String)> {
     let allowlist_path = config_dir.join("shell-hooks-allowlist.json");
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -1410,14 +1826,17 @@ fn render_hermes_allowlist(
         })
         .ok_or_else(|| anyhow::anyhow!("allowlist root is not a JSON object with approvals[]"))?;
 
-    for (event, status) in HERMES_HOOKS {
-        let cmd = hook_command(status, target);
+    for event in events {
+        let Some(status) = event.status else {
+            continue;
+        };
+        let cmd = hook_command(status.as_str(), target);
         // Preserve the original `approved_at` when an entry with the same
         // (event, command) already exists; only fresh entries get `now`.
         // A `null` value is preserved verbatim: the field records
         // first-approval time, so a null stays a null on re-render.
         let preserved = approvals.iter().find_map(|entry| {
-            let same = entry.get("event").and_then(|v| v.as_str()) == Some(*event)
+            let same = entry.get("event").and_then(|v| v.as_str()) == Some(event.name.as_str())
                 && entry.get("command").and_then(|v| v.as_str()) == Some(&cmd);
             if same {
                 entry.get("approved_at").cloned()
@@ -1426,11 +1845,11 @@ fn render_hermes_allowlist(
             }
         });
         approvals.retain(|entry| {
-            !(entry.get("event").and_then(|v| v.as_str()) == Some(*event)
+            !(entry.get("event").and_then(|v| v.as_str()) == Some(event.name.as_str())
                 && entry.get("command").and_then(|v| v.as_str()) == Some(&cmd))
         });
         approvals.push(serde_json::json!({
-            "event": *event,
+            "event": event.name,
             "command": cmd,
             "approved_at": preserved.unwrap_or_else(|| Value::String(now.clone())),
             "script_mtime_at_approval": Value::Null,
@@ -1440,14 +1859,6 @@ fn render_hermes_allowlist(
     let formatted = serde_json::to_string_pretty(&data)?;
     Ok((allowlist_path, formatted))
 }
-
-/// Kiro CLI hook events. Kiro uses lowercase camelCase event names and a flat
-/// `[{"command": "..."}]` structure in its agent config JSON.
-const KIRO_HOOKS: &[(&str, &str)] = &[
-    ("preToolUse", "running"),
-    ("userPromptSubmit", "running"),
-    ("stop", "idle"),
-];
 
 /// Single source of truth for the `aoe-hooks` Kiro agent identifier. Used
 /// both as the agent name (passed to `kiro-cli agent set-default`) and as the
@@ -1479,6 +1890,15 @@ pub const KIRO_HOOKS_AGENT_FILE: &str = concat!(".kiro/agents/", kiro_hooks_agen
 /// Idempotent on disk: when the on-disk file already encodes the same
 /// AoE-managed hook subtree, it is not rewritten (same inode, same bytes).
 pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -> Result<()> {
+    let events = default_sidecar_events("kiro");
+    install_kiro_hooks_with_events(agent_config_path, target, &events)
+}
+
+pub fn install_kiro_hooks_with_events(
+    agent_config_path: &Path,
+    target: HookInstallTarget,
+    events: &[crate::agents::ResolvedHookEvent],
+) -> Result<()> {
     with_config_lock(agent_config_path, "json.lock", || {
         let mut config: serde_json::Map<String, Value> = if agent_config_path.exists() {
             let content = std::fs::read_to_string(agent_config_path)?;
@@ -1506,9 +1926,12 @@ pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -
             .cloned()
             .unwrap_or_default();
 
-        for (event, status) in KIRO_HOOKS {
+        for event in events {
+            let Some(status) = event.status else {
+                continue;
+            };
             let entries = hooks_obj
-                .entry((*event).to_string())
+                .entry(event.name.clone())
                 .or_insert_with(|| Value::Array(Vec::new()));
             if let Some(arr) = entries.as_array_mut() {
                 arr.retain(|hook| {
@@ -1517,7 +1940,7 @@ pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -
                         .and_then(|c| c.as_str())
                         .is_some_and(is_aoe_hook_command)
                 });
-                arr.push(serde_json::json!({ "command": hook_command(status, target) }));
+                arr.push(serde_json::json!({ "command": hook_command(status.as_str(), target) }));
             }
         }
 
@@ -1741,47 +2164,48 @@ pub fn uninstall_all_hooks() {
 mod tests {
     use super::targets::collect_env_lists_from_session;
     use super::*;
+    use crate::session::test_support::EnvGuard;
     use tempfile::TempDir;
 
-    fn claude_events() -> &'static [crate::agents::HookEvent] {
-        crate::agents::get_agent("claude")
+    fn claude_events() -> Vec<crate::agents::ResolvedHookEvent> {
+        let agent = crate::agents::get_agent("claude").unwrap();
+        crate::agents::resolved_hook_events(agent, &crate::session::config::Config::default())
             .unwrap()
-            .hook_config
+    }
+
+    fn codex_events() -> Vec<crate::agents::ResolvedHookEvent> {
+        let agent = crate::agents::get_agent("codex").unwrap();
+        crate::agents::resolved_hook_events(agent, &crate::session::config::Config::default())
+            .unwrap()
+    }
+
+    fn resolved_events_with_override(
+        agent_name: &str,
+        event_name: &str,
+        status: crate::agents::HookStatus,
+    ) -> Vec<crate::agents::ResolvedHookEvent> {
+        let mut config = crate::session::config::Config::default();
+        config
+            .agents
+            .entry(agent_name.to_string())
+            .or_default()
+            .status_map
+            .insert(event_name.to_string(), status);
+        let agent = crate::agents::get_agent(agent_name).unwrap();
+        if agent.hook_config.is_some() {
+            crate::agents::resolved_hook_events(agent, &config).unwrap()
+        } else {
+            crate::agents::resolved_sidecar_hook_events(agent, &config).unwrap()
+        }
+    }
+
+    fn sidecar_default_events(agent_name: &str) -> &'static [crate::agents::SidecarHookEvent] {
+        crate::agents::get_agent(agent_name)
+            .unwrap()
+            .sidecar_hooks
             .as_ref()
             .unwrap()
             .events
-    }
-
-    fn codex_events() -> &'static [crate::agents::HookEvent] {
-        crate::agents::get_agent("codex")
-            .unwrap()
-            .hook_config
-            .as_ref()
-            .unwrap()
-            .events
-    }
-
-    struct CodexHomeGuard(Option<String>);
-    impl CodexHomeGuard {
-        fn set(path: &Path) -> Self {
-            let prev = std::env::var("CODEX_HOME").ok();
-            std::env::set_var("CODEX_HOME", path);
-            Self(prev)
-        }
-
-        fn unset() -> Self {
-            let prev = std::env::var("CODEX_HOME").ok();
-            std::env::remove_var("CODEX_HOME");
-            Self(prev)
-        }
-    }
-    impl Drop for CodexHomeGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => std::env::set_var("CODEX_HOME", v),
-                None => std::env::remove_var("CODEX_HOME"),
-            }
-        }
     }
 
     fn claude_hook_config() -> &'static crate::agents::AgentHookConfig {
@@ -1792,36 +2216,10 @@ mod tests {
             .unwrap()
     }
 
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, prev }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::remove_var(key);
-            Self { key, prev }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_agent_settings_path_defaults_to_home_relative() {
-        let _guard = EnvGuard::unset("CLAUDE_CONFIG_DIR");
+        let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         let path = agent_settings_path_for_host_environment(claude_hook_config(), &[]).unwrap();
         let expected = dirs::home_dir().unwrap().join(".claude/settings.json");
         assert_eq!(path, expected);
@@ -1830,7 +2228,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_agent_settings_path_honors_host_env_override() {
-        let _guard = EnvGuard::unset("CLAUDE_CONFIG_DIR");
+        let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         let host_env = vec!["CLAUDE_CONFIG_DIR=/home/me/.claude-work".to_string()];
         let path =
             agent_settings_path_for_host_environment(claude_hook_config(), &host_env).unwrap();
@@ -1843,7 +2241,7 @@ mod tests {
     #[serial_test::serial(shell_env)]
     fn test_agent_settings_path_host_env_takes_precedence_over_process_env() {
         // When both are set, the session's profile env wins over AoE's own env.
-        let _guard = EnvGuard::set("CLAUDE_CONFIG_DIR", "/from/process/env");
+        let _guard = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", "/from/process/env")]);
         let host_env = vec!["CLAUDE_CONFIG_DIR=/from/host/env".to_string()];
         let path =
             agent_settings_path_for_host_environment(claude_hook_config(), &host_env).unwrap();
@@ -1855,7 +2253,7 @@ mod tests {
     fn test_agent_settings_path_falls_back_to_process_env() {
         // Not present in the host env list at all, but set in AoE's own env:
         // the launched agent inherits it, so hooks must follow.
-        let _guard = EnvGuard::set("CLAUDE_CONFIG_DIR", "/tmp/claude-proc");
+        let _guard = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", "/tmp/claude-proc")]);
         let path = agent_settings_path_for_host_environment(claude_hook_config(), &[]).unwrap();
         assert_eq!(path, PathBuf::from("/tmp/claude-proc/settings.json"));
     }
@@ -1863,7 +2261,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_agent_settings_path_display_matches_resolution() {
-        let _guard = EnvGuard::unset("CLAUDE_CONFIG_DIR");
+        let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
 
         // Default: tilde-relative, matching how the path is shown elsewhere.
         assert_eq!(
@@ -1882,7 +2280,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_agent_settings_path_empty_override_is_ignored() {
-        let _guard = EnvGuard::unset("CLAUDE_CONFIG_DIR");
+        let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         let host_env = vec!["CLAUDE_CONFIG_DIR=".to_string()];
         let path =
             agent_settings_path_for_host_environment(claude_hook_config(), &host_env).unwrap();
@@ -1906,6 +2304,41 @@ mod tests {
         assert!(hooks.contains_key("Stop"));
         assert!(hooks.contains_key("Notification"));
         assert!(hooks.contains_key("ElicitationResult"));
+    }
+
+    #[test]
+    fn test_install_hooks_uses_resolved_status_override() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+        let events = resolved_events_with_override(
+            "claude",
+            "PreToolUse",
+            crate::agents::HookStatus::Waiting,
+        );
+
+        install_hooks(&settings_path, &events, HookInstallTarget::Host).unwrap();
+
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let cmd = content["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(cmd.contains("printf waiting"), "got command: {cmd}");
+    }
+
+    #[test]
+    fn test_install_hooks_removes_stale_custom_event() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+        let custom_events =
+            resolved_events_with_override("claude", "PreCompact", crate::agents::HookStatus::Idle);
+
+        install_hooks(&settings_path, &custom_events, HookInstallTarget::Host).unwrap();
+        install_hooks(&settings_path, claude_events(), HookInstallTarget::Host).unwrap();
+
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(content["hooks"].get("PreCompact").is_none());
     }
 
     #[test]
@@ -2154,20 +2587,20 @@ mod tests {
             .unwrap()
             .as_mapping()
             .unwrap();
-        for (event, _) in HERMES_HOOKS {
+        for event in sidecar_default_events("hermes") {
             assert!(
                 hooks
-                    .get(serde_yaml::Value::String((*event).into()))
+                    .get(serde_yaml::Value::String(event.name.into()))
                     .is_some(),
                 "event {} missing on dotfile target",
-                event
+                event.name
             );
         }
         let allowlist: Value =
             serde_json::from_str(&std::fs::read_to_string(&allowlist_target).unwrap()).unwrap();
         assert_eq!(
             allowlist["approvals"].as_array().unwrap().len(),
-            HERMES_HOOKS.len()
+            sidecar_default_events("hermes").len()
         );
 
         uninstall_hermes_hooks(&config_path).unwrap();
@@ -2206,7 +2639,7 @@ mod tests {
     #[serial_test::serial]
     fn test_codex_config_path_respects_codex_home() {
         let tmp = TempDir::new().unwrap();
-        let _guard = CodexHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
 
         assert_eq!(codex_config_path().unwrap(), tmp.path().join("config.toml"));
         assert_eq!(
@@ -2219,7 +2652,7 @@ mod tests {
     #[serial_test::serial]
     fn test_codex_config_path_for_host_environment_ignores_empty_codex_home() {
         let tmp = TempDir::new().unwrap();
-        let _guard = CodexHomeGuard::unset();
+        let _guard = EnvGuard::unset(&["CODEX_HOME"]);
         std::env::set_var("HOME", tmp.path());
 
         // An empty `CODEX_HOME=` must not resolve to a bare relative
@@ -2243,7 +2676,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // An empty `CODEX_HOME` in AoE's own process env must fall back to the
         // home-relative default rather than a bare relative `config.toml`.
-        let _guard = CodexHomeGuard::set(Path::new(""));
+        let _guard = EnvGuard::set(&[("CODEX_HOME", Path::new(""))]);
         std::env::set_var("HOME", tmp.path());
 
         let path = codex_config_path().unwrap();
@@ -2258,7 +2691,7 @@ mod tests {
     #[serial_test::serial]
     fn test_iter_hook_targets_includes_profile_codex_home() {
         let tmp = TempDir::new().unwrap();
-        let _guard = CodexHomeGuard::unset();
+        let _guard = EnvGuard::unset(&["CODEX_HOME"]);
         std::env::set_var("HOME", tmp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
@@ -2541,6 +2974,134 @@ trust_level = "trusted"
     }
 
     #[test]
+    fn test_disable_gemini_folder_trust_creates_nested_flag() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join(".gemini").join("settings.json");
+
+        disable_gemini_folder_trust(&settings_path).unwrap();
+
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            settings["security"]["folderTrust"]["enabled"],
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_disable_gemini_folder_trust_preserves_existing_keys() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"theme":"dark","security":{"auth":{"selectedType":"oauth"}}}"#,
+        )
+        .unwrap();
+
+        disable_gemini_folder_trust(&settings_path).unwrap();
+
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(settings["security"]["auth"]["selectedType"], "oauth");
+        assert_eq!(
+            settings["security"]["folderTrust"]["enabled"],
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_disable_gemini_folder_trust_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+
+        disable_gemini_folder_trust(&settings_path).unwrap();
+        let first = std::fs::read_to_string(&settings_path).unwrap();
+        let mtime = std::fs::metadata(&settings_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        disable_gemini_folder_trust(&settings_path).unwrap();
+        let second = std::fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(first, second);
+        // No-change second pass must not rewrite the file.
+        assert_eq!(
+            mtime,
+            std::fs::metadata(&settings_path)
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_trust_codex_project_writes_project_table() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join(".codex").join("config.toml");
+
+        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+
+        let config_text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            config_text.contains(r#"[projects."/workspace/my-worktree"]"#),
+            "unexpected config:\n{config_text}"
+        );
+        let config: toml::Value = toml::from_str(&config_text).unwrap();
+        assert_eq!(
+            config["projects"]["/workspace/my-worktree"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn test_trust_codex_project_preserves_existing_config() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"model = "gpt-5.3-codex"
+
+[projects."/other/path"]
+trust_level = "trusted"
+"#,
+        )
+        .unwrap();
+
+        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+
+        let config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(config["model"].as_str(), Some("gpt-5.3-codex"));
+        assert_eq!(
+            config["projects"]["/other/path"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert_eq!(
+            config["projects"]["/workspace/my-worktree"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn test_trust_codex_project_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+        let first = std::fs::read_to_string(&config_path).unwrap();
+        let mtime = std::fs::metadata(&config_path).unwrap().modified().unwrap();
+
+        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+        let second = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            mtime,
+            std::fs::metadata(&config_path).unwrap().modified().unwrap()
+        );
+    }
+
+    #[test]
     fn test_install_codex_hooks_preserves_inline_disabled_flag_and_skips_install() {
         let tmp = TempDir::new().unwrap();
         let codex_dir = tmp.path().join(".codex");
@@ -2682,6 +3243,97 @@ command = "echo user-hook"
         assert_eq!(std::fs::read_to_string(&status_path).unwrap(), "waiting");
     }
 
+    /// Run a waiting-tools PreToolUse command against a temp hook base with
+    /// the given stdin payload; return what it wrote to the status file.
+    fn run_waiting_tools_hook(stdin_payload: &str) -> String {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::{Command, Stdio};
+
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("aoe-hooks");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let cmd = hook_command_waiting_tools_with_base(
+            "running",
+            &["AskUserQuestion".to_string()],
+            base.to_str().unwrap(),
+            HookInstallTarget::Host,
+        );
+
+        let mut child = Command::new("sh")
+            .args(["-c", &cmd])
+            .env("AOE_INSTANCE_ID", "waiting_tools")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(stdin_payload.as_bytes())
+            .expect("write hook stdin");
+        let output = child.wait_with_output().expect("wait for sh");
+        assert!(output.status.success(), "hook must exit 0: {output:?}");
+        std::fs::read_to_string(base.join("waiting_tools").join("status")).unwrap()
+    }
+
+    #[test]
+    fn test_waiting_tools_hook_writes_waiting_for_ask_user_question() {
+        // The real PreToolUse payload shape for an AskUserQuestion call:
+        // compact JSON with a top-level tool_name key.
+        let payload = r#"{"session_id":"6cbahc1c-83e0-4a1c-b22e-df2a70518746","hook_event_name":"PreToolUse","tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which approach?"}]}}"#;
+        assert_eq!(run_waiting_tools_hook(payload), "waiting");
+    }
+
+    #[test]
+    fn test_waiting_tools_hook_writes_default_for_other_tools() {
+        let payload =
+            r#"{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+        assert_eq!(run_waiting_tools_hook(payload), "running");
+    }
+
+    #[test]
+    fn test_waiting_tools_hook_ignores_escaped_mention_in_tool_input() {
+        // An Edit writing this repo's own source can carry the literal text
+        // `"tool_name":"AskUserQuestion"` inside a tool_input string, where
+        // JSON escapes its quotes (`\"tool_name\":\"AskUserQuestion\"`), so
+        // the exact byte sequence differs and must not flip the status.
+        let payload = r#"{"hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"new_string":"match on \"tool_name\":\"AskUserQuestion\" here"}}"#;
+        assert_eq!(run_waiting_tools_hook(payload), "running");
+    }
+
+    #[test]
+    fn test_waiting_tools_hook_writes_default_without_stdin() {
+        // If the agent ever stops delivering stdin, the command must fall
+        // back to the event's default status, not hang or error.
+        assert_eq!(run_waiting_tools_hook(""), "running");
+    }
+
+    #[test]
+    fn test_claude_hooks_gate_pre_tool_use_on_ask_user_question() {
+        let hooks = build_aoe_hooks(claude_events(), HookInstallTarget::Host);
+
+        // PreToolUse carries the tool-gated writer: running by default,
+        // waiting when the payload names AskUserQuestion.
+        let pre = hooks["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 1);
+        let pre_cmd = pre[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(pre_cmd.contains(r#"*\"tool_name\":\"AskUserQuestion\"*"#));
+        assert!(pre_cmd.contains("S=running"));
+
+        // PostToolUse restores running the moment the answer lands; it is
+        // scoped to AskUserQuestion so no catch-all PostToolUse group exists.
+        let post = hooks["PostToolUse"].as_array().unwrap();
+        assert_eq!(post.len(), 1);
+        assert_eq!(post[0]["matcher"].as_str().unwrap(), "AskUserQuestion");
+        let post_cmd = post[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(post_cmd.contains("printf running"));
+    }
+
     #[test]
     fn test_notification_hook_has_matcher() {
         let hooks = build_aoe_hooks(claude_events(), HookInstallTarget::Sandbox);
@@ -2700,6 +3352,8 @@ command = "echo user-hook"
         let waiting_matcher = waiting["matcher"].as_str().unwrap();
         assert!(waiting_matcher.contains("permission_prompt"));
         assert!(waiting_matcher.contains("elicitation_dialog"));
+        // Agent-view identifier (2.1.198) rides the permission/waiting group.
+        assert!(waiting_matcher.contains("agent_needs_input"));
         assert!(!waiting_matcher.contains("idle_prompt"));
         assert!(
             waiting["hooks"][0]["command"]
@@ -2711,8 +3365,17 @@ command = "echo user-hook"
 
         let idle = notification
             .iter()
-            .find(|g| g["matcher"].as_str() == Some("idle_prompt"))
+            .find(|g| {
+                g["matcher"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("idle_prompt"))
+            })
             .expect("idle_prompt matcher group present");
+        // Agent-view completion (2.1.198) rides the idle group.
+        assert!(idle["matcher"]
+            .as_str()
+            .unwrap()
+            .contains("agent_completed"));
         assert!(
             idle["hooks"][0]["command"]
                 .as_str()
@@ -3035,12 +3698,13 @@ command = "echo user-hook"
 
     #[test]
     fn test_settl_hook_commands_write_correct_status() {
-        for (event, expected_status) in SETTL_HOOKS {
+        for event in sidecar_default_events("settl") {
+            let expected_status = event.status.as_str();
             let cmd = hook_command(expected_status, HookInstallTarget::Host);
             assert!(
                 cmd.contains(&format!("printf {}", expected_status)),
                 "Hook for {} should write '{}': {}",
-                event,
+                event.name,
                 expected_status,
                 cmd
             );
@@ -3065,13 +3729,18 @@ command = "echo user-hook"
             .as_mapping()
             .unwrap();
 
-        for (event, _) in HERMES_HOOKS {
+        for event in sidecar_default_events("hermes") {
             let entries = hooks
-                .get(serde_yaml::Value::String((*event).into()))
-                .unwrap_or_else(|| panic!("event {} missing", event))
+                .get(serde_yaml::Value::String(event.name.into()))
+                .unwrap_or_else(|| panic!("event {} missing", event.name))
                 .as_sequence()
                 .unwrap();
-            assert_eq!(entries.len(), 1, "event {} should have one entry", event);
+            assert_eq!(
+                entries.len(),
+                1,
+                "event {} should have one entry",
+                event.name
+            );
             let cmd = entries[0]
                 .as_mapping()
                 .and_then(|m| m.get(serde_yaml::Value::String("command".into())))
@@ -3089,7 +3758,43 @@ command = "echo user-hook"
         let raw = std::fs::read_to_string(&allowlist).unwrap();
         let parsed: Value = serde_json::from_str(&raw).unwrap();
         let approvals = parsed["approvals"].as_array().unwrap();
-        assert_eq!(approvals.len(), HERMES_HOOKS.len());
+        assert_eq!(approvals.len(), sidecar_default_events("hermes").len());
+    }
+
+    #[test]
+    fn test_install_hermes_hooks_uses_resolved_status_override() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        let events = resolved_events_with_override(
+            "hermes",
+            "pre_approval_request",
+            crate::agents::HookStatus::Error,
+        );
+
+        install_hermes_hooks_with_events(&config_path, HookInstallTarget::Host, &events).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        let cmd = config["hooks"]["pre_approval_request"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(cmd.contains("printf error"), "got command: {cmd}");
+
+        let allowlist: Value = serde_json::from_str(
+            &std::fs::read_to_string(tmp.path().join("shell-hooks-allowlist.json")).unwrap(),
+        )
+        .unwrap();
+        let approval_cmd = allowlist["approvals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"].as_str() == Some("pre_approval_request"))
+            .and_then(|entry| entry["command"].as_str())
+            .unwrap();
+        assert!(
+            approval_cmd.contains("printf error"),
+            "got command: {approval_cmd}"
+        );
     }
 
     #[test]
@@ -3183,7 +3888,7 @@ hooks_auto_accept: false
         let raw = std::fs::read_to_string(&allowlist).unwrap();
         let parsed: Value = serde_json::from_str(&raw).unwrap();
         let approvals = parsed["approvals"].as_array().unwrap();
-        assert_eq!(approvals.len(), HERMES_HOOKS.len());
+        assert_eq!(approvals.len(), sidecar_default_events("hermes").len());
     }
 
     #[test]
@@ -3219,12 +3924,13 @@ hooks_auto_accept: false
 
     #[test]
     fn test_hermes_hook_commands_write_correct_status() {
-        for (event, expected_status) in HERMES_HOOKS {
+        for event in sidecar_default_events("hermes") {
+            let expected_status = event.status.as_str();
             let cmd = hook_command(expected_status, HookInstallTarget::Host);
             assert!(
                 cmd.contains(&format!("printf {}", expected_status)),
                 "Hook for {} should write '{}': {}",
-                event,
+                event.name,
                 expected_status,
                 cmd
             );
@@ -3234,10 +3940,10 @@ hooks_auto_accept: false
 
     #[test]
     fn test_hermes_approval_request_writes_waiting() {
-        let mapped: Vec<&str> = HERMES_HOOKS
+        let mapped: Vec<&str> = sidecar_default_events("hermes")
             .iter()
-            .filter(|(e, _)| *e == "pre_approval_request")
-            .map(|(_, s)| *s)
+            .filter(|event| event.name == "pre_approval_request")
+            .map(|event| event.status.as_str())
             .collect();
         assert_eq!(
             mapped,
@@ -3261,16 +3967,36 @@ hooks_auto_accept: false
         let config: Value = serde_json::from_str(&content).unwrap();
         let hooks = config["hooks"].as_object().unwrap();
 
-        for (event, _) in KIRO_HOOKS {
+        for event in sidecar_default_events("kiro") {
             let entries = hooks
-                .get(*event)
-                .unwrap_or_else(|| panic!("event {} missing", event))
+                .get(event.name)
+                .unwrap_or_else(|| panic!("event {} missing", event.name))
                 .as_array()
                 .unwrap();
-            assert_eq!(entries.len(), 1, "event {} should have one entry", event);
+            assert_eq!(
+                entries.len(),
+                1,
+                "event {} should have one entry",
+                event.name
+            );
             let cmd = entries[0]["command"].as_str().unwrap();
             assert!(is_aoe_hook_command(cmd));
         }
+    }
+
+    #[test]
+    fn test_install_kiro_hooks_uses_resolved_status_override() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("aoe-hooks.json");
+        let events =
+            resolved_events_with_override("kiro", "stop", crate::agents::HookStatus::Error);
+
+        install_kiro_hooks_with_events(&config_path, HookInstallTarget::Host, &events).unwrap();
+
+        let config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let cmd = config["hooks"]["stop"][0]["command"].as_str().unwrap();
+        assert!(cmd.contains("printf error"), "got command: {cmd}");
     }
 
     #[test]
@@ -3306,13 +4032,13 @@ hooks_auto_accept: false
 
         let content = std::fs::read_to_string(&config_path).unwrap();
         let config: Value = serde_json::from_str(&content).unwrap();
-        for (event, _) in KIRO_HOOKS {
-            let entries = config["hooks"][event].as_array().unwrap();
+        for event in sidecar_default_events("kiro") {
+            let entries = config["hooks"][event.name].as_array().unwrap();
             assert_eq!(
                 entries.len(),
                 1,
                 "event {} should still have exactly one AoE entry after double install",
-                event
+                event.name
             );
         }
     }
@@ -3462,13 +4188,13 @@ hooks_auto_accept: false
         // The created file's name must match the selected agent, not the
         // standalone "aoe-hooks" default, so Kiro loads it for --agent custom-agent.
         assert_eq!(config["name"].as_str(), Some("custom-agent"));
-        for (event, _) in KIRO_HOOKS {
-            let entries = config["hooks"][event].as_array().unwrap();
+        for event in sidecar_default_events("kiro") {
+            let entries = config["hooks"][event.name].as_array().unwrap();
             assert_eq!(
                 entries.len(),
                 1,
                 "event {} should have one AoE entry",
-                event
+                event.name
             );
             assert!(is_aoe_hook_command(entries[0]["command"].as_str().unwrap()));
         }
@@ -4022,6 +4748,70 @@ hooks_auto_accept: false
             .unwrap_or(false)
     }
 
+    #[cfg(target_os = "linux")]
+    fn acl_probe_uid() -> u32 {
+        let euid = nix::unistd::geteuid().as_raw();
+        [65534u32, 65533, 1, 2]
+            .into_iter()
+            .find(|uid| *uid != euid)
+            .expect("probe uid list must include a uid different from euid")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_setfacl(path: &Path, spec: &str) -> bool {
+        match std::process::Command::new("setfacl")
+            .args(["-m", spec])
+            .arg(path)
+            .output()
+        {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                eprintln!(
+                    "skipping: setfacl failed for {}: {}",
+                    path.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("skipping: setfacl unavailable: {e}");
+                false
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ls_ldn_mode(path: &Path) -> Option<String> {
+        let output = std::process::Command::new("ls")
+            .args(["-ldn"])
+            .arg(path)
+            .env("LC_ALL", "C")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8(output.stdout)
+            .ok()?
+            .split_whitespace()
+            .next()
+            .map(str::to_string)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn chmod_0700(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn hook_accepts_mode(mode: &str) -> bool {
+        matches!(
+            mode,
+            "drwx------" | "drwx------." | "drwx------+" | "drwx------@"
+        )
+    }
+
     #[test]
     fn host_shell_in_dash_refuses_wrong_mode() {
         if !dash_available() {
@@ -4047,6 +4837,127 @@ hooks_auto_accept: false
         assert!(
             !base.join("dash_wrong_mode").exists(),
             "dash must reject 0o755 parent and refuse to mkdir under it"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privdrop_host_shell_in_dash_refuses_alien_uid() {
+        use crate::hooks::test_support::{make_alien_owned, privdrop_test_enabled};
+        use std::os::unix::fs::PermissionsExt;
+
+        if !privdrop_test_enabled() {
+            return;
+        }
+        if !dash_available() {
+            panic!("dedicated Linux privdrop job requires dash");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("aoe-hooks-alien");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        make_alien_owned(&base);
+
+        let cmd =
+            hook_command_with_base("running", base.to_str().unwrap(), HookInstallTarget::Host);
+        let output = std::process::Command::new("dash")
+            .args(["-c", &cmd])
+            .env("AOE_INSTANCE_ID", "dash_alien_uid")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "hook must exit 0 on rejection");
+        assert!(
+            !base.join("dash_alien_uid").exists(),
+            "dash must reject an alien-owned parent before creating an instance directory"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_shell_accepts_acl_suffix_when_mode_tight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("aoe-hooks-acl-tight");
+        let inst = base.join("acl_tight");
+        std::fs::create_dir_all(&inst).unwrap();
+        chmod_0700(&base);
+        chmod_0700(&inst);
+
+        let probe_uid = acl_probe_uid();
+        let tight_acl = format!("u::rwx,g::---,o::---,u:{probe_uid}:---,m::---");
+        if !try_setfacl(&base, &tight_acl) || !try_setfacl(&inst, &tight_acl) {
+            return;
+        }
+
+        for path in [&base, &inst] {
+            let mode = ls_ldn_mode(path).expect("ls -ldn must report mode");
+            assert!(
+                mode.starts_with("drwx------") && mode.ends_with('+'),
+                "precondition failed: {} must report a tight ACL suffix, got {mode}",
+                path.display()
+            );
+            assert!(
+                hook_accepts_mode(&mode),
+                "precondition failed: hook pattern must accept {mode}"
+            );
+        }
+
+        let cmd =
+            hook_command_with_base("running", base.to_str().unwrap(), HookInstallTarget::Host);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .env("AOE_INSTANCE_ID", "acl_tight")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "hook must exit 0");
+        assert_eq!(
+            std::fs::read_to_string(inst.join("status")).unwrap(),
+            "running",
+            "snippet must write status when ACL suffix is tight"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_shell_rejects_acl_widening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("aoe-hooks-acl-wide");
+        let inst = base.join("acl_wide");
+        std::fs::create_dir_all(&inst).unwrap();
+        chmod_0700(&base);
+        chmod_0700(&inst);
+
+        let probe_uid = acl_probe_uid();
+        let wide_acl = format!("u::rwx,g::---,o::---,u:{probe_uid}:r-x,m::r-x");
+        if !try_setfacl(&inst, &wide_acl) {
+            return;
+        }
+
+        let base_mode = ls_ldn_mode(&base).expect("ls -ldn must report base mode");
+        assert!(
+            hook_accepts_mode(&base_mode),
+            "precondition failed: base must pass before instance guard is tested"
+        );
+
+        let inst_mode = ls_ldn_mode(&inst).expect("ls -ldn must report instance mode");
+        assert!(
+            inst_mode.ends_with('+') && !hook_accepts_mode(&inst_mode),
+            "precondition failed: widened ACL must produce a rejected + mode, got {inst_mode}"
+        );
+
+        let cmd =
+            hook_command_with_base("running", base.to_str().unwrap(), HookInstallTarget::Host);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .env("AOE_INSTANCE_ID", "acl_wide")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "hook must exit 0 even when ACL widens access"
+        );
+        assert!(
+            !inst.join("status").exists(),
+            "snippet must not write status when ACL widens access"
         );
     }
 
@@ -4164,7 +5075,7 @@ hooks_auto_accept: false
         let settings_path = tmp.path().join("settings.json");
         let events = claude_events();
 
-        install_hooks(&settings_path, events, HookInstallTarget::Host).unwrap();
+        install_hooks(&settings_path, &events, HookInstallTarget::Host).unwrap();
         let canonical = std::fs::read_to_string(&settings_path).unwrap();
         std::fs::remove_file(&settings_path).unwrap();
 
@@ -4173,6 +5084,7 @@ hooks_auto_accept: false
             for _ in 0..8 {
                 let path = settings_path.clone();
                 let b = barrier.clone();
+                let events = &events;
                 s.spawn(move || {
                     b.wait();
                     for _ in 0..100 {
@@ -4252,13 +5164,10 @@ hooks_auto_accept: false
     #[serial_test::serial(shell_env)]
     fn collect_env_lists_warns_on_corrupt_global_config_but_not_on_missing() {
         let tmp = TempDir::new().unwrap();
-        let _codex = CodexHomeGuard::unset();
-        let _home = EnvGuard::set("HOME", tmp.path().to_str().unwrap());
+        let _codex = EnvGuard::unset(&["CODEX_HOME"]);
+        let _home = EnvGuard::set(&[("HOME", tmp.path())]);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let _xdg = EnvGuard::set(
-            "XDG_CONFIG_HOME",
-            tmp.path().join(".config").to_str().unwrap(),
-        );
+        let _xdg = EnvGuard::set(&[("XDG_CONFIG_HOME", tmp.path().join(".config"))]);
 
         let app_dir = crate::session::get_app_dir().unwrap();
         let config_path = app_dir.join("config.toml");
@@ -4494,6 +5403,154 @@ hooks_auto_accept: false
             std::fs::read(&config_path).unwrap(),
             bytes_before,
             "second install must leave bytes byte-identical"
+        );
+    }
+
+    #[test]
+    fn test_install_kimi_hooks_preserves_oauth_block_and_comments() {
+        // Kimi's config.toml also holds provider/model/oauth settings, so the
+        // installer must preserve the surrounding document (comments, nested
+        // tables, key order) rather than reserialise it.
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let original = "\
+# ~/.kimi-code/config.toml
+default_model = \"kimi-k2\"
+
+[providers.kimi]
+type = \"kimi\"
+oauth = { storage = \"keyring\", key = \"user@example.com\" }
+
+[models.\"kimi-k2\"]
+provider = \"kimi\"
+model = \"kimi-k2\"
+max_context_size = 200000
+";
+        std::fs::write(&config_path, original).unwrap();
+
+        install_kimi_hooks(&config_path, HookInstallTarget::Host).unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        // The comment and the oauth/provider/model tables survive verbatim.
+        assert!(written.contains("# ~/.kimi-code/config.toml"));
+        assert!(written.contains("[providers.kimi]"));
+        assert!(written.contains("key = \"user@example.com\""));
+        assert!(written.contains("max_context_size = 200000"));
+
+        // Hooks were appended and the file still parses as valid TOML.
+        let parsed: toml::Value = toml::from_str(&written).unwrap();
+        let hooks = parsed["hooks"].as_array().expect("hooks array installed");
+        assert_eq!(
+            hooks.len(),
+            crate::agents::KIMI_SIDECAR_EVENTS.len(),
+            "one hook entry per default kimi status event"
+        );
+        assert!(hooks.iter().all(|h| {
+            h.get("command")
+                .and_then(|c| c.as_str())
+                .is_some_and(is_aoe_hook_command)
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_install_kimi_hooks_no_rewrite_when_unchanged() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        install_kimi_hooks(&config_path, HookInstallTarget::Host).unwrap();
+        let ino_before = std::fs::metadata(&config_path).unwrap().ino();
+        let bytes_before = std::fs::read(&config_path).unwrap();
+
+        install_kimi_hooks(&config_path, HookInstallTarget::Host).unwrap();
+        assert_eq!(
+            std::fs::metadata(&config_path).unwrap().ino(),
+            ino_before,
+            "second install must not replace the inode"
+        );
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            bytes_before,
+            "second install must leave bytes byte-identical"
+        );
+    }
+
+    #[test]
+    fn test_uninstall_kimi_hooks_removes_only_aoe_and_preserves_rest() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "default_model = \"kimi-k2\"\n").unwrap();
+
+        install_kimi_hooks(&config_path, HookInstallTarget::Host).unwrap();
+        assert!(uninstall_kimi_hooks(&config_path).unwrap(), "removed hooks");
+
+        let parsed: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(parsed["default_model"].as_str(), Some("kimi-k2"));
+        // The emptied hooks array is dropped, leaving no residue.
+        assert!(parsed.get("hooks").is_none(), "empty hooks key removed");
+
+        // A second uninstall is a no-op.
+        assert!(!uninstall_kimi_hooks(&config_path).unwrap());
+    }
+
+    #[test]
+    fn test_install_kimi_hooks_migrates_inline_hooks_array_preserving_user_entries() {
+        // A user (or Kimi) may write hooks as an inline `hooks = [{...}]`
+        // array. Install must migrate it to `[[hooks]]` and keep the
+        // user-authored entry rather than refusing or dropping it.
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "hooks = [{ event = \"SessionStart\", command = \"echo hi\" }]\n",
+        )
+        .unwrap();
+
+        install_kimi_hooks(&config_path, HookInstallTarget::Host).unwrap();
+
+        let parsed: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let hooks = parsed["hooks"].as_array().unwrap();
+        // The user's non-AoE hook survives alongside the installed AoE hooks.
+        assert!(hooks.iter().any(|h| {
+            h.get("command").and_then(|c| c.as_str()) == Some("echo hi")
+                && h.get("event").and_then(|e| e.as_str()) == Some("SessionStart")
+        }));
+        assert_eq!(
+            hooks.len(),
+            crate::agents::KIMI_SIDECAR_EVENTS.len() + 1,
+            "AoE events plus the preserved user hook"
+        );
+        // Uninstall removes only the AoE hooks, leaving the user's entry.
+        assert!(uninstall_kimi_hooks(&config_path).unwrap());
+        let after: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let after_hooks = after["hooks"].as_array().unwrap();
+        assert_eq!(after_hooks.len(), 1);
+        assert_eq!(
+            after_hooks[0].get("command").and_then(|c| c.as_str()),
+            Some("echo hi")
+        );
+    }
+
+    #[test]
+    fn test_install_kimi_hooks_rejects_mixed_inline_array_leaving_file_untouched() {
+        // A hooks array with a non-table element is a shape we don't
+        // understand; install must fail without rewriting the file rather than
+        // silently dropping the unexpected entry.
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let original =
+            "hooks = [{ event = \"SessionStart\", command = \"echo hi\" }, \"custom\"]\n";
+        std::fs::write(&config_path, original).unwrap();
+
+        assert!(install_kimi_hooks(&config_path, HookInstallTarget::Host).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            original,
+            "a rejected install must leave the config byte-for-byte unchanged"
         );
     }
 

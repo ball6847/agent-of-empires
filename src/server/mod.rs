@@ -8,13 +8,17 @@ pub mod acp_reconciler;
 #[cfg(feature = "serve")]
 pub mod acp_ws;
 pub mod api;
+pub(crate) mod attach_project;
 pub mod auth;
+pub mod callback;
 pub mod live_ws;
 pub mod login;
 mod pane;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
+pub(crate) mod session_service;
+pub(crate) mod session_spawn;
 pub mod tunnel;
 
 use std::net::SocketAddr;
@@ -179,6 +183,29 @@ impl TokenManager {
     }
 }
 
+/// Build the owner-only `serve.url` contents for a remotely exposed daemon.
+/// The public tunnel stays first for backwards-compatible display/QR consumers,
+/// while the loopback alternate lets same-host clients (notably the TUI) use the
+/// auth middleware's filesystem-trusted loopback bypass instead of round-tripping
+/// through the tunnel and getting challenged for a browser passphrase session.
+fn remote_serve_url_contents(
+    remote_base_url: &str,
+    local_port: u16,
+    token: Option<&str>,
+) -> String {
+    let with_token = |base_url: &str| {
+        let base_url = base_url.trim_end_matches('/');
+        match token {
+            Some(token) => format!("{base_url}/?token={token}"),
+            None => format!("{base_url}/"),
+        }
+    };
+
+    let remote_url = with_token(remote_base_url);
+    let loopback_url = with_token(&format!("http://127.0.0.1:{local_port}"));
+    format!("{remote_url}\nlocalhost\t{loopback_url}\n")
+}
+
 /// Read `AOE_TEST_TOKEN_LIFETIME_SECS`. Debug builds only; ignored in
 /// release so production cannot be forced into a short rotation cycle
 /// by a stray env var.
@@ -276,7 +303,19 @@ pub(crate) enum StatusSource {
 pub struct AppState {
     pub profile: String,
     pub read_only: bool,
-    pub instances: RwLock<Vec<Instance>>,
+    /// CityHall client mode, resolved once at launch from `AOE_CITYHALL_MODE`.
+    /// When set, the web dashboard is locked down to an end-user client
+    /// (composer + structured view only) and the server rejects terminal,
+    /// diff, project-management, and advanced-settings endpoints. Enforced
+    /// server-side, not only in the UI, mirroring `read_only`. See #7.
+    pub cityhall_mode: bool,
+    pub instances: Arc<RwLock<Vec<Instance>>>,
+    /// Session-domain service handle sharing `instances`, `instance_locks`,
+    /// `file_watch`, the telemetry create counter, and the ACP supervisor
+    /// with the fields on this struct, so a non-HTTP caller (the plugin
+    /// host, #2897) can drive session create/turn without holding
+    /// `AppState`.
+    pub session_service: Arc<session_service::SessionService>,
     pub token_manager: Arc<TokenManager>,
     pub login_manager: Arc<login::LoginManager>,
     pub rate_limiter: Arc<RateLimiter>,
@@ -290,11 +329,32 @@ pub struct AppState {
     /// (`"tunnel"` / `"tailscale"` / `"local"`), fed to the telemetry snapshot.
     /// Never a tunnel name, hostname, or `.ts.net` URL, only the mode.
     pub serve_mode: &'static str,
+    /// DNS-rebinding gate: accepted `Host` values, port-stripped,
+    /// ASCII-lowercased, IPv6 unbracketed. Resolved once at launch by
+    /// `resolve_access_policy` from the bind host, `--allowed-host`, and any
+    /// auto-injected tunnel host. `access_policy` rejects an unlisted `Host`
+    /// with 403, before auth. See #2735.
+    pub allowed_hosts: Vec<String>,
+    /// DNS-rebinding gate: accepted `Origin` values (scheme + host [+ port],
+    /// ASCII-lowercased). A request whose `Origin` is unlisted is rejected
+    /// with 403; a request with no `Origin` (curl, native TUI, non-browser
+    /// WS) is exempt. Resolved alongside `allowed_hosts`. See #2735.
+    pub allowed_origins: Vec<String>,
     /// Per-instance mutex guarding mutations that must not interleave
     /// (e.g. `ensure_session` decide-and-restart). Entries are created on
     /// first use and live for the lifetime of the process — there are only
     /// as many as the user has sessions.
-    pub instance_locks: RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    pub instance_locks: Arc<RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Per-`idempotency_key` mutex serializing `POST /api/sessions` create
+    /// requests that share a key, so two concurrent retries with the same
+    /// key can't both scan-miss the existing-instance check and both create
+    /// a session. Unlike `instance_locks` above, entries here are NOT bounded
+    /// by the number of sessions: keys are caller-supplied, one per request.
+    /// `idempotency_lock` therefore prunes unreferenced entries on its miss
+    /// path, so the map tracks in-flight keyed creates rather than every key
+    /// the daemon has ever seen. See #3156.
+    pub idempotency_locks:
+        Arc<RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Session ids with an in-flight smart-rename one-shot, so a burst of rapid
     /// first prompts cannot spawn concurrent title generators for the same
     /// session. Synchronous mutex: critical sections are tiny and never span an
@@ -311,6 +371,18 @@ pub struct AppState {
     /// up to `ONESHOT_TIMEOUT`. Held only across the child spawn + wait. See
     /// `session::smart_rename` and #2348.
     pub smart_rename_semaphore: tokio::sync::Semaphore,
+    /// Session ids with an in-flight conversation-summary one-shot, so the
+    /// automatic trigger and the on-demand endpoint cannot spawn concurrent
+    /// summaries for the same session (which would also race on the
+    /// last-summary seq). Synchronous mutex; tiny critical sections. See
+    /// `session::conversation_summary` and #2808.
+    pub summary_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Global cap on concurrent conversation-summary one-shots. Separate from
+    /// `smart_rename_semaphore` (permits=2) and sized to 1: a summary runs the
+    /// agent over the whole transcript, so it is slower and costlier than a
+    /// title call; a dedicated single slot keeps heavy background summaries
+    /// from starving the snappy first-prompt rename. See #2808.
+    pub summary_semaphore: tokio::sync::Semaphore,
     /// Suppression set for the startup-recovery cascade. While an entry is
     /// present and younger than `recovery::RECENTLY_RESTARTED_TTL`, the
     /// `status_poll_loop` skips `update_status_with_metadata` for that
@@ -386,6 +458,16 @@ pub struct AppState {
     /// checks this to suppress notifications when someone is actively using
     /// the web dashboard (on any device).
     pub last_web_activity: std::sync::atomic::AtomicI64,
+    /// Packed sleep-inhibit reconciler snapshot for read-only status reporting:
+    /// bit `SLEEP_INHIBIT_SNAPSHOT_ENABLED` is the
+    /// `prevent_sleep_when_active` toggle as the reconciler last read it, bit
+    /// `SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT` is whether an inhibitor slot is
+    /// retained (slot presence, not the gated held state the endpoint reports).
+    /// Sole writer is `update_sleep_inhibit`; `/api/about` reads it. Packed into
+    /// one byte so the two correlated bits are read torn-free. The slot itself
+    /// stays loop-local; only this derived scalar reaches `AppState`.
+    /// `backend_available` is read live from the latch, not stored here.
+    pub sleep_inhibit_snapshot: std::sync::atomic::AtomicU8,
     /// Allowlisted usage-signal counters: per-signal counts of browser reports
     /// that a surface (web dashboard / acp web UI) was opened, so the next
     /// opt-in telemetry snapshot can carry the `usage_seen` map. Monotonic
@@ -409,7 +491,7 @@ pub struct AppState {
     /// that start and end between two snapshots are still counted. Decremented (by
     /// the value reported) only after a confirmed send, so a failed send retains
     /// the count for the next snapshot instead of silently dropping it.
-    pub telemetry_session_creates: std::sync::atomic::AtomicU32,
+    pub telemetry_session_creates: Arc<std::sync::atomic::AtomicU32>,
     /// Aggregate structured-interaction tallies for the next opt-in snapshot
     /// (approvals decision mix, agent/substrate switches, plan-mode, queued
     /// prompts). Same monotonic-counter, decrement-by-reported discipline as
@@ -503,10 +585,38 @@ impl AppState {
             .clone()
     }
 
+    /// Get or create the per-idempotency-key serialization mutex. Same
+    /// get-or-create shape as `instance_lock`, but prunes on the miss path:
+    /// unlike session ids, idempotency keys are per-request and unbounded, so
+    /// without eviction the map would grow for the daemon's lifetime.
+    pub async fn idempotency_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        {
+            let guard = self.idempotency_locks.read().await;
+            if let Some(lock) = guard.get(key) {
+                return lock.clone();
+            }
+        }
+        let mut guard = self.idempotency_locks.write().await;
+        // Drop keys nobody is using. A strong count of 1 means the map holds
+        // the only reference, so no request is mid-flight on that key and the
+        // created session's persisted `idempotency_key` is now the durable
+        // dedup record; a later retry re-creates a fresh mutex and re-reads
+        // that record, which is equivalent. A waiter can only clone the `Arc`
+        // while holding this same write lock, so pruning cannot race one away.
+        // Mirrors the prune-under-write-lock shape in `changed_files_cached`.
+        guard.retain(|_, lock| Arc::strong_count(lock) > 1);
+        guard
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// Record that an authenticated web client just made a request.
     pub fn touch_web_activity(&self) {
-        self.last_web_activity
-            .store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
+        self.last_web_activity.store(
+            crate::util::now_ms() as i64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Returns true if an authenticated web request arrived within `threshold`.
@@ -517,16 +627,9 @@ impl AppState {
         if last == 0 {
             return false;
         }
-        let elapsed_ms = epoch_millis() - last;
+        let elapsed_ms = crate::util::now_ms() as i64 - last;
         elapsed_ms >= 0 && (elapsed_ms as u64) < threshold.as_millis() as u64
     }
-}
-
-fn epoch_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 /// Raise the soft `RLIMIT_NOFILE` so the server can sustain many WS
@@ -544,10 +647,12 @@ fn epoch_millis() -> i64 {
 #[cfg(unix)]
 fn raise_fd_limit() {
     use nix::sys::resource::{getrlimit, setrlimit, Resource};
-    const TARGET: u64 = 8192;
     match getrlimit(Resource::RLIMIT_NOFILE) {
         Ok((soft, hard)) => {
-            let target = TARGET.min(hard).max(soft);
+            // `rlim_t` is u64 on Linux/macOS but i64 on the BSDs, so derive the
+            // 8192 ceiling in the limits' own type rather than a hardcoded u64;
+            // this keeps the arithmetic and the setrlimit call below portable.
+            let target = hard.min(8192).max(soft);
             if target > soft {
                 if let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
                     tracing::warn!(target: "http.middleware", "Failed to raise RLIMIT_NOFILE to {}: {}", target, e);
@@ -584,6 +689,12 @@ pub struct ServerConfig<'a> {
     /// same surface as `remote`, without spawning a tunnel.
     pub behind_proxy: bool,
     pub open_browser: bool,
+    /// Operator-supplied `--allowed-host` entries, merged with the derived
+    /// loopback/bind/tunnel set by `resolve_access_policy`. See #2735.
+    pub extra_allowed_hosts: Vec<String>,
+    /// Operator-supplied `--allowed-origin` entries (normalized to the browser
+    /// `Origin` form), for reverse proxies on nonstandard ports. See #2735.
+    pub extra_allowed_origins: Vec<String>,
 }
 
 /// Resolve the coarse auth-mode label the same way `/api/about` reports it, so
@@ -617,6 +728,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         passphrase,
         behind_proxy,
         open_browser,
+        extra_allowed_hosts,
+        extra_allowed_origins,
     } = config;
 
     raise_fd_limit();
@@ -666,6 +779,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // `push_enabled`, this is read once at startup; a config change needs a
     // restart to take effect. The TUI process maintains its own copy.
     crate::session::set_unread_enabled(config.session.unread_indicator);
+    crate::session::set_favorites_first(config.session.favorites_first);
 
     // Login sessions persist across daemon restarts by default (#1235) so
     // signed-in devices are not re-prompted for the passphrase on every
@@ -764,6 +878,29 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // The Tier 1 plugin worker host. Opening it (the plugin event-bus database,
     // the worker log dir) is cheap and side-effect-free until workers launch,
     // which happens after the daemon is up. A failure here is logged, not fatal:
+    // The session-domain service is built before the plugin host so the
+    // host's session RPCs (#2897) get it by construction, never late-bound.
+    let instances = Arc::new(RwLock::new(instances));
+    let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
+    let idempotency_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
+    let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    #[cfg(feature = "serve")]
+    let session_service = Arc::new(session_service::SessionService::new(
+        Arc::clone(&instances),
+        Arc::clone(&instance_locks),
+        Arc::clone(&file_watch),
+        Arc::clone(&telemetry_session_creates),
+        acp_supervisor.clone(),
+        acp_event_store.clone(),
+    ));
+    #[cfg(not(feature = "serve"))]
+    let session_service = Arc::new(session_service::SessionService::new(
+        Arc::clone(&instances),
+        Arc::clone(&instance_locks),
+        Arc::clone(&file_watch),
+        Arc::clone(&telemetry_session_creates),
+    ));
+
     // the daemon serves fine without plugin workers.
     // The host API includes mutating session.meta.set/cas, so a read-only
     // daemon must not run plugin workers at all: gate the host on !read_only.
@@ -773,13 +910,34 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         None
     } else {
         match crate::session::get_app_dir() {
-            Ok(app_dir) => match crate::plugin::host::PluginHost::new(&app_dir, profile) {
-                Ok(host) => Some(host),
-                Err(e) => {
-                    tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
-                    None
+            Ok(app_dir) => {
+                // Session RPCs need the automation-policy ledger; if it cannot
+                // open, workers still run but session RPCs answer
+                // service_unavailable (fail closed on limits, not open).
+                let session_rpc = match crate::plugin::automation_policy::AutomationPolicy::open(
+                    &app_dir.join("plugin_events.db"),
+                ) {
+                    Ok(policy) => Some(Arc::new(crate::plugin::session_api::SessionRpcDeps {
+                        session_service: Arc::clone(&session_service),
+                        policy: Arc::new(policy),
+                        profile: profile.to_string(),
+                    })),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "plugin.host",
+                            "plugin session RPCs disabled: automation policy store failed: {e:#}"
+                        );
+                        None
+                    }
+                };
+                match crate::plugin::host::PluginHost::new(&app_dir, profile, session_rpc) {
+                    Ok(host) => Some(host),
+                    Err(e) => {
+                        tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
+                        None
+                    }
                 }
-            },
+            }
             Err(e) => {
                 tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
                 None
@@ -801,6 +959,11 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let local_port = listener.local_addr()?.port();
+
+    {
+        let instances = instances.read().await;
+        crate::acp::version_probe::warn_for_structured_sessions(&instances, !is_daemon).await;
+    }
 
     // Start tunnel if remote mode. Preference order:
     //  1. User-specified named Cloudflare tunnel (stable, explicit choice).
@@ -891,11 +1054,13 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             }
         }
 
-        // Write tunnel URL for daemon discovery. Single-line content:
-        // backward-compatible with any consumer that does `head -1 serve.url`,
-        // and the TUI parses both single- and multi-URL formats.
+        // Keep the public tunnel URL first for backwards-compatible consumers,
+        // plus a loopback alternate so same-host clients do not round-trip
+        // through the tunnel and hit the passphrase wall.
         if let Ok(app_dir) = crate::session::get_app_dir() {
-            write_secret_file(&app_dir.join("serve.url"), &tunnel_url_with_token).await;
+            let contents =
+                remote_serve_url_contents(&handle.url, local_port, auth_token.as_deref());
+            write_secret_file(&app_dir.join("serve.url"), &contents).await;
             // serve.mode lets the TUI reattach to a running daemon and
             // render the right transport label: "tunnel" for Cloudflare,
             // "tailscale" for Tailscale Funnel, "local" for local-only.
@@ -985,21 +1150,50 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         .map(|h| h.mode_label())
         .unwrap_or("local");
 
+    // DNS-rebinding gate (#2735). Auto-inject the tunnel/Tailscale public host
+    // so remote dashboards and their live-terminal WS upgrade (which carries
+    // `Origin: https://<tunnel-host>`) pass without any operator flag; the URL
+    // rotates on quick tunnels and the bind is forced to loopback, so
+    // `--allowed-host` cannot cover this path.
+    let tunnel_host: Option<String> = tunnel_handle.as_ref().and_then(|h| host_from_url(&h.url));
+    let (allowed_hosts, allowed_origins) = resolve_access_policy(
+        host,
+        local_port,
+        &extra_allowed_hosts,
+        &extra_allowed_origins,
+        tunnel_host.as_deref(),
+    );
+    tracing::info!(
+        target: "http.access",
+        ?allowed_hosts,
+        ?allowed_origins,
+        "resolved DNS-rebinding allowlist"
+    );
+
     let state = Arc::new(AppState {
         profile: profile.to_string(),
         read_only,
-        instances: RwLock::new(instances),
+        cityhall_mode: std::env::var_os("AOE_CITYHALL_MODE").is_some(),
+        instances,
+        session_service,
         token_manager: Arc::clone(&token_manager),
         login_manager: Arc::clone(&login_manager),
         rate_limiter: Arc::clone(&rate_limiter),
         behind_tunnel: remote || behind_proxy,
         auth_mode,
         serve_mode,
-        instance_locks: RwLock::new(std::collections::HashMap::new()),
+        allowed_hosts,
+        allowed_origins,
+        instance_locks,
+        idempotency_locks,
         smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_semaphore: tokio::sync::Semaphore::new(
             crate::session::smart_rename::MAX_CONCURRENT,
+        ),
+        summary_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        summary_semaphore: tokio::sync::Semaphore::new(
+            crate::session::conversation_summary::MAX_CONCURRENT,
         ),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
@@ -1025,10 +1219,11 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         push_enabled,
         web_config: config.web.clone(),
         last_web_activity: std::sync::atomic::AtomicI64::new(0),
+        sleep_inhibit_snapshot: std::sync::atomic::AtomicU8::new(0),
         telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
         telemetry_web_clients: FormFactorCounters::default(),
         telemetry_structured_clients: FormFactorCounters::default(),
-        telemetry_session_creates: std::sync::atomic::AtomicU32::new(0),
+        telemetry_session_creates,
         telemetry_structured: StructuredTelemetryCounters::default(),
         telemetry_last_reported: std::sync::Mutex::new(None),
         shutdown: CancellationToken::new(),
@@ -1224,6 +1419,11 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // (feature disabled via web.notifications_enabled=false).
     push::spawn_consumer(state.clone());
 
+    // Per-session dispatcher callback consumer: subscribes to the same
+    // status_tx broadcast and fires an HTTP POST to any instance's
+    // callback_url on a fire-worthy transition. See #3156.
+    callback::spawn_consumer(state.clone());
+
     // Launch plugin workers for every active plugin that declares a runtime.
     // Non-blocking: each worker runs in its own supervised task. A daemon with
     // no community plugin workers (the common case) does nothing here.
@@ -1284,9 +1484,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                 if let (Some(base_url), Some(token)) =
                     (rot_base_url.as_ref(), post_rotate_current.as_ref())
                 {
-                    let url_with_token = format!("{}/?token={}", base_url, token);
                     if let Ok(app_dir) = crate::session::get_app_dir() {
-                        write_secret_file(&app_dir.join("serve.url"), &url_with_token).await;
+                        let contents = remote_serve_url_contents(base_url, local_port, Some(token));
+                        write_secret_file(&app_dir.join("serve.url"), &contents).await;
                     }
                 }
 
@@ -1463,6 +1663,9 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/workspace-ordering",
             put(api::update_workspace_ordering),
         )
+        // Atomic multi-session workspace delete (#2536): one call replaces the
+        // web client's N-call fan-out over DELETE /api/sessions/{id}.
+        .route("/api/workspaces", delete(api::delete_workspace))
         // Unified MCP management surface (#1996)
         .route("/api/mcp/servers", get(api::get_mcp_servers))
         .route(
@@ -1481,12 +1684,20 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api::session_diff_files),
         )
         .route("/api/sessions/{id}/diff/file", get(api::session_diff_file))
+        .route("/api/sessions/{id}/file", get(api::session_file))
         .route(
             "/api/sessions/{id}/artifacts/{*path}",
             get(api::serve_session_artifact),
         )
         .route("/api/sessions/{id}/ensure", post(api::ensure_session))
         .route("/api/sessions/{id}/send", post(api::send_message))
+        .route(
+            "/api/sessions/{id}/paste-image",
+            // A base64 screenshot blows past the global 1 MiB cap. 8 MiB
+            // leaves headroom for the 5 MiB decoded cap (enforced in the
+            // handler) plus base64's ~33% overhead and JSON framing.
+            post(api::paste_image).layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
         .route("/api/sessions/{id}/output", get(api::read_output))
         .route(
             "/api/sessions/{id}/notifications",
@@ -1500,7 +1711,12 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/worktree-name",
             patch(api::set_worktree_name),
         )
+        .route(
+            "/api/sessions/{id}/projects",
+            post(api::attach_session_project),
+        )
         .route("/api/sessions/{id}/pin", patch(api::update_session_pin))
+        .route("/api/sessions/{id}/color", patch(api::update_session_color))
         .route(
             "/api/sessions/{id}/archive",
             patch(api::update_session_archive),
@@ -1520,6 +1736,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/smart-rename",
             post(api::force_smart_rename),
         )
+        .route("/api/sessions/{id}/summarize", post(api::summarize_session))
         .route("/api/sessions/{id}/start", post(api::start_session))
         .route(
             "/api/sessions/{id}/terminal",
@@ -1546,6 +1763,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/filesystem/browse", get(api::browse_filesystem))
         .route("/api/filesystem/home", get(api::filesystem_home))
         .route("/api/git/branches", get(api::list_branches))
+        .route("/api/git/is-repo", get(api::is_git_repo))
         .route("/api/git/clone", post(api::clone_repo))
         .route("/api/groups", get(api::list_groups))
         .route(
@@ -1572,12 +1790,20 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/plugins", get(api::list_plugins))
         .route("/api/plugins/{id}/icon", get(api::serve_plugin_icon))
         .route("/api/plugins/commands", get(api::plugin_commands))
+        .route(
+            "/api/plugins/commands/{fqid}/invoke",
+            post(api::invoke_plugin_command),
+        )
         .route("/api/plugins/ui-state", get(api::plugin_ui_state))
         .route("/api/plugins/updates", get(api::plugin_updates))
         .route("/api/plugins/discover", get(api::plugin_discover))
         .route("/api/plugins/details", get(api::plugin_details))
         .route("/api/plugins/{id}/enabled", post(api::set_plugin_enabled))
         .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
+        .route(
+            "/api/plugins/{id}/settings/options/resolve",
+            post(api::resolve_options),
+        )
         .route(
             "/api/plugins/install/preview",
             post(api::preview_plugin_install),
@@ -1755,7 +1981,15 @@ fn build_router(state: Arc<AppState>) -> Router {
         .fallback(get(serve_index))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            cityhall_gate,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             auth::auth_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            access_policy,
         ))
         .layer(axum::middleware::from_fn(security_headers))
         .layer(axum::middleware::from_fn(http_request_span))
@@ -1810,6 +2044,486 @@ async fn http_request_span(
         response.headers_mut().insert("x-request-id", value);
     }
     response
+}
+
+/// True when `host` is a wildcard bind ("all interfaces") rather than a
+/// concrete, routable name a browser would send back as `Host`.
+pub(crate) fn is_wildcard_bind(host: &str) -> bool {
+    matches!(host, "0.0.0.0" | "::" | "[::]")
+}
+
+/// Strip an optional `:port` and IPv6 brackets from a `Host`/authority value,
+/// yielding the canonical bare host. `localhost:8080` -> `localhost`,
+/// `[::1]:8080` -> `::1`, `127.0.0.1` -> `127.0.0.1`. A bare (unbracketed)
+/// IPv6 literal has multiple colons and no port, so it is returned unchanged.
+fn strip_host_port(host: &str) -> &str {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match host.rfind(':') {
+        Some(idx) if !host[..idx].contains(':') => &host[..idx],
+        _ => host,
+    }
+}
+
+/// Canonical host key for the allowlist and for `Host` comparison: bare host,
+/// ASCII-lowercased (DNS is case-insensitive), with a single trailing FQDN
+/// root dot stripped so `example.com.` and `example.com` compare equal. Runs
+/// on both the incoming `Host` and every allowlist entry, so the two stay
+/// symmetric. `pub(crate)` so the CLI `--allowed-host` validator can reject an
+/// entry that normalizes to nothing (e.g. `:8080`).
+pub(crate) fn norm_host(host: &str) -> String {
+    let bare = strip_host_port(host);
+    bare.strip_suffix('.').unwrap_or(bare).to_ascii_lowercase()
+}
+
+/// True when a `norm_host`'d value is a routable IP literal we trust
+/// unconditionally. An IP literal is dialed directly and never DNS-resolved, so
+/// it cannot be the target of DNS rebinding: a browser only sends an IP as
+/// `Host`/`Origin` when the user navigated straight to that address. Trusting
+/// it restores `aoe serve --host 0.0.0.0` reachability by LAN/tailnet IP with
+/// no `--allowed-host` (Vite's "Pattern A"). Hostnames are NOT trusted here and
+/// still require an explicit allowlist entry. See #2735.
+///
+/// The excluded ranges are hygiene, not rebinding-necessity (IPs can't be
+/// rebound): the unspecified address (`0.0.0.0` / `::`, also a Linux/macOS
+/// rebinding bypass), multicast, and link-local (v4 `169.254.0.0/16`, which
+/// contains the `169.254.169.254` cloud-metadata address; v6 `fe80::/10`) are
+/// never a legitimate dashboard endpoint. Routable IPs (LAN, tailnet
+/// `100.64.0.0/10`, ULA, global unicast) are trusted. IPv4-mapped IPv6 forms
+/// (`::ffff:a.b.c.d`) are canonicalized first so those exclusions also cover
+/// e.g. `::ffff:169.254.169.254`.
+fn is_trusted_ip_literal(host: &str) -> bool {
+    use std::net::IpAddr;
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return false;
+    };
+    let ip = ip.to_canonical();
+    if ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => !v4.is_link_local(),
+        // `Ipv6Addr::is_unicast_link_local` is unstable; match `fe80::/10` by
+        // hand (top 10 bits `1111111010`).
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) != 0xfe80,
+    }
+}
+
+/// True when a `norm_host`'d value parses as an IP literal the gate refuses to
+/// trust: unspecified (`0.0.0.0` / `::`), link-local, or multicast. A hostname
+/// is not an IP literal and returns false, so the CLI validators still accept
+/// `aoe.example.com`. This is the inverse of `is_trusted_ip_literal` over the
+/// values that actually parse as an IP; sharing the one predicate keeps the
+/// `--allowed-host` / `--allowed-origin` validators from ever admitting an entry
+/// that the gate's trust check excludes (the exact ordering bypass where an
+/// allowlist match wins before `is_trusted_ip_literal` runs). See #2735.
+pub(crate) fn is_untrusted_ip_literal(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_ok() && !is_trusted_ip_literal(host)
+}
+
+/// Wrap an IPv6 literal in brackets for use inside an origin authority;
+/// hostnames and IPv4 literals pass through unchanged.
+fn bracket_if_ipv6(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+fn push_unique(list: &mut Vec<String>, item: String) {
+    if !item.is_empty() && !list.contains(&item) {
+        list.push(item);
+    }
+}
+
+/// Canonicalize an `Origin` to the exact form a browser serializes: trimmed,
+/// ASCII-lowercased, no trailing slash, and with the scheme's default port
+/// elided (`https://x:443` -> `https://x`, `http://x:80` -> `http://x`). Runs
+/// on both the allowlist build and the incoming header so the two never drift;
+/// without it a copy-pasted `https://x/` or `https://x:443` would silently 403
+/// every request. See #2735.
+fn norm_origin(origin: &str) -> String {
+    let o = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+    // Strip a single trailing FQDN root dot from the host so
+    // `https://example.com.` == `https://example.com`, mirroring `norm_host`.
+    // The dot sits at the authority end or just before `:port`; IPv6
+    // authorities are bracketed (`]` precedes any port), so a `.` / `.:` here
+    // is only ever the root dot. A trailing dot (the `Some` arm) ends the
+    // authority, so no `:port` follows and `.:` cannot also be present; the two
+    // arms are mutually exclusive, which is why the dot arm skips the `replacen`
+    // that only the `.:port` form needs.
+    let o = match o.strip_suffix('.') {
+        Some(rest) => rest.to_string(),
+        None => o.replacen(".:", ":", 1),
+    };
+    for (scheme, default_port) in [("http://", ":80"), ("https://", ":443")] {
+        if let Some(host) = o
+            .strip_prefix(scheme)
+            .and_then(|r| r.strip_suffix(default_port))
+        {
+            return format!("{scheme}{host}");
+        }
+    }
+    o
+}
+
+fn push_origin(list: &mut Vec<String>, raw: String) {
+    push_unique(list, norm_origin(&raw));
+}
+
+/// Extract the bare host from a tunnel URL like `https://x.trycloudflare.com`.
+fn host_from_url(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = norm_host(authority);
+    (!host.is_empty()).then_some(host)
+}
+
+/// Resolve the `(allowed_hosts, allowed_origins)` pair the DNS-rebinding gate
+/// enforces. Pure so the defaulting, wildcard handling, and tunnel
+/// auto-injection are unit-testable without a live server (#2735).
+///
+/// - Loopback trio (`localhost`, `127.0.0.1`, `::1`) is always trusted, plus
+///   the concrete bind `host` (wildcards excluded: they mean "all interfaces",
+///   not a routable Host).
+/// - Each local host gets `http`/`https` origins on the actual bind `port`.
+/// - Operator `--allowed-host` entries are trusted for direct access on the
+///   bind port and for standard-port (proxy) access.
+/// - A `tunnel_host` (Cloudflare/Tailscale public name) is auto-injected with
+///   its portless `https` origin, so tunnels work with no operator flag.
+/// - Operator `--allowed-origin` entries are normalized to the browser's
+///   `Origin` form (lowercased, no trailing slash, default port elided) for
+///   reverse proxies on nonstandard ports.
+fn resolve_access_policy(
+    host: &str,
+    port: u16,
+    extra_hosts: &[String],
+    extra_origins: &[String],
+    tunnel_host: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
+    let mut hosts: Vec<String> = Vec::new();
+    let mut origins: Vec<String> = Vec::new();
+
+    let mut local: Vec<String> = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    if !is_wildcard_bind(host) {
+        push_unique(&mut local, norm_host(host));
+    }
+    for h in &local {
+        push_unique(&mut hosts, h.clone());
+        let hb = bracket_if_ipv6(h);
+        push_origin(&mut origins, format!("http://{hb}:{port}"));
+        push_origin(&mut origins, format!("https://{hb}:{port}"));
+    }
+
+    for h in extra_hosts {
+        let nh = norm_host(h);
+        if nh.is_empty() {
+            continue;
+        }
+        push_unique(&mut hosts, nh.clone());
+        let hb = bracket_if_ipv6(&nh);
+        push_origin(&mut origins, format!("http://{hb}:{port}"));
+        push_origin(&mut origins, format!("https://{hb}:{port}"));
+        push_origin(&mut origins, format!("http://{hb}"));
+        push_origin(&mut origins, format!("https://{hb}"));
+    }
+
+    if let Some(th) = tunnel_host {
+        let nh = norm_host(th);
+        if !nh.is_empty() {
+            push_unique(&mut hosts, nh.clone());
+            push_origin(&mut origins, format!("https://{}", bracket_if_ipv6(&nh)));
+        }
+    }
+
+    for o in extra_origins {
+        push_origin(&mut origins, o.clone());
+    }
+
+    (hosts, origins)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AccessDecision {
+    Allow,
+    DenyMissingHost,
+    DenyHost,
+    DenyOrigin,
+}
+
+/// Pure DNS-rebinding decision: reject a missing `Host`; accept a `Host` that
+/// is allowlisted or a routable IP literal (IPs can't be rebound, see
+/// `is_trusted_ip_literal`); exempt requests with no `Origin` (curl / native
+/// TUI / non-browser WS); reject a present `Origin` that is neither allowlisted
+/// nor a routable IP literal. Comparisons are case-insensitive on the host and
+/// on the whole origin. See #2735.
+fn evaluate_access(
+    host_header: Option<&str>,
+    origin_header: Option<&str>,
+    allowed_hosts: &[String],
+    allowed_origins: &[String],
+) -> AccessDecision {
+    let Some(raw_host) = host_header else {
+        return AccessDecision::DenyMissingHost;
+    };
+    let host = norm_host(raw_host);
+    if !allowed_hosts.contains(&host) && !is_trusted_ip_literal(&host) {
+        return AccessDecision::DenyHost;
+    }
+    if let Some(origin) = origin_header {
+        let origin = norm_origin(origin);
+        // A by-IP dashboard (`http://<ip>:port`) sends `Origin: http://<ip>:port`
+        // on its own fetch/WS, so trust an IP-literal origin on the same basis
+        // as the Host. This is a deliberate relaxation: a cross-origin page
+        // served from a bare IP would also pass this check, but it cannot read
+        // the auth token, so auth remains the backstop; a per-origin allowlist
+        // is the deferred stricter posture. `host_from_url` strips
+        // scheme/port/brackets.
+        let origin_is_trusted_ip =
+            host_from_url(&origin).is_some_and(|h| is_trusted_ip_literal(&h));
+        if !allowed_origins.contains(&origin) && !origin_is_trusted_ip {
+            return AccessDecision::DenyOrigin;
+        }
+    }
+    AccessDecision::Allow
+}
+
+/// Uniform 403 for every DNS-rebinding rejection. Names both gates but not
+/// which one tripped, so it is accurate for a missing/unlisted `Host` and an
+/// unlisted `Origin` alike without handing a prober a which-check oracle; the
+/// specific reason stays in the `http.access` debug log. See #2735.
+fn access_denied() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        "forbidden: host or origin not allowed",
+    )
+        .into_response()
+}
+
+/// DNS-rebinding gate. Runs before `auth_middleware` (layered outside it) so a
+/// rejected request never reaches auth: the 403 short-circuits here. HTTP/1.1
+/// always carries `Host`; for HTTP/2 the `:authority` pseudo-header maps to it,
+/// with the URI authority as a fallback. See #2735.
+async fn access_policy(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let host_header = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| request.uri().authority().map(|a| a.as_str().to_string()));
+    let origin_header = request
+        .headers()
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    match evaluate_access(
+        host_header.as_deref(),
+        origin_header.as_deref(),
+        &state.allowed_hosts,
+        &state.allowed_origins,
+    ) {
+        AccessDecision::Allow => next.run(request).await,
+        AccessDecision::DenyMissingHost => {
+            tracing::debug!(target: "http.access", "rejected: missing Host header");
+            access_denied()
+        }
+        AccessDecision::DenyHost => {
+            tracing::debug!(target: "http.access", host = ?host_header, "rejected: host not in allowlist");
+            access_denied()
+        }
+        AccessDecision::DenyOrigin => {
+            tracing::debug!(target: "http.access", origin = ?origin_header, "rejected: origin not in allowlist");
+            access_denied()
+        }
+    }
+}
+
+/// Mutating routes (POST/PUT/PATCH/DELETE) reachable in CityHall client mode.
+/// Entries are `(method, matched-path template)`. `cityhall_gate` refuses any
+/// mutating request whose `(method, template)` is not listed here, BEFORE the
+/// handler runs, so reachability is default-deny: a new mutating route is closed
+/// until deliberately classified (in this table or [`CITYHALL_MUTATION_DENY`]).
+/// This replaces the previous per-handler deny-list as the enforcement boundary;
+/// the handlers keep their `cityhall_block*` calls as defense in depth. Reads
+/// (GET/HEAD) pass the gate; the few sensitive ones keep their per-handler
+/// guard. See #7.
+#[cfg(feature = "serve")]
+const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
+    // Session creation (server-derived) + lifecycle / metadata on the structured
+    // sessions this mode owns; each handler re-checks the target is structured.
+    ("POST", "/api/sessions"),
+    ("DELETE", "/api/sessions/{id}"),
+    ("DELETE", "/api/workspaces"),
+    ("PATCH", "/api/sessions/{id}"),
+    ("PATCH", "/api/sessions/{id}/archive"),
+    ("PATCH", "/api/sessions/{id}/color"),
+    ("PATCH", "/api/sessions/{id}/diff-base"),
+    ("PATCH", "/api/sessions/{id}/group"),
+    ("PATCH", "/api/sessions/{id}/notifications"),
+    ("PATCH", "/api/sessions/{id}/pin"),
+    ("PATCH", "/api/sessions/{id}/snooze"),
+    ("PATCH", "/api/sessions/{id}/unread"),
+    ("PATCH", "/api/sessions/{id}/worktree-name"),
+    ("POST", "/api/sessions/{id}/restore"),
+    ("POST", "/api/sessions/{id}/start"),
+    ("POST", "/api/sessions/{id}/stop"),
+    ("POST", "/api/sessions/{id}/summarize"),
+    ("POST", "/api/sessions/{id}/smart-rename"),
+    ("POST", "/api/sessions/{id}/trash"),
+    // Composer.
+    ("POST", "/api/sessions/{id}/paste-image"),
+    ("POST", "/api/sessions/{id}/acp/prompt"),
+    ("POST", "/api/sessions/{id}/acp/prompt/diff-comments"),
+    ("POST", "/api/sessions/{id}/acp/cancel"),
+    ("POST", "/api/sessions/{id}/acp/force_end_turn"),
+    ("POST", "/api/sessions/{id}/acp/approvals/{nonce}"),
+    ("POST", "/api/sessions/{id}/acp/elicitations/{nonce}"),
+    // Curated settings surfaces (the handlers field-filter / strip color-mode).
+    ("PATCH", "/api/profiles/{name}/settings"),
+    ("PATCH", "/api/theme"),
+    ("POST", "/api/plugins/{id}/settings/options/resolve"),
+    // Telemetry consent (its own surface, still prompted).
+    ("POST", "/api/telemetry/consent"),
+    ("POST", "/api/telemetry/seen"),
+    ("POST", "/api/telemetry/structured-interaction"),
+    // Per-device UI preferences / client log.
+    ("PATCH", "/api/app-state/web-ui-state"),
+    ("POST", "/api/app-state/dismiss-update"),
+    ("POST", "/api/app-state/tip-seen"),
+    ("POST", "/api/app-state/volume-ignores-globs-acknowledged"),
+    ("POST", "/api/app-state/web-tour-seen"),
+    ("POST", "/api/tips/show"),
+    ("POST", "/api/client-log"),
+    // Notifications (owner-scoped) + auth / session (must stay open).
+    ("POST", "/api/push/subscribe"),
+    ("POST", "/api/push/unsubscribe"),
+    ("POST", "/api/push/test"),
+    ("POST", "/api/login"),
+    ("POST", "/api/login/elevate"),
+    ("POST", "/api/login/logout-all"),
+    ("POST", "/api/logout"),
+    ("DELETE", "/api/login/sessions/{id}"),
+];
+
+/// Mutating routes deliberately UNREACHABLE in CityHall. Same shape as
+/// [`CITYHALL_MUTATION_ALLOW`]; kept explicit so the
+/// `every_mutating_route_is_cityhall_classified` audit can prove every
+/// router-registered mutation is consciously classified (a new one absent from
+/// both tables fails the build). `cityhall_gate` denies these anyway (they are
+/// simply not in the allow table), but listing them documents the intent and
+/// lets the audit prove exhaustiveness, so it is only needed under `cfg(test)`.
+/// #7.
+#[cfg(test)]
+const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
+    // Terminal surface.
+    ("POST", "/api/sessions/{id}/ensure"),
+    ("POST", "/api/sessions/{id}/send"),
+    ("POST", "/api/sessions/{id}/terminal"),
+    ("DELETE", "/api/sessions/{id}/terminal"),
+    ("POST", "/api/sessions/{id}/container-terminal"),
+    // Git / project / profile management.
+    ("POST", "/api/git/clone"),
+    ("POST", "/api/projects"),
+    // Attaching a repo to a session (#3103) takes an arbitrary host path, so it
+    // is denied for the same reason `git/clone` and `POST /api/projects` are: it
+    // would let a CityHall client create a git worktree anywhere the daemon user
+    // can write, and it also stops the agent worker and removes the sandbox
+    // container. The session lifecycle routes this mode does allow all operate on
+    // state the session already owns.
+    ("POST", "/api/sessions/{id}/projects"),
+    ("PATCH", "/api/projects/{name}"),
+    ("DELETE", "/api/projects/{name}"),
+    ("POST", "/api/profiles"),
+    ("DELETE", "/api/profiles/{name}"),
+    ("PATCH", "/api/profiles/{name}/rename"),
+    ("PATCH", "/api/default-profile"),
+    // MCP mutations.
+    ("POST", "/api/mcp/servers/{name}/drop"),
+    ("POST", "/api/mcp/servers/{name}/keep"),
+    ("POST", "/api/mcp/servers/{name}/resolve"),
+    // Plugin lifecycle.
+    ("POST", "/api/plugins/install"),
+    ("POST", "/api/plugins/install/preview"),
+    ("POST", "/api/plugins/{id}/action"),
+    ("POST", "/api/plugins/{id}/enabled"),
+    ("POST", "/api/plugins/{id}/uninstall"),
+    ("POST", "/api/plugins/{id}/update/apply"),
+    ("POST", "/api/plugins/{id}/update/dismiss"),
+    ("POST", "/api/plugins/commands/{fqid}/invoke"),
+    // ACP agent / worker lifecycle + config.
+    ("DELETE", "/api/sessions/{id}/acp"),
+    ("POST", "/api/sessions/{id}/acp/config-option"),
+    ("POST", "/api/sessions/{id}/acp/disable"),
+    ("POST", "/api/sessions/{id}/acp/enable"),
+    ("POST", "/api/sessions/{id}/acp/install-agent"),
+    ("POST", "/api/sessions/{id}/acp/mode"),
+    ("POST", "/api/sessions/{id}/acp/spawn"),
+    ("POST", "/api/sessions/{id}/acp/switch-agent"),
+    // Global settings / ops / shared workspace ordering.
+    ("PATCH", "/api/settings"),
+    ("PATCH", "/api/log-level"),
+    ("PUT", "/api/workspace-ordering"),
+];
+
+/// Default-deny CityHall reachability boundary. A no-op outside CityHall mode
+/// and for read methods (GET/HEAD/OPTIONS); for a mutating method it refuses any
+/// request whose matched-path template is not in [`CITYHALL_MUTATION_ALLOW`]
+/// with the canonical 403. This is the single choke point the reviewer asked
+/// for: it covers every module prefix and method uniformly (an unmatched or
+/// unlisted mutating route fails closed), so a handler can no longer silently
+/// reopen a hole by omission. See #7.
+#[cfg(feature = "serve")]
+async fn cityhall_gate(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::Method;
+    let mutating = matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
+    if !state.cityhall_mode || !mutating {
+        return next.run(request).await;
+    }
+    let method = request.method().as_str();
+    let template = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string());
+    let allowed = template.as_deref().is_some_and(|t| {
+        CITYHALL_MUTATION_ALLOW
+            .iter()
+            .any(|(m, p)| *m == method && *p == t)
+    });
+    if allowed {
+        next.run(request).await
+    } else {
+        tracing::debug!(
+            target: "http.access",
+            method,
+            template = ?template,
+            "rejected: mutating route not reachable in CityHall mode"
+        );
+        api::cityhall_response()
+    }
 }
 
 /// Content-Security-Policy for the dashboard.
@@ -2222,6 +2936,129 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     fresh
 }
 
+/// Carry the previous tick's Unknown-escalation tracking fields
+/// (`ever_confirmed_present`, `unknown_since`) onto a freshly disk-loaded
+/// instance, keyed by id. `load_all_instances` unconditionally resets both
+/// `#[serde(skip)]` fields to their defaults on every call, so
+/// `status_poll_loop` must call this BEFORE running
+/// `update_status_with_metadata` on the fresh instance: otherwise
+/// `unknown_since` restarts at `Instant::now()` every 2s tick and the
+/// bounded Unknown->Error escalation window in
+/// `update_status_with_metadata_inner` can never elapse (#2865). The
+/// counterpart carry for the opposite direction, after the status decision
+/// has run, lives in `reload_state_instances_from_disk`'s per-`StatusSource`
+/// handling.
+fn seed_unknown_tracking(
+    instances: &mut [Instance],
+    prev: &std::collections::HashMap<String, (bool, Option<std::time::Instant>)>,
+) {
+    for inst in instances {
+        if let Some(&(ever_confirmed_present, unknown_since)) = prev.get(&inst.id) {
+            inst.ever_confirmed_present = ever_confirmed_present;
+            inst.unknown_since = unknown_since;
+        }
+    }
+}
+
+/// One tick's per-instance status decision: seed each freshly disk-loaded row's
+/// live baseline from `prev`, then let tmux speak for the rows tmux owns.
+///
+/// Split out of `status_poll_loop` with [`observed_transitions`] so the two
+/// halves stay testable as a pair. They are a pair by contract: this one decides
+/// each row's status, that one reports which of those differ from `prev`. Fold
+/// either back inline and the phantom-transition regression this guards (see
+/// [`skip_tmux_decision_for_structured`]) loses its only coverage.
+fn apply_tick_status_decisions(
+    instances: &mut [Instance],
+    prev: &std::collections::HashMap<String, crate::session::Status>,
+    suppressed_ids: &std::collections::HashSet<String>,
+    pane_metadata: &std::collections::HashMap<String, crate::tmux::PaneMetadata>,
+) {
+    for inst in instances.iter_mut() {
+        if suppressed_ids.contains(&inst.id) {
+            inst.status = Status::Starting;
+            continue;
+        }
+        inst.live_status_baseline = prev.get(&inst.id).copied();
+        if skip_tmux_decision_for_structured(inst) {
+            continue;
+        }
+        let session_name = crate::tmux::resolve_agent_session_name_in(
+            pane_metadata,
+            &inst.id,
+            &crate::tmux::Session::generate_name(&inst.id, &inst.title),
+        );
+        inst.update_status_with_metadata(pane_metadata.get(&session_name), Some(&session_name));
+    }
+}
+
+/// The real status transitions this tick observed, as `(index into instances,
+/// previous status)` pairs.
+///
+/// The other half of [`apply_tick_status_decisions`]; see its docstring for why
+/// they belong together. A row absent from `prev` is new this tick and has no
+/// transition to report. Indices are only valid against the same slice, which
+/// the caller consumes immediately.
+fn observed_transitions(
+    instances: &[Instance],
+    prev: &std::collections::HashMap<String, crate::session::Status>,
+) -> Vec<(usize, Status)> {
+    instances
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, inst)| {
+            let old = *prev.get(&inst.id)?;
+            (old != inst.status).then_some((idx, old))
+        })
+        .collect()
+}
+
+/// Report whether the caller must skip the tmux status decision for this row,
+/// carrying the acp-authoritative live status onto it when so.
+///
+/// A structured row has no tmux pane to probe, so the poller has no say in its
+/// status: [`apply_acp_overlay_inplace`] re-pins the in-memory value on every
+/// reload, and `decide_passive_transition` deliberately never persists the
+/// poller's view (#2690 / #2697). Disk therefore stays permanently out of step
+/// with live, and `status_poll_loop` compares exactly those two: `prev` comes
+/// from `state.instances` (overlaid, live), `fresh` from disk. Left alone, every
+/// tick reads that standing mismatch as a brand new transition, which logs a
+/// `session.status_change` line, broadcasts a `StatusChange`, and resets the
+/// push dwell timer in `server::push`. Forever, at the 2s tick, surviving daemon
+/// restarts because `seed_acp_statuses` re-derives the same live status from the
+/// stored event log on boot. One session whose worker died with
+/// `AgentStartupError` wrote 81k such lines into a single 43MB log file.
+///
+/// A phantom whose live side is `Running` costs one more: `mark_unread` in
+/// `decide_passive_transition` is not gated on `is_structured`, so it re-marks
+/// the row unread seconds after the user reads it. That one needs `old ==
+/// Running` specifically, so the `AgentStartupError` case above never reached
+/// it.
+///
+/// Aligning `status` with the baseline the caller just seeded makes that
+/// comparison like-for-like, so a structured row reports a transition only when
+/// its live status actually moved, which for these rows means an acp event
+/// handler moved it.
+///
+/// Deliberately does not lean on the structured short-circuit in
+/// `Instance::update_status_with_metadata_inner`: that path heals `Error` to
+/// `Idle` unconditionally, which is correct for the TUI poller and `aoe ps`
+/// (neither has an overlay to re-pin the value) but is what mints the phantom
+/// here, since the overlay restores `Error` moments later.
+fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
+    if !inst.is_structured() {
+        return false;
+    }
+    inst.clear_stale_tmux_error();
+    // `None` means the row is newer than the last tick and has no live value
+    // yet; its disk status is all there is, and the absent baseline already
+    // suppresses a transition report.
+    if let Some(live) = inst.live_status_baseline {
+        inst.status = live;
+    }
+    true
+}
+
 // INVARIANTS for `reload_state_instances_from_disk` (do not break without
 // revisiting `tests/serve_disk_reload_helper_equivalence.rs`):
 // 1. Both call sites (`status_poll_loop` and `disk_watcher_consumer`) must
@@ -2229,13 +3066,22 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
 //    calling it (tmux scrape lives only in `status_poll_loop`), and in
 //    the StatusSource they pass.
 // 2. `merge_runtime_fields` is mandatory per-id. Skipping it wipes the
-//    five #[serde(skip)] runtime fields (`last_error_check`,
+//    #[serde(skip)] runtime fields (`last_error_check`,
 //    `last_start_time`, `last_error`, `session_id_poller`,
 //    `retroactive_capture_excludes`) that disk reload zeroes by design.
 // 3. `merge_runtime_fields` does NOT carry `status`, `last_accessed_at`,
-//    or `idle_entered_at`. Those three are handled per StatusSource:
-//    DiskOnly takes prior.status and `prior.idle_entered_at.or(fresh.idle_entered_at)`,
-//    TmuxApplied takes fresh's. `last_accessed_at` is monotonic-max
+//    `idle_entered_at`, `ever_confirmed_present`, or `unknown_since`.
+//    Those are handled per StatusSource: DiskOnly takes prior.status,
+//    `prior.idle_entered_at.or(fresh.idle_entered_at)`, and prior's
+//    Unknown-tracking pair verbatim (its `fresh` never went through
+//    `update_status_with_metadata`, so both fields are still at their
+//    zeroed defaults). TmuxApplied takes fresh's status and Unknown-tracking
+//    pair: the caller (`status_poll_loop`) already seeded `fresh` from the
+//    prior tick's tracking pair before running the tmux scrape and status
+//    decision, so `fresh` already holds this tick's authoritative values;
+//    restoring the pre-decision prior snapshot here would erase that
+//    decision every tick and re-freeze the Unknown->Error escalation window
+//    at zero elapsed time (#2865). `last_accessed_at` is monotonic-max
 //    regardless.
 // 4. The acp overlay filter is `inst.is_structured()`, never the lazy
 //    ACP session id. The latter is set lazily by the ACP handshake
@@ -2287,6 +3133,7 @@ impl PriorById {
 pub(crate) async fn reload_state_instances_from_disk(
     state: &Arc<AppState>,
     fresh: Vec<Instance>,
+    #[cfg(feature = "serve")] live_worker_records: Vec<LiveStructuredWorkerRecord>,
     status_source: StatusSource,
 ) {
     // Snapshot suppression here so a worker that unmarks between the
@@ -2307,17 +3154,28 @@ pub(crate) async fn reload_state_instances_from_disk(
             let prior_status = prior.status;
             let prior_last_accessed = prior.last_accessed_at;
             let prior_idle_entered = prior.idle_entered_at;
+            let prior_ever_confirmed_present = prior.ever_confirmed_present;
+            let prior_unknown_since = prior.unknown_since;
             row = merge_runtime_fields(prior, row);
             match status_source {
                 StatusSource::DiskOnly => {
                     row.status = prior_status;
                     row.idle_entered_at = prior_idle_entered.or(row.idle_entered_at);
+                    // `row` here is a raw disk load (no tmux scrape ran), so
+                    // both `#[serde(skip)]` tracking fields are still at
+                    // their zeroed defaults; restore the prior tick's.
+                    row.ever_confirmed_present = prior_ever_confirmed_present;
+                    row.unknown_since = prior_unknown_since;
                 }
                 StatusSource::TmuxApplied => {
                     // Caller already applied tmux scrape to fresh.status;
                     // that is the authoritative value. idle_entered_at is
                     // recomputed by upstream status-transition logic;
-                    // trust fresh.
+                    // trust fresh. Likewise `ever_confirmed_present` /
+                    // `unknown_since`: the caller seeded them from the
+                    // prior tick before running the status decision, so
+                    // `row` already carries this tick's advanced values.
+                    // See #2865.
                 }
             }
             row.last_accessed_at = prior_last_accessed.max(row.last_accessed_at);
@@ -2329,9 +3187,16 @@ pub(crate) async fn reload_state_instances_from_disk(
     }
 
     #[cfg(feature = "serve")]
+    let repairs = repair_structured_rows_from_live_workers(&mut merged, live_worker_records);
+
+    #[cfg(feature = "serve")]
     apply_acp_overlay_inplace(&prior_by_id, &mut merged);
 
     *current = merged;
+    drop(current);
+
+    #[cfg(feature = "serve")]
+    persist_structured_row_repairs(state, repairs);
 }
 
 /// Apply the acp status / timestamps overlay to `merged`, sourcing
@@ -2340,6 +3205,20 @@ pub(crate) async fn reload_state_instances_from_disk(
 /// `inst.is_structured()` per the invariant above; filtering on
 /// the lazy session id would silently drop overlay coverage for
 /// pre-handshake rows.
+///
+/// ## Durability contract (#2690 follow-up)
+///
+/// Structured rows accept a soft reset of `status` / `last_accessed_at` /
+/// `idle_entered_at` on daemon restart, by contract. The values written
+/// here come from `prior_by_id`, an in-memory snapshot that the daemon
+/// rebuilds each tick from live worker state, and never flow through
+/// [`crate::session::PassiveStatusPatch`] (`decide_passive_transition`
+/// returns `patch: None` for `is_structured()` rows). After a daemon
+/// restart, disk-loaded structured rows read whatever was durably
+/// persisted last (initial creation, or an explicit user action). ACP
+/// event handlers are responsible for any post-restart re-emission that
+/// updates these fields for structured sessions; the passive-status
+/// writer at `status_poll_loop` deliberately does not.
 #[cfg(feature = "serve")]
 fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [Instance]) {
     for inst in merged.iter_mut() {
@@ -2352,6 +3231,188 @@ fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [Instance]) {
         inst.status = prior.status;
         inst.last_accessed_at = prior.last_accessed_at;
         inst.idle_entered_at = prior.idle_entered_at;
+    }
+}
+
+#[cfg(feature = "serve")]
+struct StructuredRowRepair {
+    session_id: String,
+    source_profile: String,
+    agent_name: Option<String>,
+    agent_model: Option<String>,
+    acp_session_id: String,
+}
+
+#[cfg(feature = "serve")]
+type LiveStructuredWorkerRecord = (crate::process::worker_registry::WorkerRecord, String);
+
+#[cfg(feature = "serve")]
+fn live_structured_worker_records() -> Vec<LiveStructuredWorkerRecord> {
+    use crate::process::worker_registry::{self, is_record_live};
+
+    let records = match worker_registry::list() {
+        Ok(records) => records,
+        Err(e) => {
+            tracing::warn!(
+                target: "server.file_watch",
+                error = %e,
+                "worker registry list failed; structured row repair disabled this tick"
+            );
+            return Vec::new();
+        }
+    };
+    records
+        .into_iter()
+        .filter(is_record_live)
+        .filter_map(|record| {
+            let acp_session_id = record
+                .stored_acp_session_id
+                .as_deref()
+                .filter(|id| !id.is_empty())?
+                .to_string();
+            Some((record, acp_session_id))
+        })
+        .collect()
+}
+
+/// Runs before the ACP overlay so freshly repaired rows pass the
+/// `is_structured()` gate and keep their live worker status.
+#[cfg(feature = "serve")]
+fn repair_structured_rows_from_live_workers(
+    merged: &mut [Instance],
+    records: Vec<LiveStructuredWorkerRecord>,
+) -> Vec<StructuredRowRepair> {
+    let live_by_id: std::collections::HashMap<String, LiveStructuredWorkerRecord> = records
+        .into_iter()
+        .map(|(record, acp_session_id)| (record.session_id.clone(), (record, acp_session_id)))
+        .collect();
+
+    let mut repairs = Vec::new();
+    for inst in merged.iter_mut() {
+        if inst.is_structured() {
+            continue;
+        }
+        let Some((record, acp_session_id)) = live_by_id.get(&inst.id) else {
+            continue;
+        };
+        if inst.acp_session_id.is_some()
+            && inst.acp_session_id.as_deref() != Some(acp_session_id.as_str())
+        {
+            tracing::warn!(
+                target: "server.file_watch",
+                session = %inst.id,
+                disk = ?inst.acp_session_id,
+                registry = %acp_session_id,
+                "repairing structured session row with mismatched ACP session id"
+            );
+        }
+        inst.view = crate::session::View::Structured;
+        if inst.agent_name.is_none() && !record.agent_key.is_empty() {
+            inst.agent_name = Some(record.agent_key.clone());
+        }
+        if inst.agent_model.is_none() {
+            inst.agent_model = record.model.clone();
+        }
+        inst.acp_session_id = Some(acp_session_id.clone());
+        tracing::warn!(
+            target: "server.file_watch",
+            session = %inst.id,
+            pid = record.pid,
+            "repaired structured session row from live ACP worker registry"
+        );
+        repairs.push(StructuredRowRepair {
+            session_id: inst.id.clone(),
+            source_profile: inst.source_profile.clone(),
+            agent_name: inst.agent_name.clone(),
+            agent_model: inst.agent_model.clone(),
+            acp_session_id: acp_session_id.clone(),
+        });
+    }
+    repairs
+}
+
+#[cfg(feature = "serve")]
+fn persist_structured_row_repairs(state: &Arc<AppState>, repairs: Vec<StructuredRowRepair>) {
+    if repairs.is_empty() {
+        return;
+    }
+    let state = state.clone();
+    let file_watch = state.file_watch.clone();
+    let shutdown = state.shutdown.clone();
+    crate::task_util::spawn_supervised(
+        "server.reload.persist_repairs",
+        crate::task_util::PanicPolicy::Log,
+        async move {
+            let mut by_profile: std::collections::HashMap<String, Vec<StructuredRowRepair>> =
+                std::collections::HashMap::new();
+            for repair in repairs {
+                by_profile
+                    .entry(repair.source_profile.clone())
+                    .or_default()
+                    .push(repair);
+            }
+            for (profile, repairs) in by_profile {
+                if shutdown.is_cancelled() {
+                    break;
+                }
+                let file_watch = file_watch.clone();
+                let failed_ids: Vec<String> = repairs
+                    .iter()
+                    .map(|repair| repair.session_id.clone())
+                    .collect();
+                let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let storage = crate::session::Storage::new(&profile, file_watch)?;
+                    storage.update(|all, _groups| {
+                        for repair in repairs {
+                            if let Some(inst) = all.iter_mut().find(|i| i.id == repair.session_id) {
+                                inst.view = crate::session::View::Structured;
+                                if inst.agent_name.is_none() {
+                                    inst.agent_name = repair.agent_name;
+                                }
+                                if inst.agent_model.is_none() {
+                                    inst.agent_model = repair.agent_model;
+                                }
+                                inst.acp_session_id = Some(repair.acp_session_id);
+                            } else {
+                                tracing::debug!(
+                                    target: "server.file_watch",
+                                    session = %repair.session_id,
+                                    "repair target not found on disk; skipping"
+                                );
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    Ok(())
+                })
+                .await;
+                match save_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        rollback_structured_row_repairs(&state, &failed_ids).await;
+                        tracing::warn!(target: "server.file_watch", "save after structured row repair: {e}");
+                    }
+                    Err(join_err) => {
+                        rollback_structured_row_repairs(&state, &failed_ids).await;
+                        tracing::warn!(
+                            target: "server.file_watch",
+                            "structured row repair save task panicked: {join_err}"
+                        );
+                    }
+                }
+            }
+        },
+    );
+}
+
+#[cfg(feature = "serve")]
+async fn rollback_structured_row_repairs(state: &Arc<AppState>, failed_ids: &[String]) {
+    let mut instances = state.instances.write().await;
+    for inst in instances.iter_mut() {
+        if failed_ids.iter().any(|id| id == &inst.id) {
+            inst.view = crate::session::View::Terminal;
+            inst.acp_session_id = None;
+        }
     }
 }
 
@@ -2612,30 +3673,39 @@ async fn disk_watcher_consumer(state: Arc<AppState>) {
         }
         let started = std::time::Instant::now();
         let file_watch_for_load = state.file_watch.clone();
-        let fresh =
-            match tokio::task::spawn_blocking(move || load_all_instances(&file_watch_for_load))
-                .await
-            {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        target: "server.file_watch",
-                        error = %e,
-                        "disk reload failed"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "server.file_watch",
-                        error = %e,
-                        "spawn_blocking joined with error"
-                    );
-                    continue;
-                }
-            };
+        let loaded = match tokio::task::spawn_blocking(move || {
+            load_all_instances(&file_watch_for_load)
+                .map(|fresh| (fresh, live_structured_worker_records()))
+        })
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "server.file_watch",
+                    error = %e,
+                    "disk reload failed"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "server.file_watch",
+                    error = %e,
+                    "spawn_blocking joined with error"
+                );
+                continue;
+            }
+        };
+        let (fresh, live_worker_records) = loaded;
         let count = fresh.len();
-        reload_state_instances_from_disk(&state, fresh, StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(
+            &state,
+            fresh,
+            live_worker_records,
+            StatusSource::DiskOnly,
+        )
+        .await;
         tracing::trace!(
             target: "server.file_watch",
             latency_us = started.elapsed().as_micros() as u64,
@@ -2974,6 +4044,182 @@ fn decrement_reported_count(counter: &std::sync::atomic::AtomicU32, reported: u3
     });
 }
 
+/// What to do with one instance's status_poll_loop diff, once a genuine
+/// `old != inst.status` transition (against the tick's `prev` snapshot) has
+/// already been established by the caller.
+struct PassiveTransitionDecision {
+    /// `None` for structured (ACP) sessions: their `status` isn't
+    /// poller-authoritative (see the `is_structured()` guard in
+    /// `update_status_with_metadata_inner`, and `apply_acp_overlay_inplace`,
+    /// which is the sole authority for their status/timestamps). Persisting
+    /// a patch here would write a bogus tmux-derived status to disk for a
+    /// session the poller never actually controls. Locked by
+    /// `decide_passive_transition_skips_patch_for_structured_session`
+    /// (a `#[cfg(test)]` item; kept as a code-span rather than an
+    /// intra-doc link that would degrade to literal text under
+    /// `cargo doc`).
+    patch: Option<crate::session::PassiveStatusPatch>,
+    mark_unread: bool,
+}
+
+/// Compute the passive-status write decision for one instance whose
+/// `status` differs from the tick's `prev` snapshot. The full
+/// contract lives on the return type at [`PassiveTransitionDecision`]:
+/// `patch: None` for structured / ACP sessions (the ACP overlay is the
+/// sole authority), and `mark_unread: true` only on genuine
+/// Running -> Idle when unread is enabled and the row is not already
+/// unread.
+fn decide_passive_transition(
+    inst: &Instance,
+    old_status: Status,
+    unread_enabled: bool,
+) -> PassiveTransitionDecision {
+    let patch =
+        (!inst.is_structured()).then(|| crate::session::PassiveStatusPatch::from_instance(inst));
+    let mark_unread = unread_enabled
+        && old_status == Status::Running
+        && inst.status == Status::Idle
+        && !inst.unread;
+    PassiveTransitionDecision { patch, mark_unread }
+}
+
+/// Per-profile bundle of passive-status writes accumulated in one
+/// `status_poll_loop` tick. `patches` is keyed by instance id so the
+/// persistence closure resolves each row in O(1); `unread_ids` stays a
+/// small `Vec` because per-tick cardinality is low and `Vec::contains`
+/// beats `HashSet` at that N.
+///
+/// ## Persistence divergence between daemon and TUI (#2690 follow-up)
+///
+/// The daemon batches transitions here (one `Storage::update` per profile
+/// per tick, via `persist_session_update`). The TUI's
+/// [`crate::tui::home::HomeView::persist_passive_status_transition`]
+/// writes one transition at a time. Both funnel through
+/// [`crate::session::Instance::merge_passive_status_patch`], whose field
+/// semantics are: `last_accessed_at` is monotone non-decreasing (guarded
+/// by `>=`, so an older-or-equal incoming value is dropped);
+/// `status` and `idle_entered_at` are unconditional writes
+/// (last-writer-wins). The two paths are safe to interleave today because
+/// the poller is the sole authority on those two fields and both writers
+/// read the same live source, so they converge within one poll interval
+/// of the slower cadence (daemon at 2s, TUI at ~500ms) even when their
+/// observations disagree mid-cadence.
+///
+/// A future field added to [`crate::session::PassiveStatusPatch`] that is
+/// neither monotone (like `last_accessed_at`) nor single-authority (like
+/// the current `status`/`idle_entered_at`) would diverge silently
+/// between the daemon's batched replay and the TUI's per-transition
+/// writes. Any such addition must either unify the two paths first, or
+/// explicitly document why the two-writer shape stays safe.
+#[derive(Default)]
+struct PassiveTransitionWrites {
+    /// Keyed by instance id for O(1) lookup inside the persist closure.
+    /// The patch value carries no id of its own; the flush site reads the
+    /// map key (via `get_key_value`) and threads it into
+    /// [`crate::session::Instance::merge_passive_status_patch`].
+    patches: std::collections::HashMap<String, crate::session::PassiveStatusPatch>,
+    unread_ids: Vec<String>,
+}
+
+/// Flush one tick's per-profile passive-status writes: persist each bundle,
+/// then mirror its unread marks into the live `instances` slice ONLY for the
+/// bundles whose durable write returned `Ok`.
+///
+/// The ordering is load-bearing. `instances` is the vec that
+/// `reload_state_instances_from_disk` folds straight into `state.instances`,
+/// so a mark applied here is what makes the unread indicator visible this
+/// tick. Marking before the flock write landed stranded that mark on a failed
+/// persist: disk stayed unmarked, the next tick reloaded the unmarked row,
+/// and the `prev == inst.status` short-circuit blocked any re-mark, so a
+/// Running -> Idle transition whose write failed silently lost its unread
+/// indicator with no user-visible recovery path. Deferring the in-memory mark
+/// to a persisted `Ok` keeps memory and disk in lockstep: on failure neither
+/// is marked. See #2755 (follow-up to #2729).
+async fn flush_passive_transition_writes(
+    file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
+    instances: &mut [Instance],
+    bundles: std::collections::HashMap<String, PassiveTransitionWrites>,
+) {
+    for (
+        profile,
+        PassiveTransitionWrites {
+            patches,
+            unread_ids,
+        },
+    ) in bundles
+    {
+        // The closure moves `unread_ids`; keep a copy to mirror into the live
+        // vec once the write is durable.
+        let unread_ids_for_local = unread_ids.clone();
+        let patch_count = patches.len();
+        let unread_count = unread_ids.len();
+        let persisted = api::persist_session_update(
+            profile.clone(),
+            "passive-status",
+            file_watch.clone(),
+            move |insts| {
+                for inst in insts.iter_mut() {
+                    if let Some((id, patch)) = patches.get_key_value(&inst.id) {
+                        inst.merge_passive_status_patch(id, patch);
+                    }
+                    if unread_ids.contains(&inst.id) {
+                        inst.mark_unread();
+                    }
+                }
+            },
+        )
+        .await;
+        // Per-tick roll-up of the passive-status batch this flush persisted.
+        // `merge_passive_status_patch` only logs when it drops a stale
+        // `last_accessed_at`, so without this there is no per-tick anchor for
+        // "why did N rows change on this tick". `ok` reports the durable
+        // write's outcome; on a failure the counts are what was attempted, not
+        // what landed, and the unread mirror below is skipped. See #2760.
+        tracing::debug!(
+            target: "session.store",
+            profile = %profile,
+            patches = patch_count,
+            unread = unread_count,
+            ok = persisted.is_ok(),
+            "persisted passive-status batch"
+        );
+        if persisted.is_ok() {
+            for inst in instances.iter_mut() {
+                if unread_ids_for_local.contains(&inst.id) {
+                    inst.mark_unread();
+                }
+            }
+        }
+    }
+}
+
+/// Drop entries whose session id is no longer live from the persistent
+/// per-session reconciler maps the status loop owns. Without this sweep a
+/// long-uptime daemon accumulates one entry per ever-observed instance id in
+/// each map, so the footprint grows with lifetime-observed sessions rather than
+/// with the live-session count (#2758).
+///
+/// The reconciler also retains these maps, but against its resume-eligible
+/// subset (structured, not archived / snoozed / trashed / idle-dormant) and
+/// only when the tmux scrape succeeds and the reconciler runs. This sweep runs
+/// at the top of every tick against the full live-instance set, so deletion GC
+/// is guaranteed even on a tick whose scrape fails, and entries for a session
+/// that is merely paused (archived / snoozed / idle-dormant) are not needed to
+/// be re-derived here.
+#[cfg(feature = "serve")]
+fn gc_reconciler_session_maps(
+    live_ids: &std::collections::HashSet<&str>,
+    attempted: &mut std::collections::HashSet<String>,
+    respawn_history: &mut std::collections::HashMap<String, Vec<std::time::Instant>>,
+    parked: &mut std::collections::HashSet<String>,
+    capacity_deferred: &mut std::collections::HashSet<String>,
+) {
+    attempted.retain(|id| live_ids.contains(id.as_str()));
+    respawn_history.retain(|id, _| live_ids.contains(id.as_str()));
+    parked.retain(|id| live_ids.contains(id.as_str()));
+    capacity_deferred.retain(|id| live_ids.contains(id.as_str()));
+}
+
 /// Background task that periodically refreshes session statuses. On each
 /// tick, diffs pre- and post-refresh statuses and emits a `StatusChange`
 /// on `state.status_tx` for every transition. Keeping the diff here,
@@ -2990,11 +4236,17 @@ async fn status_poll_loop(state: Arc<AppState>) {
     let mut attempted_acp_spawns: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     #[cfg(feature = "serve")]
-    let mut last_idle_reap: Option<std::time::Instant> = None;
+    let mut acp_reap_cadence = acp_reconciler::ReapCadence::default();
     #[cfg(feature = "serve")]
     let mut last_session_idle_reap: Option<std::time::Instant> = None;
+    // Loop-local, single-owner sleep-inhibit assertion (single global toggle,
+    // so one slot for the whole daemon). Kept off `AppState`, which is for
+    // cross-task shared state; this is owned solely by the poll loop, like
+    // `last_session_idle_reap`.
     #[cfg(feature = "serve")]
-    let mut last_rate_limit_reap: Option<std::time::Instant> = None;
+    let mut sleep_inhibitor: Option<Box<dyn crate::process::SleepInhibit>> = None;
+    #[cfg(feature = "serve")]
+    let mut last_sleep_inhibit_reconcile: Option<std::time::Instant> = None;
     // Per-session reconciler respawn budget + crash-loop park set (#1945).
     // Owned by the loop so they persist across ticks, swept against live
     // sessions inside the reconciler.
@@ -3003,12 +4255,55 @@ async fn status_poll_loop(state: Arc<AppState>) {
         std::collections::HashMap::new();
     #[cfg(feature = "serve")]
     let mut acp_parked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Per-session capacity-deferred marker (#1027). A structured session
+    // refused by `CapacityFull` is re-armed for retry every tick; this set
+    // gates the capacity banner to publish once per transition and is cleared
+    // once the session's worker comes online or leaves the live set.
+    #[cfg(feature = "serve")]
+    let mut acp_capacity_deferred: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     loop {
         interval.tick().await;
 
         let prev: std::collections::HashMap<String, crate::session::Status> = {
             let instances = state.instances.read().await;
             instances.iter().map(|i| (i.id.clone(), i.status)).collect()
+        };
+
+        // GC the reconciler's persistent per-session maps against the live
+        // instance set (keyed by `prev`, the full snapshot above) so a
+        // long-uptime daemon's footprint stays bounded by live-session count,
+        // not by lifetime-observed sessions (#2758). Above the scrape guard so
+        // the sweep still runs on a tick whose tmux scrape fails.
+        #[cfg(feature = "serve")]
+        {
+            let live_ids: std::collections::HashSet<&str> =
+                prev.keys().map(String::as_str).collect();
+            gc_reconciler_session_maps(
+                &live_ids,
+                &mut attempted_acp_spawns,
+                &mut acp_respawn_history,
+                &mut acp_parked,
+                &mut acp_capacity_deferred,
+            );
+        }
+        // Snapshot of the prior tick's Unknown-escalation tracking fields,
+        // taken from the same in-memory `state.instances` this tick's
+        // `load_all_instances()` call is about to reset to defaults. Fed to
+        // `seed_unknown_tracking` below, before `update_status_with_metadata`
+        // runs, so the escalation window in
+        // `update_status_with_metadata_inner` can actually accumulate
+        // elapsed time across ticks instead of restarting at zero every
+        // 2s (#2865).
+        let prev_unknown_tracking: std::collections::HashMap<
+            String,
+            (bool, Option<std::time::Instant>),
+        > = {
+            let instances = state.instances.read().await;
+            instances
+                .iter()
+                .map(|i| (i.id.clone(), (i.ever_confirmed_present, i.unknown_since)))
+                .collect()
         };
 
         // Snapshot suppression BEFORE `batch_pane_metadata()` so a worker
@@ -3019,142 +4314,114 @@ async fn status_poll_loop(state: Arc<AppState>) {
         let suppressed_ids =
             crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
         let file_watch_for_poll = state.file_watch.clone();
+        // Seed each freshly-disk-loaded instance's live status baseline from
+        // `prev` (the true previous-tick live status) rather than letting
+        // `update_status_with_metadata` fall back to comparing against its
+        // own possibly-stale disk-loaded `status`. Without this, every tick
+        // that finds disk out of sync with live reality (the common case,
+        // since nothing persists a passive transition until the patch below
+        // lands) misreads that mismatch as a brand new transition and
+        // restamps idle_entered_at/last_accessed_at. See #2690.
+        let prev_for_poll = prev.clone();
         let updated = tokio::task::spawn_blocking(move || {
             let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
+            seed_unknown_tracking(&mut instances, &prev_unknown_tracking);
             crate::tmux::refresh_session_cache();
             let pane_metadata = crate::tmux::batch_pane_metadata().unwrap_or_default();
-            for inst in &mut instances {
-                if suppressed_ids.contains(&inst.id) {
-                    inst.status = Status::Starting;
-                    continue;
-                }
-                let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-                let metadata = pane_metadata.get(&session_name);
-                inst.update_status_with_metadata(metadata);
-            }
-            instances
+            apply_tick_status_decisions(
+                &mut instances,
+                &prev_for_poll,
+                &suppressed_ids,
+                &pane_metadata,
+            );
+            (instances, live_structured_worker_records())
         })
         .await;
 
-        if let Ok(mut instances) = updated {
-            // Diff BEFORE the helper: status_tx must observe the raw
-            // post-suppression, post-tmux-scrape values, never the acp
-            // overlay applied by the helper.
+        if let Ok((mut instances, live_worker_records)) = updated {
+            // Diff BEFORE `reload_state_instances_from_disk`: for a tmux-backed
+            // row, status_tx must observe the raw post-suppression,
+            // post-tmux-scrape value, never the acp overlay that helper
+            // re-applies. A structured row is the deliberate exception:
+            // `skip_tmux_decision_for_structured` above already put the live acp
+            // status on it, which is what makes it compare equal to `prev` here
+            // instead of reporting a phantom transition every tick.
             let now = chrono::Utc::now();
-            for inst in &instances {
-                if let Some(old) = prev.get(&inst.id) {
-                    if *old != inst.status {
-                        let _ = state.status_tx.send(StatusChange {
-                            instance_id: inst.id.clone(),
-                            instance_title: inst.title.clone(),
-                            old: *old,
-                            new: inst.status,
-                            at: now,
-                        });
-                    }
+            let unread_enabled = crate::session::unread_enabled();
+            // Passive status transitions observed this tick, batched per
+            // profile so one `Storage::update` flock covers every
+            // transitioned session on that profile (plus its unread mark
+            // when applicable). Persisting promptly is what keeps the next
+            // reload (this loop's next tick, or a TUI relaunch) from
+            // comparing against a stale snapshot and restamping again. See
+            // #2690.
+            let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
+                std::collections::HashMap::new();
+            for (idx, old) in observed_transitions(&instances, &prev) {
+                let inst = &instances[idx];
+                // First turn's `Running -> Idle` edge: best-effort auto-name a
+                // still-default-named terminal session. Detached and
+                // self-gating, so ineligible sessions cost only the cheap gate.
+                if old == Status::Running && inst.status == Status::Idle {
+                    crate::session::smart_rename::maybe_spawn_terminal_smart_rename(inst);
+                }
+                let _ = state.status_tx.send(StatusChange {
+                    instance_id: inst.id.clone(),
+                    instance_title: inst.title.clone(),
+                    old,
+                    new: inst.status,
+                    at: now,
+                });
+                let decision = decide_passive_transition(inst, old, unread_enabled);
+                if decision.patch.is_none() && !decision.mark_unread {
+                    continue;
+                }
+                let bundle = bundles.entry(inst.source_profile.clone()).or_default();
+                if let Some(patch) = decision.patch {
+                    bundle.patches.insert(inst.id.clone(), patch);
+                }
+                if decision.mark_unread {
+                    // Record the id only; the in-memory mark on `instances`
+                    // is deferred to `flush_passive_transition_writes` so it
+                    // fires only after the durable write returns Ok. See
+                    // #2755.
+                    bundle.unread_ids.push(inst.id.clone());
                 }
             }
+            flush_passive_transition_writes(state.file_watch.clone(), &mut instances, bundles)
+                .await;
 
-            // Auto-mark unread on a finished turn (Running -> Idle), the same
-            // transition the TUI marks on. This is what lets a web-only user
-            // (no TUI process polling) accrue the indicator. There's no
-            // server-side "is being viewed" exemption: the client suppresses
-            // the chip on the session it is actively viewing and clears the
-            // auto marker on open. Mutate the in-memory rows we're about to
-            // install AND persist per profile so the next disk reload keeps it.
-            if crate::session::unread_enabled() {
-                let mut newly_idle: std::collections::HashMap<String, Vec<String>> =
-                    std::collections::HashMap::new();
-                for inst in &mut instances {
-                    let finished_turn = prev.get(&inst.id) == Some(&Status::Running)
-                        && inst.status == Status::Idle
-                        && !inst.unread;
-                    if finished_turn {
-                        inst.mark_unread();
-                        newly_idle
-                            .entry(inst.source_profile.clone())
-                            .or_default()
-                            .push(inst.id.clone());
-                    }
-                }
-                for (profile, ids) in newly_idle {
-                    let _ = api::persist_session_update(
-                        profile,
-                        "auto-unread",
-                        state.file_watch.clone(),
-                        move |insts| {
-                            for inst in insts.iter_mut() {
-                                if ids.contains(&inst.id) {
-                                    inst.mark_unread();
-                                }
-                            }
-                        },
-                    )
-                    .await;
-                }
-            }
+            reload_state_instances_from_disk(
+                &state,
+                instances,
+                live_worker_records,
+                StatusSource::TmuxApplied,
+            )
+            .await;
 
-            reload_state_instances_from_disk(&state, instances, StatusSource::TmuxApplied).await;
-
-            // Drain poller observations into sessions.json so daemon-only
-            // sessions (no attached TUI) persist post-`/clear` sids (#2291).
-            // Snapshot + spawn_blocking + reapply, never holding AppState
-            // across the flock or tmux exec, per storage.rs:46.
-            let snapshot = state.instances.read().await.clone();
-            let drain_state = state.clone();
-            match tokio::task::spawn_blocking(move || {
-                let mut snapshot = snapshot;
-                let outcome = crate::session::sync::drain_and_persist_session_ids(
-                    &mut snapshot,
-                    &drain_state.file_watch,
-                );
-                (outcome, snapshot)
-            })
-            .await
-            {
-                Ok((outcome, mutated)) if outcome.touched() => {
-                    // Reapply only for ids the helper actually touched, so a
-                    // peer that wrote `agent_session_id` (e.g. the restart-
-                    // completion path) on the live state during the
-                    // spawn_blocking window is not silently reverted.
-                    let touched: std::collections::HashSet<&str> = outcome
-                        .applied
-                        .iter()
-                        .chain(outcome.rolled_back.iter())
-                        .map(String::as_str)
-                        .collect();
-                    if !touched.is_empty() {
-                        let mut guard = state.instances.write().await;
-                        for src in mutated.iter().filter(|i| touched.contains(i.id.as_str())) {
-                            if let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) {
-                                dst.agent_session_id = src.agent_session_id.clone();
-                                dst.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
-                            }
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!(
-                        target: "session.sync",
-                        "drain_and_persist task failed: {e}",
-                    );
-                }
-            }
+            drain_session_id_updates_in_state(&state).await;
 
             #[cfg(feature = "serve")]
             acp_reconciler::reconcile_acp_workers(
                 &state,
                 &mut attempted_acp_spawns,
-                &mut last_idle_reap,
-                &mut last_rate_limit_reap,
+                &mut acp_reap_cadence,
                 &mut acp_respawn_history,
                 &mut acp_parked,
+                &mut acp_capacity_deferred,
             )
             .await;
 
             #[cfg(feature = "serve")]
             reap_idle_sessions(&state, &mut last_session_idle_reap).await;
+
+            #[cfg(feature = "serve")]
+            update_sleep_inhibit(
+                &state,
+                &mut sleep_inhibitor,
+                &mut last_sleep_inhibit_reconcile,
+            )
+            .await;
         }
     }
 }
@@ -3300,6 +4567,113 @@ async fn reap_idle_sessions(state: &Arc<AppState>, last_reap: &mut Option<std::t
     }
 }
 
+/// Cadence at which the daemon reconciles the OS sleep-inhibit assertion.
+/// Mirrors [`SESSION_IDLE_REAP_INTERVAL`]: a 2s status tick must not drive a
+/// config-file read plus a subprocess reconcile every iteration. Recovery
+/// latency is irrelevant here: the backing child only dies on external kill
+/// (caffeinate `-w <pid>` and the systemd-inhibit `cat` otherwise outlive every
+/// tick), and both acquire and release lag are dominated by the minutes-long
+/// grace window and the OS idle-sleep timer.
+#[cfg(feature = "serve")]
+const SLEEP_INHIBIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `AppState::sleep_inhibit_snapshot` bit: `prevent_sleep_when_active` was on
+/// at the last reconcile.
+#[cfg(feature = "serve")]
+pub(crate) const SLEEP_INHIBIT_SNAPSHOT_ENABLED: u8 = 0b01;
+/// `AppState::sleep_inhibit_snapshot` bit: an inhibitor slot is retained. This
+/// is slot presence, not held: the endpoint gates it on `backend_available`.
+#[cfg(feature = "serve")]
+pub(crate) const SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT: u8 = 0b10;
+
+/// Acquire or release the OS sleep-inhibit assertion. Throttled to
+/// [`SLEEP_INHIBIT_INTERVAL`] like the idle reaper, so the per-tick disk read
+/// is avoided. Reads the global config (the toggle is daemon-global, not
+/// per-profile) off the async runtime because `Config::load_or_warn` touches disk,
+/// then reconciles: hold the assertion while the toggle is on and any session
+/// has recent activity, release once every session has been idle past the
+/// grace window.
+#[cfg(feature = "serve")]
+async fn update_sleep_inhibit(
+    state: &Arc<AppState>,
+    slot: &mut Option<Box<dyn crate::process::SleepInhibit>>,
+    last_reconcile: &mut Option<std::time::Instant>,
+) {
+    if last_reconcile.is_some_and(|t| t.elapsed() < SLEEP_INHIBIT_INTERVAL) {
+        return;
+    }
+    *last_reconcile = Some(std::time::Instant::now());
+    let Ok(config) = tokio::task::spawn_blocking(crate::session::Config::load_or_warn).await else {
+        return;
+    };
+    let window = std::time::Duration::from_secs(
+        u64::from(config.session.prevent_sleep_idle_grace_minutes) * 60,
+    );
+    let desired = config.session.prevent_sleep_when_active && {
+        let instances = state.instances.read().await;
+        instances.iter().any(|i| i.has_recent_activity(window))
+    };
+    reconcile_sleep_inhibit(desired, slot, crate::process::sleep_inhibitor);
+
+    let mut snapshot = 0u8;
+    if config.session.prevent_sleep_when_active {
+        snapshot |= SLEEP_INHIBIT_SNAPSHOT_ENABLED;
+    }
+    if slot.is_some() {
+        snapshot |= SLEEP_INHIBIT_SNAPSHOT_SLOT_PRESENT;
+    }
+    state
+        .sleep_inhibit_snapshot
+        .store(snapshot, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Level-triggered reconciler for the sleep-inhibit slot. Acquiring on a slot
+/// whose child has died respawns it, so a caffeinate / systemd-inhibit child
+/// that exits unexpectedly is replaced within one reconcile interval while
+/// sessions are still active. The grace window is the hysteresis (`idle_age`
+/// is monotonic within an idle period and crosses the window exactly once), so
+/// no extra debounce is needed. `make` is injected so tests can supply a mock.
+///
+/// Runs inline on the async task rather than `spawn_blocking`: every operation
+/// here is a subprocess spawn / `try_wait` / kill that returns in milliseconds,
+/// and the call is throttled to once per interval; only the config read in
+/// `update_sleep_inhibit`, which touches disk, is offloaded.
+#[cfg(feature = "serve")]
+fn reconcile_sleep_inhibit(
+    desired: bool,
+    slot: &mut Option<Box<dyn crate::process::SleepInhibit>>,
+    make: impl FnOnce() -> Box<dyn crate::process::SleepInhibit>,
+) {
+    match (desired, slot.as_mut().map(|i| i.is_held_alive())) {
+        (true, Some(true)) => {}
+        (true, _) => {
+            // In the normal path any prior dead child was already reaped by the
+            // `try_wait` inside `is_held_alive` above, so overwriting the slot
+            // below leaks no zombie. The only unreaped case is a `try_wait`
+            // error, which is ECHILD-class (the child is already gone), so no
+            // defensive reap is warranted.
+            let mut inhibitor = make();
+            match inhibitor.acquire() {
+                Ok(()) => *slot = Some(inhibitor),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "server.sleep_inhibit",
+                        error = %e,
+                        "failed to acquire OS sleep-inhibit assertion",
+                    );
+                    *slot = None;
+                }
+            }
+        }
+        (false, Some(_)) => {
+            if let Some(mut inhibitor) = slot.take() {
+                inhibitor.release();
+            }
+        }
+        (false, None) => {}
+    }
+}
+
 /// Startup auto-recovery for AI agent sessions whose tmux pane is missing
 /// after a daemon restart or system reboot.
 ///
@@ -3374,12 +4748,16 @@ async fn daemon_startup_recovery_mark(
         }
     };
 
-    let candidates: Vec<crate::session::Instance> = {
+    let mut candidates: Vec<crate::session::Instance> = {
         let instances = state.instances.read().await;
         instances
             .iter()
             .filter(|i| {
-                let session_name = crate::tmux::Session::generate_name(&i.id, &i.title);
+                let session_name = crate::tmux::resolve_agent_session_name_in(
+                    &pane_meta,
+                    &i.id,
+                    &crate::tmux::Session::generate_name(&i.id, &i.title),
+                );
                 let has_live_tmux = pane_meta
                     .get(&session_name)
                     .map(|m| !m.pane_dead)
@@ -3390,9 +4768,49 @@ async fn daemon_startup_recovery_mark(
             .collect()
     };
 
+    // #2994 (deterministic): drop any session already attempted this boot. The
+    // boot-scoped ledger makes startup recovery idempotent per boot for every
+    // agent, so a prior pass that resumed (then whose owner exited) cannot be
+    // duplicated here regardless of whether the orphan is still identifiable.
+    let attempted = crate::session::recovery::recovery_attempted_this_boot();
+    candidates.retain(|i| !attempted.contains(&i.id));
+
+    // #2994 (defense-in-depth): also skip sessions whose agent is positively
+    // still alive on a tmux server this daemon can no longer see (orphaned
+    // socket). The batched process-table scan runs in `spawn_blocking` and only
+    // after the `instances` read lock is dropped, so its heavy synchronous I/O
+    // cannot stall the executor or block REST writers.
+    if !candidates.is_empty() {
+        let scan_input = candidates.clone();
+        let orphan_flags = tokio::task::spawn_blocking(move || {
+            crate::session::recovery::orphaned_agents_alive(&scan_input)
+        })
+        .await
+        .unwrap_or_else(|_| vec![false; candidates.len()]);
+        let mut idx = 0;
+        candidates.retain(|i| {
+            let alive = orphan_flags.get(idx).copied().unwrap_or(false);
+            idx += 1;
+            if alive {
+                tracing::info!(
+                    target: "session.startup_recovery",
+                    id = %i.id,
+                    "skipping recovery: agent already alive on an orphaned tmux server",
+                );
+            }
+            !alive
+        });
+    }
+
     if candidates.is_empty() {
         return None;
     }
+
+    // Record the attempt *before* any worker runs `tmux new-session`, so a
+    // mid-pass crash fails toward "already attempted" for the next pass.
+    crate::session::recovery::mark_recovery_attempted(
+        &candidates.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+    );
 
     for inst in &candidates {
         crate::session::recovery::mark_recently_restarted(&state.recently_restarted, &inst.id);
@@ -3470,20 +4888,42 @@ async fn daemon_startup_recovery_cascade(
                     return;
                 }
             };
-            let still_candidate = {
+            let recheck_inst: Option<crate::session::Instance> = {
                 let instances = inst_state.instances.read().await;
                 instances
                     .iter()
                     .find(|i| i.id == id)
-                    .map(|i| {
-                        let session_name = crate::tmux::Session::generate_name(&i.id, &i.title);
+                    .filter(|i| {
+                        let session_name = crate::tmux::resolve_agent_session_name_in(
+                            &pane_meta,
+                            &i.id,
+                            &crate::tmux::Session::generate_name(&i.id, &i.title),
+                        );
                         let has_live_tmux = pane_meta
                             .get(&session_name)
                             .map(|m| !m.pane_dead)
                             .unwrap_or(false);
                         !has_live_tmux && crate::session::recovery::is_recovery_candidate(i)
                     })
-                    .unwrap_or(false)
+                    .cloned()
+            };
+            // #2994: re-check the orphan guard *outside* the lock and inside
+            // `spawn_blocking` so an agent still alive on an invisible tmux
+            // server is not duplicated by the cascade, without the process-table
+            // scan stalling the executor or blocking REST writers on the
+            // `instances` lock. The boot ledger is intentionally not re-checked
+            // here: Phase A already recorded this id, so re-reading it would
+            // self-skip every candidate.
+            let still_candidate = match recheck_inst {
+                Some(inst) => {
+                    let alive = tokio::task::spawn_blocking(move || {
+                        crate::session::recovery::orphaned_agent_process_alive(&inst)
+                    })
+                    .await
+                    .unwrap_or(false);
+                    !alive
+                }
+                None => false,
             };
             if !still_candidate {
                 // Phase A pre-marked this id and seeded recovery_pending;
@@ -3820,10 +5260,16 @@ async fn acp_event_listener(state: Arc<AppState>) {
 
         // Smart-rename defer: fire the one-shot only on a clean
         // `prompt_complete` `Event::Stopped`, so it never races the live worker
-        // for the same provider API. The reason-allowlist plus the two sync
-        // mutex `contains()` checks drop non-matching events before we touch
-        // the event store or spawn a task. See #2348.
-        let should_rename = {
+        // for the same provider API. Fast-path on the event variant BEFORE
+        // touching the two sync mutexes so high-volume streaming-delta frames
+        // (`AgentMessageChunk`, `ToolCallStarted`, `ThinkingStarted`, ...) skip
+        // the locks entirely; the pure predicate then applies the reason
+        // allowlist + the two per-session `contains()` checks. See #2348 and
+        // the post-merge review nit on #2651.
+        let should_rename = matches!(
+            frame.event.as_ref(),
+            crate::acp::state::Event::Stopped { .. }
+        ) && {
             let attempted = state
                 .smart_rename_attempted
                 .lock()
@@ -3840,15 +5286,29 @@ async fn acp_event_listener(state: Arc<AppState>) {
             )
         };
         if should_rename {
-            if let Some(first_message) = state.acp_event_store.first_user_prompt(&frame.session_id)
+            if let Some((first_user_prompt, agent_prose)) =
+                state.acp_event_store.first_turn_context(
+                    &frame.session_id,
+                    crate::session::smart_rename::FIRST_TURN_AGENT_BYTES,
+                )
             {
                 let state_for_rename = state.clone();
                 let session_id = frame.session_id.clone();
+                let context = crate::session::smart_rename::render_first_turn(
+                    &first_user_prompt,
+                    &agent_prose,
+                );
                 tokio::spawn(async move {
                     crate::session::smart_rename::try_smart_rename(
                         state_for_rename,
                         session_id,
-                        first_message,
+                        crate::session::smart_rename::SmartRenameInput {
+                            first_user_prompt,
+                            context,
+                        },
+                        // Automatic turn-end trigger: honor the smart_rename
+                        // setting. Only the manual action forces past it (#3039).
+                        false,
                     )
                     .await;
                 });
@@ -3863,9 +5323,41 @@ async fn acp_event_listener(state: Arc<AppState>) {
                 tracing::debug!(
                     target: "smart_rename",
                     session = %frame.session_id,
-                    "trigger fired but event store has no first_user_prompt; skipping"
+                    "trigger fired but event store has no first-turn context; skipping"
                 );
             }
+        }
+
+        // Conversation-summary defer: same clean-turn-boundary discipline as
+        // smart-rename. Fast-path on the event variant before the inflight
+        // lock so streaming frames skip it; the spawned task re-checks the
+        // setting, eligibility, and the byte/turn delta threshold (all of
+        // which need config + the event store). See #2808.
+        let should_summarize = matches!(
+            frame.event.as_ref(),
+            crate::acp::state::Event::Stopped { .. }
+        ) && {
+            let inflight = state
+                .summary_inflight
+                .lock()
+                .expect("summary_inflight poisoned");
+            crate::session::conversation_summary::should_trigger_summary(
+                frame.event.as_ref(),
+                &frame.session_id,
+                &inflight,
+            )
+        };
+        if should_summarize {
+            let state_for_summary = state.clone();
+            let session_id = frame.session_id.clone();
+            tokio::spawn(async move {
+                crate::session::conversation_summary::try_conversation_summary(
+                    state_for_summary,
+                    session_id,
+                    crate::session::conversation_summary::SummaryTrigger::Auto,
+                )
+                .await;
+            });
         }
 
         let status_intent = derive_acp_status(frame.event.as_ref());
@@ -4133,6 +5625,29 @@ fn apply_acp_session_change(
                 inst.import_pending = None;
             }
         }
+        AcpSessionChange::Cleared => {
+            tracing::info!(
+                target: "acp.event_listener",
+                session = %session_id,
+                "clearing stored ACP session id after a user /clear"
+            );
+            // For a profile that forwards its clear alias, AoE never learns the
+            // adapter's post-clear conversation id, so the only way to stop a
+            // restart from resurrecting the pre-clear conversation via
+            // session/load is to drop the stored id now and force a fresh
+            // session/new. That leaves the post-clear conversation
+            // unresumable, which is why the profiles whose adapters withhold
+            // the new id drive the reset themselves instead
+            // (`clear_requires_driven_reset`); on that path this arm still
+            // runs, but the driven burst ends in `AcpSessionAssigned`, which
+            // re-pins the id the adapter just minted. Clear the paired
+            // fork/import markers unconditionally too: a /clear issued before
+            // a pending fork/import resolves must still restart clean, not
+            // re-session/fork the parent. See #3080.
+            inst.acp_session_id = None;
+            inst.fork_pending = None;
+            inst.import_pending = None;
+        }
     }
     Some(inst.source_profile.clone())
 }
@@ -4145,6 +5660,10 @@ fn apply_acp_session_change(
 enum AcpSessionChange {
     Assigned(String),
     Reset(String),
+    /// A user `/clear`: drop the stored resume id so the next worker
+    /// restart starts a fresh `session/new` instead of resurrecting the
+    /// pre-clear conversation via `session/load`. See #3080.
+    Cleared,
 }
 
 #[cfg(feature = "serve")]
@@ -4155,6 +5674,7 @@ fn derive_acp_session_change(event: &crate::acp::Event) -> Option<AcpSessionChan
             Some(AcpSessionChange::Assigned(acp_session_id.clone()))
         }
         Event::SessionContextReset { reason } => Some(AcpSessionChange::Reset(reason.clone())),
+        Event::SessionCleared => Some(AcpSessionChange::Cleared),
         _ => None,
     }
 }
@@ -4214,6 +5734,50 @@ pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusInten
     }
 }
 
+async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
+    // Drain poller observations into sessions.json so daemon-only sessions
+    // persist post-`/clear` sids (#2291). Snapshot + spawn_blocking + reapply,
+    // never holding AppState across the flock or tmux exec, per storage.rs:46.
+    let snapshot = state.instances.read().await.clone();
+    let file_watch = state.file_watch.clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut snapshot = snapshot;
+        let outcome =
+            crate::session::sync::drain_and_persist_session_ids(&mut snapshot, &file_watch);
+        (outcome, snapshot)
+    })
+    .await
+    {
+        Ok((outcome, mutated)) if outcome.touched() => {
+            // Reapply only for ids the helper actually touched, so a peer that
+            // wrote `agent_session_id` on the live state during spawn_blocking
+            // is not silently reverted.
+            let touched: std::collections::HashSet<&str> = outcome
+                .applied
+                .iter()
+                .chain(outcome.rolled_back.iter())
+                .map(String::as_str)
+                .collect();
+            if !touched.is_empty() {
+                let mut guard = state.instances.write().await;
+                for src in mutated.iter().filter(|i| touched.contains(i.id.as_str())) {
+                    if let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) {
+                        dst.agent_session_id = src.agent_session_id.clone();
+                        dst.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
+                    }
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(
+                target: "session.sync",
+                "drain_and_persist task failed: {e}",
+            );
+        }
+    }
+}
+
 /// Test-only constructors that integration tests in `tests/` need to drive
 /// `reload_state_instances_from_disk` and the dynamic-profile-rewire helpers
 /// without going through the full daemon. Mirrors the pattern at
@@ -4232,6 +5796,34 @@ pub mod test_support {
     /// `recently_restarted`, and the file-watch trio are real. Acp
     /// fields are stubbed because the helper's acp overlay reads them.
     pub fn build_test_app_state(prior: Vec<Instance>) -> Arc<AppState> {
+        build_test_app_state_with_policy(prior, Vec::new(), Vec::new(), None)
+    }
+
+    /// Like [`build_test_app_state`] but with CityHall client mode on, so route
+    /// tests can assert the mode's 403/400 guards fire (#7).
+    pub fn build_test_app_state_cityhall(prior: Vec<Instance>) -> Arc<AppState> {
+        build_test_app_state_impl(prior, Vec::new(), Vec::new(), None, true)
+    }
+
+    /// Like [`build_test_app_state`] but seeds the DNS-rebinding allowlist and,
+    /// optionally, a real auth token so tests can exercise `access_policy` and
+    /// the router layering, including the before-auth ordering (#2735).
+    pub fn build_test_app_state_with_policy(
+        prior: Vec<Instance>,
+        allowed_hosts: Vec<String>,
+        allowed_origins: Vec<String>,
+        token: Option<String>,
+    ) -> Arc<AppState> {
+        build_test_app_state_impl(prior, allowed_hosts, allowed_origins, token, false)
+    }
+
+    fn build_test_app_state_impl(
+        prior: Vec<Instance>,
+        allowed_hosts: Vec<String>,
+        allowed_origins: Vec<String>,
+        token: Option<String>,
+        cityhall_mode: bool,
+    ) -> Arc<AppState> {
         let app_dir = tempfile::tempdir().expect("tempdir");
         let acp_db = app_dir.path().join("acp_events.db");
         let event_store =
@@ -4243,21 +5835,43 @@ pub mod test_support {
         });
         let supervisor =
             std::sync::Arc::new(crate::acp::supervisor::Supervisor::with_capacity(sink, 1));
+        let instances = Arc::new(RwLock::new(prior));
+        let instance_locks = Arc::new(RwLock::new(HashMap::new()));
+        let idempotency_locks = Arc::new(RwLock::new(HashMap::new()));
+        let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let file_watch = FileWatchService::noop();
+        let session_service = Arc::new(session_service::SessionService::new(
+            Arc::clone(&instances),
+            Arc::clone(&instance_locks),
+            Arc::clone(&file_watch),
+            Arc::clone(&telemetry_session_creates),
+            supervisor.clone(),
+            event_store.clone(),
+        ));
         Arc::new(AppState {
             profile: "test".to_string(),
             read_only: false,
-            instances: RwLock::new(prior),
-            token_manager: Arc::new(TokenManager::new(None, Duration::from_secs(3600))),
+            cityhall_mode,
+            instances,
+            session_service,
+            token_manager: Arc::new(TokenManager::new(token, Duration::from_secs(3600))),
             login_manager: Arc::new(login::LoginManager::new(None)),
             rate_limiter: Arc::new(RateLimiter::new()),
             behind_tunnel: false,
             auth_mode: "none",
             serve_mode: "local",
-            instance_locks: RwLock::new(HashMap::new()),
+            allowed_hosts,
+            allowed_origins,
+            instance_locks,
+            idempotency_locks,
             smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
             smart_rename_semaphore: tokio::sync::Semaphore::new(
                 crate::session::smart_rename::MAX_CONCURRENT,
+            ),
+            summary_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            summary_semaphore: tokio::sync::Semaphore::new(
+                crate::session::conversation_summary::MAX_CONCURRENT,
             ),
             recently_restarted: crate::session::recovery::new_recently_restarted(),
             recovery_pending: crate::session::recovery::new_recovery_pending(),
@@ -4277,21 +5891,53 @@ pub mod test_support {
             push_enabled: false,
             web_config: crate::session::config::WebConfig::default(),
             last_web_activity: AtomicI64::new(0),
+            sleep_inhibit_snapshot: std::sync::atomic::AtomicU8::new(0),
             telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
             telemetry_web_clients: FormFactorCounters::default(),
             telemetry_structured_clients: FormFactorCounters::default(),
-            telemetry_session_creates: std::sync::atomic::AtomicU32::new(0),
+            telemetry_session_creates,
             telemetry_structured: StructuredTelemetryCounters::default(),
             telemetry_last_reported: std::sync::Mutex::new(None),
             shutdown: CancellationToken::new(),
-            file_watch: FileWatchService::noop(),
+            file_watch,
             disk_changed: Arc::new(tokio::sync::Notify::new()),
             disk_watch_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
     }
 
+    pub async fn drain_session_id_updates_for_test(state: &Arc<AppState>) {
+        super::drain_session_id_updates_in_state(state).await;
+    }
+
+    pub fn attach_session_id_update_for_test(inst: &mut Instance, sid: &str) {
+        let poller = crate::session::poller::SessionPoller::new(format!("test-tmux-{}", inst.id));
+        poller.inject_test_update(&inst.id, sid);
+        inst.session_id_poller = Some(Arc::new(std::sync::Mutex::new(poller)));
+    }
+
+    pub fn seed_instances_on_disk_for_test(profile: &str, insts: Vec<Instance>) {
+        let storage = Storage::new_unwatched(profile).expect("storage");
+        storage
+            .update(move |instances, _groups| {
+                *instances = insts;
+                Ok(())
+            })
+            .expect("seed sessions.json");
+    }
+
+    pub fn load_instances_from_disk_for_test(profile: &str) -> Vec<Instance> {
+        Storage::new_unwatched(profile)
+            .expect("storage")
+            .load()
+            .expect("load sessions.json")
+    }
+
     pub async fn has_disk_watch_handle(state: &Arc<AppState>, profile: &str) -> bool {
         state.disk_watch_handles.lock().await.contains_key(profile)
+    }
+
+    pub fn build_router_for_test(state: Arc<AppState>) -> axum::Router {
+        super::build_router(state)
     }
 
     pub async fn disk_watch_handle_count(state: &Arc<AppState>) -> usize {
@@ -4328,19 +5974,1609 @@ pub mod test_support {
         state.file_watch.clone()
     }
 
-    pub async fn reload_disk_only_for_test(state: &Arc<AppState>, fresh: Vec<Instance>) {
-        super::reload_state_instances_from_disk(state, fresh, super::StatusSource::DiskOnly).await
+    pub async fn reload_disk_only_for_test(
+        state: &Arc<AppState>,
+        fresh: Vec<Instance>,
+        live_worker_records: Vec<(crate::process::worker_registry::WorkerRecord, String)>,
+    ) {
+        super::reload_state_instances_from_disk(
+            state,
+            fresh,
+            live_worker_records,
+            super::StatusSource::DiskOnly,
+        )
+        .await
     }
 
-    pub async fn reload_tmux_applied_for_test(state: &Arc<AppState>, fresh: Vec<Instance>) {
-        super::reload_state_instances_from_disk(state, fresh, super::StatusSource::TmuxApplied)
-            .await
+    pub async fn reload_tmux_applied_for_test(
+        state: &Arc<AppState>,
+        fresh: Vec<Instance>,
+        live_worker_records: Vec<(crate::process::worker_registry::WorkerRecord, String)>,
+    ) {
+        super::reload_state_instances_from_disk(
+            state,
+            fresh,
+            live_worker_records,
+            super::StatusSource::TmuxApplied,
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn vecs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `idempotency_locks` must not grow for the daemon's lifetime: keys are
+    /// caller-supplied and unbounded, so an entry nobody holds is pruned on
+    /// the next miss. A key whose lock is still held must survive. See #3156.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn idempotency_lock_prunes_unreferenced_keys() {
+        let state = test_support::build_test_app_state(vec![]);
+
+        // A key acquired and released leaves nothing behind: the next miss on
+        // a different key prunes it.
+        drop(state.idempotency_lock("released-key").await);
+        let _other = state.idempotency_lock("other-key").await;
+        assert!(
+            !state
+                .idempotency_locks
+                .read()
+                .await
+                .contains_key("released-key"),
+            "an unreferenced key must be pruned rather than retained forever"
+        );
+
+        // A key still held by a live caller must NOT be pruned, or two
+        // concurrent same-key creates would stop serializing.
+        let held = state.idempotency_lock("held-key").await;
+        let _guard = held.lock_owned().await;
+        let _third = state.idempotency_lock("third-key").await;
+        assert!(
+            state
+                .idempotency_locks
+                .read()
+                .await
+                .contains_key("held-key"),
+            "a key with a live holder must survive pruning"
+        );
+    }
+
+    /// Extract every mutating `(METHOD, path-template)` pair registered in
+    /// `build_router` by scanning `.route("<path>", <handlers>)` and reading the
+    /// method combinators inside each handler expression (balanced parens so a
+    /// nested `get(...).post(...)` doesn't bleed into the next route). Shared by
+    /// the CityHall table-exhaustiveness audit below.
+    #[cfg(test)]
+    fn router_mutating_routes() -> std::collections::BTreeSet<(String, String)> {
+        let src = include_str!("mod.rs");
+        let start = src.find("fn build_router").expect("build_router present");
+        let end = src[start..]
+            .find(".layer(axum::middleware::from_fn_with_state")
+            .map(|o| start + o)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        let mut out = std::collections::BTreeSet::new();
+        let bytes = body.as_bytes();
+        let marker = ".route(";
+        let mut i = 0;
+        while let Some(rel) = body[i..].find(marker) {
+            let mut j = i + rel + marker.len();
+            // Skip to the opening quote of the path literal.
+            while j < body.len() && bytes[j] != b'"' {
+                j += 1;
+            }
+            j += 1;
+            let path_start = j;
+            while j < body.len() && bytes[j] != b'"' {
+                j += 1;
+            }
+            let path = &body[path_start..j];
+            // Handler expression: from here to the matching close paren of
+            // `.route(` at depth 0.
+            let mut depth = 1i32;
+            let mut k = j;
+            while k < body.len() && depth > 0 {
+                match bytes[k] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                k += 1;
+            }
+            let expr = &body[j..k];
+            for method in ["post", "patch", "put", "delete"] {
+                if expr.contains(&format!("{method}(")) {
+                    out.insert((method.to_uppercase(), path.to_string()));
+                }
+            }
+            i = k;
+        }
+        out
+    }
+
+    /// CityHall audit (route-table exhaustiveness, replaces the old
+    /// handler-body text scan). Both sides are route enumerations, so it is
+    /// sound where a text scan was not: every mutating route the router
+    /// registers (ANY module prefix, ANY method) must appear in exactly the
+    /// `CITYHALL_MUTATION_ALLOW` / `CITYHALL_MUTATION_DENY` tables that drive the
+    /// default-deny `cityhall_gate`. A new mutating route absent from both fails
+    /// the build (forcing a reachable/closed decision), and a stale table entry
+    /// with no matching route also fails. See #7.
+    #[test]
+    fn every_mutating_route_is_cityhall_classified() {
+        let routed = router_mutating_routes();
+        assert!(
+            routed.len() > 60,
+            "router scan found only {} mutating routes; parser likely broke",
+            routed.len()
+        );
+        let classified: std::collections::BTreeSet<(String, String)> = CITYHALL_MUTATION_ALLOW
+            .iter()
+            .chain(CITYHALL_MUTATION_DENY.iter())
+            .map(|(m, p)| ((*m).to_string(), (*p).to_string()))
+            .collect();
+
+        let mut failures = Vec::new();
+        for route in &routed {
+            if !classified.contains(route) {
+                failures.push(format!(
+                    "{} {} is a mutating route but is in neither CITYHALL_MUTATION_ALLOW nor \
+                     CITYHALL_MUTATION_DENY. Add it to the allow table if the CityHall client \
+                     must reach it, else to the deny table.",
+                    route.0, route.1
+                ));
+            }
+        }
+        for entry in &classified {
+            if !routed.contains(entry) {
+                failures.push(format!(
+                    "{} {} is listed in a CityHall table but no router route matches it; remove \
+                     the stale entry (path template or method changed?).",
+                    entry.0, entry.1
+                ));
+            }
+        }
+        // Allow and deny must be disjoint.
+        for a in CITYHALL_MUTATION_ALLOW {
+            assert!(
+                !CITYHALL_MUTATION_DENY.contains(a),
+                "{} {} is in both CityHall allow and deny tables",
+                a.0,
+                a.1
+            );
+        }
+        assert!(
+            failures.is_empty(),
+            "CityHall route classification is not exhaustive:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// #2994 wiring test for `daemon_startup_recovery_mark` (Phase A). Proves
+    /// the two guards are consulted in the real daemon recovery path, not merely
+    /// as standalone predicates:
+    ///
+    /// - **ledger (deterministic):** an id already attempted this boot is
+    ///   excluded, so a second pass cannot duplicate it (the #2994 crash-then-
+    ///   re-run scenario). Covers every agent, needle or not.
+    /// - **process scan (defense-in-depth):** an id whose agent is positively
+    ///   still alive (a live `sleep` carrying `AOE_INSTANCE_ID=<id>`, the marker
+    ///   aoe injects into a resumed agent) is excluded.
+    ///
+    /// Deterministic without reproducing the `/tmp`-wipe. The ledger is isolated
+    /// to a tempdir via `AOE_RECOVERY_ATTEMPT_DIR`, so it never touches real
+    /// user state. The TUI path gates on the same two calls.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn daemon_recovery_ledger_and_scan_exclude_candidates() {
+        if !crate::tmux::is_tmux_available() {
+            eprintln!("skipping daemon_recovery_ledger_and_scan_exclude_candidates: no tmux");
+            return;
+        }
+
+        let ledger_dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var(
+            crate::session::recovery::RECOVERY_ATTEMPT_DIR_ENV,
+            ledger_dir.path(),
+        );
+
+        let unique = format!("{:012}", std::process::id());
+        let mut inst_a = crate::session::Instance::new("orphan-wire-a", "/tmp/aoe-test-2994");
+        inst_a.id = format!("wireA{unique}");
+        inst_a.agent_session_id = Some(format!("55555555-5555-4555-8555-{unique}"));
+        let id_a = inst_a.id.clone();
+        assert!(
+            crate::session::recovery::is_recovery_candidate(&inst_a),
+            "precondition: the fixture must be a recovery candidate",
+        );
+
+        // Pass 1: no orphan, id_a unattempted -> included (and now marked).
+        {
+            let state = test_support::build_test_app_state(vec![inst_a.clone()]);
+            let picked = daemon_startup_recovery_mark(state).await;
+            let candidates = picked.map(|(_lock, c)| c).unwrap_or_default();
+            assert!(
+                candidates.iter().any(|c| c.id == id_a),
+                "an unattempted, non-orphaned missing session must be a candidate",
+            );
+        }
+
+        // Ledger case: with id_a now recorded this boot, a second pass must
+        // exclude it deterministically (only assert when the ledger is active
+        // on this host, i.e. a boot id was resolvable).
+        let ledger_active =
+            crate::session::recovery::recovery_attempted_this_boot().contains(&id_a);
+        if ledger_active {
+            let state = test_support::build_test_app_state(vec![inst_a.clone()]);
+            let picked = daemon_startup_recovery_mark(state).await;
+            let candidates = picked.map(|(_lock, c)| c).unwrap_or_default();
+            assert!(
+                !candidates.iter().any(|c| c.id == id_a),
+                "an id attempted earlier this boot must be excluded (idempotent recovery)",
+            );
+        }
+
+        // Scan case: a distinct id_b (never attempted) whose agent is positively
+        // alive must be excluded by the process scan. Uses a non-hook agent
+        // (opencode) whose sid the decoy carries in argv, so detection goes
+        // through the cross-platform cmdline needle rather than `ps -E` env
+        // visibility, which a hardened macOS can hide (#3006 review).
+        let sid_b = format!("66666666-6666-4666-8666-{unique}");
+        let mut inst_b = crate::session::Instance::new("orphan-wire-b", "/tmp/aoe-test-2994");
+        inst_b.id = format!("wireB{unique}");
+        inst_b.tool = "opencode".to_string();
+        inst_b.agent_session_id = Some(sid_b.clone());
+        let id_b = inst_b.id.clone();
+        assert!(
+            crate::session::recovery::is_recovery_candidate(&inst_b),
+            "precondition: inst_b must be a recovery candidate",
+        );
+
+        // The sid rides as `$0` of a compound-list `sh` so it stays alive with
+        // the sid in argv (visible via plain `ps`, no `-E` needed).
+        let mut decoy = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 60; true")
+            .arg(&sid_b)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn orphan decoy");
+
+        // Wait until the decoy's argv is observable before running recovery.
+        for _ in 0..100 {
+            let flags =
+                crate::process::processes_matching(&[String::new()], &[Some(sid_b.clone())]);
+            if flags.first().copied().unwrap_or(false) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let state = test_support::build_test_app_state(vec![inst_b.clone()]);
+        let picked = daemon_startup_recovery_mark(state).await;
+        let candidates = picked.map(|(_lock, c)| c).unwrap_or_default();
+
+        let _ = decoy.kill();
+        let _ = decoy.wait();
+        std::env::remove_var(crate::session::recovery::RECOVERY_ATTEMPT_DIR_ENV);
+
+        assert!(
+            !candidates.iter().any(|c| c.id == id_b),
+            "a live orphan process must exclude the session from recovery candidates",
+        );
+    }
+
+    #[derive(Default)]
+    struct MockInhibitState {
+        acquires: u32,
+        releases: u32,
+        alive: bool,
+    }
+
+    struct MockInhibitor {
+        state: std::sync::Arc<std::sync::Mutex<MockInhibitState>>,
+    }
+
+    impl crate::process::SleepInhibit for MockInhibitor {
+        fn acquire(&mut self) -> anyhow::Result<()> {
+            let mut s = self.state.lock().unwrap();
+            s.acquires += 1;
+            s.alive = true;
+            Ok(())
+        }
+
+        fn release(&mut self) {
+            let mut s = self.state.lock().unwrap();
+            s.releases += 1;
+            s.alive = false;
+        }
+
+        fn is_held_alive(&mut self) -> bool {
+            self.state.lock().unwrap().alive
+        }
+    }
+
+    fn mock_factory(
+        state: &std::sync::Arc<std::sync::Mutex<MockInhibitState>>,
+    ) -> impl FnOnce() -> Box<dyn crate::process::SleepInhibit> {
+        let state = state.clone();
+        move || Box::new(MockInhibitor { state }) as Box<dyn crate::process::SleepInhibit>
+    }
+
+    fn never_built() -> Box<dyn crate::process::SleepInhibit> {
+        panic!("reconcile_sleep_inhibit must not build an inhibitor on this transition")
+    }
+
+    #[test]
+    fn reconcile_sleep_inhibit_acquires_when_desired_and_not_held() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(MockInhibitState::default()));
+        let mut slot: Option<Box<dyn crate::process::SleepInhibit>> = None;
+        reconcile_sleep_inhibit(true, &mut slot, mock_factory(&state));
+        let s = state.lock().unwrap();
+        assert_eq!(s.acquires, 1);
+        assert_eq!(s.releases, 0);
+        assert!(slot.is_some());
+    }
+
+    #[test]
+    fn reconcile_sleep_inhibit_noop_when_desired_and_held_alive() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(MockInhibitState::default()));
+        let mut slot: Option<Box<dyn crate::process::SleepInhibit>> = None;
+        reconcile_sleep_inhibit(true, &mut slot, mock_factory(&state));
+        reconcile_sleep_inhibit(true, &mut slot, never_built);
+        assert_eq!(state.lock().unwrap().acquires, 1);
+        assert!(slot.is_some());
+    }
+
+    #[test]
+    fn reconcile_sleep_inhibit_respawns_when_desired_and_child_dead() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(MockInhibitState::default()));
+        let mut slot: Option<Box<dyn crate::process::SleepInhibit>> = None;
+        reconcile_sleep_inhibit(true, &mut slot, mock_factory(&state));
+        state.lock().unwrap().alive = false;
+        reconcile_sleep_inhibit(true, &mut slot, mock_factory(&state));
+        let s = state.lock().unwrap();
+        assert_eq!(s.acquires, 2);
+        assert!(slot.is_some());
+    }
+
+    #[test]
+    fn reconcile_sleep_inhibit_releases_when_not_desired_and_held() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(MockInhibitState::default()));
+        let mut slot: Option<Box<dyn crate::process::SleepInhibit>> = None;
+        reconcile_sleep_inhibit(true, &mut slot, mock_factory(&state));
+        reconcile_sleep_inhibit(false, &mut slot, never_built);
+        let s = state.lock().unwrap();
+        assert_eq!(s.releases, 1);
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn reconcile_sleep_inhibit_noop_when_not_desired_and_not_held() {
+        let mut slot: Option<Box<dyn crate::process::SleepInhibit>> = None;
+        reconcile_sleep_inhibit(false, &mut slot, never_built);
+        assert!(slot.is_none());
+    }
+
+    #[test]
+    fn reconcile_sleep_inhibit_sequence_hold_release_hold() {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(MockInhibitState::default()));
+        let mut slot: Option<Box<dyn crate::process::SleepInhibit>> = None;
+        reconcile_sleep_inhibit(true, &mut slot, mock_factory(&state));
+        reconcile_sleep_inhibit(false, &mut slot, never_built);
+        reconcile_sleep_inhibit(true, &mut slot, mock_factory(&state));
+        let s = state.lock().unwrap();
+        assert_eq!(s.acquires, 2);
+        assert_eq!(s.releases, 1);
+        assert!(slot.is_some());
+    }
+
+    #[test]
+    fn strip_host_port_variants() {
+        assert_eq!(strip_host_port("localhost:8080"), "localhost");
+        assert_eq!(strip_host_port("localhost"), "localhost");
+        assert_eq!(strip_host_port("127.0.0.1:8080"), "127.0.0.1");
+        assert_eq!(strip_host_port("[::1]:8080"), "::1");
+        assert_eq!(strip_host_port("[::1]"), "::1");
+        assert_eq!(strip_host_port("::1"), "::1");
+        assert_eq!(strip_host_port("example.com"), "example.com");
+    }
+
+    #[test]
+    fn remote_serve_url_contents_keeps_public_primary_and_loopback_alternate() {
+        assert_eq!(
+            remote_serve_url_contents("https://aoe.example.test", 8080, Some("secret")),
+            "https://aoe.example.test/?token=secret\n\
+             localhost\thttp://127.0.0.1:8080/?token=secret\n"
+        );
+    }
+
+    #[test]
+    fn remote_serve_url_contents_handles_trailing_slash_and_no_auth() {
+        assert_eq!(
+            remote_serve_url_contents("https://aoe.example.test/", 8080, None),
+            "https://aoe.example.test/\nlocalhost\thttp://127.0.0.1:8080/\n"
+        );
+    }
+
+    #[test]
+    fn host_from_url_extracts_bare_host() {
+        assert_eq!(
+            host_from_url("https://x.trycloudflare.com").as_deref(),
+            Some("x.trycloudflare.com")
+        );
+        assert_eq!(
+            host_from_url("https://foo.ts.net/path?x=1").as_deref(),
+            Some("foo.ts.net")
+        );
+        assert_eq!(
+            host_from_url("https://Foo.TS.net").as_deref(),
+            Some("foo.ts.net")
+        );
+        assert_eq!(host_from_url(""), None);
+    }
+
+    #[test]
+    fn host_in_allowlist_passes() {
+        assert_eq!(
+            evaluate_access(Some("localhost"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn host_not_in_allowlist_403() {
+        assert_eq!(
+            evaluate_access(Some("evil.com"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::DenyHost
+        );
+    }
+
+    #[test]
+    fn host_port_stripped_before_match() {
+        assert_eq!(
+            evaluate_access(Some("localhost:8080"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn host_ipv6_bracketed_port_stripped() {
+        assert_eq!(
+            evaluate_access(Some("[::1]:8080"), None, &vecs(&["::1"]), &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn host_match_is_case_insensitive() {
+        assert_eq!(
+            evaluate_access(Some("LOCALHOST"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn missing_host_denied() {
+        assert_eq!(
+            evaluate_access(None, None, &vecs(&["localhost"]), &[]),
+            AccessDecision::DenyMissingHost
+        );
+    }
+
+    #[test]
+    fn origin_absent_is_exempt() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                None,
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn origin_in_allowlist_passes() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("http://localhost:8080"),
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn origin_not_in_allowlist_403() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("https://evil.com"),
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::DenyOrigin
+        );
+    }
+
+    #[test]
+    fn origin_match_is_case_insensitive() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("https://X.TryCloudflare.com"),
+                &vecs(&["localhost"]),
+                &vecs(&["https://x.trycloudflare.com"])
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn null_origin_is_denied() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("null"),
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::DenyOrigin
+        );
+    }
+
+    #[test]
+    fn userinfo_host_is_denied() {
+        assert_eq!(
+            evaluate_access(Some("user@localhost"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::DenyHost
+        );
+    }
+
+    #[test]
+    fn wildcard_bind_defaults_to_localhost_trio() {
+        let (h, _o) = resolve_access_policy("0.0.0.0", 8080, &[], &[], None);
+        // The static allowlist is still just the trio; a wildcard bind adds no
+        // routable *name*. A HOSTNAME is still denied without --allowed-host.
+        assert_eq!(h, vecs(&["localhost", "127.0.0.1", "::1"]));
+        assert_eq!(
+            evaluate_access(Some("my-box.local"), None, &h, &[]),
+            AccessDecision::DenyHost
+        );
+        // But a LAN IP literal is trusted unconditionally (Pattern A: an IP
+        // cannot be DNS-rebound), so by-IP access works with no flag.
+        assert_eq!(
+            evaluate_access(Some("192.168.1.5"), None, &h, &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn is_trusted_ip_literal_accepts_routable_rejects_special() {
+        for good in [
+            "127.0.0.1",
+            "192.168.1.5",
+            "10.0.0.9",
+            "100.68.123.45", // tailnet CGNAT
+            "::1",
+            "2001:db8::1",
+            "fd00::1",            // ULA
+            "::ffff:192.168.1.5", // IPv4-mapped routable: canonicalized, then trusted
+        ] {
+            assert!(is_trusted_ip_literal(good), "{good} should be trusted");
+        }
+        for bad in [
+            "0.0.0.0",
+            "::",
+            "169.254.169.254", // cloud metadata (v4 link-local)
+            "fe80::1",         // v6 link-local
+            "224.0.0.1",       // multicast
+            "ff02::1",
+            "::ffff:169.254.169.254", // IPv4-mapped metadata: canonicalized, then excluded
+            "::ffff:0.0.0.0",         // IPv4-mapped unspecified
+            "::ffff:224.0.0.1",       // IPv4-mapped multicast
+            "example.com",
+            "my-box",
+            "",
+        ] {
+            assert!(!is_trusted_ip_literal(bad), "{bad} must not be trusted");
+        }
+    }
+
+    #[test]
+    fn is_untrusted_ip_literal_flags_only_excluded_literals() {
+        for excluded in [
+            "0.0.0.0",
+            "::",
+            "169.254.169.254",
+            "fe80::1",
+            "224.0.0.1",
+            "ff02::1",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(
+                is_untrusted_ip_literal(excluded),
+                "{excluded} is an IP literal the gate excludes"
+            );
+        }
+        // Routable/loopback literals pass, and hostnames are not IP literals at
+        // all, so both must clear the validators.
+        for allowed in [
+            "127.0.0.1",
+            "::1",
+            "192.168.1.5",
+            "100.68.123.45",
+            "2001:db8::1",
+            "aoe.example.com",
+            "my-box",
+            "",
+        ] {
+            assert!(
+                !is_untrusted_ip_literal(allowed),
+                "{allowed} must not be flagged as an untrusted IP literal"
+            );
+        }
+    }
+
+    #[test]
+    fn ip_literal_host_allowed_without_flag() {
+        let allow = vecs(&["localhost"]);
+        assert_eq!(
+            evaluate_access(Some("192.168.1.5:8080"), None, &allow, &[]),
+            AccessDecision::Allow
+        );
+        assert_eq!(
+            evaluate_access(Some("[2001:db8::5]:8080"), None, &allow, &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn ip_literal_origin_allowed_without_flag() {
+        let allow = vecs(&["localhost"]);
+        assert_eq!(
+            evaluate_access(
+                Some("192.168.1.5:8080"),
+                Some("http://192.168.1.5:8080"),
+                &allow,
+                &[]
+            ),
+            AccessDecision::Allow
+        );
+        assert_eq!(
+            evaluate_access(
+                Some("[2001:db8::5]:8080"),
+                Some("http://[2001:db8::5]:8080"),
+                &allow,
+                &[]
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn excluded_ip_literals_still_denied() {
+        let allow = vecs(&["localhost"]);
+        for bad in ["0.0.0.0", "169.254.169.254", "fe80::1"] {
+            assert_eq!(
+                evaluate_access(Some(bad), None, &allow, &[]),
+                AccessDecision::DenyHost,
+                "{bad}"
+            );
+        }
+        // An unlisted hostname origin must not slip through the IP exemption.
+        assert_eq!(
+            evaluate_access(
+                Some("192.168.1.5"),
+                Some("https://evil.com"),
+                &allow,
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::DenyOrigin
+        );
+    }
+
+    #[test]
+    fn concrete_bind_host_is_allowed() {
+        let (h, o) = resolve_access_policy("192.168.1.5", 8080, &[], &[], None);
+        assert!(h.contains(&"192.168.1.5".to_string()));
+        assert!(o.contains(&"http://192.168.1.5:8080".to_string()));
+    }
+
+    #[test]
+    fn explicit_host_flag_extends_allowlist() {
+        let (h, o) = resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com"]), &[], None);
+        assert!(h.contains(&"aoe.example.com".to_string()));
+        assert!(o.contains(&"https://aoe.example.com".to_string()));
+        assert!(o.contains(&"https://aoe.example.com:8080".to_string()));
+    }
+
+    #[test]
+    fn remote_tunnel_host_auto_injected() {
+        let (h, _o) =
+            resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("x.trycloudflare.com"));
+        assert!(h.contains(&"x.trycloudflare.com".to_string()));
+        assert_eq!(
+            evaluate_access(Some("x.trycloudflare.com"), None, &h, &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn tunnel_origin_auto_injected() {
+        let (h, o) =
+            resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("x.trycloudflare.com"));
+        assert!(o.contains(&"https://x.trycloudflare.com".to_string()));
+        assert_eq!(
+            evaluate_access(
+                Some("x.trycloudflare.com"),
+                Some("https://x.trycloudflare.com"),
+                &h,
+                &o
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn tailscale_host_auto_injected() {
+        let (h, o) =
+            resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("host.tailnet.ts.net"));
+        assert!(h.contains(&"host.tailnet.ts.net".to_string()));
+        assert!(o.contains(&"https://host.tailnet.ts.net".to_string()));
+    }
+
+    #[test]
+    fn explicit_origin_flag_normalized() {
+        let (_h, o) = resolve_access_policy(
+            "127.0.0.1",
+            8080,
+            &[],
+            &vecs(&[
+                "https://aoe.example.com:8443",
+                "https://trail.example.com/",
+                "https://std.example.com:443",
+            ]),
+            None,
+        );
+        assert!(o.contains(&"https://aoe.example.com:8443".to_string()));
+        assert!(o.contains(&"https://trail.example.com".to_string()));
+        assert!(!o.contains(&"https://trail.example.com/".to_string()));
+        assert!(o.contains(&"https://std.example.com".to_string()));
+    }
+
+    #[test]
+    fn norm_origin_canonicalizes_to_browser_form() {
+        assert_eq!(norm_origin("https://x/"), "https://x");
+        assert_eq!(norm_origin("https://x:443"), "https://x");
+        assert_eq!(norm_origin("http://x:80"), "http://x");
+        assert_eq!(norm_origin("https://x:8443"), "https://x:8443");
+        assert_eq!(norm_origin("http://x:443"), "http://x:443");
+        assert_eq!(norm_origin("HTTPS://X"), "https://x");
+        assert_eq!(norm_origin("https://[::1]:443"), "https://[::1]");
+    }
+
+    #[test]
+    fn norm_origin_strips_trailing_fqdn_dot() {
+        assert_eq!(norm_origin("https://example.com."), "https://example.com");
+        assert_eq!(
+            norm_origin("https://example.com.:443"),
+            "https://example.com"
+        );
+        assert_eq!(norm_origin("http://example.com.:80"), "http://example.com");
+        assert_eq!(
+            norm_origin("https://example.com.:8443"),
+            "https://example.com:8443"
+        );
+        // Symmetric with the Host gate.
+        assert_eq!(
+            norm_origin("https://example.com."),
+            format!("https://{}", norm_host("example.com."))
+        );
+    }
+
+    #[test]
+    fn origin_default_port_matches_portless_allowlist() {
+        let (_h, o) =
+            resolve_access_policy("127.0.0.1", 8080, &vecs(&["proxy.example.com"]), &[], None);
+        assert_eq!(
+            evaluate_access(
+                Some("proxy.example.com"),
+                Some("https://proxy.example.com:443"),
+                &vecs(&["proxy.example.com"]),
+                &o
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn norm_host_strips_trailing_dot() {
+        assert_eq!(norm_host("example.com."), "example.com");
+        assert_eq!(norm_host("example.com.:8080"), "example.com");
+        assert_eq!(norm_host("[::1]:8080"), "::1");
+    }
+
+    #[test]
+    fn trailing_dot_host_matches_allowlist() {
+        let (h, _o) =
+            resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com."]), &[], None);
+        assert!(h.contains(&"aoe.example.com".to_string()));
+        assert_eq!(
+            evaluate_access(Some("aoe.example.com."), None, &h, &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn trailing_dot_origin_matches_allowlist() {
+        let (h, o) = resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com"]), &[], None);
+        assert_eq!(
+            evaluate_access(
+                Some("aoe.example.com."),
+                Some("https://aoe.example.com."),
+                &h,
+                &o
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn wildcard_bind_ipv6_forms_default_to_trio() {
+        for wild in ["::", "[::]"] {
+            let (h, _o) = resolve_access_policy(wild, 8080, &[], &[], None);
+            assert_eq!(
+                h,
+                vecs(&["localhost", "127.0.0.1", "::1"]),
+                "wildcard {wild}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn access_policy_rejects_unlisted_host_at_router() {
+        use tower::ServiceExt;
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            vecs(&["http://localhost:8080"]),
+            None,
+        );
+        let app = test_support::build_router_for_test(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "evil.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn access_policy_runs_before_auth() {
+        use tower::ServiceExt;
+        let remote: std::net::SocketAddr = "203.0.113.7:5555".parse().unwrap();
+        let make_state = || {
+            test_support::build_test_app_state_with_policy(
+                Vec::new(),
+                vecs(&["localhost"]),
+                vecs(&["http://localhost:8080"]),
+                Some("secret-token".to_string()),
+            )
+        };
+
+        let app = test_support::build_router_for_test(make_state());
+        let mut bad = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "evil.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        bad.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(bad).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "an unlisted Host must 403 before auth can 401"
+        );
+
+        let app = test_support::build_router_for_test(make_state());
+        let mut good = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        good.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(good).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "a listed Host passes the gate and reaches auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_body_is_generic_for_host_and_origin() {
+        use tower::ServiceExt;
+        async fn body_of(resp: axum::response::Response) -> String {
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+        let make_state = || {
+            test_support::build_test_app_state_with_policy(
+                Vec::new(),
+                vecs(&["localhost"]),
+                vecs(&["http://localhost:8080"]),
+                None,
+            )
+        };
+
+        let app = test_support::build_router_for_test(make_state());
+        let host_deny = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "evil.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let host_body = body_of(app.oneshot(host_deny).await.unwrap()).await;
+
+        let app = test_support::build_router_for_test(make_state());
+        let origin_deny = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .header("origin", "https://evil.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let origin_body = body_of(app.oneshot(origin_deny).await.unwrap()).await;
+
+        assert_eq!(host_body, "forbidden: host or origin not allowed");
+        assert_eq!(
+            host_body, origin_body,
+            "both deny reasons must return an identical, non-leaking body"
+        );
+    }
+
+    #[tokio::test]
+    async fn listed_origin_passes_gate_to_auth() {
+        use tower::ServiceExt;
+        let remote: std::net::SocketAddr = "203.0.113.7:5555".parse().unwrap();
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            vecs(&["http://localhost:8080"]),
+            Some("secret-token".to_string()),
+        );
+        let app = test_support::build_router_for_test(state);
+        let mut req = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .header("origin", "http://localhost:8080")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "a listed Origin must pass the gate and reach auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_policy_authority_fallback_allows_listed() {
+        use tower::ServiceExt;
+        let remote: std::net::SocketAddr = "203.0.113.7:5555".parse().unwrap();
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["x.trycloudflare.com"]),
+            Vec::new(),
+            Some("secret-token".to_string()),
+        );
+        let app = test_support::build_router_for_test(state);
+        // Absolute-form URI + no Host header: access_policy falls back to
+        // request.uri().authority() (the HTTP/2 :authority path).
+        let mut req = axum::http::Request::builder()
+            .uri("http://x.trycloudflare.com/api/sessions")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(req.headers().get(axum::http::header::HOST).is_none());
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "an :authority in the allowlist passes the gate and reaches auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_policy_authority_fallback_rejects_unlisted() {
+        use tower::ServiceExt;
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            Vec::new(),
+            None,
+        );
+        let app = test_support::build_router_for_test(state);
+        let req = axum::http::Request::builder()
+            .uri("http://evil.trycloudflare.com/api/sessions")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// #2758: the reconciler's persistent per-session maps must be swept
+    /// against the live instance set every tick, so a deleted session's id
+    /// does not linger and grow the daemon's footprint over its uptime.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn gc_reconciler_session_maps_drops_deleted_session_ids() {
+        use std::collections::{HashMap, HashSet};
+        use std::time::Instant;
+
+        let mut attempted: HashSet<String> = HashSet::new();
+        let mut respawn_history: HashMap<String, Vec<Instant>> = HashMap::new();
+        let mut parked: HashSet<String> = HashSet::new();
+        let mut capacity_deferred: HashSet<String> = HashSet::new();
+
+        // A session that has been spawn-attempted, parked (crash-loop), has
+        // respawn history, and is capacity-deferred.
+        let doomed = "sess-deleted".to_string();
+        let kept = "sess-live".to_string();
+        for id in [&doomed, &kept] {
+            attempted.insert(id.clone());
+            respawn_history.insert(id.clone(), vec![Instant::now()]);
+            parked.insert(id.clone());
+            capacity_deferred.insert(id.clone());
+        }
+
+        // Tick with both sessions live: nothing is swept.
+        let mut live: HashSet<&str> = HashSet::new();
+        live.insert(doomed.as_str());
+        live.insert(kept.as_str());
+        gc_reconciler_session_maps(
+            &live,
+            &mut attempted,
+            &mut respawn_history,
+            &mut parked,
+            &mut capacity_deferred,
+        );
+        assert!(attempted.contains(&doomed) && attempted.contains(&kept));
+        assert!(parked.contains(&doomed) && parked.contains(&kept));
+
+        // Delete the session (drops out of the live set), then tick: every
+        // map must forget it while the surviving session's entries remain.
+        live.remove(doomed.as_str());
+        gc_reconciler_session_maps(
+            &live,
+            &mut attempted,
+            &mut respawn_history,
+            &mut parked,
+            &mut capacity_deferred,
+        );
+
+        assert!(
+            !attempted.contains(&doomed),
+            "attempted must forget the deleted session id"
+        );
+        assert!(
+            !respawn_history.contains_key(&doomed),
+            "respawn_history must forget the deleted session id"
+        );
+        assert!(
+            !parked.contains(&doomed),
+            "parked must forget the deleted session id"
+        );
+        assert!(
+            !capacity_deferred.contains(&doomed),
+            "capacity_deferred must forget the deleted session id"
+        );
+
+        // The still-live session is untouched.
+        assert!(attempted.contains(&kept));
+        assert!(respawn_history.contains_key(&kept));
+        assert!(parked.contains(&kept));
+        assert!(capacity_deferred.contains(&kept));
+    }
+
+    #[test]
+    fn decide_passive_transition_skips_patch_for_structured_session() {
+        // Locks the CI regression from #2697: structured/ACP sessions
+        // have no tmux pane for the poller to probe; their `status` is not
+        // poller-authoritative (the ACP overlay is), so a disk/detected
+        // mismatch must not be persisted as a passive status patch.
+        let mut inst = Instance::new("acp-session", "/tmp/test");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Idle;
+
+        let decision = decide_passive_transition(&inst, Status::Starting, false);
+
+        assert!(
+            decision.patch.is_none(),
+            "structured sessions must never get a passive status patch"
+        );
+    }
+
+    /// A structured row as the poll loop finds it mid-phantom: disk says `Idle`,
+    /// the live acp status is `Error` because the worker died with
+    /// `AgentStartupError` and `seed_acp_statuses` re-derives that on every boot.
+    fn phantom_structured_row(id: &str) -> Instance {
+        let mut inst = Instance::new(id, "/tmp/test");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Idle;
+        inst
+    }
+
+    #[test]
+    fn skip_tmux_decision_for_structured_suppresses_the_phantom_transition() {
+        // The other half of #2690 / #2697. That pair stopped the poller from
+        // *persisting* its (void) view of a structured row's status, but left
+        // `status_poll_loop` still comparing the live `prev` against the
+        // disk-loaded `fresh`. Those two never converge for a structured row,
+        // so the loop reported one fresh transition per 2s tick forever: a
+        // `session.status_change` line, a `StatusChange` broadcast, and a reset
+        // push dwell timer, plus a re-marked-unread row when the live side was
+        // `Running`.
+        let mut inst = phantom_structured_row("acp-session");
+        inst.live_status_baseline = Some(Status::Error);
+
+        assert!(
+            skip_tmux_decision_for_structured(&mut inst),
+            "a structured row must skip the tmux status decision"
+        );
+
+        // Nothing downstream sees a transition: `observed_transitions` compares
+        // `prev` against this status, and the baseline stays in step with it for
+        // any later consumer. `update_status_with_metadata` is not involved, the
+        // caller's `continue` skips it outright.
+        assert_eq!(
+            inst.status,
+            Status::Error,
+            "the live acp status is authoritative, not the disk value"
+        );
+        assert_eq!(
+            inst.live_status_baseline,
+            Some(inst.status),
+            "baseline must stay in step with the carried status"
+        );
+    }
+
+    #[test]
+    fn tick_reports_no_transition_for_a_structured_phantom() {
+        // The regression at tick level, over the two halves together. The
+        // helper tests above pass even if the `continue` is dropped from
+        // `apply_tick_status_decisions`; this one does not, so it is what
+        // actually guards the 81k-log-lines bug.
+        let inst = phantom_structured_row("acp-session");
+        let prev = std::collections::HashMap::from([(inst.id.clone(), Status::Error)]);
+        let mut instances = vec![inst];
+
+        apply_tick_status_decisions(
+            &mut instances,
+            &prev,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        assert_eq!(
+            observed_transitions(&instances, &prev),
+            vec![],
+            "a structured row whose live status did not move must report no \
+             transition, so status_tx stays silent and nothing is persisted or \
+             marked unread"
+        );
+        // Note this holds for *every* structured row, not just a phantom: the
+        // tick always carries `prev` onto them, so this path reports nothing for
+        // them ever. That is the design. A real structured transition comes from
+        // `apply_status_intent`, which mutates `state.instances` and broadcasts
+        // its own `StatusChange`, so `prev` already carries it next tick. See
+        // `tick_forces_a_recently_restarted_row_to_starting` for the proof that
+        // the tick still reports transitions it does own.
+    }
+
+    #[test]
+    fn tick_skips_a_row_that_is_new_since_the_last_snapshot() {
+        // No `prev` entry means the row was created since the last tick; there
+        // is no previous status to have transitioned from.
+        let mut instances = vec![phantom_structured_row("acp-session")];
+        let prev = std::collections::HashMap::new();
+
+        apply_tick_status_decisions(
+            &mut instances,
+            &prev,
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        assert_eq!(instances[0].status, Status::Idle, "disk status stands");
+        assert_eq!(instances[0].live_status_baseline, None);
+        assert_eq!(observed_transitions(&instances, &prev), vec![]);
+    }
+
+    #[test]
+    fn tick_forces_a_recently_restarted_row_to_starting() {
+        // Two things at once. The suppression branch must keep winning over the
+        // structured carry (a worker mid-restart is Starting, not whatever the
+        // last tick saw), and it doubles as the positive control that the
+        // structured suppression is not a blanket mute: a transition this tick
+        // genuinely owns is still reported. Suppression is the one branch that
+        // moves a status without consulting tmux, so it proves that without
+        // needing a live pane.
+        let inst = phantom_structured_row("acp-session");
+        let id = inst.id.clone();
+        let prev = std::collections::HashMap::from([(id.clone(), Status::Error)]);
+        let mut instances = vec![inst];
+
+        apply_tick_status_decisions(
+            &mut instances,
+            &prev,
+            &std::collections::HashSet::from([id]),
+            &std::collections::HashMap::new(),
+        );
+
+        assert_eq!(instances[0].status, Status::Starting);
+        assert_eq!(
+            observed_transitions(&instances, &prev),
+            vec![(0, Status::Error)],
+            "a transition the tick does own must still be reported"
+        );
+    }
+
+    #[test]
+    fn skip_tmux_decision_for_structured_keeps_disk_status_without_a_baseline() {
+        // A row created since the last tick has no live value yet. Its disk
+        // status is all there is, and the absent baseline already suppresses
+        // the transition report.
+        let mut inst = phantom_structured_row("acp-session");
+        inst.status = Status::Running;
+
+        assert!(skip_tmux_decision_for_structured(&mut inst));
+
+        assert_eq!(inst.status, Status::Running);
+        assert_eq!(inst.live_status_baseline, None);
+    }
+
+    #[test]
+    fn skip_tmux_decision_for_structured_clears_a_stale_tmux_error() {
+        // Shares `Instance::clear_stale_tmux_error` with the structured
+        // short-circuit in `update_status_with_metadata_inner`, for a row
+        // converted from a terminal session: the tmux message cannot apply to
+        // it any more.
+        let mut inst = phantom_structured_row("acp-session");
+        inst.last_error = Some(crate::session::TMUX_SESSION_GONE_ERROR.to_string());
+
+        assert!(skip_tmux_decision_for_structured(&mut inst));
+
+        assert_eq!(inst.last_error, None);
+    }
+
+    #[test]
+    fn skip_tmux_decision_for_structured_leaves_tmux_sessions_to_the_poller() {
+        // A terminal session has a real pane; the poller is authoritative and
+        // must still run its tmux decision against the disk-loaded row.
+        let mut inst = Instance::new("tmux-session", "/tmp/test");
+        inst.status = Status::Idle;
+        inst.live_status_baseline = Some(Status::Error);
+        inst.last_error = Some(crate::session::TMUX_SESSION_GONE_ERROR.to_string());
+
+        assert!(
+            !skip_tmux_decision_for_structured(&mut inst),
+            "a tmux-backed session must not skip the tmux status decision"
+        );
+
+        assert_eq!(inst.status, Status::Idle, "disk status must be untouched");
+        assert_eq!(
+            inst.last_error.as_deref(),
+            Some(crate::session::TMUX_SESSION_GONE_ERROR),
+            "a tmux-backed session's tmux error must survive for the poller"
+        );
+    }
+
+    #[test]
+    fn decide_passive_transition_patches_plain_tmux_session() {
+        let mut inst = Instance::new("tmux-session", "/tmp/test");
+        inst.status = Status::Idle;
+        inst.idle_entered_at = Some(chrono::Utc::now());
+        inst.last_accessed_at = Some(chrono::Utc::now());
+
+        let decision = decide_passive_transition(&inst, Status::Running, false);
+
+        let patch = decision.patch.expect("plain tmux session must get a patch");
+        assert_eq!(patch.status, Status::Idle);
+        assert_eq!(patch.idle_entered_at, inst.idle_entered_at);
+        assert_eq!(patch.last_accessed_at, inst.last_accessed_at);
+    }
+
+    #[test]
+    fn decide_passive_transition_never_fabricates_last_accessed_at() {
+        // A session that transitions status before any user touch has
+        // last_accessed_at == None on disk; the patch must preserve that,
+        // not fabricate a stamp, or a brand-new session gains a spurious
+        // "touched" signal that idle-reap and the freshness sort rely on
+        // being absent.
+        let mut inst = Instance::new("tmux-session", "/tmp/test");
+        inst.status = Status::Idle;
+        inst.last_accessed_at = None;
+
+        let decision = decide_passive_transition(&inst, Status::Running, false);
+
+        let patch = decision.patch.expect("plain tmux session must get a patch");
+        assert_eq!(patch.last_accessed_at, None);
+    }
+
+    #[test]
+    fn decide_passive_transition_marks_unread_only_on_running_to_idle() {
+        let mut inst = Instance::new("tmux-session", "/tmp/test");
+        inst.status = Status::Idle;
+
+        let decision = decide_passive_transition(&inst, Status::Running, true);
+        assert!(decision.mark_unread);
+
+        let decision = decide_passive_transition(&inst, Status::Waiting, true);
+        assert!(
+            !decision.mark_unread,
+            "only a Running -> Idle transition marks unread"
+        );
+
+        inst.unread = true;
+        let decision = decide_passive_transition(&inst, Status::Running, true);
+        assert!(
+            !decision.mark_unread,
+            "already-unread sessions must not re-mark"
+        );
+    }
+
+    // #2755 (follow-up to #2729): the poller must not strand an in-memory
+    // unread mark on a persist that never landed. `flush_passive_transition_writes`
+    // applies the mark to the live vec only after `persist_session_update`
+    // returns Ok; on failure the row stays unmarked so memory and disk agree,
+    // rather than showing a phantom unread that the next reload silently drops.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flush_passive_transition_defers_unread_until_persist_ok() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let profile = "flush-persist-failure";
+        // Force the flock write to fail: making `sessions.json` a directory
+        // makes the store's read-modify-write error out during `update`.
+        let dir = crate::session::get_profile_dir(profile).expect("profile dir");
+        std::fs::create_dir_all(dir.join("sessions.json")).expect("sessions.json dir");
+
+        let mut inst = Instance::new("idle-session", "/tmp/idle");
+        inst.source_profile = profile.to_string();
+        let id = inst.id.clone();
+        let mut instances = vec![inst];
+
+        let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
+            std::collections::HashMap::new();
+        bundles
+            .entry(profile.to_string())
+            .or_default()
+            .unread_ids
+            .push(id.clone());
+
+        flush_passive_transition_writes(
+            crate::file_watch::FileWatchService::noop(),
+            &mut instances,
+            bundles,
+        )
+        .await;
+
+        assert!(
+            !instances[0].unread,
+            "a failed persist must not leave a phantom in-memory unread mark (see #2755)"
+        );
+    }
+
+    // The success path: once the write is durable, the mark lands on both the
+    // live vec (which feeds `state.instances`) and disk.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flush_passive_transition_applies_unread_after_persist_ok() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let profile = "flush-persist-success";
+        let mut inst = Instance::new("idle-session", "/tmp/idle");
+        inst.source_profile = profile.to_string();
+        let id = inst.id.clone();
+
+        // Seed the row on disk so the persist closure has a matching id to mark.
+        let seed = inst.clone();
+        crate::session::Storage::new_unwatched(profile)
+            .expect("storage")
+            .update(move |instances, _groups| {
+                *instances = vec![seed];
+                Ok(())
+            })
+            .expect("seed write");
+
+        let mut instances = vec![inst];
+        let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
+            std::collections::HashMap::new();
+        bundles
+            .entry(profile.to_string())
+            .or_default()
+            .unread_ids
+            .push(id.clone());
+
+        flush_passive_transition_writes(
+            crate::file_watch::FileWatchService::noop(),
+            &mut instances,
+            bundles,
+        )
+        .await;
+
+        assert!(
+            instances[0].unread,
+            "a durable persist must mirror the unread mark into the live vec"
+        );
+        let disk = crate::session::Storage::new_unwatched(profile)
+            .expect("storage")
+            .load()
+            .expect("load");
+        assert!(
+            disk.iter().find(|i| i.id == id).expect("seeded row").unread,
+            "the unread mark must be durable on disk"
+        );
+    }
+
+    /// Closes I1's patches-routing half from #2756: each profile's `patches`
+    /// bundle must merge onto that profile's own storage and nowhere else. The
+    /// two adjacent tests above already cover the `unread_ids` mirror, so this
+    /// test asserts only the `patches` write (status / last_accessed_at) and
+    /// its per-profile routing, never unread. Each profile is seeded with the
+    /// opposite status it is patched to, so a mis-routed bundle leaves a row at
+    /// its seeded status and fails the status assertion: that is the routing
+    /// discriminator. The instance-to-bundle assignment in `status_poll_loop`
+    /// (bundles.entry(inst.source_profile)) stays out of unit-test reach: it
+    /// needs an `AppState`, which has no test constructor.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flush_passive_transition_routes_patches_per_profile() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let old = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let new_ts = chrono::Utc::now();
+
+        let mut a1 = Instance::new("session-a", "/tmp/a");
+        a1.source_profile = "flush-a".to_string();
+        a1.status = Status::Running;
+        a1.last_accessed_at = Some(old);
+        let a1_id = a1.id.clone();
+
+        let mut b1 = Instance::new("session-b", "/tmp/b");
+        b1.source_profile = "flush-b".to_string();
+        b1.status = Status::Idle;
+        b1.last_accessed_at = Some(old);
+        let b1_id = b1.id.clone();
+
+        let seed_a = a1.clone();
+        crate::session::Storage::new_unwatched("flush-a")
+            .expect("storage")
+            .update(move |instances, _groups| {
+                *instances = vec![seed_a];
+                Ok(())
+            })
+            .expect("seed write");
+        let seed_b = b1.clone();
+        crate::session::Storage::new_unwatched("flush-b")
+            .expect("storage")
+            .update(move |instances, _groups| {
+                *instances = vec![seed_b];
+                Ok(())
+            })
+            .expect("seed write");
+
+        let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
+            std::collections::HashMap::new();
+        bundles
+            .entry("flush-a".to_string())
+            .or_default()
+            .patches
+            .insert(
+                a1_id.clone(),
+                crate::session::PassiveStatusPatch {
+                    status: Status::Idle,
+                    idle_entered_at: None,
+                    last_accessed_at: Some(new_ts),
+                },
+            );
+        bundles
+            .entry("flush-b".to_string())
+            .or_default()
+            .patches
+            .insert(
+                b1_id.clone(),
+                crate::session::PassiveStatusPatch {
+                    status: Status::Running,
+                    idle_entered_at: None,
+                    last_accessed_at: Some(new_ts),
+                },
+            );
+
+        let mut instances = vec![a1, b1];
+        flush_passive_transition_writes(
+            crate::file_watch::FileWatchService::noop(),
+            &mut instances,
+            bundles,
+        )
+        .await;
+
+        let disk_a = crate::session::Storage::new_unwatched("flush-a")
+            .expect("storage")
+            .load()
+            .expect("load");
+        let row_a = disk_a
+            .iter()
+            .find(|i| i.id == a1_id)
+            .expect("a1 on flush-a disk");
+        assert_eq!(
+            row_a.status,
+            Status::Idle,
+            "profile A's patch must merge its status onto profile A's storage"
+        );
+        assert_eq!(
+            row_a.last_accessed_at,
+            Some(new_ts),
+            "profile A's patch must merge its last_accessed_at onto profile A's storage"
+        );
+
+        let disk_b = crate::session::Storage::new_unwatched("flush-b")
+            .expect("storage")
+            .load()
+            .expect("load");
+        let row_b = disk_b
+            .iter()
+            .find(|i| i.id == b1_id)
+            .expect("b1 on flush-b disk");
+        assert_eq!(
+            row_b.status,
+            Status::Running,
+            "profile B's patch must merge its status onto profile B's storage"
+        );
+        assert_eq!(
+            row_b.last_accessed_at,
+            Some(new_ts),
+            "profile B's patch must merge its last_accessed_at onto profile B's storage"
+        );
+    }
 
     #[test]
     fn extract_web_build_id_finds_entry_bundle() {
@@ -4383,6 +7619,45 @@ mod tests {
         assert_eq!(cache_control_for("assets/logo.svg"), "no-cache");
         assert_eq!(cache_control_for("assets/readme"), "no-cache");
         assert_eq!(cache_control_for("assets/short-a1.js"), "no-cache");
+    }
+
+    #[test]
+    fn seed_unknown_tracking_carries_prior_tick_fields_onto_fresh_instance() {
+        // `load_all_instances` always resets both `#[serde(skip)]` fields to
+        // their defaults, mimicking status_poll_loop's fresh disk load.
+        let mut fresh = vec![Instance::new("sess-1", "/tmp/seed")];
+        assert!(!fresh[0].ever_confirmed_present);
+        assert_eq!(fresh[0].unknown_since, None);
+
+        let confirmed_at = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        let mut prev = std::collections::HashMap::new();
+        prev.insert(fresh[0].id.clone(), (true, Some(confirmed_at)));
+
+        seed_unknown_tracking(&mut fresh, &prev);
+
+        assert!(
+            fresh[0].ever_confirmed_present,
+            "prior tick's ever_confirmed_present must seed the fresh instance \
+             before update_status_with_metadata runs on it"
+        );
+        assert_eq!(
+            fresh[0].unknown_since,
+            Some(confirmed_at),
+            "prior tick's unknown_since must seed the fresh instance so the \
+             Unknown->Error escalation window can actually accumulate elapsed \
+             time across ticks (#2865)"
+        );
+    }
+
+    #[test]
+    fn seed_unknown_tracking_leaves_unknown_ids_untouched() {
+        let mut fresh = vec![Instance::new("sess-unseen", "/tmp/seed")];
+        let prev = std::collections::HashMap::new();
+
+        seed_unknown_tracking(&mut fresh, &prev);
+
+        assert!(!fresh[0].ever_confirmed_present);
+        assert_eq!(fresh[0].unknown_since, None);
     }
 
     #[test]
@@ -4572,6 +7847,70 @@ mod tests {
         );
     }
 
+    // #3080: a user /clear emits Event::SessionCleared. Before the fix this
+    // derived no session change, so the stale ACP id survived on disk and the
+    // next worker restart replayed the pre-clear conversation via session/load.
+    // It must now derive a Cleared change so the stored id is dropped.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn session_cleared_derives_cleared_change() {
+        assert_eq!(
+            derive_acp_session_change(&crate::acp::Event::SessionCleared),
+            Some(AcpSessionChange::Cleared),
+            "a /clear must invalidate the persisted ACP resume id"
+        );
+    }
+
+    // Applying Cleared must null the stored id and force a clean restart by
+    // dropping the paired fork/import markers too: a /clear issued before a
+    // pending fork/import resolves must still restart as session/new, not
+    // re-session/fork the parent. See #3080.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn cleared_nulls_stored_id_and_pending_markers() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+        inst.acp_session_id = Some("pre-clear-id".into());
+        inst.fork_pending = Some("parent-acp-id".into());
+        inst.import_pending = Some(true);
+
+        let profile =
+            apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared));
+
+        assert_eq!(inst.acp_session_id, None, "clear drops the stored id");
+        assert_eq!(
+            inst.fork_pending, None,
+            "clear drops fork_pending so restart does not re-fork the parent"
+        );
+        assert_eq!(
+            inst.import_pending, None,
+            "clear drops import_pending so restart is a clean session/new"
+        );
+        assert!(profile.is_some(), "the clear must persist");
+    }
+
+    // Regression for the event-ordering the listener sees: an id assigned at
+    // connect followed by a later /clear must end with no stored id. See #3080.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn assign_then_clear_leaves_no_stored_id() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.view = crate::session::View::Structured;
+
+        apply_acp_session_change(
+            &mut inst,
+            "sess-1",
+            Some(&AcpSessionChange::Assigned("old-id".into())),
+        );
+        assert_eq!(inst.acp_session_id, Some("old-id".into()));
+
+        apply_acp_session_change(&mut inst, "sess-1", Some(&AcpSessionChange::Cleared));
+        assert_eq!(
+            inst.acp_session_id, None,
+            "a /clear after an assignment must not leave the old id on disk"
+        );
+    }
+
     #[test]
     fn merge_runtime_fields_drops_stale_last_error_on_healthy_transition() {
         // Issue #1271: prior errored in-memory, the session recovered to Idle
@@ -4602,6 +7941,128 @@ mod tests {
 
         let merged = merge_runtime_fields(prior, fresh);
         assert_eq!(merged.last_error, None);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial_test::serial]
+    fn repair_structured_rows_from_live_workers_restores_structured_session_rows() {
+        let temp = tempfile::TempDir::with_prefix_in("aoe-repair-", "/tmp").expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let socket_path = crate::process::worker_registry::workers_dir()
+            .expect("workers dir")
+            .join("repair-live.sock");
+        std::fs::write(&socket_path, b"").expect("socket sentinel");
+        let live_record = crate::process::worker_registry::WorkerRecord::new(
+            "repair-live".to_string(),
+            std::process::id(),
+            socket_path,
+            "codex-acp".to_string(),
+            "codex".to_string(),
+            std::path::PathBuf::from("/tmp/repo"),
+            Some("gpt-5".to_string()),
+            Vec::new(),
+            Vec::new(),
+            Some("acp-session-1".to_string()),
+            Some("default".to_string()),
+        );
+        crate::process::worker_registry::save(&live_record).expect("save live worker record");
+
+        let existing_socket_path = crate::process::worker_registry::workers_dir()
+            .expect("workers dir")
+            .join("repair-existing.sock");
+        std::fs::write(&existing_socket_path, b"").expect("socket sentinel");
+        let existing_record = crate::process::worker_registry::WorkerRecord::new(
+            "repair-existing".to_string(),
+            std::process::id(),
+            existing_socket_path,
+            "codex-acp".to_string(),
+            "codex".to_string(),
+            std::path::PathBuf::from("/tmp/repo"),
+            Some("gpt-5".to_string()),
+            Vec::new(),
+            Vec::new(),
+            Some("acp-session-2".to_string()),
+            Some("default".to_string()),
+        );
+        crate::process::worker_registry::save(&existing_record)
+            .expect("save existing-field worker record");
+
+        let stale_socket_path = crate::process::worker_registry::workers_dir()
+            .expect("workers dir")
+            .join("repair-no-id.sock");
+        std::fs::write(&stale_socket_path, b"").expect("socket sentinel");
+        let no_id_record = crate::process::worker_registry::WorkerRecord::new(
+            "repair-no-id".to_string(),
+            std::process::id(),
+            stale_socket_path,
+            "codex-acp".to_string(),
+            "codex".to_string(),
+            std::path::PathBuf::from("/tmp/repo"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some("default".to_string()),
+        );
+        crate::process::worker_registry::save(&no_id_record).expect("save no-id worker record");
+
+        let empty_socket_path = crate::process::worker_registry::workers_dir()
+            .expect("workers dir")
+            .join("repair-empty-id.sock");
+        std::fs::write(&empty_socket_path, b"").expect("socket sentinel");
+        let empty_id_record = crate::process::worker_registry::WorkerRecord::new(
+            "repair-empty-id".to_string(),
+            std::process::id(),
+            empty_socket_path,
+            "codex-acp".to_string(),
+            "codex".to_string(),
+            std::path::PathBuf::from("/tmp/repo"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Some(String::new()),
+            Some("default".to_string()),
+        );
+        crate::process::worker_registry::save(&empty_id_record)
+            .expect("save empty-id worker record");
+
+        let mut rows = vec![
+            Instance::new("repair-live", "/tmp/repo"),
+            Instance::new("repair-existing", "/tmp/repo"),
+            Instance::new("repair-no-id", "/tmp/repo"),
+            Instance::new("repair-empty-id", "/tmp/repo"),
+        ];
+        rows[0].id = "repair-live".to_string();
+        rows[1].id = "repair-existing".to_string();
+        rows[1].agent_name = Some("custom-agent".to_string());
+        rows[1].agent_model = Some("custom-model".to_string());
+        rows[2].id = "repair-no-id".to_string();
+        rows[3].id = "repair-empty-id".to_string();
+
+        let live_records = live_structured_worker_records();
+        let repairs = repair_structured_rows_from_live_workers(&mut rows, live_records);
+
+        assert_eq!(repairs.len(), 2);
+        assert_eq!(repairs[0].session_id, "repair-live");
+        assert_eq!(repairs[0].acp_session_id, "acp-session-1");
+        assert_eq!(rows[0].view, crate::session::View::Structured);
+        assert_eq!(rows[0].agent_name.as_deref(), Some("codex"));
+        assert_eq!(rows[0].agent_model.as_deref(), Some("gpt-5"));
+        assert_eq!(rows[0].acp_session_id.as_deref(), Some("acp-session-1"));
+        assert_eq!(rows[1].view, crate::session::View::Structured);
+        assert_eq!(rows[1].agent_name.as_deref(), Some("custom-agent"));
+        assert_eq!(rows[1].agent_model.as_deref(), Some("custom-model"));
+        assert_eq!(rows[1].acp_session_id.as_deref(), Some("acp-session-2"));
+        assert_eq!(rows[2].view, crate::session::View::Terminal);
+        assert_eq!(rows[2].acp_session_id, None);
+        assert_eq!(rows[3].view, crate::session::View::Terminal);
+        assert_eq!(rows[3].acp_session_id, None);
     }
 
     #[tokio::test]
@@ -4871,7 +8332,7 @@ mod tests {
             .await
             .expect("join")
             .expect("load");
-        reload_state_instances_from_disk(&state, fresh, StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(&state, fresh, Vec::new(), StatusSource::DiskOnly).await;
 
         let instances = state.instances.read().await;
         let titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
@@ -4931,7 +8392,7 @@ mod tests {
             .await
             .expect("join")
             .expect("load");
-        reload_state_instances_from_disk(&state, fresh, StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(&state, fresh, Vec::new(), StatusSource::DiskOnly).await;
 
         let instances = state.instances.read().await;
         assert!(

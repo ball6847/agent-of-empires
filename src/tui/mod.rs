@@ -1,10 +1,13 @@
 //! Terminal User Interface module
 
 mod app;
+mod attach_project_poller;
 mod attached_status_hooks;
 pub(crate) mod clipboard;
 mod components;
 mod creation_poller;
+#[cfg(feature = "serve")]
+mod daemon_status_poller;
 mod deletion_poller;
 pub mod dialogs;
 pub mod diff;

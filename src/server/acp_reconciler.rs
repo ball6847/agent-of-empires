@@ -185,11 +185,21 @@ type RawTargetTuple = (
     String,
 );
 
+/// When each cadence-gated pass last ran. Grouped rather than passed as
+/// three more `&mut Option<Instant>` parameters: the passes are gated on the
+/// same 2s tick and the count was already at clippy's argument limit, so the
+/// next one to be added would have to either bundle or silence the lint.
+#[derive(Default)]
+pub struct ReapCadence {
+    pub idle: Option<Instant>,
+    pub rate_limit: Option<Instant>,
+    pub terminal_repair: Option<Instant>,
+}
+
 pub async fn reconcile_acp_workers(
     state: &Arc<AppState>,
     attempted: &mut HashSet<String>,
-    last_idle_reap: &mut Option<std::time::Instant>,
-    last_rate_limit_reap: &mut Option<std::time::Instant>,
+    cadence: &mut ReapCadence,
     respawn_history: &mut HashMap<String, Vec<Instant>>,
     parked: &mut HashSet<String>,
     capacity_deferred: &mut HashSet<String>,
@@ -237,9 +247,24 @@ pub async fn reconcile_acp_workers(
     // filter. The idle threshold is resolved per session profile inside
     // `reap_idle_workers`; `auto_stop_idle_secs == 0` (the default)
     // disables the feature for sessions on that profile.
-    if last_idle_reap.is_none_or(|t| t.elapsed() >= IDLE_REAP_INTERVAL) {
+    if cadence
+        .idle
+        .is_none_or(|t| t.elapsed() >= IDLE_REAP_INTERVAL)
+    {
         reap_idle_workers(state).await;
-        *last_idle_reap = Some(std::time::Instant::now());
+        cadence.idle = Some(Instant::now());
+    }
+
+    // Terminal-event repair (#3190). Cadence-gated like the reaps above.
+    // Runs AFTER the idle reap so a session the reap just marked dormant and
+    // shut down carries the reap's own `idle_auto_stop` terminal instead of
+    // collecting a second, redundant one from this pass on the same tick.
+    if cadence
+        .terminal_repair
+        .is_none_or(|t| t.elapsed() >= TERMINAL_REPAIR_INTERVAL)
+    {
+        repair_missing_terminal(state).await;
+        cadence.terminal_repair = Some(Instant::now());
     }
 
     // Rate-limit auto-resume (#1722). Cadence-gated like the idle reaper:
@@ -249,9 +274,12 @@ pub async fn reconcile_acp_workers(
     // for this same tick's spawn pass to bring its worker back. The pass is
     // a no-op for the default-off case: profiles that did not opt in are
     // dropped before any event-store probe.
-    if last_rate_limit_reap.is_none_or(|t| t.elapsed() >= RATE_LIMIT_RESUME_INTERVAL) {
+    if cadence
+        .rate_limit
+        .is_none_or(|t| t.elapsed() >= RATE_LIMIT_RESUME_INTERVAL)
+    {
         reap_rate_limit_resumes(state, attempted).await;
-        *last_rate_limit_reap = Some(std::time::Instant::now());
+        cadence.rate_limit = Some(Instant::now());
     }
 
     // Snapshot per-target resume inputs under the instances read lock.
@@ -339,7 +367,16 @@ pub async fn reconcile_acp_workers(
     ) in raw_targets
     {
         if attempted.contains(&id) {
-            continue;
+            // A restart marker that arrives after the reaper already ran. `aoe
+            // session add-project` (#3103) stops the worker first and only asks
+            // for the restart once the moved workspace is durable, precisely so
+            // a respawn cannot land in the directory it is moving; that ordering
+            // means its marker routinely misses `reap_user_stopped`. Without
+            // this the session would sit stopped until the next daemon start.
+            if !crate::process::worker_registry::take_restart_marker(&id) {
+                continue;
+            }
+            forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
         }
         if state.acp_supervisor.is_running(&id).await {
             // A REST-triggered spawn (POST /api/sessions or
@@ -552,6 +589,196 @@ pub async fn reconcile_acp_workers(
 /// every tick would hammer SQLite for no benefit; this gates the batched
 /// activity query to a coarse cadence. See #1689.
 const IDLE_REAP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often the terminal-repair pass runs. Coarser than the 2s tick so the
+/// per-candidate event-log probes stay cheap, fine enough that the wrong badge
+/// clears within about half a minute of the grace expiring. See #3190.
+const TERMINAL_REPAIR_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long a cost-bearing `UsageUpdated` must stand as the session's latest
+/// event before the repair pass treats the turn as finished.
+///
+/// The adapter emits that frame as its "wrap up accounting" end-of-turn
+/// marker, which is why `acp_client`'s own between-prompt watchdog trusts it
+/// on a 3s grace. This backstop is deliberately an order of magnitude more
+/// patient: it must not race a turn that emits the marker and then spends time
+/// inside a model call before its next frame, and unlike the in-connection
+/// watchdogs it writes to the canonical log, so a false positive costs more
+/// than a late one. 60s still bounds the wrong status to about a minute,
+/// against the hour the idle reap used to take. See #3190.
+const TERMINAL_REPAIR_GRACE_SECS: u32 = 60;
+
+/// Pure terminal-repair decision. Every input must line up before the daemon
+/// writes a terminal event the agent never sent.
+///
+/// `terminal_usage` is the load-bearing one: the repair infers completion from
+/// the adapter's own end-of-turn marker being latest, NOT from silence.
+///
+/// It rests on that marker meaning end-of-turn, which is the same thing
+/// `acp_client`'s watchdog trusts on a 3s grace. The residual risk, accepted:
+/// an adapter that emits a cost-bearing frame MID-turn and then spends over
+/// the grace inside a silent model call with no open tool gets a terminal it
+/// did not send. The status self-heals on the turn's next event, but unlike
+/// the in-memory status the fabricated `Stopped` stays in the log, so the
+/// timeline keeps a turn boundary that never happened. That is why the reason
+/// string is distinct rather than `prompt_complete`. See PR #3192 review.
+/// Silence alone is not evidence a turn finished (an agent can sit in a model
+/// call), and a turn that died mid-stream without ever emitting the marker is
+/// a worker-liveness problem with a different fix, so it is left to the idle
+/// reap rather than guessed at here.
+///
+/// The rest are refusals: a user prompt still lacking its terminator
+/// (`in_flight_turn`, which also covers a live async sub-agent), a tool the
+/// agent is still running in this epoch (`open_tool_call`), or a pending
+/// approval / elicitation (`awaiting_user`, which can outlive the `Waiting`
+/// status because a later activity event overwrites it). See #3190.
+#[allow(clippy::too_many_arguments)]
+fn should_repair_terminal(
+    now_ms: i64,
+    last_event_ms: i64,
+    terminal_usage: bool,
+    grace_secs: u32,
+    in_flight_turn: bool,
+    open_tool_call: bool,
+    awaiting_user: bool,
+) -> bool {
+    if !terminal_usage || in_flight_turn || open_tool_call || awaiting_user {
+        return false;
+    }
+    now_ms.saturating_sub(last_event_ms) >= i64::from(grace_secs) * 1000
+}
+
+/// Terminal-repair pass (#3190). Publishes the `Stopped` an agent-initiated
+/// turn never got, so a session whose agent is demonstrably done stops
+/// rendering as Running.
+///
+/// Why this lives outside the connection task: the three watchdogs that are
+/// supposed to emit that terminal all live inside one `run_connection_task`
+/// state machine, sharing a one-shot guard and a set of atomics, and a
+/// command loop that can block while also owning its own watchdog timer
+/// cannot reliably watchdog itself. Two confirmed sessions ran a full
+/// agent-initiated turn (a Monitor and a backgrounded Bash resuming the
+/// agent after its prompt had already completed), ended on the adapter's
+/// cost-bearing end-of-turn marker, and never got a terminal at all; the only
+/// thing that recovered them was the 1-hour idle reap, which kills the worker
+/// to get there.
+///
+/// Deliberately narrow: it only appends the missing event. It never stops,
+/// restarts, or marks a worker dormant, so a live agent that is merely quiet
+/// loses nothing but its green dot, and any further activity re-arms Running
+/// through `derive_acp_status` as usual.
+async fn repair_missing_terminal(state: &Arc<AppState>) {
+    // Only rows the daemon currently projects as Running. `Waiting` is
+    // excluded: a session parked on an approval is legitimately silent for
+    // as long as the user takes.
+    let candidates: Vec<String> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| i.is_structured() && i.status == crate::session::Status::Running)
+            .map(|i| i.id.clone())
+            .collect()
+    };
+    if candidates.is_empty() {
+        return;
+    }
+    // Batched age pre-filter, so the per-candidate probes below only run for
+    // sessions that could possibly qualify. Mirrors the idle reap's shape.
+    let store = Arc::clone(&state.acp_event_store);
+    let ids = candidates.clone();
+    let latest_at = match tokio::task::spawn_blocking(move || {
+        store.last_event_at_for_sessions(&ids)
+    })
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(target: "acp.supervisor", error = %e, "terminal-repair activity query failed");
+            return;
+        }
+    };
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let grace_ms = i64::from(TERMINAL_REPAIR_GRACE_SECS) * 1000;
+    for id in candidates {
+        let Some(last_ms) = latest_at.get(&id).copied() else {
+            continue;
+        };
+        if now_ms.saturating_sub(last_ms) < grace_ms {
+            continue;
+        }
+        let store = Arc::clone(&state.acp_event_store);
+        let probe_id = id.clone();
+        let probe = tokio::task::spawn_blocking(move || {
+            let latest = store.terminal_repair_probe(&probe_id);
+            (
+                latest,
+                store.has_in_flight_turn(&probe_id),
+                store.has_open_tool_call_in_epoch(&probe_id),
+                !store.unresolved_approval_nonces(&probe_id).is_empty()
+                    || !store.unresolved_elicitation_nonces(&probe_id).is_empty(),
+            )
+        })
+        .await;
+        // A panicking probe is worth a line: this pass exists to explain
+        // missing terminal events, so swallowing a panic inside it defeats
+        // the point. The no-substantive-event case below is ordinary and
+        // stays quiet.
+        let (latest, in_flight, open_tool, awaiting_user) = match probe {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    error = %e,
+                    "terminal-repair probe task failed; skipping this session"
+                );
+                continue;
+            }
+        };
+        let Some(latest) = latest else {
+            continue;
+        };
+        // The same condition `acp_client`'s `LifecycleSignal::TerminalUsage`
+        // classifier applies, evaluated on the decoded event so the two
+        // cannot drift apart in SQL.
+        let terminal_usage = matches!(
+            &latest.substantive,
+            crate::acp::Event::UsageUpdated { usage } if usage.cost.is_some()
+        );
+        if !should_repair_terminal(
+            now_ms,
+            latest.substantive_at_ms,
+            terminal_usage,
+            TERMINAL_REPAIR_GRACE_SECS,
+            in_flight,
+            open_tool,
+            awaiting_user,
+        ) {
+            continue;
+        }
+        // Conditional on the log's newest seq still being the newest
+        // allocation: anything published between the probe and here (a fresh
+        // prompt above all) must not be terminated by this repair. A refusal
+        // just waits for the next pass. Expects `latest_seq` rather than the
+        // substantive event's own seq, because the seq counter also advances
+        // for ambient events (an `AcpSessionAssigned` from a resume replay),
+        // and expecting the substantive one would make every later pass
+        // refuse forever. See PR #3192 review.
+        if state.acp_supervisor.publish_stopped_if_seq(
+            &id,
+            "inferred_prompt_complete",
+            latest.latest_seq,
+        ) {
+            tracing::info!(
+                target: "acp.supervisor",
+                session = %id,
+                after_seq = latest.latest_seq,
+                quiet_ms = now_ms.saturating_sub(latest.substantive_at_ms),
+                "terminal-repair: agent-initiated turn ended with no Stopped; published inferred_prompt_complete"
+            );
+        }
+    }
+}
 
 /// Pure idle-reap decision. A structured view worker is auto-stopped only when the
 /// feature is enabled (`threshold_secs > 0`), it is not mid-turn, and its
@@ -865,6 +1092,15 @@ const RATE_LIMIT_RESUME_INTERVAL: Duration = Duration::from_secs(15);
 /// spirit of the #1281 "no eager restart loop" fix. See #1722.
 const RATE_LIMIT_MIN_PARK_SECS: i64 = 30;
 
+/// How long auto-resume waits when the agent reported no reset time at
+/// all. Purely a retry schedule: it never lands in a `RateLimit` event's
+/// `resets_at`, so no surface presents it as a reset the agent reported,
+/// which is what #3152 is about. It does reach the `RateLimitAutoResumed`
+/// breadcrumb, where the timestamp means "when the resume fired" (already
+/// reset plus grace even in the reported case). If the limit has not
+/// cleared, the retry re-parks and the next one is another interval out.
+const RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS: i64 = 3600;
+
 /// Opt-in rate-limit auto-resume pass (#1722). For structured view sessions parked
 /// on `Stopped { reason: "rate_limited" }` whose profile enabled
 /// `acp.rate_limit_auto_resume`, respawn the worker once the
@@ -901,6 +1137,18 @@ fn rate_limit_resume_at(
     {
         Some(floor) if floor > resets_plus_grace => floor,
         _ => resets_plus_grace,
+    }
+}
+
+/// Wall-clock instant at which a rate-limit-parked session with NO
+/// reported reset becomes eligible for an auto-resume retry: a fixed
+/// interval after the `RateLimit` event was recorded. See
+/// `RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS` and #3152.
+fn rate_limit_unknown_reset_retry_at(recorded_at_ms: i64) -> chrono::DateTime<chrono::Utc> {
+    let retry_after = chrono::Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS);
+    match chrono::DateTime::from_timestamp_millis(recorded_at_ms) {
+        Some(recorded) => recorded + retry_after,
+        None => chrono::Utc::now() + retry_after,
     }
 }
 
@@ -1000,13 +1248,18 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         let Some((info, recorded_at_ms)) = rate_limit else {
             continue;
         };
-        if now
-            < rate_limit_resume_at(
-                info.resets_at,
-                recorded_at_ms,
-                RATE_LIMIT_AUTO_RESUME_GRACE_SECS,
-            )
-        {
+        // A reported reset schedules against it; an unreported one (the
+        // agent never attributed a reset to the window that rejected, see
+        // #3152) falls back to a retry interval measured from the park.
+        // Skipping instead would leave auto-resume, whose whole job is
+        // coming back to life, doing nothing for those limits.
+        let resume_at = match info.resets_at {
+            Some(resets_at) => {
+                rate_limit_resume_at(resets_at, recorded_at_ms, RATE_LIMIT_AUTO_RESUME_GRACE_SECS)
+            }
+            None => rate_limit_unknown_reset_retry_at(recorded_at_ms),
+        };
+        if now < resume_at {
             continue;
         }
         // Re-check liveness right before publishing: several awaits sit
@@ -1026,13 +1279,14 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
         enqueue_rate_limit_continuation(state, &id).await;
         state
             .acp_supervisor
-            .publish_rate_limit_auto_resumed(&id, info.resets_at);
+            .publish_rate_limit_auto_resumed(&id, resume_at);
         attempted.remove(&id);
         tracing::info!(
             target: "acp.supervisor",
             session = %id,
-            resets_at = %info.resets_at,
-            "rate-limit auto-resume: reset window elapsed; respawning worker"
+            resets_at = ?info.resets_at,
+            resume_at = %resume_at,
+            "rate-limit auto-resume: park window elapsed; respawning worker"
         );
     }
 }
@@ -1435,9 +1689,9 @@ async fn resume_target_for_session(
 ) -> Option<ResumeTarget> {
     let instances = service.instances.read().await;
     // Filter the same triage states the reconciler skips everywhere else.
-    // The wake path drops `instance_lock` before calling this, so an archive
-    // or snooze can win the race after dormancy was cleared; resolving to
-    // None (then NotFound) keeps us from respawning a session the reconciler
+    // This runs without `instance_lock` held, so an archive or snooze can
+    // win the race after dormancy was cleared; resolving to None (then
+    // NotFound) keeps us from respawning a session the reconciler
     // intentionally leaves sunk. See #1748.
     let inst = instances.iter().find(|i| {
         i.id == id
@@ -1481,6 +1735,11 @@ pub(crate) enum ResumeTrigger {
 /// reconciler tick sees the reservation via `is_running` and skips the
 /// session, so there is no double-spawn. Returns `Err(CapacityFull)` when
 /// the worker cap is reached so the handler can surface 503. See #1748.
+///
+/// Callers MUST NOT hold the session's `instance_lock` while awaiting the
+/// worker this kicks: the detached task takes that same lock inside
+/// `build_spawn_request`, so a caller that holds it stalls the spawn for
+/// its whole `WORKER_READY_TIMEOUT` wait and then gives up. See #3172.
 pub(crate) async fn trigger_resume_background(
     service: &Arc<SessionService>,
     id: &str,
@@ -1631,8 +1890,9 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adopt_decision, rate_limit_resume_at, should_auto_stop, should_readopt_orphan_runner,
-        AdoptDecision, RATE_LIMIT_MIN_PARK_SECS,
+        adopt_decision, rate_limit_resume_at, rate_limit_unknown_reset_retry_at, should_auto_stop,
+        should_readopt_orphan_runner, AdoptDecision, RATE_LIMIT_MIN_PARK_SECS,
+        RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS,
     };
     use chrono::{Duration, TimeZone, Utc};
 
@@ -1880,6 +2140,18 @@ mod tests {
         assert_eq!(got, resets_at + Duration::seconds(15));
     }
 
+    // #3152: the agent reported no reset at all. Auto-resume still has to
+    // retry, on a policy interval measured from the park, because otherwise
+    // an enabled auto-resume would never pick the session back up.
+    #[test]
+    fn unknown_reset_retries_an_interval_after_the_park() {
+        let recorded_at = Utc.timestamp_opt(1_500_000, 0).unwrap();
+        assert_eq!(
+            rate_limit_unknown_reset_retry_at(recorded_at.timestamp_millis()),
+            recorded_at + Duration::seconds(RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS)
+        );
+    }
+
     #[test]
     fn resume_at_floors_on_recorded_at_for_past_reset() {
         // Adapter reported a reset in the past with zero grace; without the
@@ -1946,6 +2218,237 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
+    /// #3190. An agent that parks on off-protocol work resumes itself after
+    /// its prompt already completed, and that resumed turn used to end with no
+    /// terminal event at all, pinning the session at Running until the 1-hour
+    /// reap killed the worker. Case 0 is the real occurrence, replayed from the
+    /// affected session's log: prompt, its own `Stopped`, then agent-initiated
+    /// work ending on the adapter's cost-bearing end-of-turn marker.
+    ///
+    /// The rest are the refusals, each one thing that must veto writing a
+    /// terminal the agent never sent. Table rather than a test per case
+    /// because they share the whole fixture; only the seeded log and the row's
+    /// status differ.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn terminal_repair_publishes_only_for_a_finished_agent_turn() {
+        use crate::acp::state::{SessionUsage, ToolCall, UsageCost};
+        use crate::acp::Event;
+        use crate::server::test_support::build_test_app_state;
+
+        fn usage(cost: bool) -> Event {
+            Event::UsageUpdated {
+                usage: SessionUsage {
+                    used: 400_000,
+                    size: 1_000_000,
+                    cost: cost.then(|| UsageCost {
+                        amount: 21.4,
+                        currency: "USD".to_string(),
+                    }),
+                },
+            }
+        }
+        fn tool_call(id: &str) -> ToolCall {
+            ToolCall {
+                id: id.to_string(),
+                name: "Terminal".to_string(),
+                kind: "execute".to_string(),
+                args_preview: "{}".to_string(),
+                started_at: Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            }
+        }
+        fn tool_started(id: &str) -> Event {
+            Event::ToolCallStarted {
+                tool_call: tool_call(id),
+            }
+        }
+        fn tool_done(id: &str) -> Event {
+            Event::ToolCallCompleted {
+                tool_call_id: id.to_string(),
+                is_error: false,
+                content: String::new(),
+                output: Vec::new(),
+                completed_at: Utc::now(),
+                async_subagent: false,
+            }
+        }
+        let stopped = |reason: &str| Event::Stopped {
+            reason: reason.to_string(),
+        };
+        // The agent-initiated turn, shared by every case: no UserPromptSent
+        // behind it, ending on the cost-bearing marker.
+        let finished_agent_turn = |extra: Vec<Event>| {
+            let mut evs = vec![
+                Event::UserPromptSent {
+                    text: "continue".to_string(),
+                    attachments: Vec::new(),
+                },
+                stopped("prompt_complete"),
+                tool_started("t1"),
+                tool_done("t1"),
+                Event::AgentMessageChunk {
+                    text: "Done.".to_string(),
+                },
+            ];
+            evs.extend(extra);
+            evs.push(usage(true));
+            evs
+        };
+
+        struct Case {
+            name: &'static str,
+            events: Vec<Event>,
+            status: crate::session::Status,
+            /// Age of every seeded event, so a case can sit inside the grace.
+            age_secs: i64,
+            expect_repair: bool,
+        }
+        let cases = vec![
+            Case {
+                name: "finished agent-initiated turn",
+                events: finished_agent_turn(Vec::new()),
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: true,
+            },
+            Case {
+                // The seq counter advances for ambient events too, so a
+                // repair that expected the substantive event's own seq
+                // refused forever on any session a resume had replayed
+                // into. See PR #3192 review.
+                name: "ambient event trails the marker",
+                events: {
+                    let mut evs = finished_agent_turn(Vec::new());
+                    evs.push(Event::AcpSessionAssigned {
+                        acp_session_id: "acp-1".to_string(),
+                    });
+                    evs
+                },
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: true,
+            },
+            Case {
+                name: "still inside the grace window",
+                events: finished_agent_turn(Vec::new()),
+                status: crate::session::Status::Running,
+                age_secs: 5,
+                expect_repair: false,
+            },
+            Case {
+                name: "latest event is not the end-of-turn marker",
+                // A cost-free usage frame is ordinary mid-turn accounting.
+                events: {
+                    let mut evs = finished_agent_turn(Vec::new());
+                    evs.push(usage(false));
+                    evs
+                },
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: false,
+            },
+            Case {
+                name: "user prompt still lacks its terminator",
+                events: vec![
+                    Event::UserPromptSent {
+                        text: "go".to_string(),
+                        attachments: Vec::new(),
+                    },
+                    usage(true),
+                ],
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: false,
+            },
+            Case {
+                name: "tool still open in this epoch",
+                events: finished_agent_turn(vec![tool_started("t2")]),
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: false,
+            },
+            Case {
+                // The veto that keeps the daemon from terminating a session
+                // genuinely blocked on the user. It has to be reachable with
+                // status Running, because an approval can outlive the Waiting
+                // status: a later activity event overwrites it. The row below
+                // seeds the approval BEFORE the marker so the marker is still
+                // latest, which is what isolates this veto from the
+                // not-the-marker one. See PR #3192 review.
+                name: "unresolved approval, marker still latest",
+                events: finished_agent_turn(vec![Event::ApprovalRequested {
+                    approval: crate::acp::approvals::Approval {
+                        nonce: crate::acp::approvals::Nonce("n-1".to_string()),
+                        tool_call: tool_call("t-approval"),
+                        destructive: false,
+                        requested_at: Utc::now(),
+                        resolved: None,
+                    },
+                }]),
+                status: crate::session::Status::Running,
+                age_secs: 120,
+                expect_repair: false,
+            },
+            Case {
+                name: "waiting on the user",
+                events: finished_agent_turn(Vec::new()),
+                status: crate::session::Status::Waiting,
+                age_secs: 120,
+                expect_repair: false,
+            },
+        ];
+
+        for case in cases {
+            let id = "acp-terminal-repair";
+            let project = tempfile::TempDir::new().unwrap();
+            let mut inst = structured_instance(id, &project.path().to_string_lossy());
+            inst.status = case.status;
+            let state = build_test_app_state(vec![inst]);
+            let at_ms = Utc::now().timestamp_millis() - case.age_secs * 1000;
+            let last_seq = case.events.len() as u64;
+            for (idx, event) in case.events.iter().enumerate() {
+                state
+                    .acp_event_store
+                    .record_at(id, idx as u64 + 1, event, at_ms)
+                    .unwrap();
+            }
+            // Mirror daemon startup: the seq counter is seeded from the log,
+            // so the repair's compare-and-publish has something to compare.
+            state
+                .acp_supervisor
+                .hydrate_seqs([(id.to_string(), last_seq)]);
+
+            super::repair_missing_terminal(&state).await;
+
+            let repaired: Vec<u64> = state
+                .acp_event_store
+                .replay_from(id, 0)
+                .into_iter()
+                .filter(|(_, e)| {
+                    matches!(e, Event::Stopped { reason } if reason == "inferred_prompt_complete")
+                })
+                .map(|(seq, _)| seq)
+                .collect();
+            if case.expect_repair {
+                assert_eq!(
+                    repaired,
+                    vec![last_seq + 1],
+                    "{}: expected exactly one inferred terminal, appended after the marker",
+                    case.name
+                );
+            } else {
+                assert!(
+                    repaired.is_empty(),
+                    "{}: must not write a terminal the agent never sent",
+                    case.name
+                );
+            }
+        }
+    }
+
     fn structured_instance(id: &str, project_path: &str) -> crate::session::Instance {
         use crate::session::{Instance, View};
         let mut inst = Instance::new(id, project_path);
@@ -1991,13 +2494,17 @@ mod tests {
         parked: &mut HashSet<String>,
         capacity_deferred: &mut HashSet<String>,
     ) {
-        let mut last_idle_reap = Some(Instant::now());
-        let mut last_rate_limit_reap = Some(Instant::now());
+        // Pre-stamped so the cadence-gated passes sit out these ticks; the
+        // capacity tests below exercise the spawn path only.
+        let mut cadence = super::ReapCadence {
+            idle: Some(Instant::now()),
+            rate_limit: Some(Instant::now()),
+            terminal_repair: Some(Instant::now()),
+        };
         super::reconcile_acp_workers(
             state,
             attempted,
-            &mut last_idle_reap,
-            &mut last_rate_limit_reap,
+            &mut cadence,
             respawn_history,
             parked,
             capacity_deferred,
@@ -2015,6 +2522,93 @@ mod tests {
                     if message.contains("capacity full"))
             })
             .count()
+    }
+
+    /// A restart marker written AFTER the reaper already ran must still be
+    /// honoured. `aoe session add-project` (#3103) deletes the registry entry
+    /// and SIGTERMs first, and only writes the marker once the moved workspace
+    /// is durable, so on a slow conversion the marker routinely lands after
+    /// `reap_user_stopped` has already classified the teardown as
+    /// `user_stopped` and pinned the id in `attempted`. Without the late-marker
+    /// branch the session sits stopped until the next daemon start, and the
+    /// stale marker file is left behind to poison a later `aoe acp stop`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_late_restart_marker_clears_the_budget_and_is_consumed() {
+        let (state, _home, _project) = capacity_test_state("s-late-marker").await;
+
+        let mut attempted = HashSet::new();
+        let mut respawn_history: HashMap<String, Vec<Instant>> = HashMap::new();
+        let mut parked = HashSet::new();
+        let mut capacity_deferred = HashSet::new();
+
+        // The state the reaper leaves behind when it wins the race.
+        attempted.insert("s-late-marker".to_string());
+        crate::process::worker_registry::mark_restart_pending("s-late-marker");
+
+        run_tick(
+            &state,
+            &mut attempted,
+            &mut respawn_history,
+            &mut parked,
+            &mut capacity_deferred,
+        )
+        .await;
+
+        // The marker must be consumed, not left behind to poison a later stop.
+        assert!(
+            !crate::process::worker_registry::take_restart_marker("s-late-marker"),
+            "the tick must consume the late marker"
+        );
+        // And the budget clear must actually let the spawn pass run: the bogus
+        // agent fails fast with UnknownAgent, which records one startup error.
+        // Without the late-marker branch the loop `continue`s and records none.
+        assert_eq!(
+            state.acp_event_store.replay_from("s-late-marker", 0).len(),
+            1,
+            "clearing the budget must let the spawn pass attempt a respawn"
+        );
+        assert!(
+            !crate::process::worker_registry::take_restart_marker("s-late-marker"),
+            "the marker must be consumed by the tick, not left to poison a later stop"
+        );
+    }
+
+    /// The other half: with no marker, an id in `attempted` stays skipped.
+    /// Without this the late-marker branch would re-arm every parked session on
+    /// every tick and defeat the crash-loop budget entirely.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn no_marker_leaves_an_attempted_id_skipped() {
+        let (state, _home, _project) = capacity_test_state("s-no-marker").await;
+
+        let mut attempted = HashSet::new();
+        let mut respawn_history: HashMap<String, Vec<Instant>> = HashMap::new();
+        let mut parked = HashSet::new();
+        let mut capacity_deferred = HashSet::new();
+
+        attempted.insert("s-no-marker".to_string());
+
+        run_tick(
+            &state,
+            &mut attempted,
+            &mut respawn_history,
+            &mut parked,
+            &mut capacity_deferred,
+        )
+        .await;
+
+        assert!(
+            attempted.contains("s-no-marker"),
+            "without a marker the id must stay pinned; otherwise the respawn budget is void"
+        );
+        assert!(
+            state
+                .acp_event_store
+                .replay_from("s-no-marker", 0)
+                .is_empty(),
+            "a pinned id must not reach the spawn pass"
+        );
     }
 
     /// The core of the fix: a CapacityFull spawn must re-arm `attempted`

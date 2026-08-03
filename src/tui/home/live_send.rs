@@ -487,9 +487,12 @@ impl LiveSendWorker {
                 LIVE_SEND_WORKER_COUNTER.fetch_add(1, Ordering::Relaxed)
             );
             let session = crate::tmux::Session::from_name(&tmux_name);
-            // False only when the tmux session is missing/broken at entry
-            // (the steal is unconditional otherwise); retried on the next
-            // resize batch so a slow-to-appear pane still gets owned.
+            // Entering live mode is explicit user intent, so entry forces the
+            // lock even over a live holder. False means either the tmux
+            // session is missing/broken at entry or another surface won the
+            // confirm-read race; the retry on the next resize batch tells
+            // those apart (a slow-to-appear pane still gets owned, a real
+            // takeover is flagged instead of fought).
             let mut owned = session.steal_size_owner(&owner_id);
             // Refresh-or-flag: bump our heartbeat iff we still hold the
             // lock; a failed refresh means another surface took over, which
@@ -532,10 +535,21 @@ impl LiveSendWorker {
                         // plain keystrokes never read the lock.
                         if batch_needs_owner_first(&batch) {
                             if !owned {
-                                // Entry steal failed (session missing at
-                                // spawn); live entry is user intent, so keep
-                                // trying to take the size until it works.
-                                owned = session.steal_size_owner(&owner_id);
+                                // Entry steal failed. Claim rather than steal:
+                                // a vacant, stale, or already-ours lock still
+                                // gets taken (the slow-to-appear pane case),
+                                // but a live holder means another surface won
+                                // the lock and must not be stomped. Re-forcing
+                                // here would fight a takeover the entry race
+                                // makes indistinguishable from a missing pane,
+                                // and would never flag the loss.
+                                owned = session
+                                    .claim_size_owner(&owner_id, crate::tmux::SIZE_OWNER_TTL);
+                                if !owned && session.has_active_size_owner() {
+                                    // Our own claim would have succeeded if the
+                                    // live owner were us, so this is a takeover.
+                                    thread_lock_lost.store(true, Ordering::Relaxed);
+                                }
                             } else {
                                 maintain(owned);
                             }
@@ -793,6 +807,157 @@ impl Drop for LiveCaptureWorker {
     }
 }
 
+/// How often the worker re-asks how many panes its target window has, and
+/// whether one is zoomed. The answer only changes when the user splits, closes,
+/// or zooms a pane by hand, so a lazy cadence is enough; it costs one tiny
+/// `display-message` fork on the previewed pane, in live mode as well as out of
+/// it (a mid-session split has to be noticed either way).
+///
+/// This bounds a visible transient rather than only a cost. The render-thread
+/// fallback probes `window_panes` in the SAME fork as its capture, so it composites
+/// as soon as the user splits, while the worker keeps publishing single-pane
+/// frames until this elapses; the preview alternates between the two until they
+/// agree. One second keeps that wobble short without putting the probe anywhere
+/// near per-frame. `VtChannel::sample` already forks `pane_size` about once a
+/// second, so this roughly doubles a cost that was already there rather than
+/// introducing one.
+const PANE_COUNT_PROBE_MS: u64 = 1_000;
+
+/// How many panes the worker's target window has, for deciding whether the
+/// preview needs the composite path. Returns 1 on any failure, which keeps the
+/// caller on the cheap single-pane transport.
+///
+/// A zoomed pane (`C-b z`) also reports 1: tmux keeps `window_panes` at its real
+/// count while reporting every pane at the window's full rectangle, so the panes
+/// overlap and the compositor's tiling assumption does not hold. Compositing
+/// there hides the zoomed pane behind border fill, so the single-pane transport
+/// is both cheaper and more correct.
+fn probe_pane_count(name: &str) -> u16 {
+    let out = crate::tmux::tmux_command()
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            &format!("{name}:^"),
+            "-F",
+            "#{window_panes} #{window_zoomed_flag}",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok());
+    let Some(out) = out else { return 1 };
+    let mut fields = out.split_whitespace();
+    let count: u16 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(1);
+    // Absent (older tmux, or a truncated line) reads as not zoomed.
+    if fields.next().is_some_and(|z| z != "0") {
+        return 1;
+    }
+    count.max(1)
+}
+
+/// Capture transport for a split window: every pane laid back out on the window
+/// grid, plus pane 0's cursor.
+///
+/// The cursor rides along because this path also serves live-send whenever no VT
+/// channel is available (arming failed, `[tmux] vt_live` off, non-unix).
+/// Dropping it there would cost a split preview its painted cursor and, worse,
+/// the alternate-screen and mouse-mode flags the wheel forward reads to decide
+/// how to scroll a full-screen agent.
+fn capture_composited(
+    name: &str,
+    lines: usize,
+    forward_empty: bool,
+) -> (Option<String>, Option<crate::tmux::PaneCursor>) {
+    let session = crate::tmux::Session::from_name(name);
+    match session.capture_window_composited_with_cursor(lines) {
+        Ok((content, cursor)) => (Some(content), cursor),
+        Err(_) if forward_empty => (Some(String::new()), None),
+        Err(_) => (None, None),
+    }
+}
+
+/// How long a cached window layout serves the composite before the panes
+/// around pane 0 are re-captured.
+///
+/// Only pane 0 receives input, so only its latency can be felt; the panes
+/// beside it are being watched, not driven. Refreshing them at this cadence
+/// while pane 0 comes from its VT grid every frame keeps echo latency
+/// identical to an unsplit session, at roughly three forks a second instead of
+/// one per frame.
+const COMPOSITE_LAYOUT_MS: u64 = 300;
+
+/// Composite transport for a split window with a live VT channel on pane 0.
+///
+/// Pane 0's rows come from the grid every call (so typing echoes at full
+/// speed); every other pane comes from `cache`, re-captured on the
+/// [`COMPOSITE_LAYOUT_MS`] cadence. Falls back to the all-panes fork whenever
+/// there is no usable layout or the grid cannot be read.
+///
+/// `last_pane_probe` is reset whenever the layout capture fails, which is the
+/// signal that `pane_count` has gone stale: the chained capture addresses
+/// `^.0..^.{pane_count-1}`, so a pane the user closed since the last probe makes
+/// tmux exit non-zero (`can't find pane: N`) for the whole invocation. Without
+/// that reset the count would stay wrong until [`PANE_COUNT_PROBE_MS`] elapsed,
+/// and because the cache is only stamped on success the failing fork would be
+/// retried every frame while the preview kept compositing a ghost of the closed
+/// pane from the stale rectangles.
+fn capture_composited_over_grid(
+    name: &str,
+    channel: &crate::tmux::vt::VtChannel,
+    cache: &mut Option<(std::time::Instant, crate::tmux::composite::WindowLayout)>,
+    last_pane_probe: &mut Option<std::time::Instant>,
+    pane_count: u16,
+    lines: usize,
+    forward_empty: bool,
+) -> (Option<String>, Option<crate::tmux::PaneCursor>) {
+    let stale = cache.as_ref().is_none_or(|(at, _)| {
+        at.elapsed() >= std::time::Duration::from_millis(COMPOSITE_LAYOUT_MS)
+    });
+    if stale {
+        match crate::tmux::Session::from_name(name).capture_window_layout(pane_count) {
+            Some(layout) => *cache = Some((std::time::Instant::now(), layout)),
+            // The window is no longer the one these rectangles describe. Drop
+            // them rather than compositing a pane that is gone, force a count
+            // re-probe on the next cycle, and let the fallback below carry this
+            // frame: it probes `window_panes` in the same fork as its capture,
+            // so it is correct no matter how stale the count had become.
+            None => {
+                *cache = None;
+                *last_pane_probe = None;
+            }
+        }
+    }
+
+    let Some((_, layout)) = cache.as_ref() else {
+        return capture_composited(name, lines, forward_empty);
+    };
+    let Some(first) = layout.first_pane() else {
+        return capture_composited(name, lines, forward_empty);
+    };
+    let Some((rows, mut cursor)) = channel.sample_rows_padded(first.width, first.height) else {
+        return capture_composited(name, lines, forward_empty);
+    };
+
+    // The cursor is pane 0's, and tmux puts pane 0 at the window origin, so its
+    // coordinates already index the composite with no translation. What must be
+    // restated is the frame it is measured against: the renderer anchors the
+    // cursor by `pane_height` against the painted line count, which is now the
+    // whole window rather than one pane.
+    cursor.pane_height = layout.window_height;
+    cursor.pane_width = layout.window_width;
+    // A composite carries no scrollback (panes have independent histories), so
+    // the preview must not advertise any to scroll into.
+    cursor.history_size = 0;
+    // Rebasing onto the window erases how wide the input pane is, which mouse
+    // forwarding maps into; carry pane 0's extent so it can clamp.
+    cursor.composite_pane0 = Some((first.width, first.height));
+    (
+        Some(layout.composite_with_first_pane_rows(&rows)),
+        Some(cursor),
+    )
+}
+
 /// The default capture transport: one `capture-pane` fork that folds in the
 /// cursor probe. Shared by the worker's non-VT path on all platforms.
 fn capture_via_tmux(
@@ -865,6 +1030,22 @@ impl LiveCaptureWorker {
             // panes. Reset on target change so a new pane arms immediately.
             #[cfg(unix)]
             let mut last_vt_arm: Option<std::time::Instant> = None;
+            // Panes in the target window, refreshed on the lazy
+            // `PANE_COUNT_PROBE_MS` cadence. The seed only covers the window
+            // between arming and the first probe, which runs on the first cycle
+            // (`last_pane_probe` starts unset), so an already-split window
+            // composites immediately rather than showing one pane first. Reset on
+            // retarget so a probe runs for the new pane.
+            let mut pane_count: u16 = 1;
+            let mut last_pane_probe: Option<std::time::Instant> = None;
+            // Window geometry plus the captured rows of every pane, reused
+            // across frames while pane 0 is re-rendered from its VT grid.
+            // Dropped on retarget and whenever the pane count changes, since
+            // the cached rectangles then describe a layout that is gone.
+            let mut composite_layout: Option<(
+                std::time::Instant,
+                crate::tmux::composite::WindowLayout,
+            )> = None;
             while !stop_flag.load(Ordering::Relaxed) {
                 let lines = lines_cell.load(Ordering::Relaxed);
                 // Read the target without holding the lock across the fork:
@@ -898,6 +1079,9 @@ impl LiveCaptureWorker {
                         vt_source = None;
                         last_vt_arm = None;
                     }
+                    pane_count = 1;
+                    last_pane_probe = None;
+                    composite_layout = None;
                 }
                 // `[tmux] vt_live`, re-read every cycle. Toggling off while a
                 // channel is armed tears it down (disabling its `pipe-pane`);
@@ -914,6 +1098,27 @@ impl LiveCaptureWorker {
                 }
                 if lines > 0 && !name.is_empty() {
                     let forward_empty = forward_empty_cell.load(Ordering::Relaxed);
+                    // Keep a lazy count of the target window's panes so a
+                    // hand-made split stops being invisible. One tiny fork
+                    // every couple of seconds on the single previewed pane.
+                    if last_pane_probe.is_none_or(|t| {
+                        t.elapsed() >= std::time::Duration::from_millis(PANE_COUNT_PROBE_MS)
+                    }) {
+                        last_pane_probe = Some(std::time::Instant::now());
+                        let seen = probe_pane_count(&name);
+                        if seen != pane_count {
+                            // Layout changed under us; the cached rectangles no
+                            // longer describe this window.
+                            composite_layout = None;
+                            pane_count = seen;
+                        }
+                    }
+                    // A split window renders through the compositor in BOTH
+                    // passive and live mode. With a VT channel armed the split
+                    // costs no more per frame than an unsplit session: pane 0
+                    // still comes from the grid, and only the panes beside it
+                    // are re-captured, on their own slower cadence.
+                    let composite = pane_count > 1;
                     // An OSC 52 clipboard write the displayed agent emitted
                     // since the last cycle (VT path only). Published below
                     // under the same retarget guard as the cursor.
@@ -957,17 +1162,38 @@ impl LiveCaptureWorker {
                         }
                         match vt_source.as_ref() {
                             Some(v) => {
-                                let (content, cur) = v.sample(lines);
                                 clipboard_now = v.take_clipboard();
-                                (Some(content), cur)
+                                if composite {
+                                    capture_composited_over_grid(
+                                        &name,
+                                        v,
+                                        &mut composite_layout,
+                                        &mut last_pane_probe,
+                                        pane_count,
+                                        lines,
+                                        forward_empty,
+                                    )
+                                } else {
+                                    let (content, cur) = v.sample(lines);
+                                    (Some(content), cur)
+                                }
                             }
+                            // No grid for pane 0, so every pane comes from the
+                            // fork instead.
+                            None if composite => capture_composited(&name, lines, forward_empty),
                             None => capture_via_tmux(&name, lines, forward_empty),
                         }
+                    } else if composite {
+                        capture_composited(&name, lines, forward_empty)
                     } else {
                         capture_via_tmux(&name, lines, forward_empty)
                     };
                     #[cfg(not(unix))]
-                    let (capture, cursor_now) = capture_via_tmux(&name, lines, forward_empty);
+                    let (capture, cursor_now) = if composite {
+                        capture_composited(&name, lines, forward_empty)
+                    } else {
+                        capture_via_tmux(&name, lines, forward_empty)
+                    };
                     // Chunk-arrival timing for the repaint-quiescence debounce,
                     // only when sampling a live VT grid. `None` on the
                     // capture-pane fallback and non-unix, which leaves pacing to
@@ -2922,5 +3148,108 @@ mod tests {
             || pane_width(guard.name()) == 60,
         );
         assert!(!worker.lock_lost());
+    }
+
+    /// The entry steal can come up empty two ways: the pane has not appeared
+    /// yet, or another surface won the confirm-read race. The retry path used
+    /// to force-steal for both, which silently stomped a live owner and never
+    /// flagged the loss. Spawning before the session exists reproduces the
+    /// `owned == false` entry deterministically, without racing tmux forks.
+    #[test]
+    #[serial_test::serial]
+    fn worker_defers_to_live_owner_when_entry_steal_found_no_session() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_late");
+        // Spawn against a name that does not exist yet: the entry steal sees
+        // no session and leaves the worker unowned.
+        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let out = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        crate::tmux::refresh_session_cache();
+        let session = crate::tmux::Session::from_name(guard.name());
+
+        // Another surface owns the pane before the worker ever retries.
+        assert!(session.steal_size_owner("live-test-thief"));
+        assert!(!worker.lock_lost());
+
+        // The retry must claim, not steal: a live holder is a takeover, so the
+        // loss is flagged and the resize dropped.
+        worker.resize(60, 20);
+        wait_until("lock_lost flag", std::time::Duration::from_secs(5), || {
+            worker.lock_lost()
+        });
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("live-test-thief".to_string()),
+            "unowned retry must not steal from a live owner"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            pane_width(guard.name()),
+            80,
+            "dropped resize must not dispatch"
+        );
+    }
+
+    /// The same retry path must still take a vacant lock, so a genuinely
+    /// slow-to-appear pane gets owned instead of being abandoned.
+    #[test]
+    #[serial_test::serial]
+    fn worker_claims_vacant_lock_when_session_appears_late() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = crate::tmux::test_helpers::TmuxTestSession::new("aoe_test_livelock_vacant");
+        let worker = LiveSendWorker::spawn(guard.name().to_string(), None);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let out = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        crate::tmux::refresh_session_cache();
+        let session = crate::tmux::Session::from_name(guard.name());
+
+        worker.resize(60, 20);
+        wait_until(
+            "late resize dispatch",
+            std::time::Duration::from_secs(5),
+            || pane_width(guard.name()) == 60,
+        );
+        assert!(!worker.lock_lost());
+        assert!(
+            matches!(session.size_owner(), Some((id, _)) if id.starts_with("tui-")),
+            "vacant lock must still be claimed on the retry path"
+        );
     }
 }

@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use serial_test::serial;
+use serial_test::parallel;
 
 use crate::harness::{pick_free_port, require_tmux, wait_for_port, TuiTestHarness};
 
@@ -39,7 +39,7 @@ fn pid_alive(pid: i32) -> bool {
 /// transport-picker-deferred hint on the Tunnel card ("Pick transport
 /// on next screen.").
 #[test]
-#[serial]
+#[parallel]
 fn tui_serve_dialog_opens_to_mode_picker() {
     require_tmux!();
 
@@ -62,7 +62,7 @@ fn tui_serve_dialog_opens_to_mode_picker() {
 /// without spawning anything. Regression guard against state-transition
 /// bugs where ModePicker might latch onto a stale mode.
 #[test]
-#[serial]
+#[parallel]
 fn tui_serve_dialog_escape_returns_home() {
     require_tmux!();
 
@@ -84,7 +84,7 @@ fn tui_serve_dialog_escape_returns_home() {
 /// `run()`, found its own PID via `daemon_pid()`, and bailed with
 /// "A serve daemon is already running" — about itself.
 #[test]
-#[serial]
+#[parallel]
 fn cli_serve_daemon_starts_and_stops_cleanly() {
     let h = TuiTestHarness::new("serve_daemon_lifecycle");
     let port = pick_free_port();
@@ -149,7 +149,7 @@ fn cli_serve_daemon_starts_and_stops_cleanly() {
 /// same port rebound, and `serve.launch` rewritten. Locks in #1794's
 /// restart primitive end to end.
 #[test]
-#[serial]
+#[parallel]
 fn cli_serve_restart_replays_launch_state() {
     let h = TuiTestHarness::new("serve_restart_replays");
     let port = pick_free_port();
@@ -234,7 +234,7 @@ fn cli_serve_restart_replays_launch_state() {
 /// change that misclassifies the daemon child as `ServeForeground` (or
 /// reintroduces the `serve.log` redirect) would slip through CI.
 #[test]
-#[serial]
+#[parallel]
 fn cli_serve_daemon_writes_marker_to_debug_log_not_serve_log() {
     let h = TuiTestHarness::new("serve_daemon_logging_sinks");
     let port = pick_free_port();
@@ -287,7 +287,7 @@ fn cli_serve_daemon_writes_marker_to_debug_log_not_serve_log() {
 ///      `"auth_mode":"passphrase"`. Proves both the wall handoff and
 ///      the `/api/about` mode-derivation surface.
 #[test]
-#[serial]
+#[parallel]
 fn cli_serve_auth_passphrase_login_round_trip() {
     let h = TuiTestHarness::new("serve_auth_passphrase");
     let port = pick_free_port();
@@ -441,7 +441,7 @@ fn cli_serve_auth_passphrase_login_round_trip() {
 ///   3. GET `/api/sessions` from 127.0.0.1 -> 200 (proves the bypass
 ///      covers the structured view REST surface, not just `/api/about`).
 #[test]
-#[serial]
+#[parallel]
 fn cli_serve_auth_passphrase_loopback_bypass() {
     let h = TuiTestHarness::new("serve_auth_passphrase_loopback");
     let port = pick_free_port();
@@ -527,4 +527,33 @@ fn cli_serve_auth_passphrase_loopback_bypass() {
     if let Err(e) = result {
         panic!("{e}");
     }
+}
+
+/// Regression test for #2896: a fatal startup validation failure must reach the
+/// `tracing` sink `aoe logs` reads, not only the process's raw stderr. A
+/// foreground `aoe serve --behind-proxy` with no `--allowed-host` bails the
+/// DNS-rebinding gate before binding; the reason must land in the configured
+/// `[logging].file_path` (default `debug.log`) so a supervisor-driven
+/// crash-loop is diagnosable from the log, and the process must still exit
+/// non-zero.
+#[test]
+#[parallel]
+fn cli_serve_startup_bail_reaches_debug_log() {
+    let h = TuiTestHarness::new("serve_startup_bail_logged");
+
+    let out = h.run_cli(&["serve", "--behind-proxy"]);
+    assert!(
+        !out.status.success(),
+        "serve --behind-proxy without --allowed-host must exit non-zero.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let debug_log = crate::harness::app_dir_in(h.home_path()).join("debug.log");
+    let contents = std::fs::read_to_string(&debug_log)
+        .unwrap_or_else(|e| panic!("debug.log unreadable at {}: {}", debug_log.display(), e));
+    assert!(
+        contents.contains("--behind-proxy requires --allowed-host"),
+        "fatal startup reason must be routed through the tracing sink; debug.log was:\n{contents}"
+    );
 }

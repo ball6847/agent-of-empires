@@ -3985,6 +3985,244 @@ fn test_sort_order_defaults_to_newest() {
     assert_eq!(env.view.sort_order, SortOrder::Newest);
 }
 
+/// The picker must not offer a repo the session already has: the attach would
+/// be rejected as a duplicate, so offering it is offering a guaranteed failure.
+/// With no registry entries there is nothing to offer, and the dialog says so
+/// rather than rendering an empty list.
+#[test]
+#[serial]
+fn add_project_picker_opens_and_excludes_repos_already_on_the_session() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.open_add_project_for_selected();
+    let dialog = env
+        .view
+        .attach_project_dialog
+        .as_ref()
+        .expect("picker should open for a selected session");
+    assert_eq!(dialog.session_id(), id);
+    // The fixture registers no projects, so every candidate is filtered out or
+    // absent; either way the picker reports that rather than showing a list.
+    assert!(dialog.is_empty());
+
+    // Esc closes without attaching.
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(env.view.attach_project_dialog.is_none());
+    assert!(
+        env.view
+            .get_instance(&id)
+            .is_some_and(|i| i.all_repos().is_empty()),
+        "cancelling must not attach anything"
+    );
+}
+
+/// Attaching bounces the worker and creates a worktree, so the picker must
+/// refuse the same lifecycle states every sibling mutator refuses. The context
+/// menu offers the row unconditionally, so this gate is the only thing stopping
+/// an archived or mid-turn session from being attached to.
+#[test]
+#[serial]
+fn add_project_picker_refuses_shelved_and_mid_turn_sessions() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    // `Waiting` and `Starting` are turns in flight too, which is why the gate
+    // reuses `Status::blocks_worktree_edit()` rather than naming `Running` alone:
+    // SIGTERMing a `Waiting` worker throws away a pending approval.
+    for status in [
+        crate::session::Status::Creating,
+        crate::session::Status::Deleting,
+        crate::session::Status::Running,
+        crate::session::Status::Waiting,
+        crate::session::Status::Starting,
+    ] {
+        env.view.mutate_instance(&id, |inst| inst.status = status);
+        env.view.info_dialog = None;
+        env.view.open_add_project_for_selected();
+        assert!(
+            env.view.attach_project_dialog.is_none(),
+            "picker must not open for status {status:?}"
+        );
+        assert!(
+            env.view.info_dialog.is_some(),
+            "the refusal must be visible for status {status:?}, not a silent no-op"
+        );
+    }
+
+    // Archived: agent is deliberately stopped, so a worktree here reads nothing.
+    env.view
+        .mutate_instance(&id, |inst| inst.status = crate::session::Status::Idle);
+    env.view.mutate_instance(&id, |inst| inst.archive());
+    env.view.info_dialog = None;
+    env.view.open_add_project_for_selected();
+    assert!(env.view.attach_project_dialog.is_none());
+    assert!(env.view.info_dialog.is_some());
+
+    // Idle and unshelved: the picker opens.
+    env.view.mutate_instance(&id, |inst| inst.unarchive());
+    env.view.info_dialog = None;
+    env.view.open_add_project_for_selected();
+    assert!(
+        env.view.attach_project_dialog.is_some(),
+        "an idle, unshelved session must be attachable"
+    );
+}
+
+/// The attach runs on a background poller, so the dispatch must return without
+/// touching git: `git worktree add` plus an optional fetch and submodule init on
+/// the render thread froze the UI for the whole attach. A second dispatch for the
+/// same session is refused, because it would race the first one's worktree
+/// creation and its worker bounce.
+#[test]
+#[serial]
+fn add_project_dispatches_to_the_poller_and_refuses_a_second_attach() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+
+    let dispatched = env
+        .view
+        .add_project_to_session(&id, std::path::Path::new("/tmp/some-repo"));
+    assert!(dispatched.is_ok(), "dispatch must not block on the attach");
+    assert!(
+        env.view.attach_project_in_flight.contains(&id),
+        "the in-flight marker is what suppresses a concurrent attach"
+    );
+    assert!(
+        env.view
+            .get_instance(&id)
+            .is_some_and(|i| i.all_repos().is_empty()),
+        "nothing is recorded until the worker reports back"
+    );
+
+    let second = env
+        .view
+        .add_project_to_session(&id, std::path::Path::new("/tmp/other-repo"));
+    assert!(second.is_err(), "a second attach must be refused");
+    assert!(format!("{:#}", second.unwrap_err()).contains("already running"));
+}
+
+/// The completion path clears the marker and replaces the progress dialog, for
+/// both outcomes. Without the clear, one failed attach would leave the session
+/// permanently unattachable.
+#[test]
+#[serial]
+fn apply_attach_project_results_reports_and_clears_the_marker() {
+    for outcome in [
+        Ok("Attached 'frontend' on branch 'feature/abc'.".to_string()),
+        Err("branch 'feature/abc' already exists in the repo being attached".to_string()),
+    ] {
+        let expect_ok = outcome.is_ok();
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.instance_at(0).id.clone();
+        env.view.attach_project_in_flight.insert(id.clone());
+        env.view.attach_project_poller =
+            crate::tui::attach_project_poller::AttachProjectPoller::with_result_for_test(
+                crate::tui::attach_project_poller::AttachProjectResult {
+                    session_id: id.clone(),
+                    outcome,
+                },
+            );
+
+        assert!(
+            env.view.apply_attach_project_results(),
+            "a delivered result has to repaint"
+        );
+        assert!(
+            !env.view.attach_project_in_flight.contains(&id),
+            "the marker must clear, or the session stays unattachable forever"
+        );
+        let dialog = env
+            .view
+            .info_dialog
+            .as_ref()
+            .expect("the outcome must be visible, not a silent no-op");
+        if expect_ok {
+            assert!(
+                dialog.title().contains("Attached"),
+                "got {}",
+                dialog.title()
+            );
+        } else {
+            assert!(
+                dialog.title().contains("Could Not Attach"),
+                "got {}",
+                dialog.title()
+            );
+        }
+    }
+}
+
+/// A scratch session has no repo of its own, so there is nothing for an
+/// attached one to widen and deletion drops its whole directory. The picker
+/// refuses it outright rather than opening on a list where every choice would be
+/// rejected by `attach_project::plan`.
+#[test]
+#[serial]
+fn add_project_picker_refuses_a_scratch_session() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    env.view.mutate_instance(&id, |inst| inst.scratch = true);
+    env.view.open_add_project_for_selected();
+    assert!(
+        env.view.attach_project_dialog.is_none(),
+        "a scratch session has no repo to attach to"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "the refusal must be visible, not a silent no-op"
+    );
+
+    // The same session stops being scratch and becomes attachable, so the
+    // refusal is keyed on the flag rather than on some other property of the row.
+    env.view.mutate_instance(&id, |inst| inst.scratch = false);
+    env.view.info_dialog = None;
+    env.view.open_add_project_for_selected();
+    assert!(env.view.attach_project_dialog.is_some());
+}
+
+/// The picker is a modal, so it has to register in the overlay predicates that
+/// gate scroll, right-click, footer clicks, drag start, and paste-burst routing.
+/// Missing from them, the wheel moved the cursor underneath the open modal and
+/// right-click stacked a second context menu on top of it.
+#[test]
+#[serial]
+fn add_project_picker_registers_as_an_overlay() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    assert!(!env.view.has_dialog(), "no dialog open yet");
+
+    env.view.open_add_project_for_selected();
+    assert!(
+        env.view.attach_project_dialog.is_some(),
+        "picker should be open"
+    );
+    assert!(
+        env.view.has_dialog(),
+        "an open picker must count as a dialog, or list keyboard actions fire behind it"
+    );
+    assert!(
+        env.view.has_non_live_send_overlay(),
+        "an open picker must count as an overlay, or scroll and right-click reach the list under it"
+    );
+
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(
+        !env.view.has_dialog(),
+        "closing the picker clears the dialog"
+    );
+    assert!(
+        !env.view.has_non_live_send_overlay(),
+        "closing the picker clears the non-live overlay"
+    );
+}
+
 #[test]
 #[serial]
 fn test_o_key_opens_sort_picker() {
@@ -5363,6 +5601,7 @@ fn test_row_tag_none_hides_workspace_suffix() {
                 worktree_path: "/tmp/workspace/api".to_string(),
                 main_repo_path: "/src/api".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             },
             crate::session::WorkspaceRepo {
                 name: "web".to_string(),
@@ -5371,6 +5610,7 @@ fn test_row_tag_none_hides_workspace_suffix() {
                 worktree_path: "/tmp/workspace/web".to_string(),
                 main_repo_path: "/src/web".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             },
         ],
         created_at: chrono::Utc::now(),
@@ -5399,6 +5639,7 @@ fn test_row_tag_branch_renders_workspace_branch_repo_count() {
                 worktree_path: "/tmp/workspace/api".to_string(),
                 main_repo_path: "/src/api".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             },
             crate::session::WorkspaceRepo {
                 name: "web".to_string(),
@@ -5407,6 +5648,7 @@ fn test_row_tag_branch_renders_workspace_branch_repo_count() {
                 worktree_path: "/tmp/workspace/web".to_string(),
                 main_repo_path: "/src/web".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             },
         ],
         created_at: chrono::Utc::now(),
@@ -9268,11 +9510,29 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
 
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
+    // The transcript-existence gate (`claude_host_transcript_confirmed_absent`)
+    // resolves the Claude home via CLAUDE_CONFIG_DIR before falling back to
+    // $HOME/.claude. If the var is set in the invoking environment (running
+    // `cargo test` from inside a Claude Code session sets it), the lookup
+    // points outside this test's temp home, the seeded transcript reads as
+    // absent, and the restart launches fresh-pinned (`--session-id`) instead
+    // of driving the --resume cascade this test exercises: no probe, no
+    // ResumeFailed, no dialog. Pin the var to the temp home for the duration.
+    let claude_home = temp.path().join(".claude");
+    let _claude_config_guard =
+        crate::session::test_support::EnvGuard::set(&[("CLAUDE_CONFIG_DIR", claude_home.clone())]);
     let profile = "restart-resume-failed";
     let storage = Storage::new_unwatched(profile).unwrap();
     let stale_sid = "11111111-2222-3333-4444-555555555555";
 
-    let mut inst = Instance::new("restart-resume-failed", "/tmp/x");
+    // The instance workdir is a created tempdir path, not a shared global like
+    // /tmp/x: tmux new-session -c on a nonexistent dir fails outright, and a
+    // pre-existing /tmp/x on a dev machine would change the launch behavior.
+    let workdir = temp.path().join("workdir");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let workdir_str = workdir.to_str().unwrap().to_string();
+
+    let mut inst = Instance::new("restart-resume-failed", &workdir_str);
     inst.source_profile = profile.to_string();
     inst.tool = "claude".to_string();
     inst.command = "/bin/false".to_string();
@@ -9294,9 +9554,16 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     // A real prior conversation on disk so the restart drives the --resume
     // cascade (and its ResumeFailed path). A stored sid with no transcript now
     // launches fresh-pinned (`--session-id`), which would not surface here.
-    let claude_dir = temp.path().join(".claude").join("projects").join(
-        crate::session::capture::encode_claude_project_path("/tmp/x"),
-    );
+    // The transcript lookup canonicalizes the project path, so encode the
+    // canonical form (the tempdir may sit behind a symlink, e.g. /tmp on
+    // macOS).
+    let canonical_workdir = std::fs::canonicalize(&workdir).unwrap();
+    let claude_dir =
+        claude_home
+            .join("projects")
+            .join(crate::session::capture::encode_claude_project_path(
+                &canonical_workdir.to_string_lossy(),
+            ));
     std::fs::create_dir_all(&claude_dir).unwrap();
     std::fs::write(claude_dir.join(format!("{stale_sid}.jsonl")), "seed\n").unwrap();
 
@@ -9327,9 +9594,23 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
         .output();
 
     assert!(applied, "timed out waiting for async restart result");
-    let dialog = view.info_dialog.as_ref().expect("resume failure dialog");
+    let row_dbg = view.get_instance(&id).cloned();
+    let dialog =
+        view.info_dialog.as_ref().unwrap_or_else(|| {
+            panic!(
+            "resume failure dialog missing; row status={:?} last_error={:?} sid={:?} marker={:?}",
+            row_dbg.as_ref().map(|r| r.status),
+            row_dbg.as_ref().and_then(|r| r.last_error.clone()),
+            row_dbg.as_ref().and_then(|r| r.agent_session_id.clone()),
+            row_dbg.as_ref().and_then(|r| r.resume_probe_failed_sid.clone()),
+        )
+        });
     assert_eq!(dialog.title(), "Restart Failed");
-    assert!(dialog.message().contains(stale_sid));
+    assert!(
+        dialog.message().contains(stale_sid),
+        "dialog message was: {}",
+        dialog.message()
+    );
     let row = view.get_instance(&id).expect("instance remains visible");
     assert_eq!(row.agent_session_id.as_deref(), Some(stale_sid));
     assert_eq!(row.resume_probe_failed_sid.as_deref(), Some(stale_sid));
@@ -11395,6 +11676,7 @@ mod scroll_pane_isolation {
             mouse_sgr,
             mouse_all: false,
             position_reliable: true,
+            composite_pane0: None,
         }
     }
 
@@ -14630,19 +14912,49 @@ mod live_send_mode {
     #[test]
     #[serial]
     fn drift_check_auto_exits_when_session_renamed() {
-        // Title changes the generated tmux name. After a rename the
-        // worker is targeting a stale name, so the next keystroke
-        // should auto-exit. Simulate the rename by mutating the
-        // instance title after installing live state.
+        // A rename that carried the tmux session with it: the worker now holds
+        // a name tmux no longer has, so the next keystroke should auto-exit.
+        // Force the cache to the post-rename state (only the new name live) so
+        // the id-anchored resolution has nothing stale to adopt.
         let mut env = create_test_env_with_sessions(1);
         let id = install_live_for_first_session(&mut env);
         env.view.mutate_instance(&id, |inst| {
             inst.title = "renamed-after-entry".to_string();
         });
+        let inst = env.view.get_instance(&id).unwrap().clone();
+        let renamed = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&[renamed.as_str()]);
+
         env.view
             .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
         assert!(env.view.live_send.is_none());
         assert!(env.view.info_dialog.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn drift_check_stays_when_retitle_did_not_rename_the_tmux_session() {
+        // #3157: smart rename moves the title but the tmux session keeps the
+        // name it was created under. The worker still holds THIS session's
+        // pane, so that is not drift and live mode must survive; auto-exiting
+        // here would kick the user out of a pane that is still correct.
+        let mut env = create_test_env_with_sessions(1);
+        let id = install_live_for_first_session(&mut env);
+        let created = env.view.live_send.as_ref().unwrap().tmux_name.clone();
+        env.view.mutate_instance(&id, |inst| {
+            inst.title = "Refactor billing module".to_string();
+        });
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&[created.as_str()]);
+
+        env.view
+            .handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), None);
+        assert!(
+            env.view.live_send.is_some(),
+            "a retitle that never reached tmux must not read as drift"
+        );
+        assert!(env.view.info_dialog.is_none());
     }
 
     #[test]
@@ -16735,16 +17047,15 @@ mod right_click_context_menu {
         disable_delete_to_trash();
         setup_inner(&mut env);
         // Attention sort surfaces the full session menu (New Session / Rename
-        // / Archive / Snooze / Mark unread / Delete), so Delete is five Downs
-        // away. (Unread defaults on, so the "Mark unread" row is present.)
+        // / Archive / Snooze / Mark unread / Add project / Delete), so Delete is
+        // six Downs away. (Unread defaults on, so the "Mark unread" row is
+        // present.)
         env.view.sort_order = SortOrder::Attention;
         env.view.flat_items = env.view.build_flat_items();
         env.view.handle_right_click(5, 1);
-        env.view.handle_key(key(KeyCode::Down), None);
-        env.view.handle_key(key(KeyCode::Down), None);
-        env.view.handle_key(key(KeyCode::Down), None);
-        env.view.handle_key(key(KeyCode::Down), None);
-        env.view.handle_key(key(KeyCode::Down), None);
+        for _ in 0..6 {
+            env.view.handle_key(key(KeyCode::Down), None);
+        }
         env.view.handle_key(key(KeyCode::Enter), None);
         assert!(env.view.context_menu.is_none());
         assert!(
@@ -16832,7 +17143,7 @@ mod right_click_context_menu {
         // tool is claude (a forkable terminal agent), so the Fork row shows;
         // `right_click_session_menu_hides_fork_for_unforkable_agent` covers the
         // gated-off case. Menu is New Session / Rename / Unarchive / Mark unread
-        // / Delete / Fork.
+        // / Add project / Delete / Fork.
         assert_eq!(
             labels,
             vec![
@@ -16840,6 +17151,7 @@ mod right_click_context_menu {
                 "Rename",
                 "Unarchive",
                 "Mark unread",
+                "Add project",
                 "Delete",
                 "Fork session"
             ]
@@ -17926,6 +18238,265 @@ mod settings_scroll_wiring {
         assert!(
             env.view.drag_state.is_none(),
             "a click off the bar must not begin a scrollbar drag"
+        );
+    }
+}
+
+/// Structured (ACP) rows get their status from the daemon, because nothing else
+/// can tell you what an ACP session is doing: they have no tmux pane, the tmux
+/// poller bails on them, and the daemon deliberately never persists their
+/// status to `sessions.json` (see the durability contract on
+/// `apply_acp_overlay_inplace`). Before this wiring existed the pill sat frozen
+/// at whatever creation or an explicit start/stop wrote, for the whole life of
+/// the session.
+#[cfg(feature = "serve")]
+mod daemon_status_apply_tests {
+    use super::*;
+    use crate::session::Status;
+    use crate::tui::daemon_status_poller::DaemonStatusUpdate;
+
+    fn structured_row(env: &mut TestEnv, status: Status) -> String {
+        let mut inst = Instance::new("acp-session", "/tmp/repo");
+        inst.source_profile = "test".to_string();
+        inst.tool = "claude".into();
+        inst.view = crate::session::View::Structured;
+        inst.status = status;
+        let id = inst.id.clone();
+        env.view.add_instance(inst);
+        id
+    }
+
+    fn update(id: &str, status: Status) -> DaemonStatusUpdate {
+        DaemonStatusUpdate {
+            id: id.to_string(),
+            status,
+            last_error: None,
+            last_accessed_at: None,
+            idle_entered_at: None,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_status_moves_a_structured_row_off_idle() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Idle);
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Running));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Running),
+            "a Running turn on the daemon must move the TUI's pill"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_status_carries_the_waiting_state_for_a_pending_approval() {
+        // `derive_acp_status` maps ApprovalRequested/ElicitationRequested to
+        // Waiting; the whole point of the yellow pill is spotting a session
+        // blocked on you from the home list without opening it.
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Running);
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Waiting));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Waiting)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_status_clears_a_stale_error_message() {
+        // The pre-fix sandbox-dead branch left sandboxed structured rows at
+        // Idle with a phantom "Container is not running" hanging off them. The
+        // daemon's own `last_error` is authoritative, so applying it clears the
+        // leftover rather than letting it sit on the row for the session's life.
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Error);
+        env.view.mutate_instance(&id, |inst| {
+            inst.last_error = Some("Container is not running".to_string())
+        });
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Idle));
+
+        let inst = env.view.get_instance(&id).expect("row still present");
+        assert_eq!(inst.status, Status::Idle);
+        assert_eq!(inst.last_error, None, "the phantom container error is gone");
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_status_ignores_a_terminal_row() {
+        // The tmux poller owns terminal rows. Letting the daemon's copy through
+        // would give them two producers fighting on alternating cycles.
+        let mut env = create_test_env_empty();
+        let mut inst = Instance::new("tmux-session", "/tmp/repo");
+        inst.source_profile = "test".to_string();
+        inst.status = Status::Idle;
+        let id = inst.id.clone();
+        env.view.add_instance(inst);
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Running));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Idle),
+            "a terminal row must not be driven by the daemon overlay"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_status_ignores_an_unknown_session_id() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Idle);
+
+        env.view
+            .apply_daemon_status_update(update("not-a-session", Status::Running));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Idle)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn request_daemon_status_refresh_is_a_no_op_without_structured_rows() {
+        // A terminal-only home view must never talk to the daemon; that would
+        // be one HTTP round trip per second for nothing.
+        let mut env = create_test_env_empty();
+        let mut inst = Instance::new("tmux-session", "/tmp/repo");
+        inst.source_profile = "test".to_string();
+        let _ = inst.id.clone();
+        env.view.add_instance(inst);
+
+        env.view.request_daemon_status_refresh();
+
+        assert!(
+            !env.view.pending_daemon_status_refresh,
+            "no structured rows means no fetch is issued"
+        );
+    }
+
+    /// The in-flight flag is the only thing stopping a slow daemon from
+    /// accumulating one queued request per tick, so assert the full cycle:
+    /// a first request arms it, a second while armed is dropped, and draining
+    /// the worker disarms it so the next tick can fetch again. Asserting only
+    /// that the flag is still true after the second call would pass even if
+    /// the second call had enqueued another request.
+    #[test]
+    #[serial]
+    fn request_daemon_status_refresh_arms_and_disarms_the_in_flight_flag() {
+        let mut env = create_test_env_empty();
+        let _id = structured_row(&mut env, Status::Idle);
+
+        assert!(!env.view.pending_daemon_status_refresh, "starts disarmed");
+        env.view.request_daemon_status_refresh();
+        assert!(env.view.pending_daemon_status_refresh, "first request arms");
+
+        // While armed, further ticks are dropped at the guard rather than
+        // reaching the worker.
+        env.view.pending_daemon_status_refresh = true;
+        env.view.request_daemon_status_refresh();
+        assert!(env.view.pending_daemon_status_refresh);
+
+        // Draining the worker disarms, so the next tick can fetch again. The
+        // fetch itself returns empty here (no daemon in the test env), which is
+        // the same path a daemon-less TUI takes.
+        while env.view.pending_daemon_status_refresh {
+            if env.view.apply_daemon_status_updates() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            !env.view.pending_daemon_status_refresh,
+            "draining the worker disarms the flag"
+        );
+    }
+
+    /// The regression that made this producer necessary in the first place,
+    /// surviving in a reachable path: stopping a structured session persists
+    /// `Stopped`, `open_structured_view` does not clear it, and
+    /// `apply_status_update` drops every update whose row is `Stopped`. Without
+    /// the explicit lift, the pill stays grey through the entire next turn.
+    #[test]
+    #[serial]
+    fn daemon_status_lifts_a_locally_stopped_structured_row() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Stopped);
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Running));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Running),
+            "a fresh worker epoch on the daemon must wake a locally-Stopped row"
+        );
+    }
+
+    /// The other side of that lift: a daemon still reporting `Stopped` must not
+    /// be turned into a wake-up. Only a non-Stopped reading, which the daemon
+    /// emits only after `AcpSessionAssigned` heals its own row, counts.
+    #[test]
+    #[serial]
+    fn daemon_status_stopped_leaves_a_stopped_row_alone() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Stopped);
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Stopped));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Stopped)
+        );
+    }
+
+    /// A row mid-restart has its post-cascade `Instance` delivered by
+    /// `apply_restart_results`; the daemon's copy landing inside that window
+    /// races it. `pollable_instances` excludes these rows from the tmux
+    /// producer, so this producer has to match.
+    #[test]
+    #[serial]
+    fn daemon_status_skips_a_row_mid_restart() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Starting);
+        env.view.restart_in_flight.insert(id.clone());
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Idle));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Starting),
+            "the restart cascade owns this row until it reports back"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn daemon_status_skips_a_row_mid_recovery() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Starting);
+        env.view.recovery_in_flight.insert(id.clone());
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Idle));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Starting)
         );
     }
 }

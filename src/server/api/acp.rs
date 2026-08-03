@@ -228,7 +228,7 @@ fn rate_limit_resume_marker_resets_at(
     match latest_status {
         Some(Event::Stopped { reason }) if reason == "rate_limited" => Some(
             latest_rate_limit
-                .map(|info| info.resets_at)
+                .and_then(|info| info.resets_at)
                 .unwrap_or(fallback_resets_at),
         ),
         _ => None,
@@ -328,6 +328,10 @@ pub async fn spawn_acp(
     req: Result<Json<SpawnAcpRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    // Manual worker spawn is an admin/power operation with no composer surface.
+    if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     let Json(req) = match req {
@@ -680,6 +684,10 @@ pub async fn install_agent(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Installing agent binaries is an admin operation, not a composer action.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     if !crate::session::Config::load_or_warn()
         .acp
         .allow_agent_install
@@ -801,6 +809,10 @@ pub async fn shutdown_acp(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Worker shutdown is a lifecycle/admin action with no composer surface.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     match state.acp_supervisor.shutdown(&id).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => supervisor_error_response("shutdown failed", &e),
@@ -881,6 +893,11 @@ pub async fn switch_acp_agent(
     Json(req): Json<SwitchAgentRequest>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    // CityHall sessions are pinned to their configured ACP agent; switching
+    // agents (including to a non-ACP one) would break the locked-down mode.
+    if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
 
@@ -1197,28 +1214,36 @@ pub async fn acp_prompt(
     // A fresh user prompt supersedes any queued rate-limit resume
     // continuation, so drop it before sending: otherwise the reconciler could
     // later replay the older interrupted prompt after this newer one (#3028).
-    // The clear + send run under the per-session `instance_lock` because the
-    // pending-turn drain holds that same lock across its whole snapshot ->
-    // reload -> send -> clear; without it a drain mid-await could deliver the
-    // stale continuation *after* this newer prompt. `send_turn` does not take
-    // `instance_lock` (the drain calls it while holding the lock), so this
-    // cannot deadlock. Resume + publish + forward all live in the shared
-    // service so the plugin host delivers turns through the same path (#2897).
-    let outcome = {
+    // The clear alone runs under the per-session `instance_lock`, and the
+    // guard is dropped before `send_turn`. Mutual exclusion with the
+    // pending-turn drain is enough to keep the #3028 ordering: the drain
+    // holds this same lock across its whole snapshot -> reload -> send ->
+    // clear, so whichever side wins the lock, the stale continuation can
+    // never be published after this newer prompt. If the drain wins it
+    // delivers first; if we win, the drain then reads None and returns.
+    //
+    // Holding the guard across `send_turn` is what broke #3172:
+    // `send_turn` -> `trigger_resume_background` detaches a task that calls
+    // `build_spawn_request`, which takes this very lock, so the spawn could
+    // not start until this handler released it, and the handler was busy
+    // burning `WORKER_READY_TIMEOUT` waiting for that spawn. Resume +
+    // publish + forward still live in the shared service so the plugin host
+    // delivers turns through the same path (#2897).
+    {
         let inst_lock = state.instance_lock(&id).await;
         let _serialized = inst_lock.lock().await;
         state.session_service.clear_pending_initial_turn(&id).await;
-        state
-            .session_service
-            .send_turn(
-                &SessionCaller::User,
-                &id,
-                &req.text,
-                &attachments,
-                woke_idle_dormant,
-            )
-            .await
-    };
+    }
+    let outcome = state
+        .session_service
+        .send_turn(
+            &SessionCaller::User,
+            &id,
+            &req.text,
+            &attachments,
+            woke_idle_dormant,
+        )
+        .await;
     // Smart-rename fires from `acp_event_listener` on the first clean
     // `prompt_complete` `Event::Stopped` (turn-end), so the one-shot never
     // races this handler's live worker for the provider API. See
@@ -1400,6 +1425,10 @@ pub async fn acp_files(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // Enumerates the workspace tree for the Files pane, which CityHall hides.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let instances = state.instances.read().await;
     let Some(inst) = instances.iter().find(|i| i.id == id).cloned() else {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
@@ -1466,6 +1495,10 @@ pub async fn acp_worker_log(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<WorkerLogQuery>,
 ) -> impl IntoResponse {
+    // Raw worker logs are a debug surface, not part of the composer.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let instances = state.instances.read().await;
     let session_known = instances.iter().any(|i| i.id == id);
     drop(instances);
@@ -1690,6 +1723,10 @@ pub async fn acp_enable(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    // Enabling ACP on a session is an admin toggle mirroring the gated disable.
+    if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     let (mut instance, profile) = {
@@ -1939,6 +1976,11 @@ pub async fn acp_disable(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Disabling ACP drops the session to the terminal view, which CityHall
+    // mode forbids. Keep sessions in structured view.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     {
         let instances = state.instances.read().await;
         if !instances.iter().any(|i| i.id == id) {
@@ -2135,6 +2177,10 @@ pub async fn acp_set_mode(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    // Agent mode switching is a power control the dumbed-down composer omits.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Json(req) = match req {
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
@@ -2285,6 +2331,10 @@ pub async fn acp_set_config_option(
     req: Result<Json<SetConfigOptionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if let Some(resp) = read_only_block(&state) {
+        return resp;
+    }
+    // Agent config options are a power control the dumbed-down composer omits.
+    if let Some(resp) = super::cityhall_block(&state) {
         return resp;
     }
     let Json(req) = match req {
@@ -2933,6 +2983,97 @@ mod tests {
         assert!(state.instance_locks.read().await.is_empty());
     }
 
+    /// #3172: two invariants of the idle-dormant prompt-wake path, both of
+    /// which the pre-fix tree violates.
+    ///
+    /// 1. `acp_prompt` must release `instance_lock` before it awaits the
+    ///    worker. The detached spawn task the wake kicks needs that same
+    ///    lock inside `build_spawn_request`, so a handler that keeps it
+    ///    stalls its own resume for the whole `WORKER_READY_TIMEOUT` and
+    ///    then reports the worker never arrived.
+    /// 2. A prompt that never reaches a worker must not be published. A
+    ///    `UserPromptSent` with no turn behind it renders as a session
+    ///    stuck on "running" that only a stop plus re-send clears.
+    ///
+    /// A held `ResumeReservation` stands in for a spawn in flight: it makes
+    /// `wait_for_worker` park exactly as it does mid-respawn, with no
+    /// process, sandbox, or agent involved. It also pins the subtler of the
+    /// two publish branches, because a reservation counts as `is_running`:
+    /// `needs_resume` is false here even though no worker exists, so only
+    /// an unconditional readiness gate catches it. Pre-fix that combination
+    /// published the prompt and then answered 404; it is now a retryable
+    /// 503 with nothing written.
+    #[tokio::test]
+    async fn wake_prompt_frees_instance_lock_and_publishes_nothing_without_a_worker() {
+        use crate::acp::supervisor::{ResumeKind, ResumeReservationOutcome};
+        use std::time::Duration;
+
+        let mut inst = crate::session::Instance::new("wake-3172", "/tmp/aoe-3172-project");
+        inst.id = "sess-3172".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        // Hold the reservation for the whole probe so no worker can land.
+        let reservation = match state
+            .acp_supervisor
+            .begin_resume(&id, ResumeKind::Spawn)
+            .await
+            .expect("begin_resume must not error under capacity")
+        {
+            ResumeReservationOutcome::Reserved(r) => r,
+            ResumeReservationOutcome::AlreadyPresent => panic!("expected a fresh reservation"),
+        };
+
+        let handler = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                acp_prompt(
+                    State(state),
+                    Path(id),
+                    Ok(Json(PromptRequest {
+                        text: "lgtm".to_string(),
+                        attachments: Vec::new(),
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        });
+
+        // Let the handler reach its parked wait. It cannot return until the
+        // reservation drops, so anything past the lock scope is enough.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // The 2s budget is far under the 10s `WORKER_READY_TIMEOUT` the
+        // pre-fix handler holds the lock for, and far over the microseconds
+        // the fixed one needs to clear and release.
+        let inst_lock = state.instance_lock(&id).await;
+        let acquired = tokio::time::timeout(Duration::from_secs(2), inst_lock.lock()).await;
+        assert!(
+            acquired.is_ok(),
+            "acp_prompt must not hold instance_lock while it waits for the worker"
+        );
+        drop(acquired);
+
+        drop(reservation);
+        let response = tokio::time::timeout(Duration::from_secs(30), handler)
+            .await
+            .expect("handler must finish once the reservation drops")
+            .expect("handler task must not panic");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        assert!(
+            !state
+                .acp_event_store
+                .replay_from(&id, 0)
+                .iter()
+                .any(|(_, e)| matches!(e, Event::UserPromptSent { .. })),
+            "a prompt no worker ever received must not reach the event store"
+        );
+    }
+
     #[tokio::test]
     async fn acp_disable_missing_session_does_not_create_instance_lock() {
         let state = crate::server::test_support::build_test_app_state(Vec::new());
@@ -2971,7 +3112,7 @@ mod tests {
         let fallback = utc_ts("2099-01-01T00:00:00Z");
         let info = RateLimitInfo {
             status: "limited".to_string(),
-            resets_at,
+            resets_at: Some(resets_at),
             kind: "rate_limit".to_string(),
         };
 
@@ -2990,6 +3131,27 @@ mod tests {
 
         assert_eq!(
             rate_limit_resume_marker_resets_at(Some(&stopped), None, fallback),
+            Some(fallback)
+        );
+    }
+
+    /// The park exists but the agent reported no reset: the marker has to
+    /// fall through to the caller's fallback, or auto-resume loses its
+    /// schedule for exactly the sessions #3152 is about.
+    #[test]
+    fn rate_limit_resume_marker_falls_back_when_reset_unknown() {
+        let stopped = Event::Stopped {
+            reason: "rate_limited".to_string(),
+        };
+        let fallback = utc_ts("2099-01-01T00:00:00Z");
+        let info = RateLimitInfo {
+            status: "limited".to_string(),
+            resets_at: None,
+            kind: "rate_limit".to_string(),
+        };
+
+        assert_eq!(
+            rate_limit_resume_marker_resets_at(Some(&stopped), Some(&info), fallback),
             Some(fallback)
         );
     }

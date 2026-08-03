@@ -344,7 +344,7 @@ impl SessionResponse {
                 .unwrap_or_default(),
             group_path: inst.group_path.clone(),
             tool: inst.tool.clone(),
-            status: format!("{:?}", inst.status),
+            status: inst.status.wire_str().to_string(),
             dormant: inst.is_shown_dormant(),
             yolo_mode: inst.yolo_mode,
             created_at: inst.created_at.to_rfc3339(),
@@ -445,20 +445,20 @@ impl SessionResponse {
             #[cfg(feature = "serve")]
             acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
+            // A session converted by `attach_project` (#3103) has a real
+            // `workspace_info`, so this lists both repos with no special case:
+            // the structured view's repo-relative path rendering, the diff-repo
+            // resolver and the sidebar's multi-repo grouping all see the same
+            // shape they see for a session created multi-repo.
             workspace_repos: inst
-                .workspace_info
-                .as_ref()
-                .map(|w| {
-                    w.repos
-                        .iter()
-                        .map(|r| WorkspaceRepoSummary {
-                            name: r.name.clone(),
-                            source_path: r.source_path.clone(),
-                            branch: r.branch.clone(),
-                        })
-                        .collect()
+                .all_repos()
+                .iter()
+                .map(|r| WorkspaceRepoSummary {
+                    name: r.name.clone(),
+                    source_path: r.source_path.clone(),
+                    branch: r.branch.clone(),
                 })
-                .unwrap_or_default(),
+                .collect(),
             warnings: Vec::new(),
             plan_summary,
             next_wakeup_at,
@@ -584,15 +584,58 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
-pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsEnvelope> {
+/// Archival scope for `GET /api/sessions?state=`. `Live` excludes archived
+/// and trashed rows so a headless dispatcher polling the list doesn't have
+/// to know to filter `trashed_at`/`archived_at` client-side; `All` (or no
+/// `state` param) keeps the historical unfiltered behavior the web
+/// dashboard's client-side Trash view still relies on. See #3156.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionScope {
+    Live,
+    Trashed,
+    All,
+}
+
+#[derive(Deserialize)]
+pub struct ListSessionsQuery {
+    pub state: Option<SessionScope>,
+}
+
+fn instance_matches_scope(inst: &Instance, scope: Option<SessionScope>) -> bool {
+    match scope {
+        None | Some(SessionScope::All) => true,
+        Some(SessionScope::Live) => !inst.is_archived() && !inst.is_trashed(),
+        Some(SessionScope::Trashed) => inst.is_trashed(),
+    }
+}
+
+pub async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<ListSessionsQuery>,
+) -> Json<SessionsEnvelope> {
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
     // Snapshot the supervisor's worker lifecycle map once per request
     // rather than locking it per row. See #1088.
     #[cfg(feature = "serve")]
     let worker_states = state.acp_supervisor.worker_states_snapshot().await;
-    let mut sessions: Vec<SessionResponse> = instances
+    // Filtered once up front; every positional zip with `instances` below
+    // (ACP capability overlay, smart-rename overlay) must walk this same
+    // filtered view so indices stay aligned with `sessions`.
+    let scoped_instances: Vec<&Instance> = instances
         .iter()
+        // CityHall only ever creates structured sessions; a plain/terminal
+        // session (from the TUI, `aoe add`, or another client on the same
+        // daemon) must not be visible or actionable to a locked-down client, so
+        // it never appears in the list. The lifecycle routes apply the matching
+        // structured-target gate. See #7.
+        .filter(|inst| !state.cityhall_mode || inst.is_structured())
+        .filter(|inst| instance_matches_scope(inst, query.state))
+        .collect();
+    let mut sessions: Vec<SessionResponse> = scoped_instances
+        .iter()
+        .copied()
         .map(|inst| {
             let plan_summary = if inst.is_structured() {
                 state
@@ -650,7 +693,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
     // once via the shared cache above.
     #[cfg(feature = "serve")]
     {
-        for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+        for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
             if resp.acp_capable {
                 continue;
             }
@@ -735,7 +778,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        for (resp, inst) in sessions.iter_mut().zip(instances.iter()) {
+        for (resp, inst) in sessions.iter_mut().zip(scoped_instances.iter().copied()) {
             resp.default_name = crate::session::civilizations::is_default_civ_name(&inst.title);
             if inflight.contains(&inst.id) {
                 resp.smart_rename = SmartRenameState::Running;
@@ -1032,25 +1075,27 @@ async fn quiesce_structured_worker_for_worktree_move(
     }
 }
 
-/// Probe whether a sandboxed session's container is still holding its
-/// worktree mount, on the blocking pool.
+/// Release a sandboxed session's hold on its worktree mount ahead of a
+/// `git worktree move`, on the blocking pool, and report whether the
+/// worktree is *still* held.
 ///
-/// A sandbox container runs `sleep infinity` for the life of the session
-/// and keeps the worktree dir bind-mounted even while the agent is Idle,
-/// so a `git worktree move` would fail with `EBUSY`. Callers gate the
-/// rename/workdir-edit endpoints on this probe.
+/// NOT a read-only probe: for a container that is merely stopped this
+/// removes it, because a surviving container keeps pinning the bind mount
+/// and the rename would fail. Only call it on a path that is about to
+/// perform the move. See `ensure_sandbox_container_released` for the
+/// running-vs-stopped split.
 ///
 /// Fails closed at the async boundary: a `spawn_blocking` panic or
 /// cancellation reports the worktree as held (with a `warn!` log), so
 /// the caller rejects the mutating request with `409 CONFLICT` rather
-/// than risk `EBUSY` against a possibly-live container mount. Sharing
+/// than risk renaming against a possibly-live container mount. Sharing
 /// this helper between `rename_session` and `set_worktree_name` keeps
 /// the fail-closed policy synchronized across the two endpoints (#2596).
-async fn probe_container_holds_worktree(id: &str, is_sandboxed: bool) -> bool {
+async fn ensure_sandbox_container_released_blocking(id: &str, is_sandboxed: bool) -> bool {
     let probe_id = id.to_string();
     let log_id = id.to_string();
     tokio::task::spawn_blocking(move || {
-        crate::session::worktree_edit::sandbox_container_holds_worktree(&probe_id, is_sandboxed)
+        crate::session::worktree_edit::ensure_sandbox_container_released(&probe_id, is_sandboxed)
     })
     .await
     .unwrap_or_else(|e| {
@@ -1058,7 +1103,7 @@ async fn probe_container_holds_worktree(id: &str, is_sandboxed: bool) -> bool {
             target: "server.api.sessions",
             session = %log_id,
             error = %e,
-            "sandbox container probe task failed at the async boundary; failing closed and reporting the worktree as held to prevent EBUSY against a possibly-live container"
+            "sandbox container release task failed at the async boundary; failing closed and reporting the worktree as held rather than renaming against a possibly-live container mount"
         );
         true
     })
@@ -1067,15 +1112,21 @@ async fn probe_container_holds_worktree(id: &str, is_sandboxed: bool) -> bool {
 /// Rename a session's title (and, when tied, its worktree directory).
 ///
 /// The sandbox container probe runs on the blocking pool via
-/// `probe_container_holds_worktree`, which fails closed on a
+/// `ensure_sandbox_container_released_blocking`, which fails closed on a
 /// `spawn_blocking` panic or cancellation so the rename is rejected
 /// with `409 CONFLICT` rather than proceeding against a possibly-live
-/// container mount and hitting `EBUSY`.
+/// container mount.
 pub async fn rename_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     body: Result<Json<RenameSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -1135,9 +1186,22 @@ pub async fn rename_session(
         // standalone worktree-name edit. A running session must be stopped
         // first; the setting is the escape hatch for free-form relabeling.
         // A sandbox session's container keeps the worktree dir mounted even
-        // while the agent is Idle, so the move would fail with EBUSY; stopping
-        // the session tears the container down and releases the mount.
-        let container_holds = probe_container_holds_worktree(&id, is_sandboxed).await;
+        // while the agent is Idle, so the move would fail. The helper drops a
+        // merely-stopped container to free the mount and only reports held for
+        // a live one, which the user has to stop.
+        // Short-circuited twice, because the helper removes a stopped
+        // container: once on the status check, so a request about to be
+        // rejected never discards, and once on whether the directory is
+        // actually going to move, so a no-op or branch-only rename does not
+        // either. The tied leaf comes from the title, matching what is handed
+        // to `edit_worktree_workdir` below.
+        let moves_worktree = crate::session::worktree_edit::worktree_move_required(
+            std::path::Path::new(&current_path),
+            &crate::session::worktree_edit::worktree_leaf_from_title(&title),
+        );
+        let container_holds = !status.blocks_worktree_edit()
+            && moves_worktree
+            && ensure_sandbox_container_released_blocking(&id, is_sandboxed).await;
         if status.blocks_worktree_edit() || container_holds {
             return (
                 StatusCode::CONFLICT,
@@ -1343,16 +1407,22 @@ fn worktree_edit_error_response(
 /// Edit a managed worktree session's workdir directory name (and optionally
 /// its git branch).
 ///
-/// The sandbox container probe runs on the blocking pool via
-/// `probe_container_holds_worktree`, which fails closed on a
+/// The sandbox container gate runs on the blocking pool via
+/// `ensure_sandbox_container_released_blocking`, which fails closed on a
 /// `spawn_blocking` panic or cancellation so the edit is rejected with
 /// `409 CONFLICT` rather than proceeding against a possibly-live container
-/// mount and hitting `EBUSY`.
+/// mount.
 pub async fn set_worktree_name(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     body: Result<Json<SetWorktreeNameBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -1418,9 +1488,20 @@ pub async fn set_worktree_name(
             .into_response();
     }
     // A sandbox container keeps the worktree dir mounted even while the agent
-    // is Idle, so the move would fail with EBUSY; stopping the session releases
-    // the mount, same as the active-status case.
-    let container_holds = probe_container_holds_worktree(&id, is_sandboxed).await;
+    // is Idle, so the move would fail. The helper drops a merely-stopped
+    // container to free the mount and only reports held for a live one, which
+    // the user has to stop, same as the active-status case.
+    // Short-circuited twice, because the helper removes a stopped container:
+    // once on the status check, so a request about to be rejected never
+    // discards, and once on whether the directory is actually going to move, so
+    // a no-op or branch-only edit does not either.
+    let moves_worktree = crate::session::worktree_edit::worktree_move_required(
+        std::path::Path::new(&current_path),
+        &name,
+    );
+    let container_holds = !status.blocks_worktree_edit()
+        && moves_worktree
+        && ensure_sandbox_container_released_blocking(&id, is_sandboxed).await;
     if status.blocks_worktree_edit() || container_holds {
         return (
             StatusCode::CONFLICT,
@@ -1547,6 +1628,179 @@ pub async fn set_worktree_name(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
+// --- Attach a project to an existing session (#3103) ---
+
+#[derive(Deserialize)]
+pub struct AttachProjectBody {
+    /// Absolute host path of the repo to attach, or the name of a registered
+    /// project. A name is resolved against the project registry.
+    pub project: String,
+    /// Check out a branch that already exists in the added repo instead of
+    /// refusing. Off by default: a same-named branch in another repo can hold
+    /// unrelated commits, and checking it out would feed the agent the wrong
+    /// tree. Setting this records the branch as not aoe-created, so deleting the
+    /// session leaves it alone.
+    #[serde(default)]
+    pub attach_existing_branch: bool,
+}
+
+/// `POST /api/sessions/:id/projects`. Attaches a repo to a session that already
+/// exists, converting it into a multi-repo workspace and restarting it so the
+/// agent comes up there with its transcript intact.
+///
+/// Modelled on the workdir endpoint, which refuses while the session is active
+/// because it moves the directory out from under a live worker (#2260).
+/// Attaching moves it too, so rather than refuse (which would gut the feature)
+/// this stops the session for the move and starts it again, which is what #2346
+/// asks for. Mid-turn is still refused, with 409.
+pub async fn attach_session_project(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<AttachProjectBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    // Defense in depth behind `cityhall_gate`, which already denies this route:
+    // attaching takes an arbitrary host path, so it is classified with
+    // `git/clone` and `POST /api/projects` rather than with the session lifecycle
+    // routes CityHall mode allows.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let raw = body.project.trim().to_string();
+    if raw.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "message": "Project path or name is required" })),
+        )
+            .into_response();
+    }
+
+    let profile = {
+        let instances = state.instances.read().await;
+        match instances.iter().find(|i| i.id == id) {
+            Some(inst) => inst.source_profile.clone(),
+            None => return super::session_not_found(),
+        }
+    };
+
+    // A bare name is a registry lookup; anything path-shaped is used as-is. The
+    // registry is what the picker offers, so this keeps the API usable by hand
+    // without making the caller resolve names itself.
+    let repo_path = match resolve_project_input(&profile, &raw).await {
+        Ok(p) => p,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "message": message })),
+            )
+                .into_response();
+        }
+    };
+
+    let on_existing = if body.attach_existing_branch {
+        crate::session::attach_project::ExistingBranch::Attach
+    } else {
+        crate::session::attach_project::ExistingBranch::Refuse
+    };
+
+    match crate::server::attach_project::attach_project(&state, &id, &repo_path, on_existing).await
+    {
+        Ok((outcome, worker)) => {
+            use crate::server::attach_project::WorkerOutcome;
+            let (worker_status, worker_message) = match &worker {
+                WorkerOutcome::Restarted => ("restarted", None),
+                WorkerOutcome::NotRunning => ("not_running", None),
+                WorkerOutcome::RestartFailed(m) => ("restart_failed", Some(m.clone())),
+            };
+            let response = {
+                let instances = state.instances.read().await;
+                instances.iter().find(|i| i.id == id).map(|inst| {
+                    SessionResponse::from_instance(
+                        inst,
+                        crate::claude_settings::read_tui_fullscreen(),
+                    )
+                })
+            };
+            // 200 even on RestartFailed: the attachment itself succeeded and is
+            // durable. The client renders the worker status so the user can see
+            // the agent needs a restart rather than being told the whole
+            // operation failed and left nothing behind.
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "session": response,
+                    "attached": {
+                        "name": outcome.repo.name,
+                        "worktree_path": outcome.repo.worktree_path,
+                        "branch": outcome.repo.branch,
+                        "branch_created": !outcome.repo.branch_preexisting,
+                        "moved_to": outcome.moved_to,
+                    },
+                    "warnings": outcome.warnings,
+                    "worker": worker_status,
+                    "worker_message": worker_message,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            use crate::server::attach_project::AttachError;
+            let status = match &e {
+                AttachError::NotFound => StatusCode::NOT_FOUND,
+                AttachError::TurnInFlight => StatusCode::CONFLICT,
+                AttachError::Rejected(_) => StatusCode::BAD_REQUEST,
+            };
+            (
+                status,
+                Json(serde_json::json!({ "message": e.to_string() })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Resolve the request's `project` field to a host path.
+///
+/// An absolute path is taken as-is. Anything else is looked up in the project
+/// registry, so the web picker can send the name it already displays.
+async fn resolve_project_input(profile: &str, raw: &str) -> Result<std::path::PathBuf, String> {
+    // `Path` in this module is axum's extractor, so the std types are qualified.
+    if std::path::Path::new(raw).is_absolute() {
+        return Ok(std::path::PathBuf::from(raw));
+    }
+    // Path-shaped but not absolute. Without this the input falls through to the
+    // registry lookup and comes back as "not in the registry", sending the user
+    // after a registry problem they do not have.
+    if raw.starts_with('~') || raw.contains('/') || raw.contains(std::path::MAIN_SEPARATOR) {
+        return Err(format!(
+            "'{raw}' looks like a path but is not absolute. Pass an absolute path, or the name of \
+             a registered project."
+        ));
+    }
+    let profile = profile.to_string();
+    let name = raw.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::session::projects::resolve_names(&profile, &[name])
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|projects| {
+                projects
+                    .into_iter()
+                    .next()
+                    .map(|p| std::path::PathBuf::from(p.path))
+                    .ok_or_else(|| "Project not found in the registry".to_string())
+            })
+    })
+    .await
+    .map_err(|e| format!("project lookup panicked: {e}"))?
+}
+
 fn apply_worktree_name_edit(inst: &mut Instance, new_path: &str, new_branch: Option<&str>) {
     inst.project_path = new_path.to_string();
     if let Some(branch) = new_branch {
@@ -1587,6 +1841,12 @@ pub async fn update_session_group(
     Path(id): Path<String>,
     body: Result<Json<UpdateGroupBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -1830,6 +2090,12 @@ pub async fn update_session_notifications(
     Path(id): Path<String>,
     body: Result<Json<UpdateNotificationsBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -1924,6 +2190,12 @@ pub async fn update_session_diff_base(
     Path(id): Path<String>,
     body: Result<Json<UpdateDiffBaseBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -2071,6 +2343,12 @@ pub async fn update_session_pin(
     Path(id): Path<String>,
     body: Result<Json<UpdatePinBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -2139,6 +2417,12 @@ pub async fn update_session_color(
     Path(id): Path<String>,
     body: Result<Json<UpdateColorBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -2214,6 +2498,12 @@ pub async fn update_session_archive(
     Path(id): Path<String>,
     body: Result<Json<UpdateArchiveBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -2383,6 +2673,12 @@ pub async fn trash_session(
     Path(id): Path<String>,
     body: Option<Json<TrashSessionBody>>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -2488,9 +2784,12 @@ pub async fn trash_session(
     // The session is durably trashed; stop its sandbox container (so it doesn't
     // keep running for the whole retention window) and relocate its managed
     // worktree out of the active dir into the holding area, then persist the
-    // repointed project_path. Stopping the container also releases the worktree
-    // bind mount, without which the git move hits EBUSY. Both the container stop
-    // and the git move are blocking, so this runs on a blocking thread.
+    // repointed project_path. Stopping the container is not enough on its own
+    // to release the worktree bind mount (a stopped container keeps pinning it,
+    // which is why the rename gate discards it); the stop is here so the
+    // sandbox isn't left running for the whole retention window. Both the
+    // container stop and the git move are blocking, so this runs on a blocking
+    // thread.
     // Best-effort: a failure leaves the worktree in place and the daemon's
     // reconcile pass can move it later. Never blocks the trash itself, which
     // already landed above.
@@ -2624,6 +2923,12 @@ pub async fn restore_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -2766,6 +3071,12 @@ pub async fn force_smart_rename(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = super::acp::read_only_block(&state) {
         return resp;
     }
@@ -2789,9 +3100,9 @@ pub async fn force_smart_rename(
 
     // Preflight the SAME gate the spawned try_smart_rename re-applies, so the
     // action never reports success (202) for a session the gate would silently
-    // drop (sandboxed, or a resolved rename agent with no one-shot / an
-    // overridden command). Without this, the sidebar would show success while
-    // no title job runs. Resolves with the SAME repo-aware config the worker
+    // drop (a resolved rename agent with no one-shot, an overridden command, or
+    // a sandboxed session whose rename agent is not its own). Without this, the
+    // sidebar would show success while no title job runs. Resolves with the SAME repo-aware config the worker
     // uses (resolve_config_with_repo_or_warn), so a repo-local smart_rename_agent
     // or agent_command_override cannot make the preflight and worker disagree.
     // Passes `setting_on = true` because this is the manual "Auto-name now"
@@ -2813,29 +3124,61 @@ pub async fn force_smart_rename(
         &config.agent_command_override,
     ) {
         use crate::session::smart_rename::SkipReason;
-        let (status, message) = match reason {
-            SkipReason::NotStructured => (
-                StatusCode::BAD_REQUEST,
-                "Session is not a structured-view session",
-            ),
-            SkipReason::NameNotDefault => {
-                (StatusCode::CONFLICT, "Session already has a custom name")
-            }
-            SkipReason::Disabled => (StatusCode::CONFLICT, "Smart rename is disabled in settings"),
-            SkipReason::Sandboxed => (
-                StatusCode::CONFLICT,
-                "Smart rename is not available for sandboxed sessions",
-            ),
-            SkipReason::NoOneshot => (
-                StatusCode::CONFLICT,
-                "The smart-rename agent has no one-shot mode",
-            ),
-            SkipReason::CommandOverridden => (
-                StatusCode::CONFLICT,
-                "The smart-rename agent's command is overridden",
-            ),
+        // Wording comes from the shared `user_message` so this response and the
+        // TUI's dialog cannot drift; only the status code is per-reason.
+        let status = match reason {
+            SkipReason::NotStructured => StatusCode::BAD_REQUEST,
+            _ => StatusCode::CONFLICT,
         };
-        return (status, Json(serde_json::json!({ "message": message }))).into_response();
+        return (
+            status,
+            Json(serde_json::json!({ "message": reason.user_message() })),
+        )
+            .into_response();
+    }
+
+    // A sandboxed session's one-shot runs inside its container, so a stopped
+    // container is the one remaining way the spawned job would drop the session
+    // after the static gate passed. Probe it here too, else this would answer 202
+    // while nothing renames, which is exactly what the gate above exists to
+    // prevent. Same check and wording as the TUI's preflight; the spawned
+    // try_smart_rename re-probes and stays the authority.
+    if sandboxed {
+        use crate::containers::Probe;
+        let sid = id.clone();
+        let probe = tokio::task::spawn_blocking(move || {
+            crate::containers::DockerContainer::from_session_id(&sid).probe_running()
+        })
+        .await;
+        // A failed inspection is not a stopped container: telling the user to
+        // start a container that may already be running sends them the wrong
+        // way, so the runtime error is surfaced as its own state. Same split as
+        // the TUI preflight.
+        let unknown = match probe {
+            Ok(Probe::Running) => None,
+            Ok(Probe::NotRunning) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "error": "container_not_running",
+                        "message": "The session's sandbox container is not running, so its agent cannot be asked for a name. Open the session to start it, then try again.",
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(Probe::Unknown(e)) => Some(e.to_string()),
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(err) = unknown {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "container_state_unknown",
+                    "message": format!("Couldn't check the session's sandbox container, so its agent cannot be asked for a name: {err}"),
+                })),
+            )
+                .into_response();
+        }
     }
 
     let Some((first_user_prompt, agent_prose)) = state
@@ -2886,6 +3229,12 @@ pub async fn summarize_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if let Some(resp) = super::acp::read_only_block(&state) {
         return resp;
     }
@@ -2937,7 +3286,9 @@ pub async fn summarize_session(
                 "The summary agent's command is overridden",
             ),
             // resolve_summary_agent never returns the rename-only reasons.
-            SkipReason::NameNotDefault | SkipReason::Disabled => (
+            SkipReason::NameNotDefault
+            | SkipReason::Disabled
+            | SkipReason::SandboxRenameAgentMismatch => (
                 StatusCode::CONFLICT,
                 "Conversation summary is unavailable for this session",
             ),
@@ -2963,6 +3314,12 @@ pub async fn stop_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -3104,6 +3461,12 @@ pub async fn start_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -3285,6 +3648,12 @@ pub async fn update_session_snooze(
     Path(id): Path<String>,
     body: Result<Json<UpdateSnoozeBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -3417,6 +3786,12 @@ pub async fn update_session_unread(
     Path(id): Path<String>,
     body: Result<Json<UpdateUnreadBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -3881,6 +4256,12 @@ pub async fn delete_session(
     Path(id): Path<String>,
     body: Option<Json<DeleteSessionBody>>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     if state.read_only {
         return super::read_only_response();
     }
@@ -4216,6 +4597,14 @@ pub async fn delete_workspace(
             .into_response();
     };
 
+    // CityHall: `purge_workspace_artifacts` tears down EVERY id in the list, not
+    // just the owner, so every id (not only `session_ids.first()`) must be a
+    // structured session this mode created. Otherwise a client could smuggle a
+    // foreign plain session in as a sibling and have it destroyed. See #7.
+    if let Some(resp) = cityhall_block_any_non_structured(&state, &session_ids).await {
+        return resp;
+    }
+
     let owner_needs_dirty_check = body.delete_worktree && !body.force_delete;
 
     // Preflight: refuse a non-force delete of a dirty shared worktree before
@@ -4386,6 +4775,36 @@ pub struct CreateSessionBody {
     #[cfg(feature = "serve")]
     #[serde(default)]
     pub fork_from: Option<String>,
+    /// External work-queue dispatcher completion callback: an HTTP POST
+    /// fires here when the session transitions to Idle, Waiting, or Error.
+    /// Must be `http`/`https` and not resolve to a loopback/private/
+    /// link-local address; validated at create time, re-validated on every
+    /// dispatch. See #3156.
+    #[serde(default)]
+    pub callback_url: Option<String>,
+    /// Idempotency key for `POST /api/sessions`: a retry using the same key
+    /// (even across a daemon restart, since it's persisted on the created
+    /// instance) returns the existing session instead of creating a
+    /// duplicate. See #3156.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Hard cap on a single `idempotency_key`'s length, so one request cannot
+/// persist an arbitrarily large string onto its instance. This bounds key
+/// SIZE, not the number of distinct keys; entry count is bounded separately
+/// by the pruning in `AppState::idempotency_lock`.
+const IDEMPOTENCY_KEY_MAX_LEN: usize = 200;
+
+/// Find a prior session created with the given `idempotency_key`. Scans all
+/// instances, including trashed, so a retry against a soft-deleted session
+/// still returns it rather than creating a duplicate; a hard-deleted
+/// (physically removed) session falls through to a fresh create, a
+/// documented, accepted limitation for this "nice-to-have" item.
+fn find_by_idempotency_key<'a>(instances: &'a [Instance], key: &str) -> Option<&'a Instance> {
+    instances
+        .iter()
+        .find(|i| i.idempotency_key.as_deref() == Some(key))
 }
 
 fn create_body_uses_worktree(body: &CreateSessionBody) -> bool {
@@ -4437,6 +4856,32 @@ fn both_import_and_fork_set(body: &CreateSessionBody) -> bool {
 #[cfg(feature = "serve")]
 fn agent_is_structured_fork_capable(tool: &str, agent_name: Option<&str>) -> bool {
     crate::session::fork::structured_fork_capable(tool, agent_name)
+}
+
+/// True iff the agent can run a structured (ACP) session in this project: a
+/// built-in ACP agent in the registry, or a custom tool with a valid
+/// `agent_acp_cmd`. Mirrors the post-build capability check (below) so
+/// CityHall mode can reject a non-ACP agent up front instead of letting the
+/// session silently downgrade to the terminal view. See #7.
+#[cfg(feature = "serve")]
+fn agent_is_acp_capable(
+    profile: &str,
+    project_path: &std::path::Path,
+    tool: &str,
+    agent_name: Option<&str>,
+) -> bool {
+    let resolved = agent_name.filter(|s| !s.is_empty()).unwrap_or(tool);
+    if crate::acp::AgentRegistry::with_defaults()
+        .get(resolved)
+        .is_some()
+    {
+        return true;
+    }
+    crate::session::repo_config::resolve_config_with_repo_or_warn(profile, project_path)
+        .session
+        .agent_acp_cmd
+        .get(tool)
+        .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
 }
 
 fn validate_session_tool_identity(
@@ -4682,17 +5127,214 @@ pub(crate) fn run_create_hooks(
     Ok(())
 }
 
+/// CityHall structured-target gate for per-session lifecycle / metadata routes.
+/// CityHall only ever creates structured sessions and `list_sessions` hides
+/// everything else, so a mutation must refuse any non-structured target (or an
+/// unknown id): otherwise a locked-down client could enumerate a pre-existing
+/// plain/terminal session (from the TUI, `aoe add`, or another client on the
+/// same daemon) and respawn it (re-running its stored `command_override` host
+/// binary via `build_host_command`), destroy it, or edit it. Returns the
+/// canonical CityHall 403 (never a 404, so the mode does not leak which ids
+/// exist); `None` in normal mode or for a genuine structured target. See #7.
+#[cfg(feature = "serve")]
+async fn cityhall_block_non_structured(
+    state: &AppState,
+    id: &str,
+) -> Option<axum::response::Response> {
+    if !state.cityhall_mode {
+        return None;
+    }
+    let is_structured_target = state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|i| i.id == id)
+        .is_some_and(|i| i.is_structured());
+    (!is_structured_target).then(super::cityhall_response)
+}
+
+/// Plural [`cityhall_block_non_structured`]: refuse unless EVERY id resolves to
+/// a structured session this mode created. Used by multi-session teardown
+/// (`delete_workspace`), which acts on all ids, not just the owner. See #7.
+#[cfg(feature = "serve")]
+async fn cityhall_block_any_non_structured(
+    state: &AppState,
+    ids: &[String],
+) -> Option<axum::response::Response> {
+    if !state.cityhall_mode {
+        return None;
+    }
+    let instances = state.instances.read().await;
+    let all_structured = ids.iter().all(|id| {
+        instances
+            .iter()
+            .find(|i| &i.id == id)
+            .is_some_and(|i| i.is_structured())
+    });
+    (!all_structured).then(super::cityhall_response)
+}
+
+/// Query params for `POST /api/sessions`. `wait=ready` blocks the response
+/// until the new session's status leaves `Starting` (or a bounded timeout
+/// elapses), so a caller that sends a message immediately after create
+/// doesn't race the agent's own startup. See #3156.
+#[derive(Deserialize)]
+pub struct CreateSessionQuery {
+    pub wait: Option<String>,
+}
+
+/// Bound on `?wait=ready`: how long `create_session` will block before
+/// returning whatever status the session has reached.
+const WAIT_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn current_instance(state: &Arc<AppState>, id: &str) -> Option<Instance> {
+    state
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|i| i.id == id)
+        .cloned()
+}
+
+/// Blocks until `id`'s status leaves `Starting`, or `timeout` elapses.
+/// Subscribes to `status_tx` before checking current state, so a transition
+/// that lands between the subscribe and the first check is still queued on
+/// the receiver rather than lost; the direct check covers a transition that
+/// already happened before subscribing. On `Lagged`, falls back to
+/// re-reading live state rather than trusting the (possibly stale) broadcast
+/// position. Returns `None` only if the instance vanished outright.
+async fn wait_until_left_starting(
+    state: &Arc<AppState>,
+    id: &str,
+    timeout: std::time::Duration,
+) -> Option<Instance> {
+    let mut rx = state.status_tx.subscribe();
+
+    let initial = current_instance(state, id).await?;
+    if initial.status != Status::Starting {
+        return Some(initial);
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return current_instance(state, id).await;
+        }
+        match tokio::time::timeout(remaining, rx.recv()).await {
+            Ok(Ok(change)) => {
+                if change.instance_id == id && change.new != Status::Starting {
+                    return current_instance(state, id).await;
+                }
+                // Different session, or re-entered Starting: keep waiting.
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                match current_instance(state, id).await {
+                    Some(inst) if inst.status != Status::Starting => return Some(inst),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                return current_instance(state, id).await;
+            }
+            Err(_elapsed) => return current_instance(state, id).await,
+        }
+    }
+}
+
 pub async fn create_session(
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<CreateSessionQuery>,
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return super::read_only_response();
     }
-    let Json(body) = match body {
+    let Json(mut body) = match body {
         Ok(b) => b,
         Err(rej) => return rej.into_response(),
     };
+
+    if state.cityhall_mode {
+        // CityHall sessions are server-derived and locked down: they span every
+        // configured project, always render in structured view, and must run an
+        // ACP-capable agent. Every client-supplied field that could escape the
+        // mode (path/repos/view/scratch plus the spawn/branch fields reset
+        // below) is neutralized so a crafted request cannot escape it. See #7.
+        let projects = crate::session::projects::load_merged(&state.profile).unwrap_or_default();
+        if projects.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "cityhall_no_projects",
+                    "message": "CityHall mode requires at least one configured project"
+                })),
+            )
+                .into_response();
+        }
+        body.scratch = false;
+        // Reset every client-controllable spawn / branch field to its default.
+        // Deriving path/repos/view is not enough: a crafted request could still
+        // smuggle an alternate binary, extra args/env, yolo mode, a chosen
+        // branch/base, or a sandbox container past the locked-down mode.
+        // `command_override` is the load-bearing one: the ACP supervisor
+        // validates the registry-default binary but then adopts the client's
+        // `argv[0]` unchecked, so `command_override: "/bin/sh -c ..."` on a
+        // registry ACP tool would pass the ACP-capable gate below and spawn an
+        // arbitrary binary as the agent. See #7 review.
+        body.command_override = String::new();
+        body.extra_args = String::new();
+        body.extra_env = Vec::new();
+        body.yolo_mode = false;
+        body.worktree_enabled = false;
+        body.worktree_branch = None;
+        body.create_new_branch = false;
+        body.base_branch = None;
+        body.sandbox = false;
+        body.sandbox_image = None;
+        // Do not let the client approve the repo's `on_create` host hooks: that
+        // would run (and persist durable trust for) operator-repo commands from
+        // a locked-down user. Reset to the untrusted default. See #7 review.
+        body.trust_hooks = None;
+        // The "primary" repo is the first entry in merged registry order; the
+        // rest ride along as workspace repos. With multiple projects that pick
+        // is arbitrary but deterministic (registry order is stable), and the
+        // session spans them all regardless, so which one is primary only
+        // affects labeling. Non-empty is checked above, so `next()` is Some.
+        let mut paths = projects.into_iter().map(|p| p.path);
+        body.path = paths.next().unwrap();
+        body.extra_repo_paths = paths.collect();
+        #[cfg(feature = "serve")]
+        {
+            body.view = crate::session::View::Structured;
+            // Fork / import resume an existing agent session and would bypass the
+            // server-derived path + ACP gate, so they are not honored in the mode.
+            body.fork_from = None;
+            body.import_acp_session_id = None;
+            let profile = body
+                .profile
+                .clone()
+                .unwrap_or_else(|| state.profile.clone());
+            if !agent_is_acp_capable(
+                &profile,
+                std::path::Path::new(&body.path),
+                &body.tool,
+                body.agent_name.as_deref(),
+            ) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "cityhall_agent_not_acp",
+                        "message": "CityHall mode requires an ACP-capable agent"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     // Scratch sessions are server-provisioned; the worktree path is the
     // wrong model for them. Reject the combination before reaching the
@@ -4952,6 +5594,53 @@ pub async fn create_session(
         None => None,
     };
 
+    if let Some(url) = body.callback_url.as_deref() {
+        if let Err(msg) = crate::server::callback::validate_callback_url(url) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
+            )
+                .into_response();
+        }
+    }
+
+    if let Some(key) = body.idempotency_key.as_deref() {
+        if key.is_empty() || key.len() > IDEMPOTENCY_KEY_MAX_LEN {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "validation_failed",
+                    "message": format!(
+                        "idempotency_key must be 1-{IDEMPOTENCY_KEY_MAX_LEN} characters"
+                    ),
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Idempotency: hold a per-key lock across the check-and-create so two
+    // concurrent requests sharing a new key can't both scan-miss and both
+    // create a session. The guard lives until this handler returns (Rust
+    // drops it at end of scope); only requests sharing this exact key
+    // serialize, not general session-create throughput.
+    let _idempotency_guard = if let Some(key) = body.idempotency_key.as_deref() {
+        let lock = state.idempotency_lock(key).await;
+        let guard = lock.lock_owned().await;
+        let existing = {
+            let instances = state.instances.read().await;
+            find_by_idempotency_key(&instances, key).map(|inst| {
+                SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+            })
+        };
+        if let Some(resp) = existing {
+            return (StatusCode::OK, Json(resp)).into_response();
+        }
+        Some(guard)
+    } else {
+        None
+    };
+
     let profile = body.profile.unwrap_or_else(|| state.profile.clone());
 
     let spec = crate::server::session_spawn::StructuredSessionSpec {
@@ -4973,6 +5662,8 @@ pub async fn create_session(
         scratch: body.scratch,
         trust_hooks: body.trust_hooks,
         custom_instruction: body.custom_instruction,
+        callback_url: body.callback_url,
+        idempotency_key: body.idempotency_key,
         profile,
         // Never decoded from the request body: only the plugin host path
         // stamps these, through create_structured_session. See #2897.
@@ -5029,6 +5720,20 @@ pub async fn create_session(
                     resp.acp_capable = custom_agent_acp_capable(&acp_cmd, &instance.tool);
                 }
             }
+
+            if query.wait.as_deref() == Some("ready") && instance.status == Status::Starting {
+                if let Some(fresh) =
+                    wait_until_left_starting(&state, &instance.id, WAIT_READY_TIMEOUT).await
+                {
+                    // `wire_str`, not `as_str`: this must match the casing the
+                    // same endpoint returns without `?wait=ready`, or a
+                    // dispatcher comparing against a `GET /api/sessions` poll
+                    // never matches. See #3187.
+                    resp.status = fresh.status.wire_str().to_string();
+                    resp.last_error = fresh.last_error;
+                }
+            }
+
             (StatusCode::CREATED, Json(resp)).into_response()
         }
         Err(e) => {
@@ -5183,6 +5888,12 @@ pub async fn ensure_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // CityHall: only act on structured sessions this mode created; refuse a
+    // non-structured (or unknown) target so a locked-down client cannot
+    // respawn/destroy/edit an enumerated plain session. See #7.
+    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
+        return resp;
+    }
     // Serialize concurrent ensure calls for the same session. The decision
     // phase reads tmux state and the restart phase mutates it; any other
     // ensure for this id must wait so both see a consistent view.
@@ -5389,6 +6100,9 @@ pub async fn ensure_terminal(
     if state.read_only {
         return super::read_only_response();
     }
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let index = q.index;
     if index > crate::server::pane::MAX_TERMINAL_INDEX {
         return (
@@ -5502,6 +6216,9 @@ pub async fn ensure_container_terminal(
     if state.read_only {
         return super::read_only_response();
     }
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let index = q.index;
     if index > crate::server::pane::MAX_TERMINAL_INDEX {
         return (
@@ -5599,6 +6316,9 @@ pub async fn kill_terminal(
 ) -> impl IntoResponse {
     if state.read_only {
         return super::read_only_response();
+    }
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
     }
     let index = q.index;
     if index == 0 || index > crate::server::pane::MAX_TERMINAL_INDEX {
@@ -5822,20 +6542,28 @@ async fn resolve_diff_repos(
         .iter()
         .find(|i| i.id == id)
         .ok_or_else(super::session_not_found)?;
-    let repos = if let Some(ws) = inst.workspace_info.as_ref() {
-        ws.repos
-            .iter()
-            .map(|r| DiffRepo {
-                name: Some(r.name.clone()),
-                path: r.worktree_path.clone(),
-            })
-            .collect()
-    } else {
-        vec![DiffRepo {
-            name: None,
-            path: inst.project_path.clone(),
-        }]
-    };
+    // A session with any repo record (a creation-time workspace, repos attached
+    // later, or both) lists one entry per repo. A session with none falls back
+    // to its project_path, which is the single-repo flow unchanged.
+    let mut repos: Vec<DiffRepo> = inst
+        .all_repos()
+        .iter()
+        .map(|r| DiffRepo {
+            name: Some(r.name.clone()),
+            path: r.worktree_path.clone(),
+        })
+        .collect();
+    if inst.workspace_info.is_none() {
+        // An attached repo widens a single-repo session rather than replacing
+        // it, so the session's own checkout stays first in the list.
+        repos.insert(
+            0,
+            DiffRepo {
+                name: None,
+                path: inst.project_path.clone(),
+            },
+        );
+    }
     Ok(DiffContext {
         repos,
         base_branch_override: inst.base_branch_override.clone(),
@@ -5872,6 +6600,9 @@ pub async fn session_diff_files(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let ctx = match resolve_diff_repos(&state, &id).await {
         Ok(c) => c,
         Err(resp) => return resp,
@@ -5976,6 +6707,9 @@ pub async fn session_diff_file(
     Path(id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<FileDiffQuery>,
 ) -> impl IntoResponse {
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let ctx = match resolve_diff_repos(&state, &id).await {
         Ok(c) => c,
         Err(resp) => return resp,
@@ -6163,6 +6897,113 @@ pub async fn session_diff_file(
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "File diff panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SessionFileQuery {
+    pub path: String,
+}
+
+/// Response for the session file-read endpoint. Mirrors the typed shape of its
+/// sibling [`RichFileContentsResponse`]; `content` is empty for a binary or
+/// truncated file (the client renders a notice instead).
+#[derive(Serialize)]
+pub struct SessionFileResponse {
+    pub content: String,
+    pub is_binary: bool,
+    pub truncated: bool,
+}
+
+/// Read a session file for the dashboard file viewer (#3088).
+///
+/// Git-agnostic (works on non-git scratch sessions). A read is allowed when the
+/// canonical target is under a session project root (project_path + worktree
+/// paths) or is a path the agent touched this session, recovered from the ACP
+/// event log. Confinement and bounded reading live in the private
+/// `file_provenance` module.
+pub async fn session_file(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<SessionFileQuery>,
+) -> impl IntoResponse {
+    // Reads workspace file contents: the same code-inspection surface as the
+    // diff reads, and the Files pane is hidden in CityHall, so close it too.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
+    let ctx = match resolve_diff_repos(&state, &id).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let project_paths: Vec<std::path::PathBuf> = ctx
+        .repos
+        .iter()
+        .map(|r| std::path::PathBuf::from(&r.path))
+        .collect();
+    let store = state.acp_event_store.clone();
+    let session_id = id.clone();
+    let requested = query.path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        // Canonicalize project roots up front; a root that no longer resolves
+        // is dropped so a stale worktree can't break or widen confinement.
+        let roots: Vec<std::path::PathBuf> = project_paths
+            .iter()
+            .filter_map(|p| p.canonicalize().ok())
+            .collect();
+
+        // Provenance fallback: page the whole session log and collect the paths
+        // the agent touched. Deferred behind a closure so it runs only when the
+        // target is outside every project root; a workspace file (the common
+        // case) never pays for the replay.
+        // ponytail: per-request scan on the miss path; cache per session keyed
+        // on highest_seq if it shows up hot on long/active sessions.
+        let touched = || {
+            let mut events = Vec::new();
+            let mut since = 0u64;
+            loop {
+                let page = store.replay_page(&session_id, since, Some(1000));
+                let advance = page.last_scanned_seq;
+                events.extend(page.events);
+                match (page.has_more, advance) {
+                    (true, Some(seq)) => since = seq,
+                    _ => break,
+                }
+            }
+            super::file_provenance::collect_touched_paths(&events)
+        };
+
+        let confined = super::file_provenance::confine_path(
+            &roots,
+            touched,
+            std::path::Path::new(&requested),
+        )?;
+        let (content, is_binary, truncated) =
+            super::file_provenance::read_confined(&confined, MAX_CONTENTS_BYTES)?;
+        Ok::<_, (StatusCode, &'static str)>(SessionFileResponse {
+            content,
+            is_binary,
+            truncated,
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(value)) => (StatusCode::OK, Json(value)).into_response(),
+        Ok(Err((status, msg))) => (
+            status,
+            Json(serde_json::json!({"error": "file_read", "message": msg})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "session_file panicked: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
@@ -6503,6 +7344,39 @@ mod tests {
         }
     }
 
+    // CityHall create-time capability gate (#7): create_session rejects a
+    // non-ACP agent up front instead of downgrading to a hidden terminal view.
+    #[cfg(feature = "serve")]
+    mod cityhall_capability {
+        use super::*;
+        use crate::session::test_support::isolate_app_dir;
+        use serial_test::serial;
+
+        #[test]
+        fn builtin_agent_is_acp_capable() {
+            // Built-in ACP agents resolve via the registry without reading
+            // config, so the gate accepts them regardless of the project path.
+            assert!(agent_is_acp_capable(
+                "default",
+                std::path::Path::new("/nonexistent"),
+                "claude",
+                None,
+            ));
+        }
+
+        #[test]
+        #[serial]
+        fn unknown_tool_is_not_acp_capable() {
+            let _tmp = isolate_app_dir();
+            assert!(!agent_is_acp_capable(
+                "default",
+                std::path::Path::new("/nonexistent"),
+                "definitely-not-a-real-tool",
+                None,
+            ));
+        }
+    }
+
     // #2587: the artifact route serves only canonicalized files confined to
     // the session's artifact dir, sets nosniff, and never serves HTML inline.
     mod artifact_route {
@@ -6624,8 +7498,24 @@ mod tests {
     #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]
-    async fn force_smart_rename_preflight_honors_repo_local_override() {
+    async fn force_smart_rename_preflight_sees_command_override_but_not_from_a_repo() {
         use axum::body::to_bytes;
+
+        async fn preflight_message(repo: &std::path::Path) -> String {
+            let mut inst = Instance::new("Vikings", repo.to_str().unwrap());
+            inst.tool = "claude".to_string();
+            inst.source_profile = "default".to_string();
+            inst.view = crate::session::View::Structured;
+            let id = inst.id.clone();
+
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let resp = force_smart_rename(axum::extract::State(state), axum::extract::Path(id))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::CONFLICT);
+            let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+            String::from_utf8_lossy(&body).to_string()
+        }
 
         let tmp_home = tempfile::tempdir().expect("tempdir HOME");
         let repo = tempfile::tempdir().expect("tempdir repo");
@@ -6634,8 +7524,9 @@ mod tests {
             std::env::set_var("HOME", tmp_home.path());
             std::env::set_var("XDG_CONFIG_HOME", tmp_home.path().join(".config"));
         }
-        // Repo-local override of the session's own agent binary: the profile
-        // config is otherwise eligible, so only the repo-aware resolver sees it.
+
+        // A repo declaring the override changes nothing: command-bearing
+        // session fields are not repo-overridable (#3154).
         let cfg_dir = repo.path().join(".agent-of-empires");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         std::fs::write(
@@ -6643,24 +7534,25 @@ mod tests {
             "[session.agent_command_override]\nclaude = \"wrapper-3058\"\n",
         )
         .unwrap();
+        let msg = preflight_message(repo.path()).await;
+        assert!(
+            !msg.contains("command is overridden"),
+            "a repo must not be able to declare the agent command override; got: {msg}"
+        );
 
-        let mut inst = Instance::new("Vikings", repo.path().to_str().unwrap());
-        inst.tool = "claude".to_string();
-        inst.source_profile = "default".to_string();
-        inst.view = crate::session::View::Structured;
-        let id = inst.id.clone();
-
-        let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        let resp = force_smart_rename(axum::extract::State(state), axum::extract::Path(id))
-            .await
-            .into_response();
-
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
-        let msg = String::from_utf8_lossy(&body);
+        // The user's own override is still seen through the repo-aware
+        // resolution the preflight routes through (#3058).
+        let app_dir = isolated_app_dir(tmp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[session.agent_command_override]\nclaude = \"wrapper-3058\"\n",
+        )
+        .unwrap();
+        let msg = preflight_message(repo.path()).await;
         assert!(
             msg.contains("command is overridden"),
-            "preflight must see the repo-local override via repo-aware resolution; got: {msg}"
+            "preflight must see the user's override via repo-aware resolution; got: {msg}"
         );
     }
 
@@ -6690,13 +7582,192 @@ mod tests {
         let state = crate::server::test_support::build_test_app_state(vec![a, a2, b]);
 
         LIST_SESSIONS_RESOLVER_MISSES.store(0, Ordering::Relaxed);
-        let _envelope = list_sessions(axum::extract::State(state.clone())).await;
+        let _envelope = list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(ListSessionsQuery { state: None }),
+        )
+        .await;
         let misses = LIST_SESSIONS_RESOLVER_MISSES.load(Ordering::Relaxed);
 
         assert_eq!(
             misses, 2,
             "shared cache must resolve exactly once per unique (profile, project_path) across both overlays; got {misses}",
         );
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn list_sessions_state_filter() {
+        let mut live = Instance::new("live", "/tmp/scope-live");
+        live.id = "scope-live".to_string();
+        let mut trashed = Instance::new("trashed", "/tmp/scope-trashed");
+        trashed.id = "scope-trashed".to_string();
+        trashed.trash();
+        let mut archived = Instance::new("archived", "/tmp/scope-archived");
+        archived.id = "scope-archived".to_string();
+        archived.archived_at = Some(chrono::Utc::now());
+
+        let state = crate::server::test_support::build_test_app_state(vec![
+            live.clone(),
+            trashed.clone(),
+            archived.clone(),
+        ]);
+
+        let ids = |envelope: &SessionsEnvelope| -> Vec<String> {
+            envelope.sessions.iter().map(|s| s.id.clone()).collect()
+        };
+
+        let all = list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(ListSessionsQuery { state: None }),
+        )
+        .await;
+        assert_eq!(
+            ids(&all).len(),
+            3,
+            "no param stays unfiltered (back-compat)"
+        );
+
+        let live_only = list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(ListSessionsQuery {
+                state: Some(SessionScope::Live),
+            }),
+        )
+        .await;
+        assert_eq!(ids(&live_only), vec!["scope-live".to_string()]);
+
+        let trashed_only = list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(ListSessionsQuery {
+                state: Some(SessionScope::Trashed),
+            }),
+        )
+        .await;
+        assert_eq!(ids(&trashed_only), vec!["scope-trashed".to_string()]);
+
+        let explicit_all = list_sessions(
+            axum::extract::State(state),
+            axum::extract::Query(ListSessionsQuery {
+                state: Some(SessionScope::All),
+            }),
+        )
+        .await;
+        assert_eq!(ids(&explicit_all).len(), 3);
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn wait_until_left_starting_returns_immediately_if_already_left() {
+        let mut inst = Instance::new("already-running", "/tmp/wait-a");
+        inst.id = "wait-already-left".to_string();
+        inst.status = Status::Running;
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let started = std::time::Instant::now();
+        let result = wait_until_left_starting(
+            &state,
+            "wait-already-left",
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(result.map(|i| i.status), Some(Status::Running));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "must not wait when the instance already left Starting"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn wait_until_left_starting_resolves_on_broadcast() {
+        let mut inst = Instance::new("starting", "/tmp/wait-b");
+        inst.id = "wait-resolves".to_string();
+        inst.status = Status::Starting;
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let updater_state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            {
+                let mut instances = updater_state.instances.write().await;
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == "wait-resolves") {
+                    inst.status = Status::Waiting;
+                }
+            }
+            let _ = updater_state
+                .status_tx
+                .send(crate::server::push::StatusChange {
+                    instance_id: "wait-resolves".to_string(),
+                    instance_title: "starting".to_string(),
+                    old: Status::Starting,
+                    new: Status::Waiting,
+                    at: chrono::Utc::now(),
+                });
+        });
+
+        let started = std::time::Instant::now();
+        let result =
+            wait_until_left_starting(&state, "wait-resolves", std::time::Duration::from_secs(5))
+                .await;
+        assert_eq!(result.map(|i| i.status), Some(Status::Waiting));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "must resolve promptly off the broadcast, not sit out the full timeout"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn wait_until_left_starting_times_out_with_current_status() {
+        let mut inst = Instance::new("stuck", "/tmp/wait-c");
+        inst.id = "wait-timeout".to_string();
+        inst.status = Status::Starting;
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let result = wait_until_left_starting(
+            &state,
+            "wait-timeout",
+            std::time::Duration::from_millis(150),
+        )
+        .await;
+        assert_eq!(
+            result.map(|i| i.status),
+            Some(Status::Starting),
+            "timeout must still return the freshest known status, not lie about readiness"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn wait_until_left_starting_returns_none_if_instance_vanished() {
+        let state = crate::server::test_support::build_test_app_state(vec![]);
+        let result = wait_until_left_starting(
+            &state,
+            "never-existed",
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn find_by_idempotency_key_matches_trashed_but_not_missing() {
+        let mut with_key = Instance::new("has-key", "/tmp/idem-a");
+        with_key.id = "idem-has-key".to_string();
+        with_key.idempotency_key = Some("retry-token-1".to_string());
+        with_key.trash(); // soft-deleted; a retry must still find it.
+
+        let mut without_key = Instance::new("no-key", "/tmp/idem-b");
+        without_key.id = "idem-no-key".to_string();
+
+        let instances = vec![with_key, without_key];
+
+        let found = find_by_idempotency_key(&instances, "retry-token-1");
+        assert_eq!(found.map(|i| i.id.as_str()), Some("idem-has-key"));
+
+        assert!(find_by_idempotency_key(&instances, "never-seen").is_none());
     }
 
     #[test]
@@ -6984,6 +8055,7 @@ mod tests {
                 worktree_path: "/tmp/ws/repo-a".to_string(),
                 main_repo_path: "/tmp/src/repo-a".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             }],
             created_at: chrono::Utc::now(),
             cleanup_on_delete: true,
@@ -7821,10 +8893,20 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn session_tool_identity_uses_repo_aware_config_for_request_path() {
+    fn session_tool_identity_uses_repo_aware_config_but_not_repo_custom_agents() {
         let temp_home = tempfile::tempdir().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        let _app_dir = isolated_app_dir(temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(
+            app_dir.join("config.toml"),
+            r#"
+                [session.custom_agents]
+                my-agent = "ssh -t lenovo claude"
+            "#,
+        )
+        .unwrap();
+
         let project = tempfile::tempdir().unwrap();
         let repo_config_dir = project.path().join(".agent-of-empires");
         std::fs::create_dir_all(&repo_config_dir).unwrap();
@@ -7837,7 +8919,14 @@ mod tests {
         )
         .unwrap();
 
+        // The user's own custom agent resolves through the repo-aware path.
         assert!(validate_session_tool_identity(
+            "my-agent",
+            "default",
+            project.path()
+        ));
+        // A repo-defined one does not exist as far as AoE is concerned (#3154).
+        assert!(!validate_session_tool_identity(
             "repo-agent",
             "default",
             project.path()
@@ -8567,6 +9656,12 @@ pub async fn send_message(
     if state.read_only {
         return super::read_only_response();
     }
+    // Terminal keystroke injection: CityHall sessions are structured-view only
+    // (the composer drives the agent via the ACP prompt route), so close this
+    // explicitly rather than leaning on the downstream StructuredView error.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let Json(req) = match req {
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
@@ -9017,6 +10112,11 @@ pub async fn read_output(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<OutputQuery>,
 ) -> impl IntoResponse {
+    // Raw terminal pane content: CityHall hides the terminal UI + WS relay, so
+    // this read must be closed too or the pane is reachable by session id.
+    if let Some(resp) = super::cityhall_block(&state) {
+        return resp;
+    }
     let lines = (q.lines as usize).clamp(1, 2000);
     let want_ansi = match q.format.as_str() {
         "ansi" => true,

@@ -1599,58 +1599,74 @@ fn preassign_opencode_session_id_impl(project_path: &str) -> Result<String> {
     let _guard = ServeGuard(Some(child));
 
     let base = format!("http://127.0.0.1:{port}");
-    // acquire_session_id runs on a synchronous launch thread (the CLI process,
-    // a server `spawn_blocking` worker, or the TUI event loop), never inside a
-    // live async task, so a short-lived current-thread runtime is safe here.
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to build the preassign runtime")?;
-
-    rt.block_on(async {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
+    // `acquire_session_id` runs on a launch thread that may itself be async: on
+    // the CLI it runs under the `#[tokio::main]` entrypoint, i.e. *inside* a live
+    // Tokio runtime. Building a runtime and `block_on`-ing it on that same thread
+    // panics with "Cannot start a runtime from within a runtime". Run the
+    // short-lived current-thread runtime on a dedicated OS thread instead, which
+    // never carries an ambient runtime, so `block_on` is valid regardless of
+    // whether the caller (CLI, a server `spawn_blocking` worker, or the TUI event
+    // loop) is itself async. `thread::scope` lets the worker borrow
+    // `id`/`base`/`project_path` without `'static` clones and keeps the
+    // `opencode serve` `_guard` alive across the join.
+    let preassign = || -> Result<()> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
-            .context("failed to build the preassign HTTP client")?;
+            .context("failed to build the preassign runtime")?;
 
-        let deadline = Instant::now() + OPENCODE_PREASSIGN_DEADLINE;
-        loop {
-            if let Ok(resp) = client.get(format!("{base}/api/session")).send().await {
-                if resp.status().is_success() {
-                    break;
+        rt.block_on(async {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(2))
+                .build()
+                .context("failed to build the preassign HTTP client")?;
+
+            let deadline = Instant::now() + OPENCODE_PREASSIGN_DEADLINE;
+            loop {
+                if let Ok(resp) = client.get(format!("{base}/api/session")).send().await {
+                    if resp.status().is_success() {
+                        break;
+                    }
                 }
+                if Instant::now() >= deadline {
+                    anyhow::bail!("opencode serve did not become ready within the deadline");
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            if Instant::now() >= deadline {
-                anyhow::bail!("opencode serve did not become ready within the deadline");
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
 
-        let body = serde_json::json!({
-            "id": id,
-            "location": { "directory": project_path },
-        });
-        let resp = client
-            .post(format!("{base}/api/session"))
-            .json(&body)
-            .send()
-            .await
-            .context("opencode preassign POST /api/session failed")?;
-        if !resp.status().is_success() {
-            anyhow::bail!("opencode preassign POST returned {}", resp.status());
-        }
-        let created: serde_json::Value = resp
-            .json()
-            .await
-            .context("opencode preassign response was not JSON")?;
-        let created_id = created
-            .get("data")
-            .and_then(|d| d.get("id"))
-            .and_then(|v| v.as_str());
-        if created_id != Some(id.as_str()) {
-            anyhow::bail!("opencode assigned {created_id:?}, expected {id}");
-        }
-        Ok::<(), anyhow::Error>(())
+            let body = serde_json::json!({
+                "id": id,
+                "location": { "directory": project_path },
+            });
+            let resp = client
+                .post(format!("{base}/api/session"))
+                .json(&body)
+                .send()
+                .await
+                .context("opencode preassign POST /api/session failed")?;
+            if !resp.status().is_success() {
+                anyhow::bail!("opencode preassign POST returned {}", resp.status());
+            }
+            let created: serde_json::Value = resp
+                .json()
+                .await
+                .context("opencode preassign response was not JSON")?;
+            let created_id = created
+                .get("data")
+                .and_then(|d| d.get("id"))
+                .and_then(|v| v.as_str());
+            if created_id != Some(id.as_str()) {
+                anyhow::bail!("opencode assigned {created_id:?}, expected {id}");
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+    };
+
+    std::thread::scope(|scope| {
+        scope
+            .spawn(preassign)
+            .join()
+            .map_err(|_| anyhow::anyhow!("opencode preassign worker thread panicked"))?
     })?;
 
     Ok(id)
@@ -2428,9 +2444,7 @@ const KIMI_MTIME_FLOOR_SLACK_MS: f64 = 2000.0;
 fn kimi_session_dir_mtime_ms(session_dir: &str) -> u64 {
     std::fs::metadata(session_dir)
         .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
+        .map(crate::util::system_time_to_ms)
         .unwrap_or(0)
 }
 
@@ -3048,61 +3062,23 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_pi_project_path_basic() {
-        assert_eq!(
-            encode_pi_project_path("/home/user/project"),
-            "--home-user-project--"
-        );
-    }
-
-    #[test]
-    fn test_encode_pi_project_path_with_dashes() {
-        assert_eq!(
-            encode_pi_project_path("/home/user/my-project"),
-            "--home-user-my-project--"
-        );
-    }
-
-    #[test]
-    fn test_encode_pi_project_path_trailing_slash() {
-        assert_eq!(
-            encode_pi_project_path("/home/user/project/"),
-            "--home-user-project---"
-        );
-    }
-
-    #[test]
-    fn test_encode_pi_project_path_double_slash() {
-        assert_eq!(
-            encode_pi_project_path("/a//double/slash"),
-            "--a--double-slash--"
-        );
-    }
-
-    #[test]
-    fn test_encode_pi_project_path_spaces() {
-        assert_eq!(
-            encode_pi_project_path("/path/with spaces"),
-            "--path-with spaces--"
-        );
-    }
-
-    #[test]
-    fn test_encode_pi_project_path_windows_backslash() {
-        assert_eq!(
-            encode_pi_project_path("C:\\Users\\bob\\proj"),
-            "--C--Users-bob-proj--"
-        );
-    }
-
-    #[test]
-    fn test_encode_pi_project_path_colon() {
-        assert_eq!(encode_pi_project_path("C:/Users/bob"), "--C--Users-bob--");
-    }
-
-    #[test]
-    fn test_encode_pi_project_path_root() {
-        assert_eq!(encode_pi_project_path("/"), "----");
+    fn test_encode_pi_project_path() {
+        // Every path separator (both flavors) and `:` collapses to `-`, and the
+        // result is wrapped in `--`. Runs of separators are not coalesced, so a
+        // trailing or doubled slash shows up as an extra dash.
+        let cases = [
+            ("/home/user/project", "--home-user-project--"),
+            ("/home/user/my-project", "--home-user-my-project--"),
+            ("/home/user/project/", "--home-user-project---"),
+            ("/a//double/slash", "--a--double-slash--"),
+            ("/path/with spaces", "--path-with spaces--"),
+            ("C:\\Users\\bob\\proj", "--C--Users-bob-proj--"),
+            ("C:/Users/bob", "--C--Users-bob--"),
+            ("/", "----"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(encode_pi_project_path(input), expected, "{input:?}");
+        }
     }
 
     #[test]
@@ -4656,10 +4632,7 @@ mod tests {
         // session is eligible; with a future floor, neither is.
         let proj = tempfile::TempDir::new().unwrap();
         let proj_path = proj.path().to_str().unwrap().to_string();
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as f64;
+        let now_ms = crate::util::now_ms() as f64;
         let sessions = vec![
             KimiSession {
                 id: "session_fresh".to_string(),

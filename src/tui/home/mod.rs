@@ -35,7 +35,7 @@ use super::deletion_poller::DeletionPoller;
 #[cfg(feature = "serve")]
 use super::dialogs::ServeView;
 use super::dialogs::{
-    ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
+    AttachProjectDialog, ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
     GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog, InfoDialog, IntroDialog,
     NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
     ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RepoTrustDialog, RestartDialog,
@@ -526,6 +526,8 @@ pub struct HomeView {
     pub(super) profile_picker_dialog: Option<ProfilePickerDialog>,
     pub(super) group_picker_dialog: Option<GroupPickerDialog>,
     pub(super) sort_picker_dialog: Option<SortPickerDialog>,
+    /// Attach-a-project picker for the selected session (#3103).
+    pub(super) attach_project_dialog: Option<AttachProjectDialog>,
     pub(super) project_session_picker_dialog: Option<ProjectSessionPickerDialog>,
     pub(super) projects_dialog: Option<ProjectsDialog>,
     pub(super) plugin_manager_dialog: Option<crate::tui::dialogs::PluginManagerDialog>,
@@ -717,6 +719,13 @@ pub struct HomeView {
     pub(super) status_poller: StatusPoller,
     pub(super) pending_status_refresh: bool,
 
+    // Structured (ACP) rows: the tmux poller above bails on them, so their
+    // status comes from the daemon instead. See `daemon_status_poller`.
+    #[cfg(feature = "serve")]
+    pub(super) daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller,
+    #[cfg(feature = "serve")]
+    pub(super) pending_daemon_status_refresh: bool,
+
     // Performance: background deletion
     pub(super) deletion_poller: DeletionPoller,
 
@@ -734,6 +743,14 @@ pub struct HomeView {
     /// Suppresses the StatusPoller's missing-tmux Error transition until the
     /// worker reports back via `apply_restart_results`.
     pub(super) restart_in_flight: std::collections::HashSet<String>,
+
+    // Performance: background attach-a-project (#3103). `git worktree add`, an
+    // optional fetch and submodule init, the worker bounce and the container
+    // removal all shell out, so an inline attach froze the UI for its duration.
+    pub(super) attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller,
+    /// Sessions whose attach is in flight. One at a time per session: a second
+    /// attach would race the first one's worktree creation and its worker bounce.
+    pub(super) attach_project_in_flight: std::collections::HashSet<String>,
 
     /// Trashed sessions whose permanent-purge Purge claim (#2541) this TUI won
     /// before dispatching the teardown. Their delete finalize applies the #2534
@@ -2153,6 +2170,7 @@ impl HomeView {
             profile_picker_dialog: None,
             group_picker_dialog: None,
             sort_picker_dialog: None,
+            attach_project_dialog: None,
             project_session_picker_dialog: None,
             projects_dialog: None,
             plugin_manager_dialog: None,
@@ -2213,11 +2231,17 @@ impl HomeView {
             available_tools,
             status_poller: StatusPoller::new(),
             pending_status_refresh: false,
+            #[cfg(feature = "serve")]
+            daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller::new(),
+            #[cfg(feature = "serve")]
+            pending_daemon_status_refresh: false,
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
+            attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
+            attach_project_in_flight: std::collections::HashSet::new(),
             purge_claimed: std::collections::HashSet::new(),
             creation_poller: CreationPoller::new(),
             creation_cancelled: false,
@@ -2803,6 +2827,135 @@ impl HomeView {
                 true
             }
         }
+    }
+
+    /// Request the daemon's view of every structured row's status
+    /// (non-blocking). Skipped entirely when no structured session is
+    /// loaded, so a terminal-only home view never talks to the daemon.
+    #[cfg(feature = "serve")]
+    pub fn request_daemon_status_refresh(&mut self) {
+        if self.pending_daemon_status_refresh {
+            return;
+        }
+        if !self.instances.values().any(|i| i.is_structured()) {
+            return;
+        }
+        self.daemon_status_poller.request_refresh();
+        self.pending_daemon_status_refresh = true;
+    }
+
+    /// Whether a daemon-sourced status may be applied to `id`, mirroring the
+    /// exclusions [`Self::pollable_instances`] applies to the tmux producer.
+    /// A row mid-restart or mid-recovery-cascade has its post-cascade
+    /// `Instance` delivered by `apply_restart_results` /
+    /// `apply_recovery_updates`; letting the daemon's copy land during that
+    /// window races those transitions. Recovery already skips structured rows
+    /// (`recovery::is_recovery_candidate`), so in practice this is the restart
+    /// guard, but both are checked so the two producers stay symmetrical.
+    #[cfg(feature = "serve")]
+    fn daemon_status_applies_to(&self, id: &str) -> bool {
+        !self.recovery_in_flight.contains(id) && !self.restart_in_flight.contains(id)
+    }
+
+    /// Apply any pending daemon-sourced statuses. Returns true if the
+    /// caller should redraw.
+    #[cfg(feature = "serve")]
+    pub fn apply_daemon_status_updates(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
+        match self.daemon_status_poller.try_recv_updates() {
+            Ok(updates) => {
+                let applied = !updates.is_empty();
+                for update in updates {
+                    self.apply_daemon_status_update(update);
+                }
+                self.pending_daemon_status_refresh = false;
+                applied
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                // Same failure mode as the tmux poller: without a respawn the
+                // in-flight flag stays set and every structured row's status
+                // freezes for the rest of the process.
+                tracing::error!(
+                    target: "tui.home",
+                    "daemon status poller worker gone; respawning a fresh poller",
+                );
+                self.daemon_status_poller = super::daemon_status_poller::DaemonStatusPoller::new();
+                self.pending_daemon_status_refresh = false;
+                true
+            }
+        }
+    }
+
+    /// Fold one daemon-sourced structured status into the shared apply path,
+    /// so sounds, status hooks, unread marking, and the `sessions.json`
+    /// patch all behave exactly as they do for a tmux-derived transition.
+    ///
+    /// The row is re-checked against `is_structured()` here rather than
+    /// trusted from the wire: the daemon's `view` and the local row's could
+    /// disagree for a session mid-conversion, and the tmux poller owns
+    /// terminal rows. Dropping the mismatch keeps one producer per row.
+    #[cfg(feature = "serve")]
+    pub(super) fn apply_daemon_status_update(
+        &mut self,
+        update: super::daemon_status_poller::DaemonStatusUpdate,
+    ) {
+        use crate::session::Status;
+        use crate::tui::status_poller::IdleIntent;
+
+        if !self
+            .get_instance(&update.id)
+            .is_some_and(|i| i.is_structured())
+        {
+            return;
+        }
+        if !self.daemon_status_applies_to(&update.id) {
+            return;
+        }
+        // Lift a locally-`Stopped` row before the shared apply path sees it.
+        // `apply_status_update`'s guard drops every update whose row is
+        // `Stopped`, which is right for tmux rows (nothing but an explicit
+        // start should wake one) but wrong here: stopping a structured session
+        // persists `Stopped`, and reopening it in the structured view does not
+        // clear that (`open_structured_view` only mounts the view), so without
+        // this the pill stays grey through the whole next turn, which is the
+        // bug this producer exists to fix.
+        //
+        // The daemon has already applied its own, stricter `Stopped` guard
+        // (`apply_status_intent`: only a `HealError` from `AcpSessionAssigned`
+        // or `RateLimitAutoResumed` lifts `Stopped`, and both are emitted only
+        // when a fresh worker attaches). So a non-`Stopped` reading from the
+        // daemon provably means a new worker epoch, never a trailing
+        // post-stop event. Reproducing the daemon's own Stopped -> Idle step
+        // here keeps the two ladders identical.
+        if update.status != Status::Stopped
+            && self.get_instance(&update.id).map(|i| i.status) == Some(Status::Stopped)
+        {
+            self.mutate_instance(&update.id, |inst| inst.status = Status::Idle);
+        }
+        self.apply_status_update(
+            StatusUpdate {
+                id: update.id,
+                status: update.status,
+                last_error: update.last_error,
+                // Mirror the daemon's own value rather than deriving one, so
+                // the TUI's idle fade matches the web dashboard's for the
+                // same session instead of restarting on the first local
+                // observation.
+                idle_entered_at: match update.idle_entered_at {
+                    Some(ts) => IdleIntent::Set(ts),
+                    None => IdleIntent::Clear,
+                },
+                last_accessed_at: update.last_accessed_at,
+                // Structured rows have no pane, so the Attention sort's
+                // dead-pane tier never applies to them.
+                pane_dead: false,
+                live_status_baseline: Some(update.status),
+            },
+            true,
+            true,
+        );
     }
 
     /// Apply a single status update from the poller. Extracted from the
@@ -3686,7 +3839,11 @@ impl HomeView {
             .instances
             .values()
             .filter(|inst| {
-                let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+                let session_name = crate::tmux::resolve_agent_session_name_in(
+                    &pane_meta,
+                    &inst.id,
+                    &crate::tmux::Session::generate_name(&inst.id, &inst.title),
+                );
                 let has_live_tmux = pane_meta
                     .get(&session_name)
                     .map(|m| !m.pane_dead)
@@ -4336,6 +4493,7 @@ impl HomeView {
             || self.profile_picker_dialog.is_some()
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
+            || self.attach_project_dialog.is_some()
             || self.plugin_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
@@ -4401,6 +4559,7 @@ impl HomeView {
             || self.profile_picker_dialog.is_some()
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
+            || self.attach_project_dialog.is_some()
             || self.plugin_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
@@ -4986,6 +5145,192 @@ impl HomeView {
         self.sort_picker_dialog = Some(SortPickerDialog::new(self.sort_order));
     }
 
+    /// Open the attach-a-project picker for the selected session (#3103).
+    ///
+    /// Offers registered projects minus the ones the session already has, which
+    /// is the same rejection `session::attach_project` would apply anyway;
+    /// filtering here means the user is not offered a choice that can only fail.
+    pub(super) fn open_add_project_for_selected(&mut self) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        // Same lifecycle gate every sibling mutator applies. A row mid-create or
+        // mid-delete must not gain a worktree, and a trashed or archived row's
+        // agent is deliberately stopped, so attaching there would create a
+        // worktree nothing is going to read. `for_session` offers the row
+        // unconditionally, so the refusal has to live here.
+        let shelved = self.get_instance(&id).and_then(|inst| {
+            if inst.scratch {
+                // No repo of its own to widen: a scratch session's cwd is a
+                // throwaway directory under the app dir. `attach_project::plan`
+                // refuses it too; catching it here means the picker never opens
+                // on a session where every choice would fail.
+                Some((
+                    "Scratch Session",
+                    "This is a scratch session, which has no repo to attach to. Create a session on the repo instead."
+                        .to_string(),
+                ))
+            } else if matches!(
+                inst.status,
+                crate::session::Status::Deleting | crate::session::Status::Creating
+            ) {
+                Some((
+                    "Session Busy",
+                    "This session is still being created or is being deleted; wait for it to settle before attaching a project.".to_string(),
+                ))
+            } else if inst.status.blocks_worktree_edit() {
+                // Attaching bounces the worker, which mid-turn would drop the
+                // agent's reply, and `Waiting` is a turn in flight too: the agent
+                // has paused on a question, so a SIGTERM here throws away a
+                // pending approval. The daemon endpoint refuses on the
+                // authoritative event-log probe (`has_in_flight_turn`); the TUI
+                // has no handle on that store, so it reuses the status set
+                // `blocks_worktree_edit` already encodes for exactly this reason
+                // rather than keeping its own narrower copy.
+                Some((
+                    "Agent Working",
+                    "This session's agent is mid-turn and attaching restarts it. Wait for the turn to finish, or stop the session first."
+                        .to_string(),
+                ))
+            } else if inst.is_trashed() {
+                Some((
+                    "Session in Trash",
+                    "This session is in the trash. Restore it before attaching a project."
+                        .to_string(),
+                ))
+            } else if inst.is_archived() {
+                Some((
+                    "Session Archived",
+                    "This session is archived and its agent stays stopped. Unarchive it before attaching a project."
+                        .to_string(),
+                ))
+            } else {
+                None
+            }
+        });
+        if let Some((dialog_title, body)) = shelved {
+            self.info_dialog = Some(InfoDialog::new(dialog_title, &body));
+            return;
+        }
+
+        let Some((title, taken, profile)) = self.get_instance(&id).map(|inst| {
+            let mut taken: Vec<String> = inst
+                .all_repos()
+                .iter()
+                .map(|r| r.main_repo_path.clone())
+                .collect();
+            if let Some(wt) = inst.worktree_info.as_ref() {
+                taken.push(wt.main_repo_path.clone());
+            }
+            taken.push(inst.project_path.clone());
+            (
+                inst.title.clone(),
+                taken
+                    .iter()
+                    .map(|p| crate::session::projects::canonical_key(p))
+                    .collect::<Vec<_>>(),
+                // The session's own profile, not the view's filter: a session
+                // belongs to one profile and its registry is that profile's.
+                inst.source_profile.clone(),
+            )
+        }) else {
+            return;
+        };
+
+        let options: Vec<crate::session::Project> = crate::session::projects::load_merged(&profile)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| !taken.contains(&crate::session::projects::canonical_key(&p.path)))
+            .collect();
+
+        self.attach_project_dialog = Some(AttachProjectDialog::new(id, title, options));
+    }
+
+    /// Dispatch the attach for a picked project and say that it started.
+    ///
+    /// The work runs on `attach_project_poller`, so this returns immediately and
+    /// the outcome replaces this dialog in `apply_attach_project_results`. A
+    /// refusal that could be decided synchronously is reported as such.
+    pub(super) fn finish_add_project(&mut self, id: &str, project: &crate::session::Project) {
+        match self.add_project_to_session(id, std::path::Path::new(&project.path)) {
+            Ok(()) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Attaching Project",
+                    &format!(
+                        "Attaching '{}'. Creating the worktree can take a moment; this dialog \
+                         updates when it finishes.",
+                        project.name
+                    ),
+                ));
+            }
+            Err(e) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Could Not Attach Project",
+                    &format!("{e:#}"),
+                ));
+            }
+        }
+    }
+
+    /// Drain finished attaches, reload from disk and report each outcome.
+    ///
+    /// Returns true when anything landed, so the caller repaints. Both outcomes
+    /// get a dialog rather than a transient toast: a success has consequences
+    /// worth stating (the agent is restarting, or will only see the repo on next
+    /// start), and a failure is usually the branch-already-exists refusal, which
+    /// the user needs to read to know the CLI flag exists.
+    pub fn apply_attach_project_results(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
+        let mut touched = false;
+        loop {
+            match self.attach_project_poller.try_recv_result() {
+                Ok(result) => {
+                    self.attach_project_in_flight.remove(&result.session_id);
+                    touched = true;
+                    match result.outcome {
+                        Ok(message) => {
+                            // The worker persisted through `Storage`, so the
+                            // in-memory list is stale until this reload. The disk
+                            // watcher would get here on its own eventually; doing
+                            // it now means the new repo is on the row by the time
+                            // the success dialog is read.
+                            if let Err(e) = self.reload() {
+                                tracing::warn!(
+                                    target: "session.attach",
+                                    id = %result.session_id,
+                                    "attach landed but the reload failed: {e:#}"
+                                );
+                            }
+                            self.info_dialog = Some(InfoDialog::new("Project Attached", &message));
+                        }
+                        Err(message) => {
+                            self.info_dialog =
+                                Some(InfoDialog::new("Could Not Attach Project", &message));
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The worker thread is gone (a panic in the attach). Clearing
+                    // the markers matters more than the lost result: otherwise
+                    // every session it held stays permanently unattachable.
+                    if !self.attach_project_in_flight.is_empty() {
+                        tracing::error!(
+                            target: "session.attach",
+                            pending = self.attach_project_in_flight.len(),
+                            "attach poller thread is gone; clearing in-flight markers"
+                        );
+                        self.attach_project_in_flight.clear();
+                        touched = true;
+                    }
+                    break;
+                }
+            }
+        }
+        touched
+    }
+
     pub fn set_instance_status(&mut self, id: &str, status: crate::session::Status) {
         let old_status = self.get_instance(id).map(|inst| inst.status);
         self.mutate_instance(id, |inst| inst.status = status);
@@ -5119,10 +5464,10 @@ impl HomeView {
                 }
             }
             live_send::LiveSendTarget::Terminal => crate::tmux::Session::from_name(
-                &crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title),
+                &crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title),
             ),
             live_send::LiveSendTarget::ContainerTerminal => crate::tmux::Session::from_name(
-                &crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title),
+                &crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title),
             ),
             live_send::LiveSendTarget::Tool(name) => crate::tmux::Session::from_name(
                 crate::tmux::ToolSession::new(&inst.id, &inst.title, name).session_name(),
@@ -5284,10 +5629,10 @@ impl HomeView {
         let tmux_name = match &self.pending_live_send_target {
             live_send::LiveSendTarget::Agent => return self.agent_pane_is_warm(session_id),
             live_send::LiveSendTarget::Terminal => {
-                crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::ContainerTerminal => {
-                crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::Tool(name) => {
                 crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
@@ -5438,10 +5783,10 @@ impl HomeView {
                 }
             }
             live_send::LiveSendTarget::Terminal => {
-                crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::ContainerTerminal => {
-                crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+                crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
             }
             live_send::LiveSendTarget::Tool(name) => {
                 crate::tmux::ToolSession::new(&inst.id, &inst.title, name)

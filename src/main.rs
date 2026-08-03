@@ -21,6 +21,25 @@ fn is_serve_command(_cli: &Cli) -> bool {
     false
 }
 
+/// Bridge the serve `--cityhall` flag into the `AOE_CITYHALL_MODE` env var at
+/// the early, single-threaded point in `main` (before the tokio worker pool),
+/// so downstream readers stay env-driven without an in-runtime `set_var`. #7.
+#[cfg(feature = "serve")]
+fn seed_cityhall_env(cli: &Cli) {
+    if let Some(Commands::Serve(args)) = &cli.command {
+        if args.cityhall {
+            // SAFETY: single-threaded here, same invariant as the
+            // AOE_DAEMON_URL seed above (no worker threads spawned yet).
+            unsafe {
+                std::env::set_var("AOE_CITYHALL_MODE", "1");
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "serve"))]
+fn seed_cityhall_env(_cli: &Cli) {}
+
 /// Did the parent `aoe serve --daemon` spawn this process as the detached
 /// child? Set by `start_daemon()` via the hidden `--daemon-child` flag.
 /// Drives sink resolution: child's stdout/stderr are redirected to the
@@ -138,6 +157,13 @@ async fn main() -> Result<()> {
             std::env::set_var("AOE_DAEMON_URL", url);
         }
     }
+
+    // Seed CityHall mode from the serve `--cityhall` flag here, at the same
+    // early single-threaded point, so `AOE_CITYHALL_MODE` is set before the
+    // tokio worker pool and every later reader (AppState, profile_config, the
+    // serve banner) sees it without an in-runtime `set_var`. The flag and the
+    // env var are equivalent; this bridges the flag into the env var path. #7.
+    seed_cityhall_env(&cli);
 
     // Detect drift between release-build state and dev-build state BEFORE
     // anything below calls `get_app_dir()` (which would auto-create the dev
@@ -268,9 +294,53 @@ async fn main() -> Result<()> {
         tracing::info!(target: "log.runtime", "Debug logging at {} to {}", lvl.as_str(), path.display());
     }
 
+    // Route a fatal from the dispatch through the tracing sink `aoe logs`
+    // reads, so a failure after logging init lands in `[logging].file_path`
+    // instead of only the process's raw stderr (issue #2896). Both surfaces
+    // use `{e:#}` (anyhow's inline cause chain): it joins the causes with `: `
+    // and omits the backtrace, so the formatter adds no newlines of its own,
+    // unlike `{e:?}` whose multi-line `Caused by:` block and `RUST_BACKTRACE`
+    // dump would fragment a record across the line-oriented sink. The
+    // `eprintln!` is the interactive fallback: a one-shot CLI runs without a
+    // subscriber, so the tracing line is dropped and stderr is all the user
+    // sees. It is skipped for the detached `--daemon-child`, whose stderr is
+    // already redirected into the same log file by `cli::serve`, so printing
+    // would duplicate the tracing line. Errors before logging init bypass the
+    // sink: clap parse and the serve-availability check exit through clap,
+    // while the pre-clap `__vt-pipe` / `__smart-rename` helpers and the
+    // plugin-command dispatch return before it. That pre-init window is a
+    // known limitation.
+    if let Err(e) = run(
+        cli,
+        is_daemon_child,
+        debug_namespace_drift,
+        debug_log_warning,
+    )
+    .await
+    {
+        tracing::error!(target: "log.runtime", "fatal: {e:#}");
+        if !is_daemon_child {
+            eprintln!("Error: {e:#}");
+        }
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Dispatch every command that runs after logging init. Split out of `main`
+/// so one wrapper can route any returned `Err` through the tracing sink before
+/// the process exits. This covers both the app-data-free early-return arms and
+/// the final `match`, so no startup bail can bypass the sink.
+async fn run(
+    cli: Cli,
+    is_daemon_child: bool,
+    debug_namespace_drift: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    debug_log_warning: Option<String>,
+) -> Result<()> {
     // CLI invocations get the dev-namespace drift warning on stderr right
     // away. TUI mode handles it via the existing startup-warning popup
-    // pipeline below — we don't print here for TUI because ratatui's
+    // pipeline below; we don't print here for TUI because ratatui's
     // alt-screen would clobber the message.
     if cli.command.is_some() {
         if let Some((release, dev)) = debug_namespace_drift.as_ref() {

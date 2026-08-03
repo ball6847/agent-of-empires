@@ -14,6 +14,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -107,6 +108,11 @@ pub enum AcpError {
     /// answer and resubmit (rather than the question aborting). See #2100.
     #[error("submitted answer is invalid: {0}")]
     InvalidAnswer(String),
+    /// A driven conversation reset (`session/new` on the live worker for
+    /// a clear command with no native adapter reset, #2979) failed; the
+    /// conversation keeps its prior context.
+    #[error("conversation reset failed: {0}")]
+    ResetFailed(String),
 }
 
 /// Boxed payload for `AcpError::IncompatibleAgent`. Carries the
@@ -175,16 +181,16 @@ impl AcpError {
 /// surface the same signal differently; the catch-all message regex in
 /// `classify_rate_limit_from_message` is the defensive fallback.
 ///
-/// Reset time is recovered, in priority order: `data.resets_at`
-/// (RFC3339) if the adapter ever supplies it; else `captured_resets_at`
-/// (the authoritative unix epoch the adapter forwards out-of-band on a
-/// `usage_update`'s `_meta._claude/rateLimit.resetsAt`, threaded in by
-/// the caller from `last_rate_limit_resets_at`) when it is still in the
-/// future; else `now + 1h`. Current claude-agent-acp puts NO reset in
-/// the error, only a locale string in the message text ("resets 12:10pm
-/// (Europe/Paris)"), so without the captured epoch the fallback would
-/// always be the wrong `now + 1h` (#3028). The message is preserved
-/// verbatim in `RateLimitInfo.status` so the UI can surface the text.
+/// `captured_resets_at` is the only source of a reset time: the epoch
+/// the adapter forwarded out-of-band for a window it reported as
+/// `rejected` (see `rate_limit_rejection_from_meta`). The error payload
+/// itself carries only `errorKind`, and its message text holds nothing
+/// machine-readable, just a locale rendering ("resets 12:10pm
+/// (Europe/Paris)"). When no rejected epoch was ever observed the reset
+/// is genuinely unknown and stays `None`; an earlier `now + 1h` guess
+/// presented a fabricated time as fact (#3152). The message is preserved
+/// verbatim in `RateLimitInfo.status` so the UI can surface the text
+/// instead.
 pub(crate) fn classify_rate_limit_error(
     err: &agent_client_protocol::Error,
     captured_resets_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -194,17 +200,9 @@ pub(crate) fn classify_rate_limit_error(
     if kind != "rate_limit" {
         return None;
     }
-    let resets_at = data
-        .get("resets_at")
-        .or_else(|| data.get("resetsAt"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .or_else(|| captured_resets_at.filter(|dt| *dt > chrono::Utc::now()))
-        .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(1));
     Some(RateLimitInfo {
         status: err.message.clone(),
-        resets_at,
+        resets_at: captured_resets_at,
         kind: kind.to_string(),
     })
 }
@@ -225,52 +223,88 @@ pub(crate) fn classify_rate_limit_from_message(
     {
         return None;
     }
-    let resets_at = captured_resets_at
-        .filter(|dt| *dt > chrono::Utc::now())
-        .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(1));
     Some(RateLimitInfo {
         status: message.to_string(),
-        resets_at,
+        resets_at: captured_resets_at,
         kind: "rate_limit".to_string(),
     })
 }
 
-/// Extract the rate-limit reset epoch (unix SECONDS) from a
-/// `usage_update`'s `_meta`. claude-agent-acp forwards the SDK's
-/// `SDKRateLimitInfo` under `_meta["_claude/rateLimit"]`, whose
-/// `resetsAt` is the authoritative window reset (the error's message
-/// text is only a locale rendering of this same value). Guards against a
-/// millisecond-scale value (the JS SDK ecosystem conflates seconds and
-/// ms) so a stray ms epoch cannot resolve to the year 5138+. See #3028.
-fn rate_limit_resets_at_secs_from_meta(
+/// One observation of the SDK's rate-limit state, as forwarded by
+/// claude-agent-acp under a `usage_update`'s
+/// `_meta["_claude/rateLimit"]` (an `SDKRateLimitInfo`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RateLimitRejection {
+    /// `rateLimitType` ("five_hour", "seven_day", ...), or empty when the
+    /// adapter omitted it. Used as the per-window map key so one window's
+    /// reset cannot overwrite another's.
+    window: String,
+    /// `resetsAt`, unix SECONDS.
+    resets_at_secs: i64,
+}
+
+/// Extract a rate-limit *rejection* from a `usage_update`'s `_meta`.
+///
+/// Only `status == "rejected"` observations are returned. A warning
+/// (`allowed_warning`) carries a real epoch too, but nothing ties it to
+/// whichever window later rejects the prompt: the adapter reduces the
+/// prompt error to `{ errorKind: "rate_limit" }`, so a retained warning
+/// epoch can only be guessed at. Guessing is what produced "come back
+/// Thursday" for a five-hour limit, so warnings are logged at the call
+/// site and dropped here (#3152).
+///
+/// Guards against a millisecond-scale value (the JS SDK ecosystem
+/// conflates seconds and ms) so a stray ms epoch cannot resolve to the
+/// year 5138+. See #3028.
+fn rate_limit_rejection_from_meta(
     meta: &Option<agent_client_protocol::schema::v1::Meta>,
-) -> Option<i64> {
-    let v = meta.as_ref()?.get("_claude/rateLimit")?.get("resetsAt")?;
+) -> Option<RateLimitRejection> {
+    let info = meta.as_ref()?.get("_claude/rateLimit")?;
+    if info.get("status").and_then(|v| v.as_str())? != "rejected" {
+        return None;
+    }
+    let v = info.get("resetsAt")?;
     let raw = v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))?;
     if raw <= 0 {
         return None;
     }
     // Anthropic reports unix seconds; anything past ~year 5138 in seconds
     // is really milliseconds.
-    Some(if raw > 100_000_000_000 {
+    let resets_at_secs = if raw > 100_000_000_000 {
         raw / 1000
     } else {
         raw
+    };
+    Some(RateLimitRejection {
+        window: info
+            .get("rateLimitType")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        resets_at_secs,
     })
 }
 
-/// Read the captured rate-limit reset epoch (unix seconds) from the shared
-/// atomic and convert to a UTC datetime; `None` when unset (0) or not
-/// representable. The classify functions additionally gate on "in the
-/// future", so a stale-but-representable value is filtered there. #3028.
+/// Pick the reset time to report from the per-window rejection captures.
+///
+/// The latest reset still ahead of `now` wins: every window that rejected
+/// has to clear before the session can run again, so the last one to
+/// reset is when the user can actually resume. In practice exactly one
+/// window is present and the choice is moot. Entries whose reset has
+/// already passed belong to a window that has since rolled over and are
+/// ignored. `None` means no rejection epoch was ever observed, which the
+/// callers surface as an unknown reset rather than a guess (#3152).
 fn captured_rate_limit_resets_at(
-    atomic: &std::sync::atomic::AtomicI64,
+    captures: &std::sync::Mutex<HashMap<String, i64>>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    let secs = atomic.load(std::sync::atomic::Ordering::Relaxed);
-    if secs <= 0 {
-        return None;
-    }
-    chrono::DateTime::from_timestamp(secs, 0)
+    captures
+        .lock()
+        .expect("rate-limit capture mutex poisoned")
+        .values()
+        .filter_map(|secs| chrono::DateTime::from_timestamp(*secs, 0))
+        .filter(|dt| *dt > now)
+        .max()
 }
 
 /// Experimental `session/delete` ACP request. Adapters advertising
@@ -327,6 +361,45 @@ const ACP_DELETE_ERROR_MSG_MAX: usize = 256;
 /// `AcpConfig` field on purpose: this is best-effort experimental
 /// cleanup with no operator-visible failure mode.
 const ACP_SESSION_DELETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Hard cap on a driven conversation reset's `session/new` round-trip
+/// (#2979). A fresh session on a live, already-initialized adapter
+/// normally answers in well under a second; the timeout keeps a wedged
+/// adapter from stalling the prompt path that requested the reset.
+const SESSION_RESET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Inner deadline for the connection task's complete reset RPC sequence.
+/// Kept below `SESSION_RESET_TIMEOUT` so the task can report the specific
+/// failure before the caller's outer guard expires, then resume draining
+/// commands instead of remaining parked on a wedged adapter.
+const SESSION_RESET_IN_TASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(28);
+
+#[derive(Debug)]
+enum ResetRequestError {
+    Acp(agent_client_protocol::Error),
+    TimedOut,
+}
+
+async fn await_reset_request<T, F, Fut>(
+    deadline: tokio::time::Instant,
+    request: F,
+) -> Result<T, ResetRequestError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T, agent_client_protocol::Error>>,
+{
+    // `send_request` enqueues the stateful RPC synchronously. Keep it
+    // lazy so a command whose caller-created deadline expired in the
+    // queue cannot send a late session/new or config mutation at all.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(ResetRequestError::TimedOut);
+    }
+    match tokio::time::timeout_at(deadline, request()).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => Err(ResetRequestError::Acp(error)),
+        Err(_) => Err(ResetRequestError::TimedOut),
+    }
+}
 
 /// Configuration for spawning an ACP agent.
 #[derive(Debug, Clone)]
@@ -437,7 +510,38 @@ enum ClientCmd {
         acp_session_id: String,
         respond_to: oneshot::Sender<DeleteSessionOutcome>,
     },
+    /// Drive a real conversation reset: issue a fresh `session/new` on
+    /// the live connection, swap the task's ACP session id to the new
+    /// one, and emit `SessionCleared` + `SessionContextReset` +
+    /// `AcpSessionAssigned` + a terminal `Stopped` so bookkeeping and
+    /// the UI follow. Issued by the supervisor when a clear command hits
+    /// a profile whose adapter cannot give AoE a durable post-reset id
+    /// (codex `/new` has no native reset; claude `/clear` has one but
+    /// withholds the new conversation id). `text`
+    /// carries the user's original clear invocation, used only by the
+    /// mid-turn refusal's `PromptRejected` so the retry pill shows what
+    /// was typed. See #2979.
+    ResetSession {
+        text: String,
+        /// Absolute deadline created by the caller. Starting it before the
+        /// command is queued prevents a delayed command from resetting the
+        /// session after the caller has already timed out.
+        deadline: tokio::time::Instant,
+        respond_to: oneshot::Sender<ResetSessionOutcome>,
+    },
     Shutdown,
+}
+
+/// Outcome of a driven conversation reset (`ClientCmd::ResetSession`).
+#[derive(Debug)]
+pub enum ResetSessionOutcome {
+    /// `session/new` succeeded and the connection task swapped its ACP
+    /// session id; carries the fresh id for logging.
+    Reset { new_acp_session_id: String },
+    /// The reset did not happen: `session/new` failed, timed out, a turn
+    /// was in flight, or a stale runner replayed the old session from its
+    /// handshake cache. The conversation keeps its context.
+    Failed { message: String },
 }
 
 /// How the connection task should handle the ACP handshake against the
@@ -1312,6 +1416,36 @@ fn between_prompt_signal_update(
     update
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BetweenPromptWorkState {
+    tool_calls: bool,
+    background_agents: bool,
+}
+
+impl BetweenPromptWorkState {
+    fn is_busy(self) -> bool {
+        self.tool_calls || self.background_agents
+    }
+}
+
+fn between_prompt_work_state(
+    tools: &std::sync::Mutex<std::collections::HashMap<String, bool>>,
+    background_agents: &std::sync::Mutex<std::collections::HashSet<String>>,
+) -> BetweenPromptWorkState {
+    let tool_calls = !tools
+        .lock()
+        .expect("between-prompt tools mutex poisoned")
+        .is_empty();
+    let background_agents = !background_agents
+        .lock()
+        .expect("between-prompt bg-agents mutex poisoned")
+        .is_empty();
+    BetweenPromptWorkState {
+        tool_calls,
+        background_agents,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn between_prompt_should_fire(
     active: bool,
@@ -1373,6 +1507,75 @@ fn between_prompt_stop_reason(adopted: bool, cost_seen: bool) -> &'static str {
         (false, _) => "agent_idle",
         (true, true) => "prompt_complete",
         (true, false) => "reattach_idle",
+    }
+}
+
+/// Per-turn claim on "who publishes this turn's terminal `Stopped`", shared by
+/// every path that can end one: the runner control reader's waiterless
+/// completion, the resume-idle watchdog, the between-prompt watchdog, and the
+/// cancel / force-stop desync recovery.
+///
+/// It replaces a single one-shot `AtomicBool`. That bool was claimed at most
+/// once per CONNECTION, so once any path had used it, a later turn on the same
+/// connection could not claim it: the between-prompt watchdog would reset its
+/// state, compute `claimed == false`, and skip the emit, leaving the session
+/// rendering Running with no terminal event. Reachable today by reattaching to
+/// an in-flight turn (the reader claims the guard for the adopted turn) and
+/// then letting the agent resume itself once more.
+///
+/// Keyed by turn instead: `begin_turn` marks the start of a turn, and a claim
+/// succeeds once per turn. An epoch rather than a reset so a claim can never
+/// clear the state of a NEWER turn, which is the race a plain "release the
+/// guard when done" would reintroduce. See #3190 and PR #3192 review.
+pub(crate) struct TerminalClaim {
+    /// Incremented for each turn that begins on this connection.
+    epoch: AtomicU64,
+    /// Epoch whose terminal has already been published. `0` means none, and
+    /// `epoch` starts at 1, so the first turn is claimable.
+    claimed_for: AtomicU64,
+}
+
+impl TerminalClaim {
+    pub(crate) fn new() -> Self {
+        Self {
+            epoch: AtomicU64::new(1),
+            claimed_for: AtomicU64::new(0),
+        }
+    }
+
+    /// A turn is starting; its terminal is unclaimed.
+    fn begin_turn(&self) {
+        self.epoch.fetch_add(1, AtomicOrdering::AcqRel);
+    }
+
+    /// Take ownership of the current turn's terminal event. `false` when some
+    /// other path already published it for this same turn, in which case the
+    /// caller must not emit.
+    fn claim(&self) -> bool {
+        let epoch = self.epoch.load(AtomicOrdering::Acquire);
+        loop {
+            let claimed = self.claimed_for.load(AtomicOrdering::Acquire);
+            if claimed == epoch {
+                return false;
+            }
+            if self
+                .claimed_for
+                .compare_exchange(
+                    claimed,
+                    epoch,
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// Whether the current turn's terminal has already been published.
+    fn claimed(&self) -> bool {
+        self.claimed_for.load(AtomicOrdering::Acquire) == self.epoch.load(AtomicOrdering::Acquire)
     }
 }
 
@@ -2025,6 +2228,94 @@ impl AcpClient {
         (client, event_tx, saw_delete)
     }
 
+    /// Like `fake_for_test`, but wires a live `cmd_tx` whose consumer
+    /// records the name of every command received (in order) and answers
+    /// the request/response-shaped ones so callers don't park on their
+    /// oneshot: `ResetSession` gets a successful `Reset` outcome carrying
+    /// `"fresh-id"`, `DeleteSession` an `UnsupportedMethod`. Used to
+    /// assert supervisor-level command routing (#2979).
+    #[cfg(test)]
+    pub fn fake_for_test_cmd_recording(
+        session_id: AcpSessionId,
+    ) -> (
+        Self,
+        mpsc::Sender<Event>,
+        std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    ) {
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCmd>(16);
+        let cmds = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cmds_task = cmds.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                let name = match cmd {
+                    ClientCmd::Prompt(_) => "prompt",
+                    ClientCmd::Cancel => "cancel",
+                    ClientCmd::ForceStop => "force_stop",
+                    ClientCmd::SetMode(_) => "set_mode",
+                    ClientCmd::SetConfigOption { .. } => "set_config_option",
+                    ClientCmd::DeleteSession { respond_to, .. } => {
+                        let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
+                        "delete_session"
+                    }
+                    ClientCmd::ResetSession { respond_to, .. } => {
+                        let _ = respond_to.send(ResetSessionOutcome::Reset {
+                            new_acp_session_id: "fresh-id".into(),
+                        });
+                        "reset_session"
+                    }
+                    ClientCmd::Shutdown => "shutdown",
+                };
+                cmds_task.lock().expect("cmd record mutex").push(name);
+            }
+        });
+        let client = Self {
+            session_id,
+            inbound: Some(event_rx),
+            cmd_tx: Some(cmd_tx),
+            pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            _child: None,
+        };
+        (client, event_tx, cmds)
+    }
+
+    /// Like `fake_for_test_cmd_recording`, but answers a driven reset
+    /// with a deterministic failure. Used by supervisor tests to assert
+    /// that a busy or otherwise rejected reset never publishes the
+    /// successful `SessionCleared` boundary.
+    #[cfg(test)]
+    pub fn fake_for_test_reset_failure(
+        session_id: AcpSessionId,
+        message: impl Into<String>,
+    ) -> (Self, mpsc::Sender<Event>) {
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientCmd>(16);
+        let message = message.into();
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    ClientCmd::ResetSession { respond_to, .. } => {
+                        let _ = respond_to.send(ResetSessionOutcome::Failed {
+                            message: message.clone(),
+                        });
+                    }
+                    ClientCmd::DeleteSession { respond_to, .. } => {
+                        let _ = respond_to.send(DeleteSessionOutcome::UnsupportedMethod);
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let client = Self {
+            session_id,
+            inbound: Some(event_rx),
+            cmd_tx: Some(cmd_tx),
+            pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            _child: None,
+        };
+        (client, event_tx)
+    }
+
     /// Spawn an ACP agent subprocess, run the handshake + create a
     /// session, and start pumping notifications into the inbound channel.
     pub async fn spawn(config: SpawnConfig, session_id: AcpSessionId) -> Result<Self, AcpError> {
@@ -2222,8 +2513,10 @@ impl AcpClient {
                 default_mode,
                 mcp_servers,
                 // Direct stdio agents have no runner and thus no control
-                // channel; the task owns its own terminal guard and speaks
-                // the full protocol over stdio.
+                // channel; the task owns its own terminal claim and
+                // prompt-in-flight flag and speaks the full protocol over
+                // stdio.
+                None,
                 None,
                 None,
             )
@@ -2319,15 +2612,20 @@ impl AcpClient {
         // older (v1) runner returns None: the task falls back to the
         // byte-relay handshake and, for a mid-flight resume, the resume-idle
         // watchdog (guard left None so it still fires).
-        let guard = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = Arc::new(TerminalClaim::new());
+        // Shared with the connection task so the control reader can hand idle
+        // ownership back when it surfaces a waiterless completion (#3190).
+        let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let control_client = connect_runner_control_v2(
             &socket_path,
             event_tx.clone(),
             session_label.clone(),
             guard.clone(),
+            prompt_in_flight.clone(),
         )
         .await;
         let external_terminal_guard = control_client.as_ref().map(|_| guard);
+        let external_prompt_in_flight = control_client.as_ref().map(|_| prompt_in_flight);
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
 
@@ -2355,6 +2653,7 @@ impl AcpClient {
                 default_mode,
                 mcp_servers,
                 external_terminal_guard,
+                external_prompt_in_flight,
                 control_client,
             )
             .instrument(conn_span),
@@ -2687,6 +2986,57 @@ impl AcpClient {
         }
     }
 
+    /// Drive a real conversation reset on the live worker: the connection
+    /// task issues a fresh `session/new`, swaps its ACP session id, and
+    /// emits `SessionCleared` + `SessionContextReset` +
+    /// `AcpSessionAssigned` + a terminal `Stopped`. Used for clear
+    /// commands whose adapter cannot hand AoE a durable post-reset session
+    /// id (codex `/new`, #2979; claude `/clear`, upstream #906).
+    /// `text` is the user's clear invocation, surfaced in the mid-turn
+    /// refusal's `PromptRejected`. Bounded so a wedged adapter cannot
+    /// stall the prompt path; a `session/new` timeout surfaces as a
+    /// `Failed` outcome, while post-reset config re-application remains
+    /// best-effort.
+    pub async fn reset_session(&self, text: &str) -> Result<ResetSessionOutcome, AcpError> {
+        let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
+        let (tx, rx) = oneshot::channel();
+        let deadline = tokio::time::Instant::now() + SESSION_RESET_IN_TASK_TIMEOUT;
+        // Mirror `delete_session`: the guard wraps BOTH the cmd_tx send
+        // and the response wait so a wedged connection task cannot park
+        // the caller indefinitely. The connection task receives the
+        // caller-created inner deadline so queueing time counts too.
+        let request = async {
+            if cmd_tx
+                .send(ClientCmd::ResetSession {
+                    text: text.to_string(),
+                    deadline,
+                    respond_to: tx,
+                })
+                .await
+                .is_err()
+            {
+                return ResetSessionOutcome::Failed {
+                    message: "connect task gone".into(),
+                };
+            }
+            match rx.await {
+                Ok(outcome) => outcome,
+                Err(_) => ResetSessionOutcome::Failed {
+                    message: "respond channel closed".into(),
+                },
+            }
+        };
+        match tokio::time::timeout(SESSION_RESET_TIMEOUT, request).await {
+            Ok(outcome) => Ok(outcome),
+            Err(_) => Ok(ResetSessionOutcome::Failed {
+                message: format!(
+                    "agent did not answer session/new within {}s",
+                    SESSION_RESET_TIMEOUT.as_secs()
+                ),
+            }),
+        }
+    }
+
     /// Shutdown the connection task and kill the subprocess.
     pub async fn shutdown(&self) -> Result<(), AcpError> {
         let cmd_tx = self.cmd_tx.as_ref().ok_or(AcpError::NotRunning)?;
@@ -2799,26 +3149,172 @@ fn scrub_stderr_secrets(line: &str) -> std::borrow::Cow<'_, str> {
 /// daemon started picks up immediately without a daemon restart. Returns
 /// None when the command is already a path, contains a `${placeholder}`,
 /// or isn't found anywhere we know to look.
-pub fn resolve_agent_command(command: &str) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+/// A resolved agent binary plus the directories to prepend to the child's
+/// PATH before spawning it.
+pub struct ResolvedAgentCommand {
+    pub path: std::path::PathBuf,
+    pub prepend_paths: Vec<std::path::PathBuf>,
+}
+
+/// Resolve an agent adapter's binary. PATH first, so a user's explicit
+/// install wins, EXCEPT when that copy is below the version floor the
+/// startup gate enforces and a pinned bundled copy is available: spawning a
+/// binary we know `initialize` will reject, while a compliant one sits in
+/// the data dir, helps nobody. Then the bundled adapter aoe installs on
+/// demand (see #1017), then the legacy node-version-manager scan.
+///
+/// `app_dir` is optional so a failure to resolve the data dir degrades to
+/// PATH plus the node-manager scan (see #1048) instead of no resolution.
+pub fn resolve_agent_command(
+    command: &str,
+    app_dir: Option<&std::path::Path>,
+) -> Option<ResolvedAgentCommand> {
     if command.contains('/') || command.contains('\\') || command.contains("${") {
         return None;
     }
 
     if let Some(path) = find_in_path_env(command) {
-        let parent = path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(std::path::PathBuf::new);
-        return Some((path, parent));
+        let bundled = app_dir.and_then(|d| crate::acp::adapters::bundled_adapter_bin(d, command));
+        // Only probe the version when there is actually a bundle to fall
+        // back to; otherwise the PATH copy is the only option anyway.
+        match bundled {
+            Some(bundled_path) if path_copy_below_floor(command, &path) => {
+                warn!(
+                    target: "acp.adapters",
+                    adapter = command,
+                    path = %path.display(),
+                    "PATH copy is below the supported version floor; using the bundled pinned copy"
+                );
+                return Some(bundled_resolution(bundled_path, app_dir));
+            }
+            _ => {
+                let dir = path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(std::path::PathBuf::new);
+                return Some(ResolvedAgentCommand {
+                    path,
+                    prepend_paths: vec![dir],
+                });
+            }
+        }
+    }
+
+    if let Some(path) = app_dir.and_then(|d| crate::acp::adapters::bundled_adapter_bin(d, command))
+    {
+        return Some(bundled_resolution(path, app_dir));
     }
 
     for dir in node_search_dirs() {
         let candidate = dir.join(command);
         if candidate.is_file() {
-            return Some((candidate, dir));
+            return Some(ResolvedAgentCommand {
+                path: candidate,
+                prepend_paths: vec![dir],
+            });
         }
     }
     None
+}
+
+/// The npm `.bin` shim is `#!/usr/bin/env node`, so resolving it is not
+/// enough: a Node interpreter must be reachable at spawn time. Add the same
+/// Node aoe uses for the adapter (the bundled one when the host has none) to
+/// the child PATH.
+fn bundled_resolution(
+    path: std::path::PathBuf,
+    app_dir: Option<&std::path::Path>,
+) -> ResolvedAgentCommand {
+    let mut prepend_paths = Vec::new();
+    if let Some(dir) = path.parent() {
+        prepend_paths.push(dir.to_path_buf());
+    }
+    if let Some(node) = app_dir.and_then(|d| crate::acp::node::resolve("", d).ok()) {
+        if let Some(node_bin) = node.path.parent() {
+            prepend_paths.push(node_bin.to_path_buf());
+        }
+    }
+    ResolvedAgentCommand {
+        path,
+        prepend_paths,
+    }
+}
+
+/// True when `path` reports a version below the adapter's startup floor.
+/// Conservative: any probe failure or unparseable output returns false, so
+/// an unknown version keeps the user's own copy rather than overriding it.
+#[cfg(feature = "serve")]
+fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bool {
+    let Some(gate) = crate::acp::agent_compat::version_gate_for(
+        crate::acp::agent_compat::ExpectedAgent::from_command(command),
+    ) else {
+        return false;
+    };
+    let Ok(min) = semver::Version::parse(gate.min_version) else {
+        return false;
+    };
+    let Some(raw) = probe_version_bounded(path) else {
+        return false;
+    };
+    raw.split_whitespace()
+        .filter_map(|tok| semver::Version::parse(tok.trim_start_matches('v')).ok())
+        .next()
+        .is_some_and(|found| found < min)
+}
+
+/// Run `<path> --version` with a deadline and return its stdout.
+///
+/// This runs on the synchronous spawn path, so it cannot reuse
+/// `version_probe`'s async `tokio::time::timeout`; it polls instead. The
+/// bound matters: an adapter that waits on stdin or a network login would
+/// otherwise block session spawn forever. Mirrors `version_probe`'s 2s
+/// budget, and any failure or timeout yields `None` so the caller keeps the
+/// user's own copy.
+#[cfg(feature = "serve")]
+fn probe_version_bounded(path: &std::path::Path) -> Option<String> {
+    const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+    let mut child = std::process::Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                let out = child.wait_with_output().ok()?;
+                return Some(String::from_utf8_lossy(&out.stdout).into_owned());
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // Reap it so the probe never leaves a zombie behind.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    warn!(
+                        target: "acp.adapters",
+                        path = %path.display(),
+                        "version probe timed out; keeping the PATH copy"
+                    );
+                    return None;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+#[cfg(not(feature = "serve"))]
+fn path_copy_below_floor(_command: &str, _path: &std::path::Path) -> bool {
+    false
 }
 
 fn find_in_path_env(binary: &str) -> Option<std::path::PathBuf> {
@@ -2940,13 +3436,20 @@ fn spawn_runner_detached(
     let resolved = if sandbox_argv.is_some() {
         None
     } else {
-        resolve_agent_command(&config.spec.command)
+        // A get_app_dir failure only costs the bundled-adapter lookup; PATH
+        // and the node-manager scan still run.
+        let app_dir = crate::session::get_app_dir().ok();
+        resolve_agent_command(&config.spec.command, app_dir.as_deref())
     };
-    let (spawn_command, extra_path_dir) = match (&sandbox_argv, &resolved) {
-        (Some(s), _) => (s.docker_binary.clone(), None),
-        (None, Some((abs, dir))) => (abs.to_string_lossy().into_owned(), Some(dir.clone())),
-        (None, None) => (config.spec.command.clone(), None),
-    };
+    let (spawn_command, extra_path_dirs): (String, Vec<std::path::PathBuf>) =
+        match (&sandbox_argv, &resolved) {
+            (Some(s), _) => (s.docker_binary.clone(), Vec::new()),
+            (None, Some(r)) => (
+                r.path.to_string_lossy().into_owned(),
+                r.prepend_paths.clone(),
+            ),
+            (None, None) => (config.spec.command.clone(), Vec::new()),
+        };
 
     let mut cmd = StdCommand::new(&current_exe);
     cmd.arg("__acp-runner")
@@ -3051,15 +3554,22 @@ fn spawn_runner_detached(
         // mount as a `-e` flag in build_sandbox_docker_argv instead. See #2587.
         cmd.env(crate::session::artifacts::ARTIFACT_DIR_ENV, dir);
     }
-    if let Some(extra) = &extra_path_dir {
-        // Prepend the resolved bin dir to the PATH we just forwarded so
-        // the adapter's own `node`/`npx` lookups land in the same install
-        // as the adapter itself, not whatever node happens to be on the
-        // daemon's frozen PATH.
-        let current = std::env::var("PATH").unwrap_or_default();
-        let extra_s = extra.to_string_lossy();
-        if !std::env::split_paths(&current).any(|p| p == *extra) {
-            cmd.env("PATH", format!("{}:{}", extra_s, current));
+    if !extra_path_dirs.is_empty() {
+        // Prepend the resolved adapter bin dir (and, for a bundled adapter,
+        // the Node bin dir) to the PATH we just forwarded so the adapter and
+        // its `#!/usr/bin/env node` shim resolve against the same install,
+        // not whatever node happens to be on the daemon's frozen PATH.
+        let current = std::env::var_os("PATH").unwrap_or_default();
+        let existing: Vec<std::path::PathBuf> = std::env::split_paths(&current).collect();
+        let mut chain: Vec<std::path::PathBuf> = Vec::new();
+        for dir in &extra_path_dirs {
+            if !existing.contains(dir) && !chain.contains(dir) {
+                chain.push(dir.clone());
+            }
+        }
+        chain.extend(existing);
+        if let Ok(joined) = std::env::join_paths(&chain) {
+            cmd.env("PATH", joined);
         }
     }
 
@@ -3394,7 +3904,25 @@ impl DaemonControlClient {
         request: serde_json::Value,
     ) -> oneshot::Receiver<control_protocol::PromptOutcome> {
         let (tx, rx) = oneshot::channel();
-        *self.completion.lock().expect("completion mutex poisoned") = Some(tx);
+        let displaced = self
+            .completion
+            .lock()
+            .expect("completion mutex poisoned")
+            .replace(tx);
+        // Installing over an unresolved waiter drops the previous prompt's
+        // receiver, so that turn's loop sees `Err -> Aborted` instead of its
+        // real outcome. It should be impossible (one prompt is in flight at a
+        // time) which is exactly why it is worth a line when it happens: a
+        // stranded prompt future is the leading suspect for a session that
+        // keeps rendering Running with no terminal event. See #3190.
+        if displaced.is_some() {
+            warn!(
+                target: "acp.protocol",
+                "installing a prompt completion waiter over an unresolved one"
+            );
+        } else {
+            debug!(target: "acp.protocol", "prompt completion waiter installed");
+        }
         if self.send(ControlBody::Prompt { request }).await.is_err() {
             // Write failed: drop the parked sender so `rx` resolves to Err ->
             // Aborted immediately instead of hanging until the cancel /
@@ -3420,10 +3948,9 @@ async fn connect_runner_control_v2(
     main_socket: &std::path::Path,
     event_tx: mpsc::Sender<Event>,
     session_label: String,
-    terminal_guard: Arc<std::sync::atomic::AtomicBool>,
+    terminal_claim: Arc<TerminalClaim>,
+    prompt_in_flight: Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<Arc<DaemonControlClient>> {
-    use std::sync::atomic::Ordering;
-
     let control_path = crate::process::worker::control_socket_sibling(main_socket);
     // A single deadline covers connect plus the Hello read. The runner
     // binds the control socket before the main relay socket the caller
@@ -3470,6 +3997,7 @@ async fn connect_runner_control_v2(
         "runner control channel v2 attached; runner owns handshake + turn"
     );
 
+    let reader_prompt_in_flight = prompt_in_flight.clone();
     let (hs_tx, hs_rx) = mpsc::channel::<ControlBody>(8);
     let completion: Arc<
         std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>,
@@ -3495,15 +4023,50 @@ async fn connect_runner_control_v2(
                         .take();
                     if let Some(tx) = waiter {
                         let _ = tx.send(outcome);
-                    } else if terminal_guard
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
+                    } else {
                         // Adopted turn on a mid-flight resume: this daemon
                         // never issued the prompt, so surface the completion
                         // as Stopped and stand the watchdogs down.
-                        let reason = control_outcome_reason(&outcome);
-                        let _ = event_tx.send(Event::Stopped { reason }).await;
+                        //
+                        // The waiter being absent means no `prompt_fut` on
+                        // this connection can ever resolve for this turn, so a
+                        // `prompt_in_flight` still set here is stale by
+                        // definition. Left set, it silently disables the whole
+                        // between-prompt lane (every bit of that bookkeeping is
+                        // gated on `!prompt_active`), so the next
+                        // agent-initiated turn gets no terminal either and the
+                        // session renders Running until the reconciler's repair
+                        // pass. Clearing it hands idle ownership back the way
+                        // the prompt drain would have.
+                        //
+                        // Partial cure by construction: it re-arms the lane but
+                        // cannot unpark a prompt loop still awaiting that dead
+                        // future, which keeps rejecting new prompts as
+                        // `agent_busy`. See #3190 and PR #3192 review.
+                        let claimed = terminal_claim.claim();
+                        let was_in_flight =
+                            reader_prompt_in_flight.swap(false, AtomicOrdering::Relaxed);
+                        if claimed {
+                            // The expected shape: a turn adopted at reattach,
+                            // whose completion this connection has to surface.
+                            debug!(
+                                target: "acp.protocol",
+                                session = %reader_session,
+                                stranded_prompt = was_in_flight,
+                                "runner reported PromptCompleted with no waiter; surfacing as Stopped"
+                            );
+                            let reason = control_outcome_reason(&outcome);
+                            let _ = event_tx.send(Event::Stopped { reason }).await;
+                        } else {
+                            // Something already published this turn's terminal,
+                            // so this completion is a duplicate. Not expected.
+                            warn!(
+                                target: "acp.protocol",
+                                session = %reader_session,
+                                stranded_prompt = was_in_flight,
+                                "runner reported PromptCompleted with no waiter and the turn's terminal was already claimed"
+                            );
+                        }
                     }
                 }
                 Ok(Some(_)) => {}
@@ -3630,10 +4193,14 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
     // `aoe serve` captures PATH at daemon-launch time and freezes it for
     // its lifetime; without this, a `nvm use` after launch leaves the
     // adapter installed but unreachable. See #1048.
-    let resolved = resolve_agent_command(&config.spec.command);
-    let (spawn_command, extra_path_dir) = match &resolved {
-        Some((abs, dir)) => (abs.to_string_lossy().into_owned(), Some(dir.clone())),
-        None => (config.spec.command.clone(), None),
+    let app_dir = crate::session::get_app_dir().ok();
+    let resolved = resolve_agent_command(&config.spec.command, app_dir.as_deref());
+    let (spawn_command, extra_path_dirs): (String, Vec<std::path::PathBuf>) = match &resolved {
+        Some(r) => (
+            r.path.to_string_lossy().into_owned(),
+            r.prepend_paths.clone(),
+        ),
+        None => (config.spec.command.clone(), Vec::new()),
     };
 
     let mut cmd = tokio::process::Command::new(&spawn_command);
@@ -3656,12 +4223,17 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
             // `node`/`npx` lookups land in the same node install as the
             // adapter itself, not whatever node happens to be on the
             // daemon's frozen PATH.
-            if name == "PATH" {
-                if let Some(extra) = &extra_path_dir {
-                    let extra_s = extra.to_string_lossy();
-                    if !std::env::split_paths(&value).any(|p| p == *extra) {
-                        value = format!("{}:{}", extra_s, value);
+            if name == "PATH" && !extra_path_dirs.is_empty() {
+                let existing: Vec<std::path::PathBuf> = std::env::split_paths(&value).collect();
+                let mut chain: Vec<std::path::PathBuf> = Vec::new();
+                for dir in &extra_path_dirs {
+                    if !existing.contains(dir) && !chain.contains(dir) {
+                        chain.push(dir.clone());
                     }
+                }
+                chain.extend(existing);
+                if let Ok(joined) = std::env::join_paths(&chain) {
+                    value = joined.to_string_lossy().into_owned();
                 }
             }
             cmd.env(name, value);
@@ -5567,7 +6139,8 @@ async fn run_connection_task<W, R>(
     // `Stopped`, so the resume-idle and between-prompt watchdogs below
     // see it already fired and stand down. `None` on paths with no
     // control channel (direct stdio), where the task owns its own guard.
-    external_terminal_guard: Option<Arc<std::sync::atomic::AtomicBool>>,
+    external_terminal_guard: Option<Arc<TerminalClaim>>,
+    external_prompt_in_flight: Option<Arc<std::sync::atomic::AtomicBool>>,
     // #2976 Phase B: control client for a v2 runner. When Some, the task
     // drives `initialize` / `session/*` / `session/prompt` / cancel over it
     // instead of the crate connection (relay), which stays attached only
@@ -5665,22 +6238,22 @@ async fn run_connection_task<W, R>(
     //   - `prompt_sent_since_attach`: set when the user issues a prompt
     //     after attach; the user's real PromptRequest will own the next
     //     Stopped, so the watchdog must stand down.
-    //   - `watchdog_fired`: ensures we synthesize Stopped at most once.
+    //   - `terminal_claim`: ensures exactly one path publishes a given
+    //     turn's terminal Stopped (see `TerminalClaim`).
     let now_ms = chrono::Utc::now().timestamp_millis();
     let last_event_at = Arc::new(AtomicI64::new(now_ms));
     let first_event_after_attach = Arc::new(AtomicBool::new(false));
     let prompt_sent_since_attach = Arc::new(AtomicBool::new(false));
-    // Shared with the runner control reader (#1054 Phase A) when present,
-    // so a native `prompt_complete` from the runner and the resume-idle /
-    // between-prompt watchdogs all claim the same one-shot terminal guard.
-    let watchdog_fired =
-        external_terminal_guard.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    // Shared with the runner control reader (#1054 Phase A) when present, so
+    // a native `prompt_complete` from the runner and the resume-idle /
+    // between-prompt watchdogs all claim the same per-turn terminal.
+    let terminal_claim = external_terminal_guard.unwrap_or_else(|| Arc::new(TerminalClaim::new()));
     // True for a turn adopted mid-flight via `Resume { in_flight_turn: true }`:
     // a prior connection issued the `session/prompt`, so this connection has no
     // owning `prompt_fut` and no real `ClientCmd::Prompt` will emit the turn's
     // terminal Stopped. Set true once the handshake resolves the mode (below).
     // Cleared when a real prompt starts or when a terminal path claims the
-    // `watchdog_fired` guard. Drives the cost-marker completion the between-
+    // turn's terminal. Drives the cost-marker completion the between-
     // prompt watchdog emits for the adopted turn. See #2899.
     let adopted_turn_active = Arc::new(AtomicBool::new(false));
     // Between-prompt idle watchdog state (#2325). Tracks an agent-initiated
@@ -5694,14 +6267,20 @@ async fn run_connection_task<W, R>(
     let between_prompt_cost_seen = Arc::new(AtomicBool::new(false));
     // Wake `at` (ms) of the latest pending scheduled wake, 0 when none.
     let between_prompt_wake_at = Arc::new(AtomicI64::new(0));
-    // Authoritative rate-limit reset epoch (unix SECONDS) captured from the
-    // most recent `usage_update` `_meta._claude/rateLimit.resetsAt`; 0 = none
-    // seen. Cleared at each prompt start so a stale value from an earlier
-    // window can't leak into a later limit, and read at the rate-limit
-    // classify sites to replace the `now + 1h` guess with the real reset. The
-    // adapter never puts the reset in the error itself, only in this
-    // out-of-band usage_update, so this is the only structured source. #3028.
-    let last_rate_limit_resets_at = Arc::new(AtomicI64::new(0));
+    // Reset epochs (unix SECONDS) for the quota windows the adapter reported
+    // as `rejected`, keyed by `rateLimitType` so one window cannot overwrite
+    // another. Fed from `usage_update`'s `_meta._claude/rateLimit` (the only
+    // place the adapter puts a reset; the prompt error carries just
+    // `errorKind`) and read at the rate-limit classify sites.
+    //
+    // Deliberately NOT cleared at prompt start: the reset belongs to the
+    // quota window, not to one prompt, and the adapter suppresses the
+    // rejection's `usage_update` on any turn that produced no assistant
+    // usage. Wiping it meant a rejection captured on an earlier turn could
+    // not answer the next prompt's rejection, which is the case the reporter
+    // hit twice. Stale entries are filtered by reset-in-the-future at read
+    // time instead. #3028, #3152.
+    let last_rate_limit_rejections = Arc::new(std::sync::Mutex::new(HashMap::<String, i64>::new()));
     // In-flight tool calls for the between-prompt (agent-initiated) path,
     // keyed by tool_call_id -> the `run_in_background` flag observed at
     // ToolStarted. Mirrors the per-prompt SilentOrphanWatchdog's
@@ -5725,15 +6304,17 @@ async fn run_connection_task<W, R>(
     let between_prompt_bg_agents = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<
         String,
     >::new()));
-    let prompt_in_flight = Arc::new(AtomicBool::new(false));
+    let prompt_in_flight =
+        external_prompt_in_flight.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let last_event_at_for_notif = last_event_at.clone();
     let first_event_after_attach_for_notif = first_event_after_attach.clone();
     let last_lifecycle_at_for_notif = last_lifecycle_at.clone();
     let between_prompt_active_for_notif = between_prompt_active.clone();
+    let terminal_claim_for_notif = terminal_claim.clone();
     let between_prompt_cost_seen_for_notif = between_prompt_cost_seen.clone();
     let between_prompt_wake_at_for_notif = between_prompt_wake_at.clone();
-    let last_rate_limit_resets_at_for_notif = last_rate_limit_resets_at.clone();
-    let last_rate_limit_resets_at_for_block = last_rate_limit_resets_at.clone();
+    let last_rate_limit_rejections_for_notif = last_rate_limit_rejections.clone();
+    let last_rate_limit_rejections_for_block = last_rate_limit_rejections.clone();
     let between_prompt_tools_for_notif = between_prompt_tools.clone();
     let between_prompt_off_protocol_for_notif = between_prompt_off_protocol.clone();
     let between_prompt_bg_agents_for_notif = between_prompt_bg_agents.clone();
@@ -5769,12 +6350,13 @@ async fn run_connection_task<W, R>(
                 let agent_msg_dedup = agent_msg_dedup_for_notif.clone();
                 let last_lifecycle_at = last_lifecycle_at_for_notif.clone();
                 let between_prompt_active = between_prompt_active_for_notif.clone();
+                let terminal_claim = terminal_claim_for_notif.clone();
                 let between_prompt_cost_seen =
                     between_prompt_cost_seen_for_notif.clone();
                 let between_prompt_wake_at =
                     between_prompt_wake_at_for_notif.clone();
-                let last_rate_limit_resets_at =
-                    last_rate_limit_resets_at_for_notif.clone();
+                let last_rate_limit_rejections =
+                    last_rate_limit_rejections_for_notif.clone();
                 let between_prompt_tools = between_prompt_tools_for_notif.clone();
                 let between_prompt_off_protocol =
                     between_prompt_off_protocol_for_notif.clone();
@@ -5851,7 +6433,21 @@ async fn run_connection_task<W, R>(
                             now,
                             between_prompt_wake_at.load(Ordering::Relaxed),
                         ) {
-                            between_prompt_active.store(true, Ordering::Relaxed);
+                            // False -> true is an agent-initiated turn
+                            // starting, so it gets its own terminal to claim.
+                            // Logged because the arming decision was
+                            // previously invisible: the watchdog only ever
+                            // logged when it fired, which is exactly the
+                            // information a stuck-Running investigation
+                            // needs. See #3190.
+                            if !between_prompt_active.swap(true, Ordering::Relaxed) {
+                                terminal_claim.begin_turn();
+                                debug!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    "between-prompt watchdog armed for an agent-initiated turn"
+                                );
+                            }
                             between_prompt_cost_seen.store(u.cost_seen, Ordering::Relaxed);
                             // Refresh from `now` on every tracked signal,
                             // including TerminalUsage, so the fast grace
@@ -5940,18 +6536,33 @@ async fn run_connection_task<W, R>(
                             _ => {}
                         }
                     }
-                    // Capture the authoritative rate-limit reset epoch the
-                    // adapter forwards on a `usage_update` (#3028) before the
-                    // update is consumed below. Overwrite unconditionally: the
-                    // freshest observed `resetsAt` for the active window is the
-                    // best "when can I resume" estimate.
-                    // ponytail: stores whatever window's resetsAt arrived last;
-                    // a seven_day-warning epoch could momentarily shadow a
-                    // five_hour-rejection one, but any real epoch beats the
-                    // now+1h guess. Per-window tracking only if that misleads.
+                    // Capture the reset epoch the adapter forwards on a
+                    // `usage_update` (#3028) before the update is consumed
+                    // below. Only rejections are retained; a warning epoch
+                    // cannot be attributed to whichever window later rejects
+                    // (#3152). Log every observation either way: this is the
+                    // only breadcrumb for diagnosing a wrong reset time from
+                    // `debug.log`.
                     if let SessionUpdate::UsageUpdate(u) = &notification.update {
-                        if let Some(secs) = rate_limit_resets_at_secs_from_meta(&u.meta) {
-                            last_rate_limit_resets_at.store(secs, Ordering::Relaxed);
+                        if let Some(raw) = u
+                            .meta
+                            .as_ref()
+                            .and_then(|m| m.get("_claude/rateLimit"))
+                        {
+                            let rejection = rate_limit_rejection_from_meta(&u.meta);
+                            debug!(
+                                target: "acp.protocol",
+                                session = %session_label,
+                                observed = %raw,
+                                retained = rejection.is_some(),
+                                "observed adapter rate-limit meta"
+                            );
+                            if let Some(r) = rejection {
+                                last_rate_limit_rejections
+                                    .lock()
+                                    .expect("rate-limit capture mutex poisoned")
+                                    .insert(r.window, r.resets_at_secs);
+                            }
                         }
                     }
                     let update_for_tool_context = notification.update.clone();
@@ -6264,8 +6875,16 @@ async fn run_connection_task<W, R>(
                 &init.agent_capabilities.mcp_capabilities,
                 &session_label,
             );
+            // Kept for the driven conversation reset (#2979): the handshake
+            // below consumes `mcp_servers`, but a later `session/new` issued
+            // for a clear command must forward the same gated list.
+            let mcp_servers_for_reset = mcp_servers.clone();
 
-            let acp_session_id: SessionId = match mode {
+            // Mutable: a driven conversation reset (#2979) swaps in the
+            // fresh id from its `session/new` so every later
+            // `session/prompt` / cancel / mode switch addresses the new
+            // conversation.
+            let mut acp_session_id: SessionId = match mode {
                 ConnectMode::Resume {
                     acp_session_id: stored,
                     in_flight_turn: _,
@@ -6815,14 +7434,14 @@ async fn run_connection_task<W, R>(
                 let last_event_at = last_event_at.clone();
                 let first_event_after_attach = first_event_after_attach.clone();
                 let prompt_sent_since_attach = prompt_sent_since_attach.clone();
-                let watchdog_fired = watchdog_fired.clone();
+                let terminal_claim = terminal_claim.clone();
                 let session_label_for_watchdog = session_label.clone();
                 let grace = resume_idle_grace();
                 tokio::spawn(async move {
                     let grace_ms = grace.as_millis() as i64;
                     loop {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        if watchdog_fired.load(Ordering::Relaxed) {
+                        if terminal_claim.claimed() {
                             return;
                         }
                         if prompt_sent_since_attach.load(Ordering::Relaxed) {
@@ -6858,15 +7477,7 @@ async fn run_connection_task<W, R>(
                             // prompt watchdog can't also emit for this adopted
                             // turn in the narrow window where the first event
                             // and this grace expiry interleave. See #2899.
-                            if watchdog_fired
-                                .compare_exchange(
-                                    false,
-                                    true,
-                                    Ordering::AcqRel,
-                                    Ordering::Acquire,
-                                )
-                                .is_err()
-                            {
+                            if !terminal_claim.claim() {
                                 return;
                             }
                             info!(
@@ -6906,18 +7517,14 @@ async fn run_connection_task<W, R>(
                             0 => None,
                             at => Some(at),
                         };
-                        let tools_in_flight = !between_prompt_tools
-                            .lock()
-                            .expect("between-prompt tools mutex poisoned")
-                            .is_empty();
                         // A tracked async background agent still running is
                         // work in flight just like an open tool: suppress the
                         // idle watchdog until its tailer reports terminal and
                         // removes it from the set. See #2573.
-                        let bg_agents_in_flight = !between_prompt_bg_agents
-                            .lock()
-                            .expect("between-prompt bg-agents mutex poisoned")
-                            .is_empty();
+                        let work_in_flight = between_prompt_work_state(
+                            &between_prompt_tools,
+                            &between_prompt_bg_agents,
+                        );
                         let cost_seen = between_prompt_cost_seen.load(Ordering::Relaxed);
                         if between_prompt_should_fire(
                             between_prompt_active.load(Ordering::Relaxed),
@@ -6925,14 +7532,14 @@ async fn run_connection_task<W, R>(
                             last_lifecycle_at.load(Ordering::Relaxed),
                             wake_at,
                             cost_seen,
-                            tools_in_flight || bg_agents_in_flight,
+                            work_in_flight.is_busy(),
                             between_prompt_off_protocol.load(Ordering::Relaxed),
                             BETWEEN_PROMPT_IDLE_GRACE,
                             OFF_PROTOCOL_WORK_GRACE_FLOOR,
                         ) {
                             // An adopted turn (#2899) has no owning prompt_fut, so
                             // this watchdog owns its terminal Stopped. Claim the
-                            // shared `watchdog_fired` guard so the detached
+                            // turn's shared terminal so the detached
                             // resume-idle task can't also fire in the narrow window
                             // where the first observable event and its grace expiry
                             // interleave; if that task already claimed, still reset
@@ -6940,15 +7547,7 @@ async fn run_connection_task<W, R>(
                             // agent-initiated turn is serialized on this loop and
                             // needs no guard.
                             let adopted = adopted_turn_active.load(Ordering::Relaxed);
-                            let claimed = !adopted
-                                || watchdog_fired
-                                    .compare_exchange(
-                                        false,
-                                        true,
-                                        Ordering::AcqRel,
-                                        Ordering::Acquire,
-                                    )
-                                    .is_ok();
+                            let claimed = !adopted || terminal_claim.claim();
                             if adopted {
                                 adopted_turn_active.store(false, Ordering::Relaxed);
                             }
@@ -7020,6 +7619,10 @@ async fn run_connection_task<W, R>(
                         // The per-prompt watchdog owns idle detection until the
                         // Stopped emit below clears `prompt_in_flight`. See #2325.
                         prompt_in_flight.store(true, Ordering::Relaxed);
+                        // This prompt is a new turn: its terminal is nobody's
+                        // yet, whatever an earlier turn on this connection
+                        // claimed.
+                        terminal_claim.begin_turn();
                         between_prompt_active.store(false, Ordering::Relaxed);
                         // A real prompt supersedes any agent-initiated turn the
                         // between-prompt watchdog was tracking; reset its state
@@ -7056,10 +7659,6 @@ async fn run_connection_task<W, R>(
                         let this_prompt_epoch = current_prompt_epoch
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                             + 1;
-                        // Clear any rate-limit reset captured for a prior turn
-                        // so this prompt only trusts a `resetsAt` observed while
-                        // it is in flight (#3028).
-                        last_rate_limit_resets_at_for_block.store(0, Ordering::Relaxed);
                         while lifecycle_signal_rx.try_recv().is_ok() {}
 
                         // Per-prompt silent-orphan state machine. Owned
@@ -7248,7 +7847,8 @@ async fn run_connection_task<W, R>(
                                             // immediately on retry. See #1281.
                                             let captured_resets_at =
                                                 captured_rate_limit_resets_at(
-                                                    &last_rate_limit_resets_at_for_block,
+                                                    &last_rate_limit_rejections_for_block,
+                                                    chrono::Utc::now(),
                                                 );
                                             if let Some(info) =
                                                 classify_rate_limit_error(&e, captured_resets_at)
@@ -7256,7 +7856,7 @@ async fn run_connection_task<W, R>(
                                                 info!(
                                                     target: "acp.protocol",
                                                     session = %session_label,
-                                                    resets_at = %info.resets_at,
+                                                    resets_at = ?info.resets_at,
                                                     "session/prompt returned rate_limit; parking session"
                                                 );
                                                 let _ = event_tx_for_block
@@ -7531,6 +8131,36 @@ async fn run_connection_task<W, R>(
                                                 break;
                                             }
                                         }
+                                        Some(ClientCmd::ResetSession {
+                                            text, respond_to, ..
+                                        }) => {
+                                            // Resetting under an in-flight
+                                            // `session/prompt` would orphan
+                                            // the pending turn on the old
+                                            // session id. Refuse; the user
+                                            // can stop the turn and retry
+                                            // the clear. Mirror the busy-
+                                            // Prompt arm above: emit a
+                                            // `PromptRejected` so the caller
+                                            // gets a terminal frame (retry
+                                            // pill) under the persisted
+                                            // UserPromptSent, not just an
+                                            // HTTP error. See #2979.
+                                            warn!(
+                                                target: "acp.protocol",
+                                                "conversation reset requested during in-flight prompt; refusing"
+                                            );
+                                            let _ = event_tx_for_block
+                                                .send(Event::PromptRejected {
+                                                    reason: "agent_busy".into(),
+                                                    text,
+                                                })
+                                                .await;
+                                            let _ = respond_to.send(ResetSessionOutcome::Failed {
+                                                message: "a turn is in flight; stop it before clearing the conversation"
+                                                    .into(),
+                                            });
+                                        }
                                         Some(ClientCmd::Shutdown) | None => {
                                             info!(
                                                 target: "acp.protocol",
@@ -7641,7 +8271,21 @@ async fn run_connection_task<W, R>(
                         // The prompt drain is done; hand idle ownership back to
                         // the between-prompt watchdog for any agent-initiated
                         // turn that fires after this point. See #2325.
+                        //
+                        // Logged because the absence of this line after a
+                        // `Stopped` is the signature of a stranded prompt
+                        // future: the terminal was emitted by some other path
+                        // while this loop stayed parked in its prompt arm, so
+                        // the between-prompt watchdog is still disarmed and
+                        // the next agent-initiated turn will get no terminal.
+                        // See #3190.
                         prompt_in_flight.store(false, Ordering::Relaxed);
+                        debug!(
+                            target: "acp.protocol",
+                            session = %session_label,
+                            reason,
+                            "prompt drain complete; between-prompt idle ownership restored"
+                        );
                         if shutdown {
                             break;
                         }
@@ -7677,7 +8321,7 @@ async fn run_connection_task<W, R>(
                         // the detached resume-idle task can't fire, and clear the
                         // adopted / between-prompt tracking so a later tick can't
                         // add a duplicate. See #2899.
-                        watchdog_fired.store(true, Ordering::Relaxed);
+                        terminal_claim.claim();
                         adopted_turn_active.store(false, Ordering::Relaxed);
                         between_prompt_active.store(false, Ordering::Relaxed);
                         let _ = event_tx_for_block
@@ -7694,7 +8338,7 @@ async fn run_connection_task<W, R>(
                         info!(target: "acp.protocol", "force-stop requested with no prompt in flight; best-effort cancel only");
                         // The supervisor owns the terminal here, so stand down the
                         // local idle-completion paths to avoid a duplicate. See #2899.
-                        watchdog_fired.store(true, Ordering::Relaxed);
+                        terminal_claim.claim();
                         adopted_turn_active.store(false, Ordering::Relaxed);
                         between_prompt_active.store(false, Ordering::Relaxed);
                         let _ = send_session_cancel!();
@@ -7726,6 +8370,299 @@ async fn run_connection_task<W, R>(
                             event_tx_for_block.clone(),
                         );
                     }
+                    Some(ClientCmd::ResetSession {
+                        text,
+                        deadline: reset_deadline,
+                        respond_to,
+                    }) => {
+                        let work_in_flight = between_prompt_work_state(
+                            &between_prompt_tools,
+                            &between_prompt_bg_agents,
+                        );
+                        if work_in_flight.is_busy() {
+                            // The parent prompt may already be complete while an
+                            // open tool or async sub-agent from that session is
+                            // still producing events. Resetting here would move
+                            // the connection onto a fresh session and attribute
+                            // those old-session events to the new conversation.
+                            warn!(
+                                target: "acp.protocol",
+                                tool_calls_in_flight = work_in_flight.tool_calls,
+                                background_agents_in_flight = work_in_flight.background_agents,
+                                "conversation reset requested while between-prompt work is in flight; refusing"
+                            );
+                            let _ = event_tx_for_block
+                                .send(Event::PromptRejected {
+                                    reason: "agent_busy".into(),
+                                    text,
+                                })
+                                .await;
+                            let _ = respond_to.send(ResetSessionOutcome::Failed {
+                                message:
+                                    "agent work is still in flight; wait for it to finish before clearing the conversation"
+                                        .into(),
+                            });
+                            continue;
+                        }
+                        // Driven conversation reset (#2979): a clear command
+                        // hit a profile whose adapter cannot hand back a
+                        // durable post-reset id (codex `/new` has no native
+                        // reset; claude `/clear` resets but keeps serving the
+                        // pre-clear id), so open a genuinely fresh session on
+                        // the live worker and swap onto its id.
+                        //
+                        // Deliberately over the byte relay, NOT the v2
+                        // control channel: the runner's `EstablishSession`
+                        // replays its cached handshake once a session
+                        // exists, which would hand back the old id. The
+                        // relay request reaches the agent directly; the
+                        // runner watches for it and refreshes its own
+                        // handshake cache from the response (see
+                        // `process/runner.rs`).
+                        // Use the caller-created shared deadline for
+                        // session/new and both config re-application
+                        // requests. Queueing time counts, and per-request
+                        // deadlines cannot accumulate past the outer guard.
+                        info!(
+                            target: "acp.protocol",
+                            session = %session_label,
+                            old_id = %acp_session_id.0,
+                            "conversation reset: issuing fresh session/new on the live worker"
+                        );
+                        let req = NewSessionRequest::new(agent_cwd.clone())
+                            .mcp_servers(mcp_servers_for_reset.clone());
+                        match await_reset_request(
+                            reset_deadline,
+                            || connection.send_request(req).block_task(),
+                        )
+                        .await
+                        {
+                            Ok(new_session)
+                                if new_session.session_id.0 != acp_session_id.0 =>
+                            {
+                                let new_id = new_session.session_id.clone();
+                                // session/new is the irreversible reset
+                                // commit. Adopt its id before attempting
+                                // best-effort config restoration so this
+                                // client and the runner cannot disagree
+                                // about which session owns later prompts.
+                                acp_session_id = new_id.clone();
+                                available_mode_ids =
+                                    new_session.modes.as_ref().map(|modes| {
+                                        modes
+                                            .available_modes
+                                            .iter()
+                                            .map(|m| m.id.0.to_string())
+                                            .collect()
+                                    });
+                                mode_config_option_id = new_session
+                                    .config_options
+                                    .as_deref()
+                                    .and_then(mode_config_id)
+                                    .map(|id| id.0.to_string());
+                                info!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    new_id = %new_id.0,
+                                    "conversation reset: session/new succeeded, swapped acp_session_id"
+                                );
+                                // Keep every success boundary on the same
+                                // FIFO. SessionCleared folds the transcript
+                                // only after session/new committed, then
+                                // SessionContextReset clears the old resume
+                                // id before AcpSessionAssigned persists the
+                                // fresh one.
+                                let _ = event_tx_for_block.send(Event::SessionCleared).await;
+                                let _ = event_tx_for_block
+                                    .send(Event::SessionContextReset {
+                                        reason: "conversation cleared; the agent started a fresh session".into(),
+                                    })
+                                    .await;
+                                let _ = event_tx_for_block
+                                    .send(Event::AcpSessionAssigned {
+                                        acp_session_id: new_id.0.to_string(),
+                                    })
+                                    .await;
+                                // Re-announce the fresh session's modes and
+                                // config options (mirroring the handshake):
+                                // the new session starts on adapter defaults,
+                                // so the old session's picker state is stale.
+                                if let Some(modes) = &new_session.modes {
+                                    let infos: Vec<ModeInfo> = modes
+                                        .available_modes
+                                        .iter()
+                                        .map(|m| ModeInfo {
+                                            id: m.id.0.to_string(),
+                                            name: m.name.clone(),
+                                            description: m.description.clone(),
+                                        })
+                                        .collect();
+                                    let _ = event_tx_for_block
+                                        .send(Event::ModesAvailable {
+                                            current_mode_id: modes
+                                                .current_mode_id
+                                                .0
+                                                .to_string(),
+                                            modes: infos,
+                                        })
+                                        .await;
+                                }
+                                if let Some(event) =
+                                    config_options_event(new_session.config_options.clone())
+                                {
+                                    let _ = event_tx_for_block.send(event).await;
+                                }
+                                // Re-apply the configured structured-view
+                                // defaults exactly like the spawn path does
+                                // after its session/new: the fresh session
+                                // starts on adapter defaults, so a
+                                // configured effort/mode pick must be
+                                // re-sent or `/new` silently downgrades it
+                                // until the next worker restart. Best-effort
+                                // with a warn, mirroring spawn.
+                                let reset_config_options =
+                                    new_session.config_options.as_deref();
+                                for (value, config_id) in [
+                                    (
+                                        default_effort.as_deref(),
+                                        reset_config_options
+                                            .and_then(thought_level_config_id),
+                                    ),
+                                    (
+                                        default_mode.as_deref(),
+                                        reset_config_options.and_then(mode_config_id),
+                                    ),
+                                ] {
+                                    let (Some(value), Some(config_id)) = (value, config_id)
+                                    else {
+                                        debug!(
+                                            "post-reset config option skipped: no configured value or matching option id"
+                                        );
+                                        continue;
+                                    };
+                                    match await_reset_request(
+                                        reset_deadline,
+                                        || {
+                                            connection
+                                                .send_request(SetSessionConfigOptionRequest::new(
+                                                new_id.clone(),
+                                                config_id,
+                                                SessionConfigValueId::new(value.to_string()),
+                                            ))
+                                                .block_task()
+                                        },
+                                    )
+                                    .await
+                                    {
+                                        Ok(resp) => {
+                                            if let Some(event) = config_options_event(Some(
+                                                resp.config_options,
+                                            )) {
+                                                let _ =
+                                                    event_tx_for_block.send(event).await;
+                                            }
+                                        }
+                                        Err(ResetRequestError::Acp(e)) => {
+                                            warn!(
+                                                target: "acp.protocol",
+                                                session = %session_label,
+                                                value,
+                                                "re-applying structured view default after reset failed: {e}"
+                                            );
+                                        }
+                                        Err(ResetRequestError::TimedOut) => {
+                                            warn!(
+                                                target: "acp.protocol",
+                                                session = %session_label,
+                                                value,
+                                                timeout_secs = SESSION_RESET_IN_TASK_TIMEOUT.as_secs(),
+                                                "post-reset config re-application timed out; skipping remaining defaults"
+                                            );
+                                            break;
+                                        }
+                                    }
+                                }
+                                let _ = event_tx_for_block
+                                    .send(Event::Stopped {
+                                        reason: "session_reset".into(),
+                                    })
+                                    .await;
+                                let _ = respond_to.send(ResetSessionOutcome::Reset {
+                                    new_acp_session_id: new_id.0.to_string(),
+                                });
+                            }
+                            Ok(_) => {
+                                // Same id back: a stale runner (predating
+                                // this reset path) answered the relay
+                                // session/new from its handshake cache.
+                                // Report honestly rather than pretending the
+                                // model forgot; a worker restart clears it.
+                                let message = "the worker replayed the existing session \
+                                     instead of creating a fresh one; restart the \
+                                     structured view worker to clear context"
+                                    .to_string();
+                                warn!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    "conversation reset failed: {message}"
+                                );
+                                let _ = event_tx_for_block
+                                    .send(Event::PromptRuntimeError {
+                                        message: message.clone(),
+                                    })
+                                    .await;
+                                let _ = event_tx_for_block
+                                    .send(Event::Stopped {
+                                        reason: "session_reset_failed".into(),
+                                    })
+                                    .await;
+                                let _ = respond_to
+                                    .send(ResetSessionOutcome::Failed { message });
+                            }
+                            Err(ResetRequestError::Acp(e)) => {
+                                let message = format!("session/new failed: {e}");
+                                warn!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    "conversation reset failed: {message}"
+                                );
+                                let _ = event_tx_for_block
+                                    .send(Event::PromptRuntimeError {
+                                        message: message.clone(),
+                                    })
+                                    .await;
+                                let _ = event_tx_for_block
+                                    .send(Event::Stopped {
+                                        reason: "session_reset_failed".into(),
+                                    })
+                                    .await;
+                                let _ = respond_to
+                                    .send(ResetSessionOutcome::Failed { message });
+                            }
+                            Err(ResetRequestError::TimedOut) => {
+                                let message =
+                                    "agent did not answer session/new before the reset deadline"
+                                        .to_string();
+                                warn!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    "conversation reset failed: {message}"
+                                );
+                                let _ = event_tx_for_block
+                                    .send(Event::PromptRuntimeError {
+                                        message: message.clone(),
+                                    })
+                                    .await;
+                                let _ = event_tx_for_block
+                                    .send(Event::Stopped {
+                                        reason: "session_reset_failed".into(),
+                                    })
+                                    .await;
+                                let _ = respond_to
+                                    .send(ResetSessionOutcome::Failed { message });
+                            }
+                        }
+                    }
                     Some(ClientCmd::Shutdown) | None => {
                         info!(target: "acp.protocol", "shutdown received, exiting connection loop");
                         break;
@@ -7752,7 +8689,7 @@ async fn run_connection_task<W, R>(
                 let _ = tx.send(Err(AcpError::Spawn(message.clone())));
             } else if let Some(info) = classify_rate_limit_from_message(
                 &message,
-                captured_rate_limit_resets_at(&last_rate_limit_resets_at),
+                captured_rate_limit_resets_at(&last_rate_limit_rejections, chrono::Utc::now()),
             ) {
                 // Defensive: rate-limit can also surface from paths the
                 // prompt arm doesn't cover (handshake-time, mid-handshake
@@ -8475,6 +9412,14 @@ async fn handle_elicitation_request(
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn reset_request_deadline_precedes_the_outer_guard() {
+        assert!(
+            SESSION_RESET_IN_TASK_TIMEOUT < SESSION_RESET_TIMEOUT,
+            "the in-task deadline must expire before the caller's outer guard"
+        );
+    }
 
     #[tokio::test]
     async fn between_prompt_signals_do_not_block_on_a_full_lifecycle_channel() {
@@ -9918,66 +10863,47 @@ mod tests {
         assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 60), cfg));
     }
 
+    // #3152: with no captured rejection epoch the reset is unknown, and an
+    // unknown reset must stay unknown. The old `now + 1h` fallback showed a
+    // fabricated clock time in the banner.
     #[test]
-    fn classify_rate_limit_recognises_data_errorkind() {
+    fn classify_rate_limit_recognises_data_errorkind_without_inventing_a_reset() {
         let mut err = agent_client_protocol::Error::internal_error();
         err.message = "You've hit your limit · resets 12:10pm (Europe/Paris)".into();
         err.data = Some(serde_json::json!({ "errorKind": "rate_limit" }));
         let info = classify_rate_limit_error(&err, None).expect("classified");
         assert_eq!(info.kind, "rate_limit");
         assert!(info.status.contains("hit your limit"));
-        assert!(info.resets_at > chrono::Utc::now());
+        assert_eq!(info.resets_at, None);
     }
 
+    // The captured rejection epoch is the only source of a reset time. #3028.
     #[test]
-    fn classify_rate_limit_prefers_rfc3339_resets_at() {
+    fn classify_rate_limit_uses_captured_resets_at() {
+        let mut err = agent_client_protocol::Error::internal_error();
+        err.message = "You've hit your limit".into();
+        err.data = Some(serde_json::json!({ "errorKind": "rate_limit" }));
+        let captured = chrono::Utc::now() + chrono::Duration::minutes(10);
+        let info = classify_rate_limit_error(&err, Some(captured)).expect("classified");
+        assert_eq!(info.resets_at, Some(captured));
+    }
+
+    // The real adapter's error data is `{ errorKind }` only, so a reset in
+    // there is not parsed; the captured epoch decides. #3152.
+    #[test]
+    fn classify_rate_limit_ignores_reset_in_error_data() {
         let mut err = agent_client_protocol::Error::internal_error();
         err.message = "rate limited".into();
         err.data = Some(serde_json::json!({
             "errorKind": "rate_limit",
             "resets_at": "2099-01-01T00:00:00Z",
         }));
-        let info = classify_rate_limit_error(&err, None).expect("classified");
-        assert_eq!(info.resets_at.to_rfc3339(), "2099-01-01T00:00:00+00:00");
-    }
-
-    // #3028: the adapter puts no reset in the error, only in an out-of-band
-    // usage_update. The captured epoch must replace the wrong now+1h guess.
-    #[test]
-    fn classify_rate_limit_uses_captured_resets_at_over_fallback() {
-        let mut err = agent_client_protocol::Error::internal_error();
-        err.message = "You've hit your limit".into();
-        err.data = Some(serde_json::json!({ "errorKind": "rate_limit" }));
-        let captured = chrono::Utc::now() + chrono::Duration::minutes(10);
-        let info = classify_rate_limit_error(&err, Some(captured)).expect("classified");
-        assert_eq!(info.resets_at, captured);
-    }
-
-    // A stale captured reset already in the past must be ignored so the
-    // fallback (now + 1h, always future) wins instead. #3028.
-    #[test]
-    fn classify_rate_limit_ignores_past_captured_resets_at() {
-        let mut err = agent_client_protocol::Error::internal_error();
-        err.message = "You've hit your limit".into();
-        err.data = Some(serde_json::json!({ "errorKind": "rate_limit" }));
-        let stale = chrono::Utc::now() - chrono::Duration::hours(3);
-        let info = classify_rate_limit_error(&err, Some(stale)).expect("classified");
-        assert!(info.resets_at > chrono::Utc::now());
-    }
-
-    // RFC3339 in the error data (should the adapter ever add it) wins over a
-    // captured epoch. #3028.
-    #[test]
-    fn classify_rate_limit_data_resets_at_beats_captured() {
-        let mut err = agent_client_protocol::Error::internal_error();
-        err.message = "rate limited".into();
-        err.data = Some(serde_json::json!({
-            "errorKind": "rate_limit",
-            "resets_at": "2099-01-01T00:00:00Z",
-        }));
-        let captured = chrono::Utc::now() + chrono::Duration::minutes(10);
-        let info = classify_rate_limit_error(&err, Some(captured)).expect("classified");
-        assert_eq!(info.resets_at.to_rfc3339(), "2099-01-01T00:00:00+00:00");
+        assert_eq!(
+            classify_rate_limit_error(&err, None)
+                .expect("classified")
+                .resets_at,
+            None
+        );
     }
 
     #[test]
@@ -10009,41 +10935,125 @@ mod tests {
         let msg = "{\n  \"errorKind\":\"rate_limit\"\n}";
         let captured = chrono::Utc::now() + chrono::Duration::minutes(20);
         let info = classify_rate_limit_from_message(msg, Some(captured)).expect("classified");
-        assert_eq!(info.resets_at, captured);
+        assert_eq!(info.resets_at, Some(captured));
+    }
+
+    fn rate_limit_meta(
+        value: serde_json::Value,
+    ) -> Option<agent_client_protocol::schema::v1::Meta> {
+        let mut meta = serde_json::Map::new();
+        meta.insert("_claude/rateLimit".to_string(), value);
+        Some(meta)
     }
 
     // #3028: resetsAt from the usage_update `_meta` is unix seconds; a
     // millisecond-scale value must be normalized so it can't resolve to a
     // far-future year.
     #[test]
-    fn rate_limit_resets_at_secs_from_meta_reads_and_guards_units() {
+    fn rate_limit_rejection_from_meta_reads_window_and_guards_units() {
         let secs = 4_102_444_800_i64; // 2100-01-01 in seconds
-        let mut meta = serde_json::Map::new();
-        meta.insert(
-            "_claude/rateLimit".to_string(),
-            serde_json::json!({ "status": "rejected", "resetsAt": secs }),
-        );
         assert_eq!(
-            rate_limit_resets_at_secs_from_meta(&Some(meta.clone())),
-            Some(secs)
+            rate_limit_rejection_from_meta(&rate_limit_meta(serde_json::json!({
+                "status": "rejected",
+                "rateLimitType": "five_hour",
+                "resetsAt": secs,
+            }))),
+            Some(RateLimitRejection {
+                window: "five_hour".to_string(),
+                resets_at_secs: secs,
+            })
         );
 
-        // Millisecond-scale value normalizes back to seconds.
-        let mut meta_ms = serde_json::Map::new();
-        meta_ms.insert(
-            "_claude/rateLimit".to_string(),
-            serde_json::json!({ "resetsAt": secs * 1000 }),
-        );
+        // Millisecond-scale value normalizes back to seconds; a missing
+        // window keys under the empty string.
         assert_eq!(
-            rate_limit_resets_at_secs_from_meta(&Some(meta_ms)),
-            Some(secs)
+            rate_limit_rejection_from_meta(&rate_limit_meta(serde_json::json!({
+                "status": "rejected",
+                "resetsAt": secs * 1000,
+            }))),
+            Some(RateLimitRejection {
+                window: String::new(),
+                resets_at_secs: secs,
+            })
         );
 
         // No meta, or meta without the rate-limit key, yields nothing.
-        assert_eq!(rate_limit_resets_at_secs_from_meta(&None), None);
+        assert_eq!(rate_limit_rejection_from_meta(&None), None);
         let mut other = serde_json::Map::new();
         other.insert("claudeCode".to_string(), serde_json::json!({}));
-        assert_eq!(rate_limit_resets_at_secs_from_meta(&Some(other)), None);
+        assert_eq!(rate_limit_rejection_from_meta(&Some(other)), None);
+    }
+
+    // #3152: a warning carries a real epoch, but nothing ties it to the
+    // window that later rejects, so it must not be retained. Retaining it is
+    // what let a seven-day warning answer a five-hour rejection.
+    #[test]
+    fn rate_limit_rejection_from_meta_ignores_non_rejections() {
+        let secs = 4_102_444_800_i64;
+        for status in ["allowed", "allowed_warning"] {
+            assert_eq!(
+                rate_limit_rejection_from_meta(&rate_limit_meta(serde_json::json!({
+                    "status": status,
+                    "rateLimitType": "seven_day",
+                    "resetsAt": secs,
+                }))),
+                None,
+                "status {status} must not be retained"
+            );
+        }
+        // A rejection without a usable epoch is nothing to retain either.
+        assert_eq!(
+            rate_limit_rejection_from_meta(&rate_limit_meta(
+                serde_json::json!({ "status": "rejected" })
+            )),
+            None
+        );
+        assert_eq!(
+            rate_limit_rejection_from_meta(&rate_limit_meta(serde_json::json!({
+                "status": "rejected",
+                "resetsAt": 0,
+            }))),
+            None
+        );
+    }
+
+    // #3152: every window that rejected has to clear before the session can
+    // run again, so the last reset still ahead of `now` is the answer.
+    // Windows that already rolled over are ignored.
+    #[test]
+    fn captured_rate_limit_resets_at_takes_the_last_future_window() {
+        let now = chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("now");
+        let five_hour = now + chrono::Duration::hours(2);
+        let seven_day = now + chrono::Duration::days(3);
+        let captures = std::sync::Mutex::new(HashMap::from([
+            ("five_hour".to_string(), five_hour.timestamp()),
+            ("seven_day".to_string(), seven_day.timestamp()),
+        ]));
+        assert_eq!(
+            captured_rate_limit_resets_at(&captures, now),
+            Some(seven_day)
+        );
+
+        // The seven-day window rolled over; only the five-hour one is live.
+        let stale = std::sync::Mutex::new(HashMap::from([
+            ("five_hour".to_string(), five_hour.timestamp()),
+            (
+                "seven_day".to_string(),
+                (now - chrono::Duration::days(1)).timestamp(),
+            ),
+        ]));
+        assert_eq!(captured_rate_limit_resets_at(&stale, now), Some(five_hour));
+
+        // Nothing captured, or everything already past, is an unknown reset.
+        assert_eq!(
+            captured_rate_limit_resets_at(&std::sync::Mutex::new(HashMap::new()), now),
+            None
+        );
+        let all_past = std::sync::Mutex::new(HashMap::from([(
+            "five_hour".to_string(),
+            (now - chrono::Duration::minutes(1)).timestamp(),
+        )]));
+        assert_eq!(captured_rate_limit_resets_at(&all_past, now), None);
     }
 
     /// Regression for issue #2414 on the structured-view path: `from_info`
@@ -10331,6 +11341,639 @@ mod tests {
                 .any(|(k, _)| k == "CLAUDE_CONFIG_DIR"),
             "CLAUDE_CONFIG_DIR must not land in inherit_env"
         );
+    }
+
+    /// Write a scripted stdio ACP agent for the conversation-reset tests
+    /// (#2979): answers `initialize`, mints `sid-1`, `sid-2`, ... on each
+    /// `session/new` (each carrying a `thought_level` config option so the
+    /// default-effort application path has a target), acks
+    /// `session/set_config_option`, and answers every `session/prompt`
+    /// with an `agent_message_chunk` notification, a `prompt_delay_secs`
+    /// pause (0 = immediate), then the turn-ending response.
+    /// `reset_new_delay_secs` delays only the second `session/new`, while
+    /// `reset_config_delay_secs` delays only the second config request;
+    /// those hooks exercise the reset deadlines without slowing ordinary
+    /// tests. Appends every inbound request line to the returned capture
+    /// file so tests can assert exactly which requests were issued.
+    #[cfg(unix)]
+    fn write_reset_fake_agent(
+        dir: &std::path::Path,
+        prompt_delay_secs: u32,
+        reset_new_delay_secs: u32,
+        reset_config_delay_secs: u32,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        write_reset_fake_agent_with_initial_update(
+            dir,
+            prompt_delay_secs,
+            reset_new_delay_secs,
+            reset_config_delay_secs,
+            None,
+        )
+    }
+
+    /// Variant that emits one unsolicited update immediately after the
+    /// initial `session/new`. This reproduces between-prompt work without
+    /// reaching into the connection task's private tracking state.
+    #[cfg(unix)]
+    fn write_reset_fake_agent_with_initial_update(
+        dir: &std::path::Path,
+        prompt_delay_secs: u32,
+        reset_new_delay_secs: u32,
+        reset_config_delay_secs: u32,
+        initial_update: Option<serde_json::Value>,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let capture = dir.join("capture.ndjson");
+        let script_path = dir.join("fake-reset-agent.sh");
+        let initial_notification = initial_update
+            .map(|update| {
+                let payload = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "sid-1",
+                        "update": update,
+                    },
+                })
+                .to_string();
+                let shell_quoted = format!("'{}'", payload.replace('\'', "'\"'\"'"));
+                format!("if [ \"$count\" -eq 1 ]; then printf '%s\\n' {shell_quoted}; fi")
+            })
+            .unwrap_or_else(|| ":".into());
+        let script = r#"#!/bin/sh
+CAPTURE=__CAPTURE__
+DELAY=__DELAY__
+RESET_NEW_DELAY=__RESET_NEW_DELAY__
+RESET_CONFIG_DELAY=__RESET_CONFIG_DELAY__
+count=0
+config_count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CAPTURE"
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":false}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      count=$((count+1))
+      if [ "$count" -eq 2 ] && [ "$RESET_NEW_DELAY" -gt 0 ]; then sleep "$RESET_NEW_DELAY"; fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-%d","configOptions":[{"id":"effort","name":"Reasoning Effort","category":"thought_level","type":"select","currentValue":"default","options":[{"value":"default","name":"Default"},{"value":"high","name":"High"}]}]}}\n' "$id" "$count"
+      __INITIAL_NOTIFICATION__
+      ;;
+    *'"method":"session/set_config_option"'*)
+      config_count=$((config_count+1))
+      if [ "$config_count" -eq 2 ] && [ "$RESET_CONFIG_DELAY" -gt 0 ]; then sleep "$RESET_CONFIG_DELAY"; fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[]}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-%d","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}}}\n' "$count"
+      if [ "$DELAY" -gt 0 ]; then sleep "$DELAY"; fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#
+        .replace("__CAPTURE__", capture.to_str().expect("utf8 tmp path"))
+        .replace("__DELAY__", &prompt_delay_secs.to_string())
+        .replace("__RESET_NEW_DELAY__", &reset_new_delay_secs.to_string())
+        .replace("__INITIAL_NOTIFICATION__", &initial_notification)
+        .replace(
+            "__RESET_CONFIG_DELAY__",
+            &reset_config_delay_secs.to_string(),
+        );
+        std::fs::write(&script_path, script).expect("write fake agent script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake agent script");
+        (script_path, capture)
+    }
+
+    #[cfg(unix)]
+    async fn reset_with_deadline_for_test(
+        client: &AcpClient,
+        deadline: tokio::time::Instant,
+    ) -> ResetSessionOutcome {
+        let cmd_tx = client.cmd_tx.as_ref().expect("connection task running");
+        let (respond_to, response) = oneshot::channel();
+        cmd_tx
+            .send(ClientCmd::ResetSession {
+                text: "/new".into(),
+                deadline,
+                respond_to,
+            })
+            .await
+            .expect("send reset command");
+        tokio::time::timeout(std::time::Duration::from_secs(4), response)
+            .await
+            .expect("connection task must answer the reset")
+            .expect("reset response channel open")
+    }
+
+    #[cfg(unix)]
+    async fn assert_between_prompt_reset_refused(
+        client: &mut AcpClient,
+        capture: &std::path::Path,
+    ) {
+        let outcome = client.reset_session("/new").await.expect("reset_session");
+        assert!(
+            matches!(
+                &outcome,
+                ResetSessionOutcome::Failed { message }
+                    if message.contains("agent work is still in flight")
+            ),
+            "between-prompt work must block a reset, got {outcome:?}"
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let event = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for reset refusal")
+                .expect("event channel closed");
+            match event {
+                Event::PromptRejected { reason, text } => {
+                    assert_eq!(reason, "agent_busy");
+                    assert_eq!(text, "/new");
+                    break;
+                }
+                Event::SessionCleared => {
+                    panic!("a refused between-prompt reset must not emit SessionCleared")
+                }
+                _ => {}
+            }
+        }
+
+        let wire = std::fs::read_to_string(capture).expect("read capture");
+        assert_eq!(
+            wire.matches("\"method\":\"session/new\"").count(),
+            1,
+            "a refused reset must not issue a second session/new;\nwire capture:\n{wire}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn reset_fake_spawn_config(script: &std::path::Path, cwd: &std::path::Path) -> SpawnConfig {
+        SpawnConfig {
+            agent_key: "codex".into(),
+            spec: AgentSpec {
+                command: script.to_string_lossy().into_owned(),
+                args: vec![],
+                description: "scripted reset fake".into(),
+                env_allowlist: None,
+            },
+            cwd: cwd.to_path_buf(),
+            additional_dirs: vec![],
+            provider_env: vec![],
+            host_environment: vec![],
+            default_effort: None,
+            default_mode: None,
+            socket_path: None,
+            stored_acp_session_id: None,
+            fork_from: None,
+            seed_history_replay: false,
+            artifact_dir: None,
+            sandbox_info: None,
+            source_profile: None,
+            mcp_servers: Vec::new(),
+        }
+    }
+
+    /// The deadline starts before enqueueing. If it has already expired
+    /// when the connection loop dequeues the command, the stateful
+    /// session/new must not be sent at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn expired_reset_deadline_does_not_send_session_new() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (script, capture) = write_reset_fake_agent(tmp.path(), 0, 0, 0);
+        let config = reset_fake_spawn_config(&script, tmp.path());
+        let client = AcpClient::spawn(config, AcpSessionId("reset-expired".into()))
+            .await
+            .expect("spawn scripted fake agent");
+
+        let outcome = reset_with_deadline_for_test(&client, tokio::time::Instant::now()).await;
+        assert!(
+            matches!(outcome, ResetSessionOutcome::Failed { .. }),
+            "an expired reset must fail, got {outcome:?}"
+        );
+        let wire = std::fs::read_to_string(&capture).expect("read capture");
+        assert_eq!(
+            wire.matches("\"method\":\"session/new\"").count(),
+            1,
+            "the expired command must not send a second session/new;\n{wire}"
+        );
+
+        let valid = reset_with_deadline_for_test(
+            &client,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            matches!(valid, ResetSessionOutcome::Reset { .. }),
+            "the loop must continue after rejecting the expired command"
+        );
+        let _ = client.shutdown().await;
+    }
+
+    /// An ACP tool can remain open after its parent prompt has returned.
+    /// Resetting while that tool is still producing events would attach its
+    /// old-session updates to the fresh conversation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reset_between_prompts_with_open_tool_is_refused() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let initial_update = serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "between-prompt-tool",
+            "title": "long-running tool",
+            "kind": "other",
+            "status": "in_progress",
+            "rawInput": {},
+        });
+        let (script, capture) =
+            write_reset_fake_agent_with_initial_update(tmp.path(), 0, 0, 0, Some(initial_update));
+        let config = reset_fake_spawn_config(&script, tmp.path());
+        let mut client = AcpClient::spawn(config, AcpSessionId("reset-open-tool".into()))
+            .await
+            .expect("spawn scripted fake agent");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let event = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for open tool")
+                .expect("event channel closed");
+            if matches!(
+                event,
+                Event::ToolCallStarted { ref tool_call }
+                    if tool_call.id == "between-prompt-tool"
+            ) {
+                break;
+            }
+        }
+
+        assert_between_prompt_reset_refused(&mut client, &capture).await;
+        let _ = client.shutdown().await;
+    }
+
+    /// A tracked async sub-agent outlives its parent prompt. Its tailer keeps
+    /// publishing progress and completion, so a reset must wait until that
+    /// tailer removes the agent from the between-prompt in-flight set.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reset_between_prompts_with_background_agent_is_refused() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let transcript = tmp.path().join("background-agent.jsonl");
+        std::fs::write(&transcript, "").expect("create background-agent transcript");
+        let initial_update = serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "between-prompt-agent-tool",
+            "_meta": {
+                "claudeCode": {
+                    "toolName": "Agent",
+                    "toolResponse": {
+                        "agentId": "between-prompt-agent",
+                        "description": "keep working after the parent turn",
+                        "prompt": "continue the delegated task",
+                        "resolvedModel": "test-model",
+                        "outputFile": transcript.to_str().expect("utf8 transcript path"),
+                        "status": "async_launched",
+                    },
+                },
+            },
+        });
+        let (script, capture) =
+            write_reset_fake_agent_with_initial_update(tmp.path(), 0, 0, 0, Some(initial_update));
+        let config = reset_fake_spawn_config(&script, tmp.path());
+        let mut client = AcpClient::spawn(config, AcpSessionId("reset-background-agent".into()))
+            .await
+            .expect("spawn scripted fake agent");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let event = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for background-agent launch")
+                .expect("event channel closed");
+            if matches!(
+                event,
+                Event::BackgroundAgentLaunched { ref agent_id, .. }
+                    if agent_id == "between-prompt-agent"
+            ) {
+                break;
+            }
+        }
+
+        assert_between_prompt_reset_refused(&mut client, &capture).await;
+        let _ = client.shutdown().await;
+    }
+
+    /// A `session/new` that never answers must release the real connection
+    /// loop at the caller-created deadline. A second reset then proves the
+    /// loop resumed draining commands instead of remaining parked on the
+    /// abandoned request.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reset_session_new_timeout_releases_the_connection_loop() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (script, _capture) = write_reset_fake_agent(tmp.path(), 0, 1, 0);
+        let config = reset_fake_spawn_config(&script, tmp.path());
+        let client = AcpClient::spawn(config, AcpSessionId("reset-timeout-new".into()))
+            .await
+            .expect("spawn scripted fake agent");
+
+        let first = reset_with_deadline_for_test(
+            &client,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(200),
+        )
+        .await;
+        assert!(
+            matches!(
+                first,
+                ResetSessionOutcome::Failed { ref message }
+                    if message.contains("before the reset deadline")
+            ),
+            "the stalled session/new must fail at the inner deadline, got {first:?}"
+        );
+
+        let second = reset_with_deadline_for_test(
+            &client,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            matches!(
+                second,
+                ResetSessionOutcome::Reset {
+                    ref new_acp_session_id
+                } if new_acp_session_id == "sid-3"
+            ),
+            "the connection loop must process a later reset, got {second:?}"
+        );
+        let _ = client.shutdown().await;
+    }
+
+    /// Once `session/new` returns, the reset is irreversible. A wedged
+    /// best-effort config re-application must still release the command
+    /// loop, adopt the fresh id, and report reset success; otherwise the
+    /// client and runner would disagree about the live session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reset_config_timeout_commits_and_releases_the_connection_loop() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (script, capture) = write_reset_fake_agent(tmp.path(), 0, 0, 1);
+        let mut config = reset_fake_spawn_config(&script, tmp.path());
+        config.default_effort = Some("high".into());
+        let client = AcpClient::spawn(config, AcpSessionId("reset-timeout-config".into()))
+            .await
+            .expect("spawn scripted fake agent");
+
+        let first = reset_with_deadline_for_test(
+            &client,
+            tokio::time::Instant::now() + std::time::Duration::from_millis(200),
+        )
+        .await;
+        assert!(
+            matches!(
+                first,
+                ResetSessionOutcome::Reset {
+                    ref new_acp_session_id
+                } if new_acp_session_id == "sid-2"
+            ),
+            "a post-commit config timeout must preserve reset success, got {first:?}"
+        );
+
+        client
+            .send_prompt("after config timeout", &[])
+            .await
+            .expect("queue follow-up prompt");
+        let capture_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let prompt_line = loop {
+            let wire = std::fs::read_to_string(&capture).expect("read capture");
+            if let Some(line) = wire
+                .lines()
+                .find(|line| line.contains("\"method\":\"session/prompt\""))
+            {
+                break line.to_string();
+            }
+            assert!(
+                std::time::Instant::now() < capture_deadline,
+                "connection loop did not process the follow-up prompt;\n{wire}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(
+            prompt_line.contains("\"sessionId\":\"sid-2\""),
+            "the follow-up prompt must use the committed fresh id: {prompt_line}"
+        );
+        let _ = client.shutdown().await;
+    }
+
+    /// #2979: a clear command on a profile with no native agent-side reset
+    /// (codex-acp swallows `/new` as an unknown command) must drive a REAL
+    /// conversation reset on the live worker: a second `session/new` that
+    /// swaps the ACP session id, with `SessionCleared` +
+    /// `SessionContextReset` + `AcpSessionAssigned` + a terminal `Stopped`
+    /// emitted so the UI's boundary bookkeeping and context tracker follow.
+    /// The raw alias text must NOT be forwarded as a `session/prompt`.
+    /// (Baseline failure
+    /// before the fix: the text-forward path issued exactly one
+    /// `session/new` and a `session/prompt` carrying "/new".)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn codex_clear_drives_fresh_session_new_on_live_worker() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (script, capture) = write_reset_fake_agent(tmp.path(), 0, 0, 0);
+        let mut config = reset_fake_spawn_config(&script, tmp.path());
+        // A configured default effort must survive the reset: spawn applies
+        // it after its session/new, and the driven reset must re-apply it
+        // after its own session/new (the fresh session starts on adapter
+        // defaults). See the maintainer's open question 2 in #2979.
+        config.default_effort = Some("high".into());
+        let mut client = AcpClient::spawn(config, AcpSessionId("reset-2979".into()))
+            .await
+            .expect("spawn scripted fake agent");
+
+        // What the service now does for a codex `/new` after publishing
+        // UserPromptSent: drive the reset instead of forwarding the raw
+        // text. The successful reset itself emits SessionCleared.
+        let outcome = client.reset_session("/new").await.expect("reset_session");
+        match &outcome {
+            ResetSessionOutcome::Reset { new_acp_session_id } => {
+                assert_eq!(
+                    new_acp_session_id, "sid-2",
+                    "the reset must swap onto the fresh session id"
+                );
+            }
+            ResetSessionOutcome::Failed { message } => {
+                panic!("reset must succeed against a live agent: {message}")
+            }
+        }
+
+        // The reset's ordered boundary events: clear the transcript, reset
+        // bookkeeping, assign the fresh id, then end the synthetic turn.
+        let mut events = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for reset events")
+                .expect("event channel closed");
+            let stop = matches!(&ev, Event::Stopped { .. });
+            events.push(ev);
+            if stop {
+                break;
+            }
+        }
+        let cleared_pos = events
+            .iter()
+            .position(|e| matches!(e, Event::SessionCleared))
+            .expect("a successful driven reset must emit SessionCleared");
+        let reset_pos = events
+            .iter()
+            .position(|e| matches!(e, Event::SessionContextReset { .. }))
+            .expect("reset must emit SessionContextReset");
+        let assigned_pos = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    Event::AcpSessionAssigned { acp_session_id } if acp_session_id == "sid-2"
+                )
+            })
+            .expect("reset must emit AcpSessionAssigned with the fresh id");
+        assert!(
+            cleared_pos < reset_pos && reset_pos < assigned_pos,
+            "SessionCleared must precede SessionContextReset, which must \
+             precede AcpSessionAssigned, got {events:?}"
+        );
+        assert!(
+            matches!(events.last(), Some(Event::Stopped { reason }) if reason == "session_reset"),
+            "the reset must end the clear turn with Stopped(session_reset), got {events:?}"
+        );
+
+        // A follow-up prompt must address the NEW session id.
+        client.send_prompt("hello", &[]).await.expect("send prompt");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for follow-up turn to end")
+                .expect("event channel closed");
+            if matches!(&ev, Event::Stopped { .. }) {
+                break;
+            }
+        }
+
+        let wire = std::fs::read_to_string(&capture).expect("read capture");
+        let new_count = wire.matches("\"method\":\"session/new\"").count();
+        assert_eq!(
+            new_count, 2,
+            "a codex clear must issue a fresh session/new on the live worker \
+             (got {new_count} session/new request(s));\nwire capture:\n{wire}"
+        );
+        assert!(
+            !wire.contains("\"text\":\"/new\""),
+            "the raw clear alias must not be forwarded as a session/prompt \
+             (codex-acp would swallow it as an unknown command);\nwire capture:\n{wire}"
+        );
+        assert!(
+            wire.contains("\"sessionId\":\"sid-2\""),
+            "the follow-up prompt must address the swapped session id;\nwire capture:\n{wire}"
+        );
+        let effort_count = wire
+            .matches("\"method\":\"session/set_config_option\"")
+            .count();
+        assert_eq!(
+            effort_count, 2,
+            "the configured default effort must be re-applied after the \
+             reset's session/new, mirroring spawn (got {effort_count} \
+             session/set_config_option request(s));\nwire capture:\n{wire}"
+        );
+        assert_eq!(
+            wire.matches("\"value\":\"high\"").count(),
+            2,
+            "both applications must carry the configured effort value;\nwire capture:\n{wire}"
+        );
+        let _ = client.shutdown().await;
+    }
+
+    /// #2979: a reset requested while a `session/prompt` is in flight must
+    /// be refused because resetting under the turn would orphan it on the old
+    /// session id. The refusal must mirror the busy-Prompt path's
+    /// `PromptRejected` so a raw API caller gets a terminal frame (retry
+    /// pill) under the persisted UserPromptSent, not just an HTTP error.
+    /// The success-only `SessionCleared` boundary must remain absent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reset_during_in_flight_prompt_is_refused_with_prompt_rejected() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        // 3s prompt delay: long enough to land the reset mid-turn, short
+        // enough to keep the test snappy.
+        let (script, capture) = write_reset_fake_agent(tmp.path(), 3, 0, 0);
+        let config = reset_fake_spawn_config(&script, tmp.path());
+        let mut client = AcpClient::spawn(config, AcpSessionId("reset-busy-2979".into()))
+            .await
+            .expect("spawn scripted fake agent");
+
+        client.send_prompt("hello", &[]).await.expect("send prompt");
+        // The fake emits an agent_message_chunk as soon as it receives the
+        // prompt; seeing it proves the connection task is inside the
+        // in-flight select, so the reset below cannot race into the idle
+        // loop and spuriously succeed.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for the turn to start")
+                .expect("event channel closed");
+            if matches!(&ev, Event::AgentMessageChunk { .. }) {
+                break;
+            }
+        }
+
+        let outcome = client.reset_session("/new").await.expect("reset_session");
+        assert!(
+            matches!(&outcome, ResetSessionOutcome::Failed { message } if message.contains("turn is in flight")),
+            "a mid-turn reset must be refused, got {outcome:?}"
+        );
+
+        // The refusal emits PromptRejected(agent_busy) carrying the user's
+        // clear invocation, then the in-flight turn still ends normally.
+        let mut saw_rejected = false;
+        let mut saw_cleared = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for PromptRejected + Stopped")
+                .expect("event channel closed");
+            match &ev {
+                Event::PromptRejected { reason, text } => {
+                    assert_eq!(reason, "agent_busy");
+                    assert_eq!(text, "/new", "the retry pill needs the typed alias");
+                    saw_rejected = true;
+                }
+                Event::SessionCleared => saw_cleared = true,
+                Event::Stopped { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_rejected,
+            "the mid-turn refusal must emit PromptRejected before the turn's Stopped"
+        );
+        assert!(
+            !saw_cleared,
+            "a busy reset must not emit the success-only SessionCleared boundary"
+        );
+
+        let wire = std::fs::read_to_string(&capture).expect("read capture");
+        assert_eq!(
+            wire.matches("\"method\":\"session/new\"").count(),
+            1,
+            "a refused reset must not have issued a second session/new;\nwire capture:\n{wire}"
+        );
+        let _ = client.shutdown().await;
     }
 
     #[tokio::test]
@@ -10801,13 +12444,98 @@ mod tests {
 
     #[test]
     fn resolve_agent_command_returns_none_for_absolute_path() {
-        assert!(resolve_agent_command("/usr/local/bin/claude-agent-acp").is_none());
-        assert!(resolve_agent_command("./relative/path").is_none());
+        let app = std::path::Path::new("/nonexistent-app-dir");
+        assert!(resolve_agent_command("/usr/local/bin/claude-agent-acp", Some(app)).is_none());
+        assert!(resolve_agent_command("./relative/path", Some(app)).is_none());
     }
 
     #[test]
     fn resolve_agent_command_returns_none_for_placeholder() {
-        assert!(resolve_agent_command("${aoe_data_dir}/acp-worker/dist/aoe-agent").is_none());
+        let app = std::path::Path::new("/nonexistent-app-dir");
+        assert!(
+            resolve_agent_command("${aoe_data_dir}/acp-worker/dist/aoe-agent", Some(app)).is_none()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_agent_command_falls_back_to_bundled_when_not_on_path() {
+        // Tagged `#[serial]` and PATH-scrubbed because the adapter names are
+        // real: a dev machine with a global `claude-agent-acp` would
+        // (correctly) resolve that copy instead of the bundled one.
+        let app = tempfile::TempDir::new().unwrap();
+        let name = "claude-agent-acp";
+        let bin_dir = app
+            .path()
+            .join("acp-worker/adapters/claude-agent-acp/node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let bin = bin_dir.join(name);
+        std::fs::write(&bin, "#!/usr/bin/env node\n").unwrap();
+
+        let empty = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var_os("PATH");
+        // SAFETY: mutates the process-wide PATH; `#[serial]` keeps other
+        // PATH readers out of the way.
+        unsafe {
+            std::env::set_var("PATH", empty.path());
+        }
+        let resolved = resolve_agent_command(name, Some(app.path()));
+        if let Some(prev) = prev {
+            unsafe {
+                std::env::set_var("PATH", prev);
+            }
+        }
+
+        let resolved = resolved.expect("should resolve from the bundled adapter dir");
+        assert_eq!(resolved.path, bin);
+        assert_eq!(resolved.prepend_paths.first(), Some(&bin_dir));
+    }
+
+    /// A hanging adapter must not block session spawn: the probe has to give
+    /// up on its deadline and report nothing, so the caller keeps the user's
+    /// copy rather than waiting forever.
+    #[cfg(all(unix, feature = "serve"))]
+    #[test]
+    fn probe_version_bounded_gives_up_on_a_hanging_binary() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("hangs");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        assert!(probe_version_bounded(&script).is_none());
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "probe should abandon a hanging binary, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(all(unix, feature = "serve"))]
+    #[test]
+    fn probe_version_bounded_reads_version_output() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("prints");
+        std::fs::write(&script, "#!/bin/sh\necho 0.61.0\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = probe_version_bounded(&script).expect("should capture stdout");
+        assert_eq!(out.trim(), "0.61.0");
+    }
+
+    /// Without an app dir (a `get_app_dir` failure) resolution must still
+    /// fall through to PATH and the node-manager scan, not collapse to
+    /// nothing. Regression guard for #1048.
+    #[test]
+    #[serial_test::serial]
+    fn resolve_agent_command_without_app_dir_still_uses_path() {
+        assert!(resolve_agent_command("aoe-definitely-not-installed", None).is_none());
+        // `sh` is on PATH everywhere the suite runs.
+        let resolved =
+            resolve_agent_command("sh", None).expect("PATH resolution must work without app_dir");
+        assert!(resolved.path.is_file());
     }
 
     #[test]
@@ -10839,15 +12567,15 @@ mod tests {
         unsafe {
             std::env::set_var("PATH", &new_path);
         }
-        let resolved = resolve_agent_command("aoe-test-resolver-fake");
+        let resolved = resolve_agent_command("aoe-test-resolver-fake", None);
         if let Some(prev) = prev {
             unsafe {
                 std::env::set_var("PATH", prev);
             }
         }
-        let (path, parent) = resolved.expect("binary should resolve from PATH");
-        assert_eq!(path, bin);
-        assert_eq!(parent, dir.path());
+        let resolved = resolved.expect("binary should resolve from PATH");
+        assert_eq!(resolved.path, bin);
+        assert_eq!(resolved.prepend_paths, vec![dir.path().to_path_buf()]);
     }
 
     #[test]
@@ -12689,7 +14417,6 @@ mod tests {
     #[tokio::test]
     async fn runner_control_native_completion_fires_stopped() {
         use crate::acp::control_protocol::{self, ControlBody, PromptOutcome};
-        use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::net::UnixListener;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -12727,19 +14454,29 @@ mod tests {
         });
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
-        let guard = Arc::new(AtomicBool::new(false));
-        let client = connect_runner_control_v2(&main_socket, event_tx, "s".into(), guard.clone())
-            .await
-            .expect("v2 control client");
+        let guard = Arc::new(TerminalClaim::new());
+        // Set, as a stranded prompt loop would leave it: the reader must hand
+        // idle ownership back when it surfaces the waiterless completion.
+        let prompt_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let client = connect_runner_control_v2(
+            &main_socket,
+            event_tx,
+            "s".into(),
+            guard.clone(),
+            prompt_in_flight.clone(),
+        )
+        .await
+        .expect("v2 control client");
 
         let ev = tokio::time::timeout(std::time::Duration::from_secs(5), event_rx.recv())
             .await
             .expect("timed out waiting for Stopped")
             .expect("event channel closed");
         assert!(matches!(ev, Event::Stopped { reason } if reason == "prompt_complete"));
+        assert!(guard.claimed(), "the turn's terminal must be claimed");
         assert!(
-            guard.load(Ordering::Relaxed),
-            "terminal guard must be claimed"
+            !prompt_in_flight.load(std::sync::atomic::Ordering::Relaxed),
+            "a waiterless completion must hand idle ownership back so the lane can arm"
         );
         drop(client);
         let _ = fake.await;
@@ -12751,7 +14488,6 @@ mod tests {
     #[tokio::test]
     async fn runner_control_version_mismatch_leaves_guard_unclaimed() {
         use crate::acp::control_protocol::{self, ControlBody};
-        use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::net::UnixListener;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -12773,17 +14509,23 @@ mod tests {
         });
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
-        let guard = Arc::new(AtomicBool::new(false));
-        let client =
-            connect_runner_control_v2(&main_socket, event_tx, "s".into(), guard.clone()).await;
+        let guard = Arc::new(TerminalClaim::new());
+        let client = connect_runner_control_v2(
+            &main_socket,
+            event_tx,
+            "s".into(),
+            guard.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await;
 
         assert!(
             client.is_none(),
             "unknown control version must not yield a v2 client"
         );
         assert!(
-            !guard.load(Ordering::Relaxed),
-            "unknown control version must not claim the guard"
+            !guard.claimed(),
+            "unknown control version must not claim the terminal"
         );
         assert!(
             event_rx.try_recv().is_err(),
@@ -12792,28 +14534,66 @@ mod tests {
         let _ = fake.await;
     }
 
+    /// The one-shot guard this replaced could be claimed once per CONNECTION,
+    /// so a second turn on the same connection found it taken and its
+    /// watchdog skipped the emit, leaving the session rendering Running with
+    /// no terminal event. Reachable by reattaching to an in-flight turn (the
+    /// control reader claims for the adopted turn) and then letting the agent
+    /// resume itself again. Each turn must own its own claim. See #3190 and
+    /// PR #3192 review.
+    #[test]
+    fn terminal_claim_is_per_turn_not_per_connection() {
+        let claim = TerminalClaim::new();
+
+        // First turn: claimable exactly once.
+        assert!(!claim.claimed());
+        assert!(claim.claim(), "first turn's terminal is unclaimed");
+        assert!(claim.claimed());
+        assert!(
+            !claim.claim(),
+            "a second path must not double-publish the same turn's terminal"
+        );
+
+        // Second turn on the same connection: its own terminal.
+        claim.begin_turn();
+        assert!(
+            !claim.claimed(),
+            "a new turn must not inherit the previous turn's claim"
+        );
+        assert!(claim.claim(), "second turn's terminal is claimable");
+        assert!(!claim.claim());
+
+        // And it keeps working, so a long-lived connection cannot run out.
+        claim.begin_turn();
+        assert!(claim.claim());
+    }
+
     /// The load-bearing backward-compat path: an old runner that never binds
     /// the control socket leaves the guard unclaimed, so the resume-idle
     /// watchdog remains the terminal authority.
     #[tokio::test]
     async fn runner_control_absent_socket_leaves_guard_unclaimed() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
         let tmp = tempfile::tempdir().unwrap();
         // No control listener is bound at the sibling path.
         let main_socket = tmp.path().join("s.sock");
 
         let (event_tx, mut event_rx) = mpsc::channel::<Event>(8);
-        let guard = Arc::new(AtomicBool::new(false));
-        let client =
-            connect_runner_control_v2(&main_socket, event_tx, "s".into(), guard.clone()).await;
+        let guard = Arc::new(TerminalClaim::new());
+        let client = connect_runner_control_v2(
+            &main_socket,
+            event_tx,
+            "s".into(),
+            guard.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+        .await;
 
         assert!(
             client.is_none(),
             "absent control socket must fall back to the watchdog"
         );
         assert!(
-            !guard.load(Ordering::Relaxed),
+            !guard.claimed(),
             "absent control socket must fall back to the watchdog"
         );
         assert!(event_rx.try_recv().is_err());

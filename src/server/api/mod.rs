@@ -14,6 +14,8 @@ pub(super) use super::AppState;
 mod acp;
 #[cfg(feature = "serve")]
 mod client_log;
+#[cfg(feature = "serve")]
+mod file_provenance;
 mod git;
 mod log_level;
 mod mcp;
@@ -49,12 +51,13 @@ pub use plugins::{
 };
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
-    create_session, delete_session, delete_workspace, ensure_container_terminal, ensure_session,
-    ensure_terminal, force_smart_rename, get_recent_projects, kill_terminal, list_sessions,
-    paste_image, preview_volume_ignores_globs, read_output, rename_session, restore_session,
-    search_sessions, send_message, serve_session_artifact, session_diff_file, session_diff_files,
-    set_worktree_name, start_session, stop_session, summarize_session, trash_session,
-    update_session_archive, update_session_color, update_session_diff_base, update_session_group,
+    attach_session_project, create_session, delete_session, delete_workspace,
+    ensure_container_terminal, ensure_session, ensure_terminal, force_smart_rename,
+    get_recent_projects, kill_terminal, list_sessions, paste_image, preview_volume_ignores_globs,
+    read_output, rename_session, restore_session, search_sessions, send_message,
+    serve_session_artifact, session_diff_file, session_diff_files, session_file, set_worktree_name,
+    start_session, stop_session, summarize_session, trash_session, update_session_archive,
+    update_session_color, update_session_diff_base, update_session_group,
     update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
     update_workspace_ordering, CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
 };
@@ -104,6 +107,34 @@ pub(super) fn read_only_response() -> axum::response::Response {
         })),
     )
         .into_response()
+}
+
+/// Canonical 403 body for CityHall client mode (`AOE_CITYHALL_MODE`). Terminal
+/// (keystrokes + raw pane/output reads), diff, project management, agent/worker
+/// lifecycle + config, git clone/probe, and uncurated settings/profile writes
+/// are all closed here, not only by hiding the UI: the create path also strips
+/// every client-controlled spawn field, and the curated settings/theme writes
+/// are field-filtered. Reachability is enforced default-deny by the
+/// `cityhall_gate` middleware against the `CITYHALL_MUTATION_ALLOW` table (with
+/// the per-handler `cityhall_block*` calls kept as defense in depth); the
+/// `every_mutating_route_is_cityhall_classified` audit and the
+/// `serve_cityhall_lockdown` route tests keep the contract honest. See #7.
+pub(crate) fn cityhall_response() -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({
+            "error": "cityhall_mode",
+            "message": "This action is disabled in CityHall client mode"
+        })),
+    )
+        .into_response()
+}
+
+/// 403 guard for CityHall client mode, mirroring `read_only_block`. Callers do
+/// `if let Some(resp) = cityhall_block(&state) { return resp; }`.
+pub(crate) fn cityhall_block(state: &AppState) -> Option<axum::response::Response> {
+    state.cityhall_mode.then(cityhall_response)
 }
 
 /// 404 for the persist-then-apply race: the write was persisted to disk, but
@@ -212,6 +243,17 @@ mod tests {
     //! `crate::session::settings_schema::policy` (#1692).
     use super::*;
 
+    /// CityHall lockdown (#7): the shared guard returns 403 so terminal, diff,
+    /// project-management, and advanced-settings endpoints are unreachable in
+    /// CityHall client mode, not merely hidden in the UI.
+    #[test]
+    fn cityhall_response_is_forbidden() {
+        assert_eq!(
+            cityhall_response().status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
+    }
+
     /// Read-only audit: every mutating handler must check `state.read_only`
     /// (directly, or via the `read_only_block` helper) and return 403
     /// before performing any write. This static check walks the handler
@@ -246,6 +288,7 @@ mod tests {
                     "delete_session",
                     "rename_session",
                     "set_worktree_name",
+                    "attach_session_project",
                     "send_message",
                     "ensure_session",
                     "ensure_terminal",
@@ -444,6 +487,7 @@ mod tests {
                     "delete_session",
                     "rename_session",
                     "set_worktree_name",
+                    "attach_session_project",
                     "send_message",
                     "ensure_session",
                     "ensure_terminal",

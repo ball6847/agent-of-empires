@@ -211,6 +211,22 @@ export function getSessionFileContents(
   return fetchJson<RichFileContentsResponse>(`/api/sessions/${id}/diff/file?${params.toString()}`);
 }
 
+export interface SessionFileResponse {
+  content: string;
+  is_binary: boolean;
+  truncated: boolean;
+}
+
+/**
+ * Read a session file for the file viewer (#3088). Path may be project-relative
+ * or an absolute path the agent touched this session; the server enforces
+ * provenance confinement. See `GET /api/sessions/{id}/file`.
+ */
+export function getSessionFile(id: string, filePath: string): Promise<SessionFileResponse | null> {
+  const params = new URLSearchParams({ path: filePath });
+  return fetchJson<SessionFileResponse>(`/api/sessions/${id}/file?${params.toString()}`);
+}
+
 // --- Settings ---
 
 export interface SettingsResponse {
@@ -1180,6 +1196,11 @@ export interface ServerAbout {
   auth_mode: "token" | "passphrase" | "none";
   read_only: boolean;
   behind_tunnel: boolean;
+  /** CityHall client mode (`AOE_CITYHALL_MODE`). Locks the dashboard
+   *  down to a composer + structured-view end-user client: name-only
+   *  session creation, theme-only settings, no terminal / diff /
+   *  project-management. Enforced server-side too. See #7. */
+  cityhall_mode: boolean;
   profile: string;
   /** Resolved `acp.show_tool_durations` from the active profile's
    *  config. Drives the per-tool elapsed-time label in the acp
@@ -1198,6 +1219,24 @@ export interface ServerAbout {
    *  installed PWA has no refresh affordance, so it keeps running old
    *  code after the binary updates until prompted to reload). */
   web_build_id?: string | null;
+  /** Read-only runtime state of the daemon's sleep-inhibit reconciler.
+   *  Always present: `get_about` emits it unconditionally
+   *  (`SleepInhibitStatus`, not `Option`). Informational only; no dashboard
+   *  flow consumes it yet. */
+  sleep_inhibit: {
+    /** The `session.prevent_sleep_when_active` toggle as the reconciler
+     *  last read it: the raw config toggle, not whether an assertion is
+     *  held. */
+    prevent_sleep_enabled: boolean;
+    /** Whether the daemon holds an OS sleep assertion as of the last
+     *  reconcile; can trail the backing child's death by up to one poll
+     *  interval. */
+    currently_held: boolean;
+    /** Whether a real OS backend is still believed able to hold the
+     *  assertion. Optimistic: `true` means no failure latched yet, not
+     *  verified working. */
+    backend_available: boolean;
+  };
 }
 
 export function fetchAbout(): Promise<ServerAbout | null> {
@@ -2090,6 +2129,79 @@ export async function setWorktreeName(
       // non-JSON error body; fall through with no message
     }
     return { ok: false, message };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/** What happened to the session's agent after a repo was attached. */
+export type AttachProjectWorker = "restarted" | "not_running" | "restart_failed";
+
+export interface AttachProjectResult {
+  ok: boolean;
+  /** Server validation message on failure, or the worker message on a failed restart. */
+  message?: string;
+  worker?: AttachProjectWorker;
+  /** Directory leaf the repo was attached under. */
+  name?: string;
+  branch?: string;
+  /** False when aoe checked out a branch the repo already had. */
+  branchCreated?: boolean;
+  /** New working directory when the attach converted the session into a
+   *  workspace; absent when it already was one and nothing moved. */
+  movedTo?: string;
+  warnings?: string[];
+}
+
+/**
+ * Attach another repo to a session that already exists, so an agent that turns
+ * out to need a second repo keeps its conversation instead of the session being
+ * recreated. Converts the session into a multi-repo workspace, which moves its
+ * working directory unless it already was one, and restarts it there. See #3103.
+ *
+ * `project` is a path or the name of a registered project.
+ *
+ * A 200 with `worker: "restart_failed"` means the repo is attached and durable
+ * but the session did not come back, so the caller must surface that rather than
+ * treating the call as a plain success.
+ */
+export async function attachSessionProject(
+  id: string,
+  project: string,
+  opts: { attachExistingBranch?: boolean } = {},
+): Promise<AttachProjectResult> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/projects`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        project,
+        attach_existing_branch: opts.attachExistingBranch ?? false,
+      }),
+    });
+    let body: Record<string, unknown> | undefined;
+    try {
+      body = await res.json();
+    } catch {
+      // non-JSON body; fall through with no detail
+    }
+    if (!res.ok) {
+      return {
+        ok: false,
+        message: typeof body?.message === "string" ? body.message : undefined,
+      };
+    }
+    const attached = body?.attached as Record<string, unknown> | undefined;
+    return {
+      ok: true,
+      worker: body?.worker as AttachProjectWorker | undefined,
+      message: typeof body?.worker_message === "string" ? body.worker_message : undefined,
+      name: typeof attached?.name === "string" ? attached.name : undefined,
+      branch: typeof attached?.branch === "string" ? attached.branch : undefined,
+      branchCreated: typeof attached?.branch_created === "boolean" ? attached.branch_created : undefined,
+      movedTo: typeof attached?.moved_to === "string" ? attached.moved_to : undefined,
+      warnings: Array.isArray(body?.warnings) ? (body.warnings as string[]) : undefined,
+    };
   } catch {
     return { ok: false };
   }

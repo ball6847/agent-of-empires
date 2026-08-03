@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.13.1"
+version = "1.13.2"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
@@ -102,6 +102,7 @@ nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resourc
 
 # Unicode width + normalization (NFKD used to fold accents in title-derived branch names)
 unicode-normalization = "0.1"
+unicode-segmentation = "1"
 unicode-width = "0.2"
 
 # Terminal spinners
@@ -181,6 +182,11 @@ xz2 = { version = "0.1", optional = true }
 # the daemon itself uses axum's built-in WS support and never pulls this in.
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-webpki-roots", "connect"], optional = true }
 
+# Capability-safe file opens for the session file-read endpoint (#3088): open
+# beneath a Dir so a component swapped after the containment check cannot
+# escape the intended root.
+cap-std = { version = "4.0.2", optional = true }
+
 # Unix-only: O_NOFOLLOW for race-free plugin-tree reads/copies (no std constant).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -234,7 +240,12 @@ serve = [
     "semver",
     "xz2",
     "tokio-tungstenite",
+    # Sandboxed, race-safe file reads for the session file endpoint (#3088):
+    # open beneath a capability Dir so a symlink or component swapped between
+    # the confinement check and the open cannot escape the intended root.
+    "cap-std",
 ]
+cap-std = ["dep:cap-std"]
 
 [dev-dependencies]
 serial_test = "3.4"

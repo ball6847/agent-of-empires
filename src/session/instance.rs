@@ -9,7 +9,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::cli::truncate_id;
 use crate::containers::{self, DockerContainer};
 use crate::tmux;
 
@@ -65,6 +64,54 @@ impl Status {
             Status::Starting => "starting",
             Status::Deleting => "deleting",
             Status::Creating => "creating",
+        }
+    }
+
+    /// Wire form for the HTTP API's `status` field: PascalCase, matching what
+    /// `SessionResponse` has emitted since the endpoint shipped (the web
+    /// dashboard and existing tests both key on it). Distinct from
+    /// [`Status::as_str`], which is the lowercase CLI/hook form.
+    ///
+    /// Spelled out rather than leaning on `format!("{:?}")` so renaming a
+    /// variant cannot silently change the public API;
+    /// `status_api_wire_form_round_trips` pins the two together. See #3187.
+    pub fn wire_str(self) -> &'static str {
+        match self {
+            Status::Running => "Running",
+            Status::Waiting => "Waiting",
+            Status::Idle => "Idle",
+            Status::Unknown => "Unknown",
+            Status::Stopped => "Stopped",
+            Status::Error => "Error",
+            Status::Starting => "Starting",
+            Status::Deleting => "Deleting",
+            Status::Creating => "Creating",
+        }
+    }
+
+    /// Parse the form `/api/sessions` puts on the wire. That endpoint
+    /// serializes with `format!("{:?}", inst.status)`, not serde, so the
+    /// variant names are `CamelCase` rather than the `lowercase` rename
+    /// `as_str` and `Deserialize` use. Kept next to `as_str` so both
+    /// spellings of the same enum are read together;
+    /// `status_api_wire_form_round_trips` locks the pairing against the
+    /// server's formatter.
+    ///
+    /// `None` for anything unrecognized, which is how a newer daemon
+    /// reaches an older client: the caller leaves the row's status alone
+    /// rather than inventing one.
+    pub fn from_api_str(s: &str) -> Option<Status> {
+        match s {
+            "Running" => Some(Status::Running),
+            "Waiting" => Some(Status::Waiting),
+            "Idle" => Some(Status::Idle),
+            "Unknown" => Some(Status::Unknown),
+            "Stopped" => Some(Status::Stopped),
+            "Error" => Some(Status::Error),
+            "Starting" => Some(Status::Starting),
+            "Deleting" => Some(Status::Deleting),
+            "Creating" => Some(Status::Creating),
+            _ => None,
         }
     }
 
@@ -322,7 +369,7 @@ pub struct WorktreeInfo {
     pub base_branch: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceRepo {
     pub name: String,
     pub source_path: String,
@@ -330,6 +377,16 @@ pub struct WorkspaceRepo {
     pub worktree_path: String,
     pub main_repo_path: String,
     pub managed_by_aoe: bool,
+    /// True when `branch` already existed in this repo and aoe merely checked it
+    /// out, which makes branch deletion on session delete a no-op.
+    ///
+    /// Only ever set by `attach_project` with `--attach-existing-branch` (#3103):
+    /// the workspace builder always creates the branch it names, so branch and
+    /// worktree ownership coincide for a repo present at creation. Phrased as
+    /// "pre-existing" rather than "aoe created it" so the serde default is
+    /// correct for every record written before the field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub branch_preexisting: bool,
 }
 
 fn default_true() -> bool {
@@ -817,6 +874,19 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify_on_error: Option<bool>,
 
+    /// External work-queue dispatcher completion callback: an HTTP POST
+    /// fires here when this session transitions to Idle, Waiting, or Error.
+    /// Set only at session-create time via `CreateSessionBody.callback_url`;
+    /// never exposed in `SessionResponse` (list/get) since URLs commonly
+    /// embed bearer tokens. See #3156.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_url: Option<String>,
+    /// Caller-supplied idempotency key from `POST /api/sessions`, persisted
+    /// so a retry (even across a daemon restart) can be matched back to this
+    /// instance instead of creating a duplicate. See #3156.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+
     /// Per-session override for the diff base ref. Takes precedence
     /// over `DiffConfig.default_branch` and the auto-detected default
     /// branch. Set when the eventual PR target differs from the project
@@ -1251,7 +1321,6 @@ fn override_if_distinct(stored: Option<&str>, fresh: String) -> Option<String> {
 }
 
 fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
-    let suffix = format!("_{}", truncate_id(instance_id, 8));
     let output = crate::tmux::tmux_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
@@ -1259,28 +1328,8 @@ fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
     if !output.status.success() {
         return None;
     }
-
-    let mut agent = None;
-    let mut terminal = None;
-    let mut container = None;
-    for name in String::from_utf8_lossy(&output.stdout).lines() {
-        if !name.ends_with(&suffix)
-            || name.starts_with(tmux::TOOL_PREFIX)
-            || crate::tmux::utils::is_pane_dead(name)
-        {
-            continue;
-        }
-
-        if name.starts_with(tmux::TERMINAL_PREFIX) {
-            terminal.get_or_insert_with(|| name.to_string());
-        } else if name.starts_with(tmux::CONTAINER_TERMINAL_PREFIX) {
-            container.get_or_insert_with(|| name.to_string());
-        } else if name.starts_with(tmux::SESSION_PREFIX) {
-            agent.get_or_insert_with(|| name.to_string());
-        }
-    }
-
-    agent.or(terminal).or(container)
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    crate::tmux::live_any_kind_name_for_id(stdout.lines(), instance_id)
 }
 
 /// A passively-detected status transition, queued for a batched disk write.
@@ -1386,6 +1435,8 @@ impl Instance {
             notify_on_waiting: None,
             notify_on_idle: None,
             notify_on_error: None,
+            callback_url: None,
+            idempotency_key: None,
             base_branch_override: None,
             color: None,
             view: View::Terminal,
@@ -1458,6 +1509,20 @@ impl Instance {
                 .workspace_info
                 .as_ref()
                 .is_some_and(|ws| ws.cleanup_on_delete)
+    }
+
+    /// Every repo this session works in, empty for a single-repo session.
+    ///
+    /// The one accessor consumers read, so nothing has to know that a session
+    /// gains repos two ways: created multi-repo, or converted by
+    /// `attach_project` (#3103). Both end up in `workspace_info.repos`, which is
+    /// the point of converting rather than keeping a second list: a repo added
+    /// later is indistinguishable from one present at creation.
+    pub fn all_repos(&self) -> &[WorkspaceRepo] {
+        self.workspace_info
+            .as_ref()
+            .map(|ws| ws.repos.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Stamp `last_accessed_at` to the current time AND wake the session
@@ -1773,6 +1838,12 @@ impl Instance {
         if pre.worktree_info != post.worktree_info {
             self.worktree_info = post.worktree_info.clone();
         }
+        // `workspace_info` deliberately has NO arm. Attaching a project (#3103)
+        // converts the session into a workspace, but it does that through
+        // `Storage::update` (which takes both lock layers) rather than through a
+        // user-action diff, so the value on disk is already authoritative here.
+        // Assigning `post`'s copy would let a stale TUI snapshot clobber a
+        // conversion a peer landed between the `pre` snapshot and this merge.
         if pre.status != post.status {
             self.status = post.status;
         }
@@ -2155,10 +2226,15 @@ impl Instance {
     /// (`Running`, `Waiting`, `Starting`, or `Creating`), or it went idle less
     /// than `window` ago. A session idle for `>= window` (or
     /// Stopped/Error/Unknown/Deleting) returns false, so the sleep-inhibit
-    /// assertion may release. `Waiting` counts as active unconditionally, so a
-    /// session parked waiting for input holds sleep until it is answered; that
-    /// is intentional for the opt-in v1 (no `waiting_since` timestamp exists to
-    /// age it out).
+    /// assertion may release. `Waiting`, `Starting`, and `Creating` all count
+    /// as active unconditionally, so a session parked waiting for input, or
+    /// one still starting or mid-create, holds sleep until it leaves that
+    /// status: the predicate ages out only `Idle`, never these three. That is
+    /// intentional for the opt-in v1, and nothing ages these three out:
+    /// `Waiting` (an unanswered prompt) and `Creating` (a container, worktree,
+    /// or submodule setup that never returns) can hold sleep indefinitely,
+    /// while `Starting` is bounded by the ~3s `last_start_time` guard in
+    /// `update_status_with_metadata_inner` and then re-resolves.
     pub fn has_recent_activity(&self, window: std::time::Duration) -> bool {
         matches!(
             self.status,
@@ -2950,7 +3026,7 @@ impl Instance {
 
     fn apply_container_terminal_tmux_options(&self, index: u32) {
         let name =
-            tmux::ContainerTerminalSession::generate_name_indexed(&self.id, &self.title, index);
+            tmux::ContainerTerminalSession::resolve_name_indexed(&self.id, &self.title, index);
         self.apply_session_tmux_options(&name, &format!("{} (container)", self.title));
     }
 
@@ -3845,7 +3921,7 @@ impl Instance {
 
 impl Instance {
     fn apply_terminal_tmux_options(&self, index: u32) {
-        let name = tmux::TerminalSession::generate_name_indexed(&self.id, &self.title, index);
+        let name = tmux::TerminalSession::resolve_name_indexed(&self.id, &self.title, index);
         self.apply_session_tmux_options(&name, &format!("{} (terminal)", self.title));
     }
 
@@ -4109,10 +4185,7 @@ impl Instance {
                 }
             }
             "opencode" => {
-                let launch_time_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as f64)
-                    .unwrap_or(0.0);
+                let launch_time_ms = crate::util::now_ms() as f64;
                 if self.is_sandboxed() {
                     let container_name = match self.sandbox_info.as_ref() {
                         Some(s) => s.container_name.clone(),
@@ -4279,10 +4352,7 @@ impl Instance {
                 if self.is_sandboxed() {
                     return;
                 }
-                let launch_time_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as f64)
-                    .unwrap_or(0.0);
+                let launch_time_ms = crate::util::now_ms() as f64;
                 Box::new(kimi_poll_fn(
                     self.project_path.clone(),
                     self.id.clone(),
@@ -4882,22 +4952,93 @@ impl Instance {
     /// guard shape (baseline vs. newly detected). Every call re-seeds the
     /// baseline at exit, so the next call compares against a value this
     /// method itself wrote.
-    pub fn update_status_with_metadata(&mut self, metadata: Option<&tmux::PaneMetadata>) {
+    pub fn update_status_with_metadata(
+        &mut self,
+        metadata: Option<&tmux::PaneMetadata>,
+        resolved_name: Option<&str>,
+    ) {
         let baseline = self.live_status_baseline;
-        self.update_status_with_metadata_inner(metadata);
-        if baseline.is_some_and(|prev| prev != self.status) {
-            let now = Utc::now();
-            self.last_accessed_at = Some(now);
-            self.idle_entered_at = if self.status == Status::Idle {
-                Some(now)
-            } else {
-                None
-            };
+        self.update_status_with_metadata_inner(metadata, resolved_name);
+        if let Some(prev) = baseline {
+            if prev != self.status {
+                self.log_status_transition(prev);
+                let now = Utc::now();
+                self.last_accessed_at = Some(now);
+                self.idle_entered_at = if self.status == Status::Idle {
+                    Some(now)
+                } else {
+                    None
+                };
+            }
         }
         self.live_status_baseline = Some(self.status);
     }
 
-    fn update_status_with_metadata_inner(&mut self, metadata: Option<&tmux::PaneMetadata>) {
+    /// One `info` line per observed status transition, carrying the evidence a
+    /// wrong-state report needs: the hook file's value and age at the moment
+    /// of the flip, and (for Claude) a content-free fingerprint of which pane
+    /// markers were on screen. Intermittent status flakes can't be reproduced
+    /// on demand, so this trail must land at the default log level; the
+    /// per-rule detector traces stay at debug/trace for when a report narrows
+    /// the hunt.
+    ///
+    /// Sessions are identified by the opaque instance id, not the title:
+    /// smart-rename derives titles from the first prompt, so a title in an
+    /// always-on log would leak conversation-derived text and break the
+    /// content-free promise the pane fingerprint keeps. `aoe list` maps ids
+    /// back to titles when correlating.
+    ///
+    /// The hook file is re-read here rather than threaded out of the detection
+    /// path, so a value that changed in the microseconds since detection can
+    /// disagree with the decision; the age field makes that visible. Costs one
+    /// file stat, plus one pane capture for Claude, gated on an actual
+    /// transition, so steady-state polling pays nothing.
+    fn log_status_transition(&self, prev: Status) {
+        let detection_tool = if self.detect_as.is_empty() {
+            &self.tool
+        } else {
+            &self.detect_as
+        };
+        let hook = crate::hooks::read_hook_status(&self.id);
+        let hook_age_ms = crate::hooks::read_hook_status_age(&self.id).map(|age| age.as_millis());
+        if detection_tool == "claude" {
+            let fingerprint = self
+                .tmux_session()
+                .ok()
+                .and_then(|s| s.capture_pane(50).ok())
+                .map(|pane| tmux::claude_pane_marker_fingerprint(&pane))
+                .unwrap_or_else(|| "capture_failed".to_string());
+            tracing::info!(target: "session.status_change",
+                "{} [{}] {:?} -> {:?} (hook={:?} hook_age_ms={:?} pane={})",
+                self.id, detection_tool, prev, self.status, hook, hook_age_ms, fingerprint
+            );
+        } else {
+            tracing::info!(target: "session.status_change",
+                "{} [{}] {:?} -> {:?} (hook={:?} hook_age_ms={:?})",
+                self.id, detection_tool, prev, self.status, hook, hook_age_ms
+            );
+        }
+    }
+
+    /// Drop a [`TMUX_SESSION_GONE_ERROR`] left on a row that no longer has a
+    /// tmux pane to speak for it, so the UI stops showing a message that cannot
+    /// apply to it any more (a session converted to, or restarted in, the
+    /// structured view).
+    ///
+    /// Shared by the structured short-circuit below and by the daemon poll
+    /// loop's `skip_tmux_decision_for_structured`, which skips that
+    /// short-circuit outright; one copy keeps the two from drifting.
+    pub(crate) fn clear_stale_tmux_error(&mut self) {
+        if self.last_error.as_deref() == Some(TMUX_SESSION_GONE_ERROR) {
+            self.last_error = None;
+        }
+    }
+
+    fn update_status_with_metadata_inner(
+        &mut self,
+        metadata: Option<&tmux::PaneMetadata>,
+        resolved_name: Option<&str>,
+    ) {
         if matches!(
             self.status,
             Status::Stopped | Status::Deleting | Status::Creating
@@ -4920,12 +5061,7 @@ impl Instance {
         // events over the broadcast. Probing tmux here only ever produces
         // a spurious "tmux session is gone" Error transition.
         if self.is_structured() {
-            // Clear any stale tmux-derived error so the UI doesn't show
-            // a misleading message after a session is converted or
-            // restarted in the structured view.
-            if self.last_error.as_deref() == Some(TMUX_SESSION_GONE_ERROR) {
-                self.last_error = None;
-            }
+            self.clear_stale_tmux_error();
             if self.status == Status::Error {
                 self.status = Status::Idle;
             }
@@ -4947,22 +5083,25 @@ impl Instance {
             }
         }
 
-        let session = match self.tmux_session() {
-            Ok(s) => s,
-            Err(_) => {
-                tracing::trace!(target: "session.store",
-                    "status '{}': tmux_session() failed, setting Error",
-                    self.title
-                );
-                self.status = Status::Error;
-                if self.last_error.is_none() {
-                    self.last_error = Some(
-                        "Could not reach tmux. Is tmux still running on the host?".to_string(),
+        let session = match resolved_name {
+            Some(name) => tmux::Session::from_name(name),
+            None => match self.tmux_session() {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::trace!(target: "session.store",
+                        "status '{}': tmux_session() failed, setting Error",
+                        self.title
                     );
+                    self.status = Status::Error;
+                    if self.last_error.is_none() {
+                        self.last_error = Some(
+                            "Could not reach tmux. Is tmux still running on the host?".to_string(),
+                        );
+                    }
+                    self.last_error_check = Some(std::time::Instant::now());
+                    return;
                 }
-                self.last_error_check = Some(std::time::Instant::now());
-                return;
-            }
+            },
         };
 
         match session.existence() {
@@ -4970,7 +5109,7 @@ impl Instance {
                 tracing::trace!(target: "session.store",
                     "status '{}': session.existence()=Absent (tmux name={}), setting Error",
                     self.title,
-                    tmux::Session::generate_name(&self.id, &self.title)
+                    session.name()
                 );
                 self.unknown_since = None;
                 self.status = Status::Error;
@@ -5034,10 +5173,7 @@ impl Instance {
 
         let pane_cmd = metadata
             .and_then(|m| m.pane_current_command.clone())
-            .or_else(|| {
-                let name = tmux::Session::generate_name(&self.id, &self.title);
-                tmux::utils::pane_current_command(&name)
-            });
+            .or_else(|| tmux::utils::pane_current_command(session.name()));
 
         tracing::trace!(target: "session.store",
             "status '{}': exists=true, is_dead={}, pane_cmd={:?}, tool={}, cmd_override={}",
@@ -5068,7 +5204,7 @@ impl Instance {
                     self.last_error = Some(summarize_error_from_pane(&pane_content));
                 }
             } else {
-                // Two hook/pane mismatches need the pane captured and consulted:
+                // Three hook/pane mismatches need the pane captured and consulted:
                 //
                 // 1. Running hook, pane parked on a blocking prompt: Codex and
                 //    Claude keep re-emitting running-mapped hooks while blocked,
@@ -5083,14 +5219,28 @@ impl Instance {
                 //    fires no completing hook, so the file sticks on `waiting`
                 //    until the next turn (regression from #2937). Any such agent
                 //    is reconciled against the pane by reconcile_waiting_hook.
+                // 3. Idle hook on a session last observed Running/Waiting:
+                //    Claude's `Notification(idle_prompt)` hook is
+                //    fire-and-forget, so when a queued prompt submits at turn
+                //    end its `idle` write can land after `UserPromptSubmit`'s
+                //    `running`, showing Idle mid-turn until the first
+                //    PreToolUse rewrites the file. The previous-status gate
+                //    keeps parked sessions (the dominant steady state) from
+                //    paying a capture per poll; see
+                //    reconcile_claude_idle_hook_status.
                 let reconciles_running = (detection_tool == "codex" || detection_tool == "claude")
                     && hook_status == Status::Running;
                 let reconciles_waiting = hook_status == Status::Waiting;
-                self.status = if reconciles_running || reconciles_waiting {
+                let reconciles_idle = detection_tool == "claude"
+                    && hook_status == Status::Idle
+                    && matches!(self.status, Status::Running | Status::Waiting);
+                self.status = if reconciles_running || reconciles_waiting || reconciles_idle {
                     match session.capture_pane(50) {
                         Ok(pane_content) => {
                             if reconciles_waiting {
                                 tmux::reconcile_waiting_hook(detection_tool, &pane_content)
+                            } else if reconciles_idle {
+                                tmux::reconcile_claude_idle_hook_status(&pane_content)
                             } else if detection_tool == "codex" {
                                 tmux::reconcile_codex_hook_status(hook_status, &pane_content)
                             } else {
@@ -5193,14 +5343,14 @@ impl Instance {
     }
 
     pub fn update_status(&mut self) {
-        self.update_status_with_metadata(None);
+        self.update_status_with_metadata(None, None);
     }
 
-    pub fn capture_output(&self, lines: usize) -> Result<String> {
-        // capture-pane has no size parameters: the pane is captured at
-        // the window's own dimensions. (A previous *_with_size variant
-        // accepted width/height and silently ignored them.)
-        self.tmux_session()?.capture_pane(lines)
+    /// Capture the session's window for the preview, with any panes the user
+    /// split off composited in. `capture-pane` has no size parameters: the
+    /// window is captured at its own dimensions.
+    pub fn capture_output_composited(&self, lines: usize) -> Result<String> {
+        self.tmux_session()?.capture_window_composited(lines)
     }
 }
 
@@ -5480,6 +5630,58 @@ mod tests {
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_present(&["aoe_some_other_session"]);
         guard
+    }
+
+    /// `/api/sessions` puts `format!("{:?}", inst.status)` on the wire, so
+    /// `from_api_str` has to speak `CamelCase` while `as_str` and serde speak
+    /// `lowercase`. Two spellings of one enum drift silently unless the pairing
+    /// is asserted against the actual formatter, which is what this does: a new
+    /// variant that nobody teaches `from_api_str` fails here rather than
+    /// showing up as a structured row whose status stops moving.
+    #[test]
+    fn status_api_wire_form_round_trips() {
+        for status in [
+            Status::Running,
+            Status::Waiting,
+            Status::Idle,
+            Status::Unknown,
+            Status::Stopped,
+            Status::Error,
+            Status::Starting,
+            Status::Deleting,
+            Status::Creating,
+        ] {
+            let wire = format!("{status:?}");
+            // `wire_str` is the explicit spelling every API surface emits;
+            // pin it to `Debug` so a variant rename cannot silently change
+            // the public wire format on one side only. See #3187.
+            assert_eq!(
+                status.wire_str(),
+                wire,
+                "wire_str must match the Debug spelling callers already receive"
+            );
+            assert_eq!(
+                Status::from_api_str(&wire),
+                Some(status),
+                "wire form {wire} must parse back"
+            );
+            assert_eq!(
+                Status::from_api_str(status.wire_str()),
+                Some(status),
+                "wire_str output must parse back through from_api_str"
+            );
+            // The lowercase serde/`as_str` spelling is a different vocabulary
+            // and must NOT be accepted here, or a caller mixing the two would
+            // silently work for `error` and fail for `Error`.
+            assert_eq!(
+                Status::from_api_str(status.as_str()),
+                None,
+                "from_api_str must not accept the lowercase spelling {}",
+                status.as_str()
+            );
+        }
+        assert_eq!(Status::from_api_str(""), None);
+        assert_eq!(Status::from_api_str("Hibernating"), None);
     }
 
     #[cfg(feature = "serve")]
@@ -5773,7 +5975,7 @@ mod tests {
         // Red on the pre-fix tree, where the tmux probe stamps Error.
         let mut inst = Instance::new("test", "/tmp/test");
         inst.archive();
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         assert_ne!(inst.status, Status::Error);
         assert_eq!(inst.status, Status::Idle);
         assert_eq!(inst.last_error, None);
@@ -5789,7 +5991,7 @@ mod tests {
         inst.archive();
         inst.status = Status::Error;
         inst.last_error = Some("agent crashed".to_string());
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
     }
@@ -5804,9 +6006,9 @@ mod tests {
         inst.archive();
         inst.status = Status::Error;
         inst.last_error = Some("agent crashed".to_string());
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         inst.unarchive();
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
     }
@@ -5828,11 +6030,44 @@ mod tests {
         // name is not in it: a confirmed-absent session.
         guard.force_present(&["some_other_session"]);
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.last_error.as_deref(), Some(TMUX_SESSION_GONE_ERROR));
         assert!(inst.last_error_check.is_some());
+    }
+
+    /// the poller / serve / ps loops resolve the session's live tmux name
+    /// once against the batch snapshot; the status probe must act on that name
+    /// instead of resolving the id a second time from the (possibly stale)
+    /// title. A live name the title could never derive proves which path ran:
+    /// only the resolved-name path can confirm it present.
+    #[test]
+    #[serial_test::serial]
+    fn update_status_probes_the_resolved_name_not_the_title() {
+        let resolved = format!("{}live_elsewhere_00000000", crate::tmux::SESSION_PREFIX);
+
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&[resolved.as_str()]);
+
+        let mut inst = Instance::new("resolve-r2", "/tmp/resolve-r2");
+        inst.status = Status::Running;
+        inst.update_status_with_metadata_inner(None, Some(&resolved));
+        assert!(
+            inst.ever_confirmed_present,
+            "the passed resolved name must be the one probed"
+        );
+        assert_ne!(inst.status, Status::Error);
+
+        let mut untold = Instance::new("resolve-r2", "/tmp/resolve-r2");
+        untold.status = Status::Running;
+        untold.update_status_with_metadata_inner(None, None);
+        assert_eq!(
+            untold.status,
+            Status::Error,
+            "without the resolved name the title-derived name is absent from the cache"
+        );
+        assert_eq!(untold.last_error.as_deref(), Some(TMUX_SESSION_GONE_ERROR));
     }
 
     /// A tmux-server-unreachable probe (`SessionExistence::Unknown`) must not
@@ -5852,7 +6087,7 @@ mod tests {
         // connection), not a confirmed-absent session.
         guard.force_unreachable();
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert_eq!(inst.status, Status::Running);
         assert_eq!(inst.last_error, None);
@@ -5877,7 +6112,7 @@ mod tests {
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_unreachable();
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
@@ -5907,7 +6142,7 @@ mod tests {
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_unreachable();
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert_eq!(inst.status, Status::Error);
         assert_eq!(
@@ -5936,7 +6171,7 @@ mod tests {
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_unreachable();
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert_eq!(inst.status, Status::Idle);
         assert_eq!(inst.last_error, None);
@@ -5961,7 +6196,7 @@ mod tests {
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_unreachable();
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert_eq!(inst.status, Status::Running);
         assert_eq!(inst.last_error, None);
@@ -5992,7 +6227,7 @@ mod tests {
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_unreachable();
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert_eq!(inst.status, Status::Error);
         assert_eq!(
@@ -6019,7 +6254,7 @@ mod tests {
         let guard = crate::tmux::SessionCacheGuard::capture();
         guard.force_present(&[name.as_str()]);
 
-        inst.update_status_with_metadata_inner(None);
+        inst.update_status_with_metadata_inner(None, None);
 
         assert!(inst.ever_confirmed_present);
         assert_eq!(inst.unknown_since, None);
@@ -7037,6 +7272,14 @@ mod tests {
     #[traced_test]
     #[test]
     fn test_merge_passive_status_patch_last_accessed_at_boundary_equal_logs_drop_event() {
+        // Tracing caches per-callsite `Interest` globally on first hit, so a
+        // parallel test that reaches the drop callsite first without a
+        // capturing subscriber pins it to `Interest::never()` and this
+        // capture silently sees zero lines. Re-evaluate the (already
+        // registered) callsite against `traced_test`'s subscriber first. Same
+        // race `run_with_capture` documents in session::deletion.
+        tracing::callsite::rebuild_interest_cache();
+
         let mut disk = Instance::new("session", "/tmp/test");
         let ts = Utc::now();
         disk.last_accessed_at = Some(ts);
@@ -7063,6 +7306,12 @@ mod tests {
     #[traced_test]
     #[test]
     fn test_merge_passive_status_patch_last_accessed_at_boundary_newer_no_drop_event() {
+        // Same callsite-interest race as its paired test above. This one
+        // asserts zero drops, so a lost race would make it pass for the
+        // wrong reason; rebuild so the pair stays a faithful drop-vs-write
+        // signal.
+        tracing::callsite::rebuild_interest_cache();
+
         let mut disk = Instance::new("session", "/tmp/test");
         let older = Utc::now() - chrono::Duration::minutes(1);
         let newer = Utc::now();
@@ -7205,7 +7454,7 @@ mod tests {
         // socket, making the test schedule-dependent and flaky (#2936).
         let _cache = force_session_absent();
 
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
 
         // Detection confirms the session Absent, resolving to Error, which
         // differs from the stale disk `Starting`. That mismatch must NOT be
@@ -7242,7 +7491,7 @@ mod tests {
         let _cache = force_session_absent();
 
         let before = Utc::now();
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         let after = Utc::now();
 
         // Detection confirms the session Absent, resolving to Error: a
@@ -7273,7 +7522,7 @@ mod tests {
         // (see #2936; without this the outcome is schedule-dependent).
         let _cache = force_session_absent();
 
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         assert_eq!(inst.status, Status::Error);
         assert_eq!(
             inst.idle_entered_at, sentinel_idle,
@@ -7284,7 +7533,7 @@ mod tests {
             "first call must not restamp"
         );
 
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         assert_eq!(inst.status, Status::Error);
         assert_eq!(
             inst.idle_entered_at, sentinel_idle,
@@ -7312,7 +7561,7 @@ mod tests {
         inst.status = Status::Running;
 
         let before1 = Utc::now();
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         let after1 = Utc::now();
         assert_eq!(
             inst.status,
@@ -7328,7 +7577,7 @@ mod tests {
 
         inst.status = Status::Idle;
         let before2 = Utc::now();
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
         let after2 = Utc::now();
         assert_eq!(inst.status, Status::Idle);
         let second_idle = inst
@@ -7387,7 +7636,7 @@ mod tests {
         // being the canonical one (`src/session/instance.rs`).
         inst.status = Status::Starting;
 
-        inst.update_status_with_metadata(None);
+        inst.update_status_with_metadata(None, None);
 
         assert_eq!(
             inst.last_accessed_at, None,
@@ -7590,6 +7839,71 @@ mod tests {
         let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &tmux_name])
             .output();
+    }
+
+    /// Real-tmux integration for #3157: a session whose stored title moved
+    /// without its tmux session being renamed (smart rename, or a manual
+    /// rename whose tmux rename failed) must still be resolvable, so teardown
+    /// stops the running agent instead of a name that never existed, and a
+    /// later start adopts the live session instead of spawning a second one.
+    // Serialized for the same reason as its neighbours: it creates and kills a
+    // real tmux session on the shared test server.
+    #[test]
+    #[serial_test::serial]
+    fn retitled_session_is_still_resolved_and_torn_down() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
+            eprintln!("tmux not available; skipping");
+            return;
+        }
+
+        let mut inst = Instance::new("Vikings", "/tmp/test");
+        let created_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        let _ = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", &created_name])
+            .output();
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &created_name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep",
+                "60",
+            ])
+            .status();
+        if !created.map(|s| s.success()).unwrap_or(false) {
+            eprintln!("tmux new-session failed; skipping");
+            return;
+        }
+        crate::tmux::refresh_session_cache();
+
+        // The rename that never reached tmux.
+        inst.title = "Refactor billing module".to_string();
+        let derived = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+        assert_ne!(derived, created_name, "the derived name must have moved");
+
+        let session = inst.tmux_session().expect("tmux_session");
+        assert_eq!(
+            session.name(),
+            created_name,
+            "lifecycle ops must resolve onto the live session, not the new derived name"
+        );
+        assert!(
+            session.exists(),
+            "the live session is reachable under the new title, so `create` adopts it \
+             rather than spawning a second agent"
+        );
+
+        inst.kill().expect("kill");
+        crate::tmux::refresh_session_cache();
+        assert!(
+            !crate::tmux::session_exists(&created_name),
+            "teardown must stop the agent that is actually running"
+        );
     }
 
     #[test]
@@ -8148,6 +8462,7 @@ mod tests {
                 worktree_path: "/tmp/ws/repo-a".to_string(),
                 main_repo_path: "/tmp/src/repo-a".to_string(),
                 managed_by_aoe: true,
+                branch_preexisting: false,
             }],
             created_at: Utc::now(),
             cleanup_on_delete: true,

@@ -897,6 +897,7 @@ impl HomeView {
             profile_picker_dialog,
             group_picker_dialog,
             sort_picker_dialog,
+            attach_project_dialog,
             project_session_picker_dialog,
             projects_dialog,
             plugin_manager_dialog,
@@ -1344,6 +1345,7 @@ impl HomeView {
             || self.profile_picker_dialog.is_some()
             || self.group_picker_dialog.is_some()
             || self.sort_picker_dialog.is_some()
+            || self.attach_project_dialog.is_some()
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
             || self.plugin_manager_dialog.is_some()
@@ -1951,7 +1953,7 @@ impl HomeView {
         let id = self.selected_session.as_ref()?;
         let inst = self.get_instance(id)?;
         let name = match &self.view_mode {
-            ViewMode::Structured => crate::tmux::Session::generate_name(&inst.id, &inst.title),
+            ViewMode::Structured => crate::tmux::Session::resolve_name(&inst.id, &inst.title),
             ViewMode::Terminal => {
                 let mode = if inst.is_sandboxed() {
                     self.get_terminal_mode(id)
@@ -1960,10 +1962,10 @@ impl HomeView {
                 };
                 match mode {
                     TerminalMode::Host => {
-                        crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+                        crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
                     }
                     TerminalMode::Container => {
-                        crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+                        crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
                     }
                 }
             }
@@ -2166,13 +2168,25 @@ impl HomeView {
                             .and_then(|inst| inst.tmux_session().ok())
                             .filter(|s| s.exists())
                         {
-                            // Defer to an active size owner (a phone/desktop live
-                            // client, or this TUI's own live-send below). The
-                            // detached preview is a passive display, so it only
-                            // sizes a session nobody else is driving and never
-                            // claims the lock itself; leaving the dedup unset
-                            // retries once the owner disconnects.
-                            if !session.has_active_size_owner() {
+                            // Defer to anything actually driving this session's
+                            // size: a real tmux client (this TUI's own
+                            // `switch-client` attach registers no size owner, so
+                            // without the `is_attached` check the passive resize
+                            // shrank the window the user just attached to back to
+                            // the preview dimensions, #3071), or an active size
+                            // owner (a phone/desktop live client, or this TUI's
+                            // own live-send below). The detached preview is a
+                            // passive display, so it only sizes a session nobody
+                            // else is driving and never claims the lock itself;
+                            // leaving the dedup unset retries once the client
+                            // detaches or the owner disconnects.
+                            //
+                            // `is_attached` is checked first: it is one tmux call
+                            // against `has_active_size_owner`'s two, and being
+                            // attached is the sticky state here (the skip leaves
+                            // the pending slot armed, so this block re-runs every
+                            // poll for as long as the user stays attached).
+                            if !session.is_attached() && !session.has_active_size_owner() {
                                 session.resize_window(width, height);
                                 self.preview_pane_synced = Some(want);
                                 self.preview_pane_pending = None;
@@ -2224,9 +2238,16 @@ impl HomeView {
                 // always overwrite, falling back to an empty body (the same
                 // "session looks gone" signal the non-live path uses).
                 let same_session = s.preview_cache.session_id.as_deref() == Some(id);
+                // Composited in BOTH modes, matching what the worker publishes.
+                // This fallback also runs on every idle refresh (the worker
+                // dedups unchanged frames, so it has nothing to hand over), so a
+                // pane-0-only capture here would clobber the worker's composite
+                // a beat after each keystroke and leave the split visible for
+                // only one frame at a time. On an unsplit window this returns
+                // the pane bytes verbatim, so nothing changes there.
                 let fork_capture = s
                     .get_instance(id)
-                    .and_then(|inst| inst.capture_output(capture_lines).ok());
+                    .and_then(|inst| inst.capture_output_composited(capture_lines).ok());
                 if in_live {
                     match fork_capture {
                         Some(content) if !content.is_empty() => Some(content),
@@ -2261,7 +2282,7 @@ impl HomeView {
             |s, id, capture_lines| {
                 s.get_instance(id).map(|inst| {
                     inst.terminal_tmux_session()
-                        .and_then(|sess| sess.capture_pane(capture_lines))
+                        .and_then(|sess| sess.capture_window_composited(capture_lines))
                         .unwrap_or_default()
                 })
             },
@@ -2290,7 +2311,7 @@ impl HomeView {
             |s, id, capture_lines| {
                 s.get_instance(id).map(|inst| {
                     inst.container_terminal_tmux_session()
-                        .and_then(|sess| sess.capture_pane(capture_lines))
+                        .and_then(|sess| sess.capture_window_composited(capture_lines))
                         .unwrap_or_default()
                 })
             },
@@ -2324,7 +2345,7 @@ impl HomeView {
             |s, id, capture_lines| {
                 s.get_instance(id).map(|inst| {
                     crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name)
-                        .capture_pane(capture_lines)
+                        .capture_window_composited(capture_lines)
                         .unwrap_or_default()
                 })
             },
@@ -4008,6 +4029,7 @@ mod tests {
             mouse_sgr: false,
             mouse_all: false,
             position_reliable: true,
+            composite_pane0: None,
         }
     }
 

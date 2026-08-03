@@ -1765,7 +1765,6 @@ mod tests {
         assert_eq!(get_agent("hermes").unwrap().binary, "hermes");
         assert_eq!(get_agent("kiro").unwrap().binary, "kiro-cli");
         assert_eq!(get_agent("qwen").unwrap().binary, "qwen");
-        assert_eq!(get_agent("kimi").unwrap().binary, "kimi");
         assert_eq!(get_agent("antigravity").unwrap().binary, "agy");
         assert_eq!(get_agent("kimi").unwrap().binary, "kimi");
         assert_eq!(get_agent("omp").unwrap().binary, "omp");
@@ -1958,9 +1957,6 @@ mod tests {
         assert_eq!(resolve_tool_name("kiro"), Some("kiro"));
         assert_eq!(resolve_tool_name("kiro-cli"), Some("kiro"));
         assert_eq!(resolve_tool_name("qwen"), Some("qwen"));
-        assert_eq!(resolve_tool_name("kimi"), Some("kimi"));
-        assert_eq!(resolve_tool_name("kimi-cli"), Some("kimi"));
-        assert_eq!(resolve_tool_name("kimi-code"), Some("kimi"));
         assert_eq!(resolve_tool_name("antigravity"), Some("antigravity"));
         assert_eq!(resolve_tool_name("agy"), Some("antigravity"));
         assert_eq!(resolve_tool_name("kimi"), Some("kimi"));
@@ -2221,12 +2217,12 @@ mod tests {
             Some("curl -fsSL https://cli.kiro.dev/install | bash")
         );
         assert_eq!(
-            install_hint("kimi"),
-            Some("curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash")
-        );
-        assert_eq!(
             install_hint("antigravity"),
             Some("curl -fsSL https://antigravity.google/cli/install.sh | bash")
+        );
+        assert_eq!(
+            install_hint("kimi"),
+            Some("curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash")
         );
         assert_eq!(
             install_hint("omp"),

@@ -1849,6 +1849,55 @@ pub fn detect_prime_agent_status(raw_content: &str) -> Status {
     Status::Idle
 }
 
+/// Qoder CLI status detection via tmux pane parsing.
+/// Qoder CLI is built on pi and shares the same TUI patterns:
+/// braille spinner glyphs for running, "esc to interrupt" for active work,
+/// and a `>` prompt when waiting for input.
+pub fn detect_qodercli_status(raw_content: &str) -> Status {
+    let clean = strip_ansi(raw_content);
+    let non_empty_lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    let footer: Vec<&str> = non_empty_lines
+        .iter()
+        .rev()
+        .take(16)
+        .rev()
+        .copied()
+        .collect();
+    let footer_lower = footer
+        .join(
+            "
+",
+        )
+        .to_lowercase();
+
+    // Braille spinner is the primary running signal.
+    if has_any_spinner(&footer) {
+        return Status::Running;
+    }
+
+    if footer_lower.contains("esc to interrupt") || footer_lower.contains("ctrl+c to interrupt") {
+        return Status::Running;
+    }
+
+    // A parked input prompt outranks activity words: a `>` or `qodercli>`
+    // prompt at rest must not flip back to Running from lingering prose.
+    if matches_input_prompt(&non_empty_lines, 5, &["qodercli>"]) {
+        return Status::Waiting;
+    }
+
+    // Reduced-motion / no-spinner fallback: a footer line that *starts* with a
+    // live activity verb is a status line, not narration buried mid-sentence.
+    if footer
+        .iter()
+        .any(|line| has_live_activity_word(&line.to_lowercase()))
+    {
+        return Status::Running;
+    }
+
+    Status::Idle
+}
+
 /// Factory Droid CLI status detection via tmux pane parsing.
 /// Droid uses an interactive REPL similar to other coding agents. It shows
 /// activity indicators while processing and prompts for input when idle.
@@ -4683,6 +4732,76 @@ Done.
     fn test_detect_prime_agent_status_finished_with_activity_prose_is_not_running() {
         assert_eq!(
             detect_prime_agent_status(PI_FINISHED_PANE_WITH_ACTIVITY_PROSE),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_detect_qodercli_status_running() {
+        assert_eq!(detect_qodercli_status("generating ⠋"), Status::Running);
+        assert_eq!(detect_qodercli_status("loading ⠹"), Status::Running);
+        assert_eq!(
+            detect_qodercli_status(
+                "processing request
+esc to interrupt"
+            ),
+            Status::Running
+        );
+        assert_eq!(
+            detect_qodercli_status("thinking about code"),
+            Status::Running
+        );
+        assert_eq!(detect_qodercli_status("reading file.ts"), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_qodercli_status_waiting() {
+        assert_eq!(
+            detect_qodercli_status(
+                "done
+>"
+            ),
+            Status::Waiting
+        );
+        assert_eq!(
+            detect_qodercli_status(
+                "ready
+> "
+            ),
+            Status::Waiting
+        );
+        assert_eq!(
+            detect_qodercli_status(
+                "complete
+qodercli>"
+            ),
+            Status::Waiting
+        );
+        assert_eq!(
+            detect_qodercli_status(
+                "reading config.toml
+Done.
+>"
+            ),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_detect_qodercli_status_idle() {
+        assert_eq!(detect_qodercli_status("file saved"), Status::Idle);
+        assert_eq!(detect_qodercli_status("random output text"), Status::Idle);
+    }
+
+    #[test]
+    fn test_detect_qodercli_status_running_spinner_footer() {
+        assert_eq!(detect_qodercli_status(PI_RUNNING_PANE), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_qodercli_status_finished_with_activity_prose_is_not_running() {
+        assert_eq!(
+            detect_qodercli_status(PI_FINISHED_PANE_WITH_ACTIVITY_PROSE),
             Status::Idle
         );
     }

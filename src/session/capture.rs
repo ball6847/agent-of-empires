@@ -40,7 +40,7 @@ fn resolve_agent_home(env_var: Option<&str>, default_subdir: &str) -> Result<Pat
 /// historical unnormalized spelling (a pre-#2858 worktree `project_path` like
 /// `/repos/x/../x-worktrees/b`) still compares equal to the plain spelling
 /// after the directory has been deleted.
-fn canonicalize_or_raw(path: &str) -> PathBuf {
+pub(crate) fn canonicalize_or_raw(path: &str) -> PathBuf {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| crate::git::template::lexical_normalize(Path::new(path)))
 }
@@ -1801,7 +1801,7 @@ pub(crate) fn capture_codex_session_id(
         let file = std::fs::File::open(path).ok()?;
         let reader = std::io::BufReader::new(file);
         let first_line = std::io::BufRead::lines(reader).next()?.ok()?;
-        let cwd = parse_codex_cwd_from_json(&first_line)?;
+        let cwd = parse_codex_cwd_from_json(&first_line, &uuid)?;
         let cwd_matches = std::fs::canonicalize(&cwd)
             .map(|c| c == canonical_project)
             .unwrap_or(false);
@@ -1815,17 +1815,33 @@ pub(crate) fn capture_codex_session_id(
     chosen.ok_or_else(|| anyhow::anyhow!("No Codex session found matching project path"))
 }
 
-/// Parse the CWD from a Codex `.jsonl` first line (already in memory).
+/// Parse the CWD from a Codex rollout's first line.
 ///
-/// Shared by the host scanner and the container scanner. Extracts `payload.cwd`
-/// from the JSON object on the first line of a session file.
-fn parse_codex_cwd_from_json(line: &str) -> Option<String> {
+/// The filename UUID remains authoritative because it names the rollout Codex
+/// can resume. When metadata declares `session_id` or `id`, require every
+/// present value to identify that same rollout. Codex child rollouts may point
+/// `session_id` at their parent while using their own filename UUID; rejecting
+/// that mismatch prevents the child from winning the newest-mtime scan.
+/// Metadata without either id remains supported for compatibility with older
+/// rollouts and capture test fixtures.
+fn parse_codex_cwd_from_json(line: &str, filename_uuid: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
-    parsed
-        .get("payload")
-        .and_then(|p| p.get("cwd"))
+    let payload = parsed.get("payload")?;
+    let filename_id = Uuid::parse_str(filename_uuid).ok()?;
+    for key in ["session_id", "id"] {
+        if let Some(value) = payload.get(key) {
+            let declared_id = Uuid::parse_str(value.as_str()?).ok()?;
+            if declared_id != filename_id {
+                return None;
+            }
+        }
+    }
+
+    payload
+        .get("cwd")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .filter(|cwd| !cwd.is_empty())
+        .map(str::to_string)
 }
 
 /// Extract UUID from a Codex rollout filename.
@@ -1926,8 +1942,8 @@ fn select_codex_session_in_container(
             Some((j, _)) => j,
             None => rest,
         };
-        let cwd = match parse_codex_cwd_from_json(json_part.trim()) {
-            Some(c) => c,
+        let cwd = match parse_codex_cwd_from_json(json_part.trim(), &uuid) {
+            Some(cwd) => cwd,
             None => continue,
         };
         candidates.push((uuid, cwd, ts));
@@ -3929,23 +3945,70 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_codex_cwd_from_json() {
-        let line = r#"{"type":"session_meta","payload":{"cwd":"/home/user/myproject"}}"#;
-        assert_eq!(
-            parse_codex_cwd_from_json(line),
-            Some("/home/user/myproject".to_string())
-        );
-    }
+    fn test_parse_codex_cwd_validates_declared_ids() {
+        let root_uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let child_uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let expected_cwd = Some("/home/user/myproject".to_string());
+        let cases = [
+            (
+                "legacy metadata without ids or type",
+                r#"{"payload":{"cwd":"/home/user/myproject"}}"#.to_string(),
+                root_uuid,
+                expected_cwd.clone(),
+            ),
+            (
+                "matching root ids",
+                format!(
+                    r#"{{"type":"session_meta","payload":{{"id":"{root_uuid}","session_id":"{root_uuid}","cwd":"/home/user/myproject"}}}}"#
+                ),
+                root_uuid,
+                expected_cwd,
+            ),
+            (
+                "child points session_id at parent",
+                format!(
+                    r#"{{"type":"session_meta","payload":{{"id":"{child_uuid}","session_id":"{root_uuid}","cwd":"/home/user/myproject"}}}}"#
+                ),
+                child_uuid,
+                None,
+            ),
+            (
+                "id differs while session_id matches filename",
+                format!(
+                    r#"{{"type":"session_meta","payload":{{"id":"{child_uuid}","session_id":"{root_uuid}","cwd":"/home/user/myproject"}}}}"#
+                ),
+                root_uuid,
+                None,
+            ),
+            (
+                "malformed session_id with matching id",
+                format!(
+                    r#"{{"type":"session_meta","payload":{{"id":"{root_uuid}","session_id":"corrupt","cwd":"/home/user/myproject"}}}}"#
+                ),
+                root_uuid,
+                None,
+            ),
+            (
+                "missing cwd",
+                format!(r#"{{"payload":{{"id":"{root_uuid}"}}}}"#),
+                root_uuid,
+                None,
+            ),
+            (
+                "invalid json",
+                "not json at all".to_string(),
+                root_uuid,
+                None,
+            ),
+        ];
 
-    #[test]
-    fn test_parse_codex_cwd_from_json_missing_field() {
-        let line = r#"{"type":"session_meta","payload":{}}"#;
-        assert_eq!(parse_codex_cwd_from_json(line), None);
-    }
-
-    #[test]
-    fn test_parse_codex_cwd_from_json_invalid_json() {
-        assert_eq!(parse_codex_cwd_from_json("not json at all"), None);
+        for (name, line, filename_uuid, expected) in cases {
+            assert_eq!(
+                parse_codex_cwd_from_json(&line, filename_uuid),
+                expected,
+                "case: {name}"
+            );
+        }
     }
 
     #[test]
@@ -4043,6 +4106,52 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_codex_capture_ignores_newer_child_with_parent_session_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let root_uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let child_uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let project_dir = tmp.path().join("test-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let root_file = sessions_dir.join(format!("rollout-2025-03-06T10-30-00-{root_uuid}.jsonl"));
+        let child_file =
+            sessions_dir.join(format!("rollout-2025-03-06T10-31-00-{child_uuid}.jsonl"));
+        std::fs::write(
+            &root_file,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{root_uuid}","session_id":"{root_uuid}","cwd":"{}"}}}}"#,
+                project_dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &child_file,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"id":"{child_uuid}","session_id":"{root_uuid}","cwd":"{}"}}}}"#,
+                project_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let old_time = std::time::SystemTime::now() - Duration::from_secs(600);
+        std::fs::File::options()
+            .write(true)
+            .open(&root_file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+
+        let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
+
+        let result = capture_codex_session_id(project_dir.to_str().unwrap(), &HashSet::new());
+        assert_eq!(result.unwrap(), root_uuid);
+    }
+
+    #[test]
+    #[serial]
     fn test_codex_capture_empty_sessions_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let sessions_dir = tmp.path().join("sessions");
@@ -4097,6 +4206,26 @@ mod tests {
         let result =
             select_codex_session_in_container(stdout.as_bytes(), "/workspace", &exclusion).unwrap();
         assert_eq!(result, uuid_available);
+    }
+
+    #[test]
+    fn test_select_codex_session_in_container_ignores_newer_child_with_parent_session_id() {
+        let root_uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let child_uuid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let stdout = format!(
+            "\
+===CODEX:1700001000:rollout-2025-01-02T00-00-00-{root_uuid}.jsonl===
+{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{root_uuid}\",\"session_id\":\"{root_uuid}\",\"cwd\":\"/workspace\"}}}}
+===END===
+===CODEX:1700002000:rollout-2025-01-02T00-01-00-{child_uuid}.jsonl===
+{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{child_uuid}\",\"session_id\":\"{root_uuid}\",\"cwd\":\"/workspace\"}}}}
+===END===
+"
+        );
+        let result =
+            select_codex_session_in_container(stdout.as_bytes(), "/workspace", &HashSet::new())
+                .unwrap();
+        assert_eq!(result, root_uuid);
     }
 
     #[test]
@@ -4929,6 +5058,53 @@ mod tests {
             Some(v) => std::env::set_var("OPENCODE_DB", v),
             None => std::env::remove_var("OPENCODE_DB"),
         }
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn test_opencode_capture_matches_symlinked_project_path_end_to_end() {
+        // End-to-end lock for the read-command self-heal path on REAL opencode
+        // storage: `try_capture_opencode_session_id` must resolve a session id
+        // from a real `opencode.db` even when the caller's project path reaches
+        // the same directory through a symlink. opencode records its
+        // `directory` as `realpathSync(cwd)` (symlinks resolved), while an aoe
+        // session's stored `project_path` may still contain a symlink
+        // component (on macOS every /tmp and /var path is one). The match
+        // survives only because `filter_agent_sessions` canonicalizes BOTH
+        // sides; this test would fail if that symmetry regressed. The
+        // fake-codex e2e cannot cover this because it uses a jsonl store, not
+        // opencode's SQLite.
+        let tmp = tempfile::tempdir().unwrap();
+        let real_project = tmp.path().join("real-project");
+        std::fs::create_dir(&real_project).unwrap();
+        let canonical_project = std::fs::canonicalize(&real_project).unwrap();
+
+        let link = tmp.path().join("link-to-project");
+        std::os::unix::fs::symlink(&real_project, &link).unwrap();
+
+        let (_dir, db_path) = create_opencode_test_db(&[(
+            "ses_symlink_target",
+            canonical_project.to_str().unwrap(),
+            5_000,
+        )]);
+
+        let old = std::env::var("OPENCODE_DB").ok();
+        std::env::set_var("OPENCODE_DB", db_path.to_str().unwrap());
+
+        let result = try_capture_opencode_session_id(link.to_str().unwrap(), &HashSet::new(), None);
+
+        match old {
+            Some(v) => std::env::set_var("OPENCODE_DB", v),
+            None => std::env::remove_var("OPENCODE_DB"),
+        }
+
+        assert_eq!(
+            result.ok().as_deref(),
+            Some("ses_symlink_target"),
+            "capture must match a canonicalized stored directory when the caller \
+             path reaches it through a symlink"
+        );
     }
 
     #[test]

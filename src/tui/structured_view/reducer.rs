@@ -88,6 +88,28 @@ pub struct AcpTranscript {
     /// by `/replay` after a `reset()`. The composer reads it to decide
     /// whether Enter sends now or parks the prompt in the local queue.
     pub turn_active: bool,
+    /// Whether the agent accepts `_session/steering`, from the latest
+    /// `PromptCapabilities`. When true the composer sends a mid-turn
+    /// prompt straight through instead of parking it: the daemon injects
+    /// it into the running turn. Rebuilt by `/replay` like `turn_active`,
+    /// and re-emitted as `false` on a respawn onto an adapter that lacks
+    /// the capability, so it cannot go stale. See #2805.
+    pub steering: bool,
+    /// Whether a `/compact` cycle is running, from
+    /// `ConversationCompactionStarted` until the matching
+    /// `ConversationCompacted` or the turn's `Stopped`. The adapter goes
+    /// silent for 90 to 170 seconds in that window, so the composer must
+    /// park a send instead of steering it: a summarization turn has
+    /// nothing to steer and never answers the injected message. Rebuilt
+    /// by `/replay` like `turn_active`. See #3219.
+    pub compacting: bool,
+    /// Whether a `session/cancel` is in flight, from `CancelRequested`
+    /// until the turn's `Stopped`. Only consulted by the composer's park
+    /// decision: the daemon reads a prompt arriving mid-cancel as a
+    /// wedged agent and escalates to a runner restart, so a steerable
+    /// agent must still park here rather than route Stop-then-type into
+    /// that path. See #2805 / #1727.
+    pub cancelling: bool,
     /// Latest context-window usage / cost snapshot the agent reported.
     /// Rendered as a token meter in the status line, mirroring the web
     /// composer's usage chip.
@@ -197,6 +219,19 @@ pub enum NoteKind {
 }
 
 impl AcpTranscript {
+    /// Whether an arriving user prompt is a message steered into the turn
+    /// already running rather than the start of a new one (#2805).
+    ///
+    /// The daemon injects a mid-turn prompt via `_session/steering`
+    /// instead of starting a turn for it, so the same condition the
+    /// composer used to send it identifies it on the way back. Such a
+    /// prompt must not run the fresh-turn bookkeeping: no new turn began,
+    /// and the running turn's `Stopped` still owns the state it built up.
+    /// Call before mutating `turn_active`.
+    fn is_steered_continuation(&self) -> bool {
+        self.turn_active && self.steering
+    }
+
     pub fn new(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
@@ -210,6 +245,9 @@ impl AcpTranscript {
             available_modes: Vec::new(),
             available_commands: Vec::new(),
             context_primer_pending: false,
+            steering: false,
+            cancelling: false,
+            compacting: false,
             turn_active: false,
             usage: None,
             current_plan: Vec::new(),
@@ -311,7 +349,16 @@ impl AcpTranscript {
                 self.rows.push(ActivityRow::UserPrompt(row));
                 // Sending a prompt dismisses any context-primer hint.
                 self.context_primer_pending = false;
+                let steered = self.is_steered_continuation();
                 self.turn_active = true;
+                // A fresh turn supersedes any stale pending cancel from a
+                // prior one, matching the web reducer. Belt and braces
+                // next to the terminal clears: a `cancelling` that leaked
+                // across a turn boundary would park every mid-turn send
+                // for the whole next turn. See #1727 / #2805.
+                if !steered {
+                    self.cancelling = false;
+                }
             }
             Event::UserDiffCommentsPrompt {
                 assembled_markdown, ..
@@ -323,11 +370,23 @@ impl AcpTranscript {
                 self.rows
                     .push(ActivityRow::UserPrompt(assembled_markdown.clone()));
                 self.context_primer_pending = false;
+                let steered = self.is_steered_continuation();
                 self.turn_active = true;
+                // The other fresh-turn branch, so it clears a stale
+                // pending cancel like `UserPromptSent` does. Web routes
+                // both through the same `applyNewTurnResets`.
+                if !steered {
+                    self.cancelling = false;
+                }
             }
             Event::ThinkingStarted => {
                 self.flush_pending_chunk();
                 self.status_text = Some("thinking…".to_string());
+                // Deliberately does NOT clear `cancelling`, even though it
+                // sets `turn_active`. This fires repeatedly *within* a
+                // running turn, so clearing here would drop the pending
+                // cancel the moment the agent emits its next thought,
+                // which is exactly when a user is waiting on a stop.
                 self.turn_active = true;
             }
             Event::ThinkingEnded => {
@@ -524,6 +583,12 @@ impl AcpTranscript {
                     text: format!("agent stopped: {reason}"),
                 });
                 self.turn_active = false;
+                self.cancelling = false;
+                // The turn is over however it ended, so any compaction it
+                // was running is over too. This is the self-healing clear:
+                // a dropped completion marker, a killed worker, or a user
+                // cancel all arrive here. See #3219.
+                self.compacting = false;
             }
             Event::AgentStartupError { message } => {
                 self.flush_pending_chunk();
@@ -533,6 +598,7 @@ impl AcpTranscript {
                     text: format!("agent startup failed: {message}"),
                 });
                 self.turn_active = false;
+                self.cancelling = false;
             }
             Event::PromptRuntimeError { message } => {
                 self.flush_pending_chunk();
@@ -542,6 +608,7 @@ impl AcpTranscript {
                     text: format!("prompt failed: {message}"),
                 });
                 self.turn_active = false;
+                self.cancelling = false;
             }
             Event::IncompatibleAgent { .. } => {
                 // Structured detail for the web structured view's StartupErrorScreen.
@@ -573,11 +640,28 @@ impl AcpTranscript {
                         .into(),
                 });
             }
+            Event::ConversationCompactionStarted => {
+                // The adapter is about to go silent for 90 to 170 seconds.
+                // No transcript row: it already emitted a visible
+                // "Compacting..." chunk. This only latches the phase so
+                // the composer parks a send rather than steering it into a
+                // turn that will never answer it. See #3219.
+                self.compacting = true;
+                self.status_text = Some("compacting…".to_string());
+            }
             Event::ConversationCompacted => {
                 // /compact replaced the model's context with a summary;
                 // the model retains continuity, so this is informational
                 // rather than a context-reset warning, and the primer
                 // banner stays untouched. See #1109.
+                self.compacting = false;
+                // Drop the pre-compaction usage snapshot: the model's
+                // context is now a summary, so the latched "160k/200k"
+                // describes a window that no longer exists. The web
+                // reducer nulls it at the same boundary; without this the
+                // meter and the compaction reminder both read stale until
+                // the next UsageUpdated lands. See #3253.
+                self.usage = None;
                 self.flush_pending_chunk();
                 self.rows.push(ActivityRow::Note {
                     kind: NoteKind::Info,
@@ -628,6 +712,13 @@ impl AcpTranscript {
                 // turn started, so clear the busy flag the optimistic
                 // submit path may have set. The richer rejected-prompt
                 // renderer is followup work (see the no-op group below).
+                //
+                // `cancelling` deliberately survives this: a rejection is
+                // not a turn boundary. The turn that the cancel targets
+                // is still running (the daemon rejects a mid-cancel
+                // prompt and then escalates, so its real `Stopped` is
+                // still to come), and clearing here would let the next
+                // send take the steering path into that escalation.
                 self.turn_active = false;
             }
             Event::RateLimitAutoResumed { resets_at } => {
@@ -667,12 +758,16 @@ impl AcpTranscript {
             | Event::BackgroundAgentCompleted { .. }
             | Event::WakeupScheduled { .. }
             | Event::MonitorArmed { .. }
-            | Event::CancelRequested { .. }
-            | Event::PromptCapabilities { .. }
             | Event::ConfigOptionsUpdated { .. }
             | Event::ConfigOptionSwitchFailed { .. } => {
                 // Surface as info notes for now; richer renderers are
                 // followup work tracked in the plan's "out of scope".
+            }
+            Event::PromptCapabilities { steering, .. } => {
+                self.steering = *steering;
+            }
+            Event::CancelRequested { .. } => {
+                self.cancelling = true;
             }
             Event::AgentSwitched { to, .. } => {
                 self.agent_name = Some(to.clone());
@@ -712,6 +807,128 @@ mod tests {
             parent_tool_call_id: None,
             memory_recall: None,
             diffs: Vec::new(),
+        }
+    }
+
+    /// The composer parks a mid-turn send while a cancel is pending even
+    /// on a steerable agent (#2805). Both directions matter: a
+    /// `cancelling` left set would park every later mid-turn send on a
+    /// session that had been stopped once, while one cleared too early
+    /// lets the next send take the steering path into the daemon's
+    /// wedged-agent escalation.
+    #[test]
+    fn cancelling_tracks_the_turn_not_the_rejection() {
+        let cancel = || Event::CancelRequested {
+            escalates_at: Utc::now(),
+        };
+
+        // A rejection is not a turn boundary. The daemon rejects a
+        // mid-cancel prompt and then escalates, so the cancel is still
+        // pending and its real `Stopped` is still to come.
+        let mut t = AcpTranscript::new("s-1");
+        assert!(!t.cancelling);
+        t.apply(&frame(1, cancel()));
+        assert!(t.cancelling);
+        t.apply(&frame(
+            2,
+            Event::PromptRejected {
+                reason: "agent_busy".into(),
+                text: "hi".into(),
+            },
+        ));
+        assert!(
+            t.cancelling,
+            "a rejected prompt must not clear a pending cancel"
+        );
+
+        // `ThinkingStarted` also sets `turn_active`, but it fires within
+        // a running turn, so it must NOT count as a fresh turn: clearing
+        // there would drop the cancel the moment the agent thinks again.
+        let mut t = AcpTranscript::new("s-1");
+        t.apply(&frame(1, cancel()));
+        t.apply(&frame(2, Event::ThinkingStarted));
+        assert!(
+            t.cancelling,
+            "mid-turn thinking must not clear a pending cancel"
+        );
+
+        // Terminal turn events clear it, and so does either fresh-turn
+        // branch: web routes both prompt kinds through the same
+        // `applyNewTurnResets`.
+        let clearing = [
+            Event::Stopped {
+                reason: "cancelled".into(),
+            },
+            Event::AgentStartupError {
+                message: "boom".into(),
+            },
+            Event::PromptRuntimeError {
+                message: "boom".into(),
+            },
+            Event::UserPromptSent {
+                text: "next turn".into(),
+                attachments: Vec::new(),
+            },
+            Event::UserDiffCommentsPrompt {
+                intro: "look".into(),
+                outro: "thanks".into(),
+                is_multi_repo: false,
+                comments: Vec::new(),
+                assembled_markdown: "next turn".into(),
+            },
+        ];
+        for event in clearing {
+            let label = format!("{event:?}");
+            let mut t = AcpTranscript::new("s-1");
+            t.apply(&frame(1, cancel()));
+            t.apply(&frame(2, event));
+            assert!(!t.cancelling, "{label} must clear the pending cancel");
+        }
+    }
+
+    /// #3219: the compaction phase latches on the start marker and clears
+    /// on exactly two events. `Stopped` is the self-healing one: a dropped
+    /// completion marker, a killed worker, and a user cancel all land
+    /// there. A mid-compaction `UserPromptSent` must NOT clear it, or a
+    /// prompt confirmed during the silent window would relabel the view
+    /// and re-arm the force-end hatch while the compaction is still
+    /// running.
+    #[test]
+    fn compaction_phase_clears_only_on_completion_or_stopped() {
+        let started = || Event::ConversationCompactionStarted;
+        // (event applied after the start marker, phase still latched)
+        let cases = [
+            (Event::ConversationCompacted, false),
+            (
+                Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+                false,
+            ),
+            (
+                Event::Stopped {
+                    reason: "cancelled".into(),
+                },
+                false,
+            ),
+            // A steered follow-up the daemon confirmed mid-compaction.
+            (
+                Event::UserPromptSent {
+                    text: "also check the tests".into(),
+                    attachments: Vec::new(),
+                },
+                true,
+            ),
+            // Ordinary streaming inside the window changes nothing.
+            (Event::ThinkingStarted, true),
+        ];
+        for (event, expected) in cases {
+            let label = format!("{event:?}");
+            let mut t = AcpTranscript::new("s-1");
+            t.apply(&frame(1, started()));
+            assert!(t.compacting, "the start marker must latch the phase");
+            t.apply(&frame(2, event));
+            assert_eq!(t.compacting, expected, "after {label}");
         }
     }
 
@@ -1292,6 +1509,11 @@ mod tests {
             },
         ));
         assert_eq!(t.usage.as_ref().map(|u| u.used), Some(5_000));
+        // A compaction rewrites the model's context, so the snapshot it
+        // replaced no longer describes anything. Matching the web reducer
+        // keeps the meter and the compaction reminder from reading stale.
+        t.apply(&frame(3, Event::ConversationCompacted));
+        assert!(t.usage.is_none());
     }
 
     #[test]

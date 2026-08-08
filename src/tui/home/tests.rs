@@ -10105,6 +10105,158 @@ fn p_key_opens_projects_dialog_off_project_header() {
     );
 }
 
+/// A user's own repo whose basename is `scratch` must be pinnable, while the
+/// synthetic scratch bucket (sessions with no repo, living under
+/// `<app_dir>/scratch/<id>`) stays excluded. The gate used to reject the header
+/// by its display LABEL, which collapsed both cases together and left `p` on a
+/// real `~/scratch` repo falling through to the Projects dialog. See #3133.
+#[test]
+#[serial]
+fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
+    use crate::session::config::GroupByMode;
+    use crate::session::projects::canonical_key;
+
+    // (case, has a real repo named `scratch`, has a synthetic scratch session,
+    //  a pre-existing registry entry for `/repos/scratch` and its pin flag,
+    //  the pin gate opens on the header, the header is pinned after `p`)
+    let cases = [
+        // The reporter's setup: a plain repo at `~/scratch`, no scratch sessions.
+        ("real repo only", true, false, None, true, true),
+        // Nothing but the synthetic bucket: no repo exists to register.
+        ("synthetic bucket only", false, true, None, false, false),
+        // Both derive the same label and so share one header today. The real
+        // repo backs it, so the header is pinnable and the pin must resolve to
+        // that repo rather than the app-internal scratch directory.
+        (
+            "real repo plus scratch session",
+            true,
+            true,
+            None,
+            true,
+            true,
+        ),
+        // A saved-but-unpinned repo named `scratch` surfaces no header of its
+        // own, so the synthetic bucket is the only thing rendering this one and
+        // the toggle has no path to act on. `p` must keep its global meaning
+        // rather than resolve to a pin that silently does nothing.
+        (
+            "saved unpinned repo plus scratch session",
+            false,
+            true,
+            Some(false),
+            false,
+            false,
+        ),
+        // A pinned registry entry backs the header even with no live session of
+        // its own, so `p` must reach the unpin path instead of being swallowed
+        // as the synthetic bucket.
+        (
+            "pinned empty repo plus scratch session",
+            false,
+            true,
+            Some(true),
+            true,
+            false,
+        ),
+    ];
+
+    for (case, has_repo, has_scratch, saved, gate_open, pinned_after) in cases {
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+        let storage = Storage::new_unwatched("test").unwrap();
+
+        let mut instances = Vec::new();
+        if has_repo {
+            instances.push(Instance::new("work", "/repos/scratch"));
+        }
+        if has_scratch {
+            let mut throwaway = Instance::new("throwaway", "/app-dir/scratch/abc123");
+            throwaway.scratch = true;
+            instances.push(throwaway);
+        }
+        storage
+            .update(|i, g| {
+                *i = instances.to_vec();
+                *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        if let Some(pinned) = saved {
+            crate::session::projects::add(
+                "test",
+                crate::session::ProjectScope::Global,
+                crate::session::Project::new(
+                    "scratch",
+                    "/repos/scratch",
+                    crate::session::ProjectScope::Global,
+                )
+                .with_pinned(pinned),
+                false,
+            )
+            .unwrap();
+        }
+
+        let mut view = HomeView::new(
+            Some("test".to_string()),
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        view.group_by = GroupByMode::Project;
+        view.flat_items = view.build_flat_items();
+
+        let idx = view
+            .flat_items
+            .iter()
+            .position(|i| matches!(i, Item::Group { name, .. } if name == "scratch"))
+            .unwrap_or_else(|| panic!("{case}: scratch header must be present"));
+        view.cursor = idx;
+        view.update_selected();
+
+        assert_eq!(
+            view.project_group_at_cursor().is_some(),
+            gate_open,
+            "{case}: pin gate"
+        );
+
+        view.handle_key(key(KeyCode::Char('p')), None);
+
+        assert_eq!(
+            view.is_project_label_pinned("scratch"),
+            pinned_after,
+            "{case}: pin state after pressing p"
+        );
+        // The chord is shared: when the gate is closed, `p` keeps its global
+        // meaning and opens the Projects dialog instead.
+        assert_eq!(
+            view.projects_dialog.is_some(),
+            !gate_open,
+            "{case}: projects dialog fallthrough"
+        );
+
+        // A registry entry exists iff one was seeded or the toggle created one;
+        // the synthetic bucket on its own must never register anything.
+        let registered = crate::session::projects::load_global().unwrap();
+        assert_eq!(
+            registered.len(),
+            usize::from(gate_open || saved.is_some()),
+            "{case}: registry entries, got {registered:?}"
+        );
+        if let Some(entry) = registered.first() {
+            assert_eq!(
+                canonical_key(&entry.path),
+                canonical_key("/repos/scratch"),
+                "{case}: the pin must target the real repo, not the app scratch dir"
+            );
+            assert_eq!(
+                entry.pinned, pinned_after,
+                "{case}: registry pin flag must track the header, got {registered:?}"
+            );
+        }
+    }
+}
+
 /// Pin a project, archive its only session, then unpin: the empty header must
 /// leave the main flow (the archived session stays under the Archived section).
 #[test]
@@ -18119,6 +18271,19 @@ mod permission_response_dialog {
 
     #[test]
     #[serial]
+    fn agent_without_allow_always_still_opens_dialog() {
+        let mut env = create_test_env_empty();
+        let id = add_session_with_tool(&mut env.view, "session-one", "omp");
+        env.view.selected_session = Some(id);
+        let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
+        assert!(
+            env.view.permission_response_dialog.is_some(),
+            "an agent with allow_always: None must still support allow/deny"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn structured_session_is_a_no_op() {
         let mut env = create_test_env_empty();
         let id = add_session_with_tool(&mut env.view, "session-one", "claude");
@@ -18498,5 +18663,176 @@ mod daemon_status_apply_tests {
             env.view.get_instance(&id).map(|i| i.status),
             Some(Status::Starting)
         );
+    }
+
+    /// #3201: the daemon owns structured status and deliberately never
+    /// persists it (`decide_passive_transition` returns `patch: None` for
+    /// `is_structured()`). The TUI's passive writer must gate the same way, or
+    /// a `Running`/`Error` stamped mid-turn survives a daemon stop and a TUI
+    /// restart, with the tmux poller now bailing on structured rows so nothing
+    /// heals it. The in-memory pill must still move.
+    #[test]
+    #[serial]
+    fn daemon_status_does_not_persist_a_structured_row_to_disk() {
+        // Pin the process-global so the assertion cannot depend on it; an
+        // Idle -> Running apply never marks unread regardless.
+        crate::session::set_unread_enabled(true);
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Idle);
+        // `add_instance` only stages the row; flush it to disk as Idle so the
+        // passive writer has a durable row to (not) touch.
+        env.view.save().expect("seed the structured row on disk");
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Running));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Running),
+            "the daemon reading must still drive the in-memory pill"
+        );
+
+        let rows = env.view.storages.get("test").unwrap().load().unwrap();
+        let disk = rows.iter().find(|i| i.id == id).expect("disk row present");
+        assert_eq!(
+            disk.status,
+            Status::Idle,
+            "structured status must not be passively persisted to sessions.json (#3201)"
+        );
+    }
+
+    /// #3201, the deliberately-ungated half: the status patch is skipped
+    /// for a structured row, but the unread mark still lands, mirroring the
+    /// daemon (`decide_passive_transition` gates only `patch` on
+    /// `is_structured()`; its `mark_unread` is ungated and
+    /// `flush_passive_transition_writes` persists it). A future refactor that
+    /// gates unread the same way it gates status would strand structured rows
+    /// as read across a restart; this locks against it.
+    #[test]
+    #[serial]
+    fn daemon_status_persists_the_unread_mark_but_not_the_status_for_structured() {
+        crate::session::set_unread_enabled(true);
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Running);
+        env.view
+            .save()
+            .expect("seed the structured row on disk as read/Running");
+
+        // A finished turn (Running -> Idle) marks the row unread.
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Idle));
+
+        let rows = env.view.storages.get("test").unwrap().load().unwrap();
+        let disk = rows.iter().find(|i| i.id == id).expect("disk row present");
+        assert_eq!(
+            disk.status,
+            Status::Running,
+            "structured status must not be passively persisted (#3201)"
+        );
+        assert!(
+            disk.is_unread(),
+            "the unread mark must still persist for a structured row, mirroring the daemon (#3201)"
+        );
+    }
+
+    /// #3201: `last_error` reconciliation on a same-status daemon tick. An
+    /// incoming `Some` is authoritative and always replaces the message, even
+    /// without a status change (gating that write on a transition froze the
+    /// first error on the row). An incoming `None` is not symmetric: the daemon
+    /// tracks only ACP errors, so a same-status `None` tick must leave a
+    /// locally-set message (e.g. the delete-failure text from
+    /// `apply_deletion_results`) in place rather than wipe it. Clearing across a
+    /// genuine transition is locked by `daemon_status_clears_a_stale_error_message`.
+    #[test]
+    #[serial]
+    fn daemon_status_reconciles_last_error_on_a_same_status_tick() {
+        // (row status, seeded local error, incoming daemon error, expected)
+        let cases = [
+            // A None tick on an unchanged status keeps the local message.
+            (
+                Status::Running,
+                "delete failed: worktree busy",
+                None,
+                Some("delete failed: worktree busy"),
+            ),
+            // A present incoming Some replaces it even with no status change.
+            (
+                Status::Error,
+                "agent failed to start",
+                Some("rate limit exceeded"),
+                Some("rate limit exceeded"),
+            ),
+        ];
+        for (status, seeded, incoming, expected) in cases {
+            let mut env = create_test_env_empty();
+            let id = structured_row(&mut env, status);
+            env.view
+                .mutate_instance(&id, |inst| inst.last_error = Some(seeded.to_string()));
+
+            let mut u = update(&id, status);
+            u.last_error = incoming.map(str::to_string);
+            env.view.apply_daemon_status_update(u);
+
+            assert_eq!(
+                env.view
+                    .get_instance(&id)
+                    .and_then(|i| i.last_error.clone()),
+                expected.map(str::to_string),
+                "status={status:?} incoming={incoming:?}"
+            );
+        }
+    }
+
+    /// #3201: a snoozed row must stay live on the daemon path. Snooze is a
+    /// user-facing triage marker, not a sink like archive or trash;
+    /// `daemon_status_applies_to` deliberately excludes only archived and
+    /// trashed rows, never snoozed. This locks against a future edit that adds
+    /// a symmetric `!is_snoozed()` exclusion and silently freezes snoozed pills.
+    #[test]
+    #[serial]
+    fn daemon_status_applies_to_a_snoozed_structured_row() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Idle);
+        env.view.mutate_instance(&id, |inst| inst.snooze(30));
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Running));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Running),
+            "a snoozed row is live triage, not a sink; the daemon overlay must still drive its status (#3201)"
+        );
+    }
+
+    /// #3201, reintroducing the #1868 / #2206 guard on the daemon path:
+    /// `/api/sessions` returns archived and trashed rows, and the
+    /// `is_archived()` short-circuit that protects the tmux producer lives in
+    /// `update_status_with_metadata_inner`, a path the daemon overlay never
+    /// reaches. A sunk row must not be restamped by the daemon reading.
+    #[test]
+    #[serial]
+    fn daemon_status_skips_a_sunk_structured_row() {
+        for label in ["archived", "trashed"] {
+            let mut env = create_test_env_empty();
+            let id = structured_row(&mut env, Status::Idle);
+            let now = chrono::Utc::now();
+            env.view.mutate_instance(&id, |inst| {
+                if label == "archived" {
+                    inst.archived_at = Some(now);
+                } else {
+                    inst.trashed_at = Some(now);
+                }
+            });
+
+            env.view
+                .apply_daemon_status_update(update(&id, Status::Running));
+
+            assert_eq!(
+                env.view.get_instance(&id).map(|i| i.status),
+                Some(Status::Idle),
+                "a {label} row is sunk; the daemon overlay must not drive its status (#3201)"
+            );
+        }
     }
 }

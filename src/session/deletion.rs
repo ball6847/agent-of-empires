@@ -34,23 +34,20 @@ pub struct DeletionResult {
     pub errors: Vec<String>,
 }
 
-/// Whether `workspace_dir` looks like a directory aoe created and may
-/// therefore remove recursively.
+/// Whether `workspace_dir` has the workspace layout AoE creates and may
+/// therefore be removed once empty.
 ///
-/// The workspace stage ends in a `remove_dir_all` of a path read straight off
-/// the session record. That was safe only implicitly, because the only writer
-/// was `super::builder::create_workspace`, which creates the directory itself
-/// and then puts every repo's worktree in a subdirectory of it. Nothing
-/// enforced the invariant at delete time, so any future writer that set
-/// `workspace_dir` to a path aoe did not create (a session's own `project_path`,
-/// say) would turn session deletion into a recursive delete of the user's
-/// checkout, and for repos aoe does not manage the dirty check would not even
-/// fire first.
+/// The workspace stage ends in a non-recursive removal of a path read from the
+/// session record. The shape check remains a defense against future writers
+/// setting `workspace_dir` to a session's own checkout, but it does not claim
+/// to prove ownership by itself.
 ///
-/// So check the invariant instead of trusting the record: there is at least one
-/// repo, and every repo's worktree is a strict descendant of `workspace_dir`.
-/// A `workspace_dir` that *is* one of the worktrees, or that holds none of
-/// them, was not laid out by the workspace builder.
+/// There must be at least one repo, and every repo's worktree must be a strict
+/// descendant of `workspace_dir`. A `workspace_dir` that is one of the
+/// worktrees, or that holds none of them, was not laid out by the workspace
+/// builder. The final `remove_dir` succeeds only after the managed worktrees
+/// have been removed and the directory is empty, so a corrupt ancestor path
+/// cannot recursively remove unrelated user data.
 fn workspace_dir_is_aoe_owned(ws_info: &crate::session::WorkspaceInfo) -> bool {
     let ws_path = Path::new(&ws_info.workspace_dir);
     if ws_info.repos.is_empty() {
@@ -60,6 +57,18 @@ fn workspace_dir_is_aoe_owned(ws_info: &crate::session::WorkspaceInfo) -> bool {
         let worktree = Path::new(&repo.worktree_path);
         worktree != ws_path && worktree.starts_with(ws_path)
     })
+}
+
+/// Whether `branch` is one of the branches git states is `main_repo`'s default,
+/// so its worktree must be preserved (#3215).
+///
+/// A repo aoe cannot open is a repo git cannot remove a worktree from either,
+/// so a failure here is not treated as protection: the removal stage surfaces
+/// its own error exactly as it did before this guard existed.
+fn is_protected_default_branch(main_repo: &Path, branch: &str) -> bool {
+    GitWorktree::new(main_repo.to_path_buf())
+        .and_then(|git| git.protected_default_branch_names())
+        .is_ok_and(|names| names.contains(branch))
 }
 
 pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
@@ -145,25 +154,80 @@ fn perform_deletion_with(
         &[]
     };
 
-    let mut skip_worktree_paths: std::collections::HashSet<PathBuf> =
+    let mut preserved_worktree_paths: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
+
+    // Default-branch guard, deliberately NOT behind the `!force_delete` gate
+    // below. A bare-repo layout checks the repo's default branch out as a
+    // linked worktree, and removing it lets the branch stage delete the branch
+    // and leave the repo's HEAD dangling. Trash auto-purge and `empty-trash`
+    // both pass `force_delete`, so they are the paths that destroy such a
+    // checkout unattended (#3215). Reported as a message rather than an error
+    // so the purge still clears the row; an error would make it retry the same
+    // refusal every hour, forever.
+    if request.delete_worktree {
+        if let Some(wt_info) = &request.instance.worktree_info {
+            if wt_info.managed_by_aoe
+                && is_protected_default_branch(Path::new(&wt_info.main_repo_path), &wt_info.branch)
+            {
+                let path = PathBuf::from(&request.instance.project_path);
+                tracing::warn!(target: "session.delete",
+                    session_id = %request.session_id,
+                    branch = %wt_info.branch,
+                    path = %path.display(),
+                    "perform_deletion: preserving the worktree of a default branch"
+                );
+                messages.push(format!(
+                    "Worktree preserved; '{}' is a default branch of its repository",
+                    wt_info.branch
+                ));
+                preserved_worktree_paths.insert(path);
+            }
+        }
+        for repo in repos.iter().filter(|r| r.managed_by_aoe) {
+            if is_protected_default_branch(Path::new(&repo.main_repo_path), &repo.branch) {
+                tracing::warn!(target: "session.delete",
+                    session_id = %request.session_id,
+                    repo = %repo.name,
+                    branch = %repo.branch,
+                    path = %repo.worktree_path,
+                    "perform_deletion: preserving the worktree of a default branch"
+                );
+                messages.push(format!(
+                    "Workspace ({}) worktree preserved; '{}' is a default branch of its repository",
+                    repo.name, repo.branch
+                ));
+                preserved_worktree_paths.insert(PathBuf::from(&repo.worktree_path));
+            }
+        }
+    }
+
     if request.delete_worktree && !request.force_delete {
         if let Some(wt_info) = &request.instance.worktree_info {
             if wt_info.managed_by_aoe {
                 let path = PathBuf::from(&request.instance.project_path);
-                if let Some(msg) = crate::git::cleanup::dirty_worktree_message(&path) {
-                    tracing::debug!(target: "session.delete",
-                        session_id = %request.session_id,
-                        path = %path.display(),
-                        "perform_deletion: dirty worktree, skipping preclean + host remove"
-                    );
-                    errors.push(format!("Worktree: {}", msg));
-                    skip_worktree_paths.insert(path);
+                // A path the guard above already preserved must not also
+                // report dirty: that error would fail the deletion and strand
+                // the row in the trash, which is what the guard exists to
+                // avoid.
+                if !preserved_worktree_paths.contains(&path) {
+                    if let Some(msg) = crate::git::cleanup::dirty_worktree_message(&path) {
+                        tracing::debug!(target: "session.delete",
+                            session_id = %request.session_id,
+                            path = %path.display(),
+                            "perform_deletion: dirty worktree, skipping preclean + host remove"
+                        );
+                        errors.push(format!("Worktree: {}", msg));
+                        preserved_worktree_paths.insert(path);
+                    }
                 }
             }
         }
         for repo in repos.iter().filter(|r| r.managed_by_aoe) {
             let path = PathBuf::from(&repo.worktree_path);
+            if preserved_worktree_paths.contains(&path) {
+                continue;
+            }
             if let Some(msg) = crate::git::cleanup::dirty_worktree_message(&path) {
                 tracing::debug!(target: "session.delete",
                     session_id = %request.session_id,
@@ -172,13 +236,18 @@ fn perform_deletion_with(
                     "perform_deletion: dirty session repo, skipping preclean + host remove"
                 );
                 errors.push(format!("Workspace ({}): {}", repo.name, msg));
-                skip_worktree_paths.insert(path);
+                preserved_worktree_paths.insert(path);
             }
         }
     }
-    let any_dirty = !skip_worktree_paths.is_empty();
+    // Any preserved worktree, dirty or default-branch, blocks the in-container
+    // preclean (a recursive `find . -delete` that would reach through and
+    // destroy the contents we just decided to keep) and the host workspace-dir
+    // removal alike: with a worktree preserved under it the directory is not
+    // ours to remove, so we skip it rather than surface a spurious failure.
+    let any_preserved = !preserved_worktree_paths.is_empty();
 
-    if request.delete_worktree && is_sandboxed && !any_dirty {
+    if request.delete_worktree && is_sandboxed && !any_preserved {
         tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "sandbox_worktree_preclean", "perform_deletion: stage");
         // Best-effort. The container's workdir is the session's main
         // worktree (or, for workspace sessions, the workspace root that
@@ -236,7 +305,7 @@ fn perform_deletion_with(
         if let Some(wt_info) = &request.instance.worktree_info {
             if wt_info.managed_by_aoe {
                 let worktree_path = PathBuf::from(&request.instance.project_path);
-                if !skip_worktree_paths.contains(&worktree_path) {
+                if !preserved_worktree_paths.contains(&worktree_path) {
                     let main_repo = PathBuf::from(&wt_info.main_repo_path);
 
                     match GitWorktree::new(main_repo.clone()) {
@@ -279,7 +348,7 @@ fn perform_deletion_with(
                 continue;
             }
             let worktree_path = PathBuf::from(&repo.worktree_path);
-            if skip_worktree_paths.contains(&worktree_path) {
+            if preserved_worktree_paths.contains(&worktree_path) {
                 continue;
             }
             let main_repo = PathBuf::from(&repo.main_repo_path);
@@ -312,16 +381,23 @@ fn perform_deletion_with(
         }
 
         if let Some(ws_info) = &request.instance.workspace_info {
-            // Remove workspace parent directory only when every repo
-            // under it cleared the dirty check; otherwise we'd nuke
-            // the user's uncommitted changes through the back door.
+            // Remove workspace parent directory only when no repo under it was
+            // preserved; otherwise we'd nuke the user's uncommitted changes,
+            // or a default-branch checkout, through the back door.
             //
-            // The ownership guard is the second half of that: this is a
-            // recursive delete of a path read straight off the session
-            // record, so it must prove aoe created that directory rather
-            // than trusting the record. See `workspace_dir_is_aoe_owned`.
-            if ws_info.cleanup_on_delete && !any_dirty {
+            // The ownership guard is the second half of that: the workspace dir
+            // is read straight off the session record, so the shape check is a
+            // defense-in-depth guard that the record was not mislaid onto an
+            // unrelated path. The removal itself is non-recursive and succeeds
+            // only once the managed worktrees are gone and the directory is
+            // empty. See `workspace_dir_is_aoe_owned`.
+            if ws_info.cleanup_on_delete && !any_preserved {
                 let ws_path = PathBuf::from(&ws_info.workspace_dir);
+                // A record whose shape is not aoe-owned should never occur: it
+                // means workspace_dir was mis-written (e.g. set to the user's
+                // own checkout). Unlike the benign non-empty case below, fail
+                // loud with an error so a corrupt record is surfaced rather than
+                // silently clearing the row over it.
                 if !workspace_dir_is_aoe_owned(ws_info) {
                     tracing::warn!(target: "session.delete",
                         session_id = %request.session_id,
@@ -334,10 +410,29 @@ fn perform_deletion_with(
                         ws_path.display()
                     ));
                 } else if ws_path.exists() {
-                    if let Err(e) = std::fs::remove_dir_all(&ws_path) {
-                        errors.push(format!("Workspace dir: {}", e));
-                    } else {
-                        messages.push("Workspace directory removed".to_string());
+                    match std::fs::remove_dir(&ws_path) {
+                        // Normally unreachable: prune_empty_parent_dirs, run
+                        // after each worktree removal, already deletes the
+                        // emptied workspace dir. This is the fallback for the
+                        // rare case where prune stopped early (hop cap, or a
+                        // home / main-repo boundary) yet the dir is empty here.
+                        Ok(()) => messages.push("Workspace directory removed".to_string()),
+                        // A non-empty dir still holds something that is not one of
+                        // the managed worktrees: unrelated content under a mislaid
+                        // record, or files written at the workspace root, which is
+                        // the session's own cwd. We cannot tell which, so we keep
+                        // them. The removal is non-recursive, so this is a safe
+                        // refusal, not a failure worth retrying: report it as a
+                        // message so the purge still clears the row instead of
+                        // retrying the same non-convergent refusal forever, as the
+                        // default-branch guard above does (#3215).
+                        Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                            messages.push(format!(
+                                "Workspace directory kept: {} is not empty, so it was not removed",
+                                ws_path.display()
+                            ));
+                        }
+                        Err(e) => errors.push(format!("Workspace dir: {}", e)),
                     }
                 }
             }
@@ -690,7 +785,7 @@ mod tests {
     }
 
     /// The layout `create_workspace` produces: every repo in a subdirectory of
-    /// the workspace dir. Only this shape may be removed recursively.
+    /// the workspace dir. Only this shape is eligible for removal.
     #[test]
     fn workspace_dir_owned_when_repos_sit_underneath_it() {
         assert!(workspace_dir_is_aoe_owned(&workspace_info(
@@ -701,8 +796,9 @@ mod tests {
 
     /// The shape a synthesized `WorkspaceInfo` would have had for a session
     /// whose `project_path` is the user's own checkout: `workspace_dir` IS the
-    /// repo worktree rather than a directory above it. Removing it recursively
-    /// would delete the user's checkout, so the guard has to refuse.
+    /// repo worktree rather than a directory above it. Treating it as an
+    /// aoe-owned workspace would target the user's checkout, so the guard has
+    /// to refuse.
     #[test]
     fn workspace_dir_not_owned_when_it_is_itself_a_worktree() {
         assert!(!workspace_dir_is_aoe_owned(&workspace_info(
@@ -1133,6 +1229,108 @@ mod tests {
             );
         }
 
+        /// Regression for #3215, in the shape that loses the most: the
+        /// bare-repo layout, where the repo's default branch is checked out as
+        /// a linked worktree that sibling tooling expects to stay put. Deleting
+        /// the session used to remove that checkout and then delete the branch,
+        /// leaving the bare repo's HEAD pointing at a ref that no longer
+        /// existed. `force_delete` is set because that is what trash
+        /// auto-purge and `empty-trash` pass, and it used to bypass every
+        /// existing protection.
+        #[test]
+        fn default_branch_worktree_survives_a_forced_delete() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let bare = tmp.path().join("project/.bare");
+            let worktree_path = tmp.path().join("project/main");
+            std::fs::create_dir_all(&bare).unwrap();
+
+            let repo = git2::Repository::init_bare(&bare).unwrap();
+            let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+            let tree_id = {
+                let blob = repo.blob(b"hello").unwrap();
+                let mut tb = repo.treebuilder(None).unwrap();
+                tb.insert("file.txt", blob, 0o100644).unwrap();
+                tb.write().unwrap()
+            };
+            let tree = repo.find_tree(tree_id).unwrap();
+            repo.commit(Some("refs/heads/main"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+            repo.set_head("refs/heads/main").unwrap();
+
+            let out = std::process::Command::new("git")
+                .args(["worktree", "add", worktree_path.to_str().unwrap(), "main"])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(worktree_path.exists());
+
+            let mut instance = Instance::new("Infra", worktree_path.to_str().unwrap());
+            instance.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: "main".to_string(),
+                main_repo_path: bare.to_string_lossy().to_string(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+
+            let result = perform_deletion(&DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: true,
+                delete_branch: true,
+                delete_sandbox: false,
+                force_delete: true,
+                detach_hooks: true,
+                keep_scratch: false,
+            });
+
+            // Success matters as much as the preservation: a failure would keep
+            // the row, and auto-purge would retry the same refusal every hour.
+            assert!(
+                result.success,
+                "deletion must still succeed: {:?}",
+                result.errors
+            );
+            assert!(
+                result
+                    .messages
+                    .iter()
+                    .any(|m| m.contains("default branch of its repository")),
+                "preservation must be reported: {:?}",
+                result.messages
+            );
+            assert!(
+                worktree_path.exists(),
+                "the default branch's checkout must survive"
+            );
+
+            let branches = std::process::Command::new("git")
+                .args(["branch", "--list", "main"])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+                "the default branch itself must survive"
+            );
+
+            let head = std::process::Command::new("git")
+                .args(["symbolic-ref", "HEAD"])
+                .current_dir(&bare)
+                .output()
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&head.stdout).trim(),
+                "refs/heads/main",
+                "the bare repo's HEAD must still resolve"
+            );
+        }
+
         /// Init a repo with one commit so branches and worktrees can be made.
         fn init_repo(path: &std::path::Path) {
             std::fs::create_dir_all(path).unwrap();
@@ -1177,7 +1375,8 @@ mod tests {
             instance.workspace_info = Some(crate::session::WorkspaceInfo {
                 branch: "feature/abc".to_string(),
                 // The shape the guard exists to catch: the workspace dir IS the
-                // repo worktree, so a recursive delete would take the checkout.
+                // repo worktree, so treating it as aoe-owned would target the
+                // checkout.
                 workspace_dir: user_checkout.to_string_lossy().to_string(),
                 repos: vec![crate::session::WorkspaceRepo {
                     name: "backend".to_string(),
@@ -1186,7 +1385,7 @@ mod tests {
                     worktree_path: user_checkout.to_string_lossy().to_string(),
                     main_repo_path: user_checkout.to_string_lossy().to_string(),
                     // Not aoe-managed, so the dirty check never fires and the
-                    // recursive delete would have been the only gate.
+                    // ownership guard is the only gate left.
                     managed_by_aoe: false,
                     branch_preexisting: false,
                 }],
@@ -1763,6 +1962,149 @@ mod tests {
                 "unsandboxed deletion must not emit sandbox preclean stage: stages={:?}",
                 stages
             );
+        }
+
+        /// A strict-descendant layout alone does not prove ownership. A corrupt
+        /// record naming a populated ancestor must never be wiped: the removal
+        /// is non-recursive, so the ancestor is left in place and reported as a
+        /// message rather than a hard error, and the trash row still clears.
+        #[test]
+        fn e2e_workspace_ancestor_with_unrelated_content_is_not_recursively_removed() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let user_checkout = tmp.path().join("backend");
+            init_repo(&user_checkout);
+            let precious = tmp.path().join("unrelated.txt");
+            std::fs::write(&precious, "do not delete me").unwrap();
+
+            let mut instance = Instance::new("Bad ancestor", user_checkout.to_str().unwrap());
+            instance.workspace_info = Some(workspace_info(
+                tmp.path().to_str().unwrap(),
+                &[user_checkout.to_str().unwrap()],
+            ));
+            if let Some(repo) = instance
+                .workspace_info
+                .as_mut()
+                .and_then(|workspace| workspace.repos.first_mut())
+            {
+                repo.source_path = user_checkout.to_string_lossy().into_owned();
+                repo.main_repo_path = user_checkout.to_string_lossy().into_owned();
+                repo.managed_by_aoe = false;
+            }
+
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: true,
+                delete_branch: false,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+            let result = perform_deletion(&request);
+
+            assert!(precious.exists(), "unrelated ancestor content must survive");
+            assert_eq!(
+                std::fs::read_to_string(&precious).unwrap(),
+                "do not delete me"
+            );
+            assert!(
+                user_checkout.exists(),
+                "the user's checkout under a corrupt ancestor must survive"
+            );
+            assert!(
+                tmp.path().exists(),
+                "the populated ancestor dir must be left in place, not wiped"
+            );
+            // A non-empty dir aoe cannot own is a safe refusal reported as a
+            // message, not a hard error, so the purge still clears the row and
+            // does not retry the same non-convergent refusal forever (#3215).
+            assert!(
+                result.success,
+                "safe refusal must not fail the purge: {:?}",
+                result.errors
+            );
+            assert!(
+                result
+                    .messages
+                    .iter()
+                    .any(|m| m.starts_with("Workspace directory kept:")),
+                "expected a 'kept' message: {:?}",
+                result.messages
+            );
+        }
+
+        /// A stray file under an otherwise aoe-owned workspace keeps the dir
+        /// non-empty after the managed worktree is gone. The non-recursive
+        /// removal must leave that file and report a kept-message rather than a
+        /// failure, so the purge still clears the row instead of looping on a
+        /// refusal that never converges (#3215).
+        #[test]
+        fn e2e_workspace_dir_with_stray_file_is_kept_not_failed() {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let workspace = tmp.path().join("ws");
+            let main_repo = tmp.path().join("frontend");
+            let worktree = workspace.join("frontend");
+            init_repo(&main_repo);
+            std::fs::create_dir_all(&workspace).unwrap();
+            git_in(
+                &main_repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feature/ws-del",
+                    worktree.to_str().unwrap(),
+                    "HEAD",
+                ],
+            );
+            let stray = workspace.join("stray.txt");
+            std::fs::write(&stray, "keep me").unwrap();
+
+            let mut instance = Instance::new("Workspace", workspace.to_str().unwrap());
+            instance.workspace_info = Some(crate::session::WorkspaceInfo {
+                branch: "feature/ws-del".to_string(),
+                workspace_dir: workspace.to_string_lossy().to_string(),
+                repos: vec![crate::session::WorkspaceRepo {
+                    name: "frontend".to_string(),
+                    source_path: main_repo.to_string_lossy().to_string(),
+                    branch: "feature/ws-del".to_string(),
+                    worktree_path: worktree.to_string_lossy().to_string(),
+                    main_repo_path: main_repo.to_string_lossy().to_string(),
+                    managed_by_aoe: true,
+                    branch_preexisting: false,
+                }],
+                created_at: chrono::Utc::now(),
+                cleanup_on_delete: true,
+            });
+            let request = DeletionRequest {
+                session_id: instance.id.clone(),
+                instance,
+                delete_worktree: true,
+                delete_branch: true,
+                delete_sandbox: false,
+                force_delete: false,
+                detach_hooks: true,
+                keep_scratch: false,
+            };
+
+            let result = perform_deletion(&request);
+            assert!(
+                result.success,
+                "a stray file must not wedge the purge: {:?}",
+                result.errors
+            );
+            assert!(
+                result
+                    .messages
+                    .iter()
+                    .any(|m| m.starts_with("Workspace directory kept:")),
+                "expected a 'kept' message: {:?}",
+                result.messages
+            );
+            assert!(!worktree.exists(), "managed worktree must be removed");
+            assert!(stray.exists(), "the stray file must survive");
+            assert!(workspace.exists(), "the kept workspace dir must remain");
         }
     }
 

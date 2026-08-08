@@ -48,6 +48,12 @@ use super::settings::SettingsView;
 use super::status_poller::{StatusPoller, StatusUpdate};
 use super::stop_poller::StopPoller;
 
+/// Header label the synthetic scratch bucket renders under in project view.
+/// Not an identity: a user's own repo whose basename happens to be `scratch`
+/// derives the same label from its path, so anything deciding whether a header
+/// has a backing repo must test the repo path, not this string (#3133).
+const SCRATCH_GROUP_LABEL: &str = "scratch";
+
 /// Extract a project group name from a session instance.
 /// Uses `worktree_info.main_repo_path` for worktree sessions (so all branches of the
 /// same repo group together), otherwise uses `project_path`. Returns the last path segment.
@@ -55,7 +61,7 @@ fn project_group_name(inst: &Instance) -> String {
     // Scratch sessions live under `<app_dir>/scratch/<instance-id>/`, so the last
     // path segment is the opaque instance id. Group them under a readable label.
     if inst.scratch {
-        return "scratch".to_string();
+        return SCRATCH_GROUP_LABEL.to_string();
     }
 
     crate::session::projects::repo_label(inst.repo_path())
@@ -531,6 +537,7 @@ pub struct HomeView {
     pub(super) project_session_picker_dialog: Option<ProjectSessionPickerDialog>,
     pub(super) projects_dialog: Option<ProjectsDialog>,
     pub(super) plugin_manager_dialog: Option<crate::tui::dialogs::PluginManagerDialog>,
+    pub(super) skills_manager_dialog: Option<crate::tui::dialogs::SkillsManagerDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     #[cfg(feature = "serve")]
     pub(super) serve_view: Option<ServeView>,
@@ -2129,7 +2136,7 @@ impl HomeView {
             group_by,
             row_tag_mode: resolved.session.row_tag,
             agent_clipboard_forward: resolved.tmux.clipboard
-                != crate::session::config::TmuxClipboardMode::Disabled,
+                != crate::session::config::TmuxSettingMode::Disabled,
             vt_live_enabled: resolved.tmux.vt_live,
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: user_config
@@ -2174,6 +2181,7 @@ impl HomeView {
             project_session_picker_dialog: None,
             projects_dialog: None,
             plugin_manager_dialog: None,
+            skills_manager_dialog: None,
             command_palette: None,
             #[cfg(feature = "serve")]
             serve_view: None,
@@ -2845,16 +2853,38 @@ impl HomeView {
     }
 
     /// Whether a daemon-sourced status may be applied to `id`, mirroring the
-    /// exclusions [`Self::pollable_instances`] applies to the tmux producer.
-    /// A row mid-restart or mid-recovery-cascade has its post-cascade
-    /// `Instance` delivered by `apply_restart_results` /
-    /// `apply_recovery_updates`; letting the daemon's copy land during that
-    /// window races those transitions. Recovery already skips structured rows
+    /// exclusions the tmux producer applies. A row mid-restart or
+    /// mid-recovery-cascade has its post-cascade `Instance` delivered by
+    /// `apply_restart_results` / `apply_recovery_updates`; letting the daemon's
+    /// copy land during that window races those transitions, so both are
+    /// excluded here just as [`Self::pollable_instances`] excludes them from the
+    /// tmux poller. Recovery already skips structured rows
     /// (`recovery::is_recovery_candidate`), so in practice this is the restart
     /// guard, but both are checked so the two producers stay symmetrical.
+    ///
+    /// Archived and trashed rows are also excluded. `/api/sessions` returns
+    /// them unfiltered, and the `is_archived()` short-circuit that keeps the
+    /// tmux producer off a sunk row lives in `update_status_with_metadata_inner`
+    /// (`instance.rs`), which this daemon path never reaches; without this a
+    /// sunk row would be restamped and re-marked unread. See #3201 / #1868 /
+    /// #2206.
+    ///
+    /// The cost of that exclusion: a sunk structured row that is already in
+    /// `Status::Error` now has no producer able to clear it. The daemon is
+    /// excluded here, the tmux poller bails on structured rows before probing
+    /// (`status_poller.rs`), and `reload_storage_only` carries `prev.status`
+    /// forward across reloads, so the stale value survives. It stays visible
+    /// because `agent_row_icon` lets `Error` and `Deleting` punch through the
+    /// sunk-row mask on purpose (a failed permanent delete has to remain
+    /// legible). The tmux producer has the same property via its own
+    /// `is_archived()` short-circuit, so this is consistent rather than new,
+    /// but unarchiving is the only way back.
     #[cfg(feature = "serve")]
-    fn daemon_status_applies_to(&self, id: &str) -> bool {
-        !self.recovery_in_flight.contains(id) && !self.restart_in_flight.contains(id)
+    fn daemon_status_applies_to(&self, inst: &Instance) -> bool {
+        !self.recovery_in_flight.contains(&inst.id)
+            && !self.restart_in_flight.contains(&inst.id)
+            && !inst.is_archived()
+            && !inst.is_trashed()
     }
 
     /// Apply any pending daemon-sourced statuses. Returns true if the
@@ -2889,8 +2919,13 @@ impl HomeView {
     }
 
     /// Fold one daemon-sourced structured status into the shared apply path,
-    /// so sounds, status hooks, unread marking, and the `sessions.json`
-    /// patch all behave exactly as they do for a tmux-derived transition.
+    /// so sounds, status hooks, and unread marking behave exactly as they do
+    /// for a tmux-derived transition. The `sessions.json` status patch is the
+    /// one deliberate exception: this path only handles structured rows, and
+    /// `persist_passive_status_transition` skips the passive status patch for
+    /// `is_structured()` (only the unread mark persists there), since a
+    /// structured row's status is a daemon-side overlay with no durable owner.
+    /// See #3201.
     ///
     /// The row is re-checked against `is_structured()` here rather than
     /// trusted from the wire: the daemon's `view` and the local row's could
@@ -2904,15 +2939,14 @@ impl HomeView {
         use crate::session::Status;
         use crate::tui::status_poller::IdleIntent;
 
-        if !self
-            .get_instance(&update.id)
-            .is_some_and(|i| i.is_structured())
-        {
+        // One lookup feeds both guards below and the Stopped-lift check.
+        let Some(inst) = self.get_instance(&update.id) else {
+            return;
+        };
+        if !inst.is_structured() || !self.daemon_status_applies_to(inst) {
             return;
         }
-        if !self.daemon_status_applies_to(&update.id) {
-            return;
-        }
+        let was_stopped = inst.status == Status::Stopped;
         // Lift a locally-`Stopped` row before the shared apply path sees it.
         // `apply_status_update`'s guard drops every update whose row is
         // `Stopped`, which is right for tmux rows (nothing but an explicit
@@ -2929,9 +2963,7 @@ impl HomeView {
         // daemon provably means a new worker epoch, never a trailing
         // post-stop event. Reproducing the daemon's own Stopped -> Idle step
         // here keeps the two ladders identical.
-        if update.status != Status::Stopped
-            && self.get_instance(&update.id).map(|i| i.status) == Some(Status::Stopped)
-        {
+        if update.status != Status::Stopped && was_stopped {
             self.mutate_instance(&update.id, |inst| inst.status = Status::Idle);
         }
         self.apply_status_update(
@@ -2998,9 +3030,24 @@ impl HomeView {
             let new_error = update.last_error;
             let new_idle_entered_at = update.idle_entered_at;
             let new_live_status_baseline = update.live_status_baseline;
+            let status_changed = old_status != Some(new_status);
             self.mutate_instance(&update.id, |inst| {
                 inst.status = new_status;
-                inst.last_error = new_error;
+                // The daemon's `last_error` is authoritative only when present:
+                // an incoming `Some` is always applied, so an `Error -> Error`
+                // tick can replace the old text. Gating that write on a status
+                // change froze the first error on the row. A `None` is not
+                // symmetric: the daemon tracks only ACP errors, so it cannot
+                // distinguish "no error" from a locally-set message such as the
+                // delete-failure text from `apply_deletion_results`, and
+                // clearing on every unchanged tick would wipe it. Clear only
+                // across a genuine transition, leaving a stale same-status
+                // message in place until then. See #3201.
+                if let Some(err) = new_error {
+                    inst.last_error = Some(err);
+                } else if status_changed {
+                    inst.last_error = None;
+                }
                 // Match on the producer's stated intent for `idle_entered_at`
                 // instead of overloading `None`. See `IdleIntent` in
                 // `status_poller` for the three-variant contract that
@@ -4401,6 +4448,13 @@ impl HomeView {
             }
         }
 
+        // Poll the skills manager's in-flight share.
+        if let Some(dialog) = &mut self.skills_manager_dialog {
+            if dialog.tick() {
+                changed = true;
+            }
+        }
+
         // Drain hook progress into the creating buffer when no dialog is open
         if self.new_dialog.is_none() {
             if let Some(ref stub_id) = self.creating_stub_id {
@@ -4495,6 +4549,7 @@ impl HomeView {
             || self.projects_dialog.is_some()
             || self.attach_project_dialog.is_some()
             || self.plugin_manager_dialog.is_some()
+            || self.skills_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
@@ -4561,6 +4616,7 @@ impl HomeView {
             || self.projects_dialog.is_some()
             || self.attach_project_dialog.is_some()
             || self.plugin_manager_dialog.is_some()
+            || self.skills_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
@@ -5520,7 +5576,9 @@ impl HomeView {
         else {
             return;
         };
-        let tokens = permission_response_tokens(&response, choice);
+        let Some(tokens) = permission_response_tokens(&response, choice) else {
+            return;
+        };
         let tmux_session = match crate::tmux::Session::new(&inst.id, &inst.title) {
             Ok(s) => s,
             Err(e) => {
@@ -5546,12 +5604,12 @@ impl HomeView {
 fn permission_response_tokens(
     response: &crate::agents::PermissionResponse,
     choice: crate::tui::dialogs::PermissionResponseChoice,
-) -> &'static [crate::agents::KeyToken] {
+) -> Option<&'static [crate::agents::KeyToken]> {
     use crate::tui::dialogs::PermissionResponseChoice::*;
     match choice {
-        Allow => response.allow,
+        Allow => Some(response.allow),
         AllowAlways => response.allow_always,
-        Deny => response.deny,
+        Deny => Some(response.deny),
     }
 }
 
@@ -5565,12 +5623,12 @@ mod permission_response_tokens_tests {
     fn maps_each_choice_to_its_own_field() {
         let response = PermissionResponse {
             allow: &[KeyToken::Literal("1")],
-            allow_always: &[KeyToken::Literal("2")],
+            allow_always: Some(&[KeyToken::Literal("2")]),
             deny: &[KeyToken::Literal("3")],
         };
         assert_eq!(
             permission_response_tokens(&response, PermissionResponseChoice::Allow),
-            response.allow
+            Some(response.allow)
         );
         assert_eq!(
             permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
@@ -5578,7 +5636,20 @@ mod permission_response_tokens_tests {
         );
         assert_eq!(
             permission_response_tokens(&response, PermissionResponseChoice::Deny),
-            response.deny
+            Some(response.deny)
+        );
+    }
+
+    #[test]
+    fn allow_always_none_maps_to_none() {
+        let response = PermissionResponse {
+            allow: &[KeyToken::Named("Enter")],
+            allow_always: None,
+            deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
+        };
+        assert_eq!(
+            permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
+            None
         );
     }
 }
@@ -6301,10 +6372,32 @@ impl HomeView {
         let Some(storage) = self.storages.get(&inst.source_profile) else {
             return;
         };
-        let patch = crate::session::PassiveStatusPatch::from_instance(inst);
+        // Structured rows are not durable: their status is a daemon-side
+        // overlay rebuilt from live worker state (`apply_acp_overlay_inplace`)
+        // and re-derived at daemon boot by `seed_acp_statuses`. The daemon's
+        // own passive writer gates the status patch on exactly this predicate
+        // (`decide_passive_transition` returns `patch: None` for
+        // `is_structured()`, `server/mod.rs`). Persisting it here would strand
+        // a row at `Running` or `Error` with no producer left to heal it once
+        // the daemon is gone, since the tmux poller now bails on structured
+        // rows (`status_poller.rs`); this is the #3201 regression from #3170.
+        // The unread mark is deliberately NOT gated: the daemon marks a
+        // structured row unread on a Running -> Idle turn (its `mark_unread` is
+        // not gated on `is_structured`), so mirroring it here keeps the two
+        // producers symmetric.
+        let structured = inst.is_structured();
+        // Pure optimization, not a correctness gate: a structured row with
+        // nothing to mark unread has no patch and no unread write, so skip the
+        // empty-write flock round-trip entirely.
+        if structured && !mark_unread {
+            return;
+        }
+        let patch = (!structured).then(|| crate::session::PassiveStatusPatch::from_instance(inst));
         if let Err(e) = storage.update(|insts, _groups| {
             if let Some(disk) = insts.iter_mut().find(|i| i.id == id) {
-                disk.merge_passive_status_patch(id, &patch);
+                if let Some(patch) = &patch {
+                    disk.merge_passive_status_patch(id, patch);
+                }
                 if mark_unread {
                     disk.mark_unread();
                 }
@@ -6679,7 +6772,12 @@ impl HomeView {
             if tool.exists() {
                 let _ = tool.kill();
             }
-            tool.create_with_size(&inst.project_path, &tool_config.command, size)?;
+            tool.create_with_size(
+                &inst.project_path,
+                &tool_config.command,
+                size,
+                &inst.effective_profile(),
+            )?;
         }
         Ok(())
     }
@@ -6796,10 +6894,16 @@ impl HomeView {
     /// recorded path (repo deleted or moved, so `canonical_key` compares raw
     /// strings) render an unpinnable phantom header: pinned by label, judged
     /// by path.
+    ///
+    /// Scratch sessions are excluded for the same reason: their `repo_path()` is
+    /// the throwaway `<app_dir>/scratch/<id>` directory, not a repo anyone can
+    /// register. They share the `scratch` header with a user repo of that
+    /// basename (#3133), so letting one lend the header its path would both hide
+    /// the real repo and offer an app-internal directory up for pinning.
     pub(super) fn project_header_repo_path(&self, label: &str) -> Option<String> {
         self.instances
             .values()
-            .find(|i| !i.is_archived() && project_group_name(i) == label)
+            .find(|i| !i.is_archived() && !i.scratch && project_group_name(i) == label)
             .map(|i| crate::session::projects::canonical_key(i.repo_path()))
     }
 
@@ -6825,10 +6929,29 @@ impl HomeView {
         }
     }
 
+    /// True when project header `label` is nothing but the synthetic scratch
+    /// bucket, so there is no repo behind it to register or pin. Judged by
+    /// backing identity rather than by the label: scratch sessions and a user's
+    /// own repo named `scratch` derive the same header label, and that header is
+    /// a real project (#3133). A PINNED registry entry carrying the label also
+    /// counts as backing, so an empty pinned `scratch` project stays reachable to
+    /// unpin. The pin flag is required because it is what `unpopulated_projects`
+    /// and `is_project_label_pinned`'s label branch key on: a saved-but-unpinned
+    /// entry never surfaces a header of its own, so counting it as backing would
+    /// open the gate on a header the toggle has no path to act on, and `p` would
+    /// silently do nothing instead of keeping its global meaning. With no
+    /// backing repo path, `is_project_label_pinned` IS that pinned-label
+    /// lookup, so it is reused here rather than restating the predicate.
+    fn is_synthetic_scratch_header(&self, label: &str) -> bool {
+        label == SCRATCH_GROUP_LABEL
+            && self.project_header_repo_path(label).is_none()
+            && !self.is_project_label_pinned(label)
+    }
+
     /// The project-view header label under the cursor when it is a real,
     /// pinnable project: project grouping is active, the cursor is on a group
-    /// header, and that header is neither the synthetic Archived section nor
-    /// the `scratch` bucket (scratch sessions have no backing repo to pin).
+    /// header, and that header is neither the synthetic Archived section nor the
+    /// synthetic `scratch` bucket (scratch sessions have no backing repo to pin).
     pub(super) fn project_group_at_cursor(&self) -> Option<String> {
         if self.group_by != GroupByMode::Project {
             return None;
@@ -6837,7 +6960,7 @@ impl HomeView {
             Some(Item::Group { path, name, .. })
                 if !crate::session::is_within_archived_section(path)
                     && !crate::session::is_within_trash_section(path)
-                    && name != "scratch" =>
+                    && !self.is_synthetic_scratch_header(name) =>
             {
                 Some(name.clone())
             }
@@ -7052,7 +7175,7 @@ impl HomeView {
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.row_tag_mode = config.session.row_tag;
         self.agent_clipboard_forward =
-            config.tmux.clipboard != crate::session::config::TmuxClipboardMode::Disabled;
+            config.tmux.clipboard != crate::session::config::TmuxSettingMode::Disabled;
         self.vt_live_enabled = config.tmux.vt_live;
         if let Some(worker) = self.preview_capture_worker.as_ref() {
             worker.set_vt_enabled(self.vt_live_enabled);

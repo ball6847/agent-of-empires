@@ -697,18 +697,37 @@ canonical-ancestor check, and symlinks are refused. No arbitrary host path is
 reachable; a host-discovered agent skills dir (`~/.claude/skills`,
 `~/.kimi-code/skills`) is not an `fs.*` root, so `fs.write` can never mutate a
 read-only host skill.
+The complete discovery registry also includes `~/.agents/skills`,
+`~/.gemini/skills`, and `~/.config/opencode/skills`.
 
-`skills.*` (#2984) manage the skill set modelled in `src/session/skills_model.rs`.
+`skills.*` (#2984, #3050) manage the skill set modelled in
+`src/session/skills_model.rs`.
 A skill's identity is its directory name, and skills are source-qualified by
 provenance, so `skills.list` returns every host-discovered and managed skill
-without shadow-merging. `skills.read { source, directory }` returns one skill's
-`SKILL.md`. `create` / `edit` / `delete` mutate the managed store in place and
-refuse a host-discovered (read-only) target with `FORBIDDEN` (adopt it first).
-`adopt` copies a host-discovered skill INTO the managed store, leaving the
-original. `skills.propagate { directory, agent }` is the one method that writes
-OUT of the store: it copies a managed skill into a supported agent's host skills
-dir; it never overwrites an existing target, and the marker/dedupe/opt-in policy
-is deferred to the plugin side.
+without shadow-merging. External provenance is keyed by the physical root, for
+example `{ "kind": "external", "root": "claude-user" }`, rather than by an
+agent name because multiple agents consume `~/.agents/skills`.
+`skills.read { source, directory }` returns one skill's `SKILL.md`. `create` /
+`edit` / `delete` mutate the managed store in place and refuse a
+host-discovered (read-only) target with `FORBIDDEN` (adopt it first). `adopt`
+copies a host-discovered skill into the managed store, leaving the original.
+The copy rejects links, special files, and packages outside the same byte,
+file-count, per-file, and nesting limits enforced by the REST API.
+`skills.propagate { agent }` is the one method that writes OUT of the store: it
+reconciles every managed skill into the skills dir that agent is the primary
+consumer of, and returns one `outcomes` entry per skill. It replaces or removes
+only copies AoE itself deployed that still match the digest recorded in their
+`.aoe-managed.json` marker; anything else is reported as a conflict and left
+alone. It previously took a `directory` and copied one named skill, refusing any
+existing target; propagation is now root-level, so a single skill is no longer an
+addressable unit.
+
+It deliberately does not consult `skills.auto_propagate`. That setting gates
+the automatic path, where AoE would write into an agent's directory without
+being asked; an explicit `skills.propagate` call is a request, like
+`aoe skill sync`, which is not gated either. The gate on writing out of the
+store is the `fs.write` capability, which the user granted when they approved
+the plugin.
 
 Every `fs.*`/`skills.*` write inherits read-only safety for free: the plugin host
 is not spawned at all in read-only serve mode (`src/server/mod.rs` gates
@@ -805,29 +824,49 @@ These slots carry more than a single value, so one entry (one declared
   dashboard renders the pill in the card header; the TUI ignores this slot.
 - `pane` also accepts `blocks: Block[]`, an ordered list of typed
   blocks. The web renderer knows these kinds: `heading { text }`,
-  `row { label, value?, sublabel?, icon?, tone?, color?, href? }`,
+  `row { label?, value?, prefix?, sublabel?, icon?, avatar?, tone?, value_tone?, color?, href?, tooltip?, mono?, selected?, badges?, method?, params? }`,
   `note { text, tone? }`, `divider {}`,
-  `section { title?, children: Block[], collapsible?, collapsed? }` (nested
+  `section { title?, children: Block[], value?, value_tone?, badges?, icon?, tone?, boxed?, scroll?, collapsible?, collapsed? }` (nested
   blocks; `collapsible` wraps the section in a native `<details>` the user can
   fold, and `collapsed` starts it folded, default open),
+  `callout { title?, detail?, icon?, tone?, color?, actions? }` (a tone-bordered
+  verdict card with its own full-width buttons: the one thing the pane is saying,
+  where a `section` is a list),
+  `bar { segments: [{ value, tone?, color?, label? }], caption? }` (a proportional
+  stacked bar; non-positive segments are dropped and an empty bar renders nothing),
+  `columns { children: Block[] }` (children side by side in equal fractions; a lone
+  child spans the full width, so eliding a card collapses the row rather than
+  leaving a gap),
   `comment { author, body, path?, line?, resolved?, href? }` (a read-only PR
   review comment: author, optional file:line, a wrapped body excerpt, and an
   unresolved/resolved marker), and
-  `action { label, method, icon? }` (a button that forwards `method` to the
-  plugin's worker, see below). A block's optional `color` is a validated hex
-  literal (`#rgb`/`#rrggbb`, normalized; no CSS names, `rgb()`, `var()`, or
-  `url()`, so it can never carry arbitrary CSS) that tints the block's
-  icon/value where a semantic `tone` cannot name the hue, e.g. a merged PR's
-  purple. The simple `{ title, body }` form still works
+  `action { label, method?, href?, disabled?, variant?, tone?, tooltip?, icon? }`
+  (a button that forwards `method` to the plugin's worker, see below; with `href`
+  and no `method` it is a link-out instead, and `disabled` renders it inert and
+  non-navigating, which is how a blocked state reads). A block's optional `color`
+  is a validated hex literal (`#rgb`/`#rrggbb`, normalized; no CSS names,
+  `rgb()`, `var()`, or `url()`, so it can never carry arbitrary CSS) that tints
+  the block's icon/value where a semantic `tone` cannot name the hue, e.g. a
+  merged PR's purple. The simple `{ title, body }` form still works
   when `blocks` is absent. A `pane`
   also takes an optional `default_location` (`right` | `bottom`) choosing the
-  dock it first opens in; the user can move it between docks afterward, and an
+  dock it first opens in; the user can move it between docks afterward, an
   optional `icon` (any lucide icon name, kebab-case) for its activity-bar
-  button, falling back to a generic plugin icon. The host renders each `pane` as
-  a dockable tool-window (activity-bar toggle, move, close) alongside the
-  built-in diff and terminal panes. Each pane's body scrolls, and a long
-  `comment` body is clamped with a "more"/"less" toggle, so a full PR comment
+  button, falling back to a generic plugin icon, and an optional
+  `footer { text?, value?, icon?, tone? }` (api_version 12) rendered outside the
+  scroll area so a status line stays put while the blocks scroll. The host renders
+  each `pane` as a dockable tool-window (activity-bar toggle, move, close)
+  alongside the built-in diff and terminal panes. Each pane's body scrolls, and a
+  long `comment` body is clamped with a "more"/"less" toggle, so a full PR comment
   list stays browsable.
+
+  A `row` lays out at most two lines: `prefix` (mono, tone-tinted) and `label`
+  lead the first with `value` pinned right, then `sublabel` leads the second with
+  `badges` (compact `{ text?, icon?, tone?, tooltip? }` signals, not pills) pinned
+  right. `value_tone` colors the trailing token independently of the row, for the
+  common shape of a status glyph beside a neutral scalar such as a timestamp.
+  `scroll` on a section caps its body height with a fixed class rather than a
+  plugin-supplied length: a worker must not be able to size host chrome.
 
   A pane entry gets a larger payload budget than the other slots: its normalized
   JSON may be up to 64KB, against 8KB for every other slot (`status-bar`,
@@ -853,14 +892,19 @@ change: an older host simply renders what it understands and drops the rest.
 This is deliberate, the GitHub plugin's pane keeps growing (PR state today,
 review/CI/timelines later) and must not require lockstep host releases.
 
-**Pane actions (host to worker).** An `action` block is a button. When clicked,
-the dashboard POSTs `/api/plugins/{id}/action { method, params? }`; the host
-writes that JSON-RPC method to the worker's stdin as a notification (no id, so
-no reply) via `PluginHost::notify_worker`. The worker runs the method (e.g.
-`github.refresh`) and re-pushes its UI state, which the next `ui-state` poll
-renders. The plugin names the `method` in its own block, and the worker is the
-trust boundary: it acts only on methods it implements and ignores the rest (the
-honest-plugin model). The endpoint is gated on read-write mode only, not on
+**Pane actions (host to worker).** An `action` block is a button, and so is a
+`row` carrying a `method`. When clicked, the dashboard POSTs
+`/api/plugins/{id}/action { method, params? }`; the host writes that JSON-RPC
+method to the worker's stdin as a notification (no id, so no reply) via
+`PluginHost::notify_worker`. The worker runs the method (e.g. `github.refresh`)
+and re-pushes its UI state, which the next `ui-state` poll renders. `params` is
+the block's own `params` object forwarded verbatim, which is what lets one method
+serve a whole list (`github.select_pr { pr }` on every row of a PR selector); the
+host merges the authoritative `session_id` in server-side, so a plugin cannot
+spoof which session it is acting on. Since the object round-trips values the
+plugin itself authored, there is nothing to sanitize on the way out. The plugin
+names the `method` in its own block, and the worker is the trust boundary: it acts
+only on methods it implements and ignores the rest (the honest-plugin model). The endpoint is gated on read-write mode only, not on
 passphrase elevation: a pane action mutates no host-managed state (config,
 registry, grants, lockfile) and grants no new host capability, so it does not
 warrant the step-up the way enable/disable does (the worker's own behavior may

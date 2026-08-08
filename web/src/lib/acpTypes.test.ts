@@ -917,6 +917,74 @@ describe("applyEvent / Stopped empty-output fallback", () => {
     expect(state.turnActive).toBe(false);
   });
 
+  // #2805 field report: a steered mid-turn prompt is not a new turn, so
+  // it must not reset the output flag the running turn already earned.
+  // Replays the reported trace: prompt, agent output, steered prompt,
+  // one Stopped. Before the fix the steered prompt cleared
+  // `turnHasOutput` and the single Stopped rendered a bogus notice.
+  it("does not append the notice when a steered prompt lands mid-turn (#2805)", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        PromptCapabilities: {
+          image: false,
+          audio: false,
+          embedded_context: false,
+          steering: true,
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { UserPromptSent: { text: "read every file in src/acp" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { AgentMessageChunk: { text: "I'll dispatch parallel readers." } },
+    });
+    expect(state.turnHasOutput).toBe(true);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 4,
+      event: { UserPromptSent: { text: "actually, just do acp_client.rs" } },
+    });
+    // The steered message is a continuation: the turn keeps the output it
+    // has already produced, and no second turn was opened.
+    expect(state.turnHasOutput).toBe(true);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 5,
+      event: { Stopped: { reason: "prompt_complete" } },
+    });
+    expect(state.activity.some((r) => r.kind === "empty_output")).toBe(false);
+  });
+
+  // The same shape without steering must keep today's behavior: that
+  // prompt really did open a turn, so the reset is correct.
+  it("still resets the output flag for a mid-turn prompt on a non-steerable agent", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "first" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { AgentMessageChunk: { text: "output" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { UserPromptSent: { text: "second" } },
+    });
+    expect(state.turnHasOutput).toBe(false);
+  });
+
   it("does not append the notice when the agent emitted a message", () => {
     let state = applyEvent(emptyAcpState(), {
       session_id: "s-1",
@@ -1462,6 +1530,56 @@ describe("applyEvent / ConversationCompacted", () => {
       event: "ConversationCompacted",
     });
     expect(next.contextPrimerAvailable).toBeNull();
+  });
+});
+
+describe("applyEvent / ConversationCompactionStarted (#3219)", () => {
+  // The adapter goes silent for 90 to 170 seconds between the two
+  // markers, so the phase has to be latched from an event rather than
+  // inferred from the absence of frames. It clears on exactly two
+  // events; `Stopped` is the self-healing one.
+  const started = (seq: number): AcpFrame => ({
+    session_id: "s-1",
+    seq,
+    event: "ConversationCompactionStarted",
+  });
+
+  it("latches the phase without adding a transcript row", () => {
+    // The visible "Compacting..." chunk is already its own row; this
+    // event is state only.
+    const next = applyEvent(emptyAcpState(), started(4));
+    expect(next.compacting).toBe(true);
+    expect(next.activity).toHaveLength(0);
+  });
+
+  it.each([
+    { label: "the completion marker", event: "ConversationCompacted" as const, expected: false },
+    {
+      label: "a clean Stopped",
+      event: { Stopped: { reason: "prompt_complete" } } as const,
+      expected: false,
+    },
+    {
+      label: "a cancelled Stopped",
+      event: { Stopped: { reason: "cancelled" } } as const,
+      expected: false,
+    },
+    // The regression guard for the clear that must NOT exist:
+    // applyNewTurnResets runs on every server-confirmed UserPromptSent,
+    // including a follow-up confirmed inside the silent window. Clearing
+    // there would relabel the spinner and re-arm the Force-end-turn
+    // hatch while the compaction is still running.
+    {
+      label: "a mid-compaction UserPromptSent",
+      event: { UserPromptSent: { text: "also check the tests" } } as const,
+      expected: true,
+    },
+    { label: "ordinary streaming", event: "ThinkingStarted" as const, expected: true },
+  ])("$label leaves compacting=$expected", ({ event, expected }) => {
+    const latched = applyEvent(emptyAcpState(), started(1));
+    expect(latched.compacting).toBe(true);
+    const next = applyEvent(latched, { session_id: "s-1", seq: 2, event });
+    expect(next.compacting).toBe(expected);
   });
 });
 
@@ -2258,6 +2376,69 @@ describe("normaliseTurnCounters (#1170 persisted-state backfill)", () => {
     // Even if the cached `turnActive` boolean was stale, the derived
     // value wins so the spinner gate matches the counters.
     expect(normalised.turnActive).toBe(true);
+  });
+});
+
+describe("compaction reminder dismissal", () => {
+  const usageFrame = (seq: number, used: number, size = 200_000): AcpFrame => ({
+    session_id: "s-1",
+    seq,
+    event: { UsageUpdated: { usage: { used, size } } },
+  });
+
+  it("survives usage climbing further, and re-arms after a context boundary", async () => {
+    const { acpHookReducer } = await import("../hooks/useAcpSession");
+    let state = applyEvent(emptyAcpState(), usageFrame(1, 160_000));
+
+    state = acpHookReducer(state, { kind: "dismiss_compaction_reminder" });
+    expect(state.compactionReminderDismissed?.used).toBe(160_000);
+
+    // Still dismissed as the window keeps filling: dismiss means dismiss,
+    // not snooze until the next percentage point.
+    state = applyEvent(state, usageFrame(2, 180_000));
+    expect(state.compactionReminderDismissed?.used).toBe(160_000);
+
+    // Compaction nulls the snapshot, so the next one is a fresh window and
+    // re-arms the reminder.
+    state = applyEvent(state, { session_id: "s-1", seq: 3, event: "ConversationCompacted" });
+    expect(state.sessionUsage).toBeNull();
+    state = applyEvent(state, usageFrame(4, 20_000));
+    expect(state.compactionReminderDismissed).toBeNull();
+
+    // The regression this shape exists for: re-arming has to latch at the
+    // boundary. Deriving "used dropped below the dismissed value" at render
+    // time re-suppresses the reminder the moment usage climbs back past it.
+    state = acpHookReducer(state, { kind: "dismiss_compaction_reminder" });
+    state = applyEvent(state, usageFrame(5, 30_000));
+    expect(state.compactionReminderDismissed?.used).toBe(20_000);
+    state = applyEvent(state, { session_id: "s-1", seq: 6, event: "SessionCleared" });
+    state = applyEvent(state, usageFrame(7, 40_000));
+    expect(state.compactionReminderDismissed).toBeNull();
+  });
+
+  it("re-arms on every boundary that nulls the usage snapshot", async () => {
+    const { acpHookReducer } = await import("../hooks/useAcpSession");
+    const boundaries: AcpFrame["event"][] = [
+      "ConversationCompacted",
+      "SessionCleared",
+      { SessionContextReset: { reason: "session/load failed: bad id" } },
+      { AgentSwitched: { from: "claude", to: "codex", reason: "rate_limit" } },
+    ];
+    for (const event of boundaries) {
+      let state = applyEvent(emptyAcpState(), usageFrame(1, 160_000));
+      state = acpHookReducer(state, { kind: "dismiss_compaction_reminder" });
+      state = applyEvent(state, { session_id: "s-1", seq: 2, event });
+      state = applyEvent(state, usageFrame(3, 170_000));
+      expect(state.compactionReminderDismissed, JSON.stringify(event)).toBeNull();
+    }
+  });
+
+  it("backfills the dismissal on entries persisted before it existed", () => {
+    const persisted = { ...emptyAcpState() } as AcpState & {
+      compactionReminderDismissed?: AcpState["compactionReminderDismissed"];
+    };
+    delete persisted.compactionReminderDismissed;
+    expect(normaliseTurnCounters(persisted).compactionReminderDismissed).toBeNull();
   });
 });
 

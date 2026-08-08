@@ -240,8 +240,17 @@ struct ViewSetup {
     state: StructuredViewState,
     startup_toast: Option<String>,
     plugin_rx: tokio::sync::mpsc::Receiver<PluginPoll>,
-    session_info_rx:
-        tokio::sync::mpsc::Receiver<Result<crate::acp::session_paths::SessionViewInfo, String>>,
+    session_info_rx: tokio::sync::mpsc::Receiver<ViewSideInfo>,
+}
+
+/// One-shot daemon reads the view wants at open but must not block on:
+/// the session header / path roots, and the resolved compaction-reminder
+/// threshold. Batched onto one channel because they share a task and both
+/// land before the first user interaction. A failed fetch degrades to the
+/// fallback header or a disabled reminder, never to a startup error.
+pub(crate) struct ViewSideInfo {
+    session: Result<crate::acp::session_paths::SessionViewInfo, String>,
+    compaction_reminder: Option<u8>,
 }
 
 /// Hydrate the transcript via /replay, open the WebSocket, and spawn
@@ -273,11 +282,23 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
         let http = state.http.clone();
         let session_id = state.session_id.clone();
         tokio::spawn(async move {
-            let result = http
+            let session = http
                 .session_view_info(&session_id)
                 .await
                 .map_err(|e| e.to_string());
-            let _ = session_info_tx.send(result).await;
+            let compaction_reminder = match http.compaction_reminder().await {
+                Ok(pct) => pct,
+                Err(e) => {
+                    tracing::warn!(target: "acp.tui", "compaction-reminder config fetch failed; reminder stays off: {e}");
+                    None
+                }
+            };
+            let _ = session_info_tx
+                .send(ViewSideInfo {
+                    session,
+                    compaction_reminder,
+                })
+                .await;
         });
     }
 
@@ -446,13 +467,8 @@ pub async fn run_for_endpoint(
                 drain_plugin_toast(&mut state, &mut toast_deadline);
                 redraw(terminal, theme, &mut state)?;
             }
-            Some(result) = session_info_rx.recv() => {
-                match result {
-                    Ok(info) => apply_session_info(&mut state, info),
-                    Err(e) => {
-                        tracing::warn!(target: "acp.tui", "session info fetch failed; rendering fallback header and raw paths: {e}");
-                    }
-                }
+            Some(side) = session_info_rx.recv() => {
+                apply_side_info(&mut state, side);
                 redraw(terminal, theme, &mut state)?;
             }
             _ = redraw_ticker.tick() => {
@@ -478,6 +494,18 @@ fn apply_session_info(
     state.transcript.session_title = Some(info.title.clone());
     state.transcript.agent_name = Some(info.agent_label());
     state.path_roots = Some(info.paths);
+}
+
+/// Fold the one-shot side-channel payload into the view. Shared by the
+/// full-screen loop and the embedded preview.
+pub(crate) fn apply_side_info(state: &mut StructuredViewState, side: ViewSideInfo) {
+    state.compaction_reminder_percent = side.compaction_reminder;
+    match side.session {
+        Ok(info) => apply_session_info(state, info),
+        Err(e) => {
+            tracing::warn!(target: "acp.tui", "session info fetch failed; rendering fallback header and raw paths: {e}");
+        }
+    }
 }
 
 /// Apply one WebSocket message to the view state: reduce a frame (with
@@ -802,9 +830,10 @@ async fn handle_terminal_event(
                 }
                 return Ok(false);
             }
-            if state.is_busy() {
-                // A turn is running (or the socket is down): park the
-                // prompt so it drains when the agent next goes idle.
+            if state.should_queue_prompt() {
+                // A turn is running on an agent that cannot be steered
+                // (or the socket is down): park the prompt so it drains
+                // when the agent next goes idle.
                 state.queue.push(text);
                 set_toast(
                     state,
@@ -1819,6 +1848,7 @@ mod tests {
                 .map(|o| crate::acp::elicitations::ElicitationOption {
                     value: o.to_string(),
                     label: o.to_string(),
+                    description: None,
                 })
                 .collect(),
             min_items: None,

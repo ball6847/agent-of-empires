@@ -1888,14 +1888,41 @@ pub fn detect_qodercli_status(raw_content: &str) -> Status {
 
     // Reduced-motion / no-spinner fallback: a footer line that *starts* with a
     // live activity verb is a status line, not narration buried mid-sentence.
+    // qodercli does not clear its "Thinking..." tag, so "thinking" is excluded
+    // from the activity-word check to avoid getting stuck on Running.
     if footer
         .iter()
-        .any(|line| has_live_activity_word(&line.to_lowercase()))
+        .any(|line| has_qodercli_live_activity_word(&line.to_lowercase()))
     {
         return Status::Running;
     }
 
     Status::Idle
+}
+
+/// Qoder CLI-specific activity word check. Mirrors `has_live_activity_word`
+/// but excludes "thinking" because qodercli leaves its thinking tag on screen
+/// after the thinking step completes.
+fn has_qodercli_live_activity_word(text_lower: &str) -> bool {
+    const QODERCLI_ACTIVITY_WORDS: &[&str] = &[
+        "analyzing",
+        "applying",
+        "building",
+        "editing",
+        "executing",
+        "fetching",
+        "generating",
+        "grepping",
+        "processing",
+        "reading",
+        "running",
+        "searching",
+        "testing",
+        "working",
+    ];
+    QODERCLI_ACTIVITY_WORDS
+        .iter()
+        .any(|word| status_line_starts_with_phrase(text_lower.trim(), word))
 }
 
 /// Factory Droid CLI status detection via tmux pane parsing.
@@ -4747,10 +4774,8 @@ esc to interrupt"
             ),
             Status::Running
         );
-        assert_eq!(
-            detect_qodercli_status("thinking about code"),
-            Status::Running
-        );
+        // "thinking" is excluded for qodercli (tag not cleared), so this reads Idle.
+        assert_eq!(detect_qodercli_status("thinking about code"), Status::Idle);
         assert_eq!(detect_qodercli_status("reading file.ts"), Status::Running);
     }
 

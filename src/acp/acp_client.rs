@@ -410,6 +410,15 @@ pub struct SpawnConfig {
     /// per-agent slash commands. Defaults to `"claude"` for legacy
     /// callers; the supervisor passes the real key when it spawns.
     pub agent_key: String,
+    /// The logical session tool, as it would appear on `Instance.tool` for a
+    /// terminal-view session. Distinct from `agent_key`: `agent_key` is the
+    /// resolved ACP backend (which can differ from the tool on an override, a
+    /// no-ACP-command custom agent, or after `switch-agent`), while `tool`
+    /// stays fixed for the session's lifetime, including across a respawn
+    /// that clones this `SpawnConfig` directly. `host_hooks.before_session`'s
+    /// `AOE_TOOL` uses this field so a tool-scoped hook picks the same
+    /// environment in structured view that it would in the terminal view.
+    pub tool: String,
     pub spec: AgentSpec,
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
@@ -481,6 +490,86 @@ pub struct SpawnConfig {
     /// fixed container mount, so this host path is only used when
     /// `sandbox_info` is `None`. `None` disables the export. See #2587.
     pub artifact_dir: Option<PathBuf>,
+}
+
+/// Params for the `_session/steering` extension request: apply a
+/// follow-up message to the turn that is already running, rather than
+/// queuing it as a separate `session/prompt`. See #2805.
+///
+/// `_meta.steering.idleBehavior = "promptRequired"` is the opt-in added
+/// in claude-agent-acp 0.64.0 (upstream #903 / #919). Without it a steer
+/// that arrives after the turn settled starts a detached turn whose
+/// `PromptResponse` no request owns; with it the adapter leaves the
+/// content untouched and says so, and AoE resends it as a normal prompt.
+/// `agent_compat::supports_steering` is what guarantees the adapter
+/// honors the opt-in, so this always requests it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_session/steering", response = serde_json::Value)]
+#[serde(rename_all = "camelCase")]
+struct SteerRequest {
+    session_id: SessionId,
+    prompt: Vec<ContentBlock>,
+    #[serde(rename = "_meta")]
+    meta: serde_json::Value,
+}
+
+impl SteerRequest {
+    fn new(session_id: SessionId, prompt: Vec<ContentBlock>) -> Self {
+        Self {
+            session_id,
+            prompt,
+            meta: serde_json::json!({ "steering": { "idleBehavior": "promptRequired" } }),
+        }
+    }
+}
+
+/// Text of the first text block, for the retry pill on a refused prompt.
+/// Attachments are not carried back into the pill; text is the retry hook
+/// and this is a rare edge.
+fn first_text_block(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// What the agent did with a steered message. Both success outcomes are
+/// normal: the adapter, not AoE, adjudicates whether a turn was still
+/// running when the steer landed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SteerOutcome {
+    /// Delivered into the running turn. The message's own output streams
+    /// as ordinary `session/update` notifications and the turn's existing
+    /// `PromptResponse` still owns the terminal `Stopped`.
+    Injected,
+    /// The turn settled before the steer was handled. The adapter
+    /// guarantees the content was neither queued nor consumed, so it is
+    /// safe (and required) to resend it as a normal `session/prompt`.
+    PromptRequired,
+    /// The adapter ignored the `promptRequired` opt-in and started a
+    /// detached turn with the content anyway. Only reachable from an
+    /// adapter that clears `supports_steering` but does not honor the
+    /// contract, so it is a protocol violation rather than an expected
+    /// state. The content IS consumed, so it must not be resent.
+    StartedNewTurn,
+    /// An outcome string this build does not know. Treated like
+    /// `StartedNewTurn`: delivery is unproven either way, and resending
+    /// risks duplicating the user's message.
+    Unknown,
+}
+
+impl SteerOutcome {
+    fn from_response(value: &serde_json::Value) -> Self {
+        match value.get("outcome").and_then(serde_json::Value::as_str) {
+            Some("injected") => Self::Injected,
+            Some("promptRequired") => Self::PromptRequired,
+            Some("startedNewTurn") => Self::StartedNewTurn,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 /// Commands sent from `AcpClient` methods to the background connection task.
@@ -860,6 +949,18 @@ pub(crate) enum LifecycleSignal {
     /// Clears the compaction suppression so any continued work in the same
     /// turn recovers on the normal grace. See #2898.
     CompactionCompleted,
+    /// The `/compact` cycle ended without replacing the context
+    /// ("Compacting failed..." text chunk): the user cancelled it, the API
+    /// call errored, or there was too little to summarize. Clears the
+    /// compaction suppression exactly like `CompactionCompleted`; the two
+    /// are distinct only so the failure is readable in the logs.
+    ///
+    /// The adapter emits this marker AFTER the turn's own terminal on a
+    /// cancel, so classifying it as ordinary `Progress` made the
+    /// between-prompt watchdog read it as the agent starting a
+    /// self-initiated turn, leaving the session Running for the full
+    /// stall grace with nothing actually running. See #3219 follow-up.
+    CompactionFailed,
 }
 
 /// Classify a `SessionUpdate` into a `LifecycleSignal`, or `None` for
@@ -884,6 +985,9 @@ fn classify_lifecycle_signal(
             if let ContentBlock::Text(t) = &chunk.content {
                 if is_compact_completion(&t.text) {
                     return Some(LifecycleSignal::CompactionCompleted);
+                }
+                if is_compact_failure(&t.text) {
+                    return Some(LifecycleSignal::CompactionFailed);
                 }
                 if is_compact_start(&t.text) {
                     return Some(LifecycleSignal::CompactionStarted);
@@ -1080,7 +1184,12 @@ impl SilentOrphanWatchdog {
                 self.last_refresh_was_progress = true;
                 self.off_protocol_work_seen = Some(OffProtocolWorkKind::Compaction);
             }
-            LifecycleSignal::CompactionCompleted => {
+            // A compaction that failed or was cancelled is just as over as
+            // one that completed, so it drops the suppression the same way.
+            // Before this, only the success marker cleared the latch, so a
+            // cancelled compaction left the 30-minute floor pinned for the
+            // rest of the prompt.
+            LifecycleSignal::CompactionCompleted | LifecycleSignal::CompactionFailed => {
                 // Compaction finished; drop its suppression so any continued
                 // work in the same turn recovers on the normal grace. Guard
                 // the clear to Compaction so a completion marker cannot erase
@@ -1396,6 +1505,13 @@ fn between_prompt_signal_update(
             last_lifecycle_at: now_ms,
             wake_at: prev_wake_at,
         }),
+        // The tail end of a compaction, not the start of anything. The
+        // adapter emits the failure marker AFTER the turn's own terminal
+        // when the user cancels a `/compact`, so arming here claimed a
+        // turn that had already ended and left the session Running for the
+        // whole stall grace with nothing running. A compaction that is
+        // genuinely still going has already armed on its start marker.
+        Some(LifecycleSignal::CompactionCompleted | LifecycleSignal::CompactionFailed) => None,
         Some(_) => Some(BetweenPromptUpdate {
             cost_seen: false,
             last_lifecycle_at: now_ms,
@@ -3267,8 +3383,8 @@ fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bool {
 /// This runs on the synchronous spawn path, so it cannot reuse
 /// `version_probe`'s async `tokio::time::timeout`; it polls instead. The
 /// bound matters: an adapter that waits on stdin or a network login would
-/// otherwise block session spawn forever. Mirrors `version_probe`'s 2s
-/// budget, and any failure or timeout yields `None` so the caller keeps the
+/// otherwise block session spawn forever. It mirrors `version_probe`'s 2s
+/// budget; any failure or timeout yields `None` so the caller keeps the
 /// user's own copy.
 #[cfg(feature = "serve")]
 fn probe_version_bounded(path: &std::path::Path) -> Option<String> {
@@ -3767,10 +3883,39 @@ const ALWAYS_FORWARD_ENV: &[&str] = &[
     "CLAUDE_CONFIG_DIR",
 ];
 
+/// The inherited host environment layer for a structured-view agent, applied
+/// under [`ALWAYS_FORWARD_ENV`] on both spawn paths.
+///
+/// This is the fix for #3262. #3079 added desktop-env forwarding for the tmux
+/// paths only, so an agent in the structured view still got `env_clear()` plus
+/// the twelve names in `ALWAYS_FORWARD_ENV` and never saw `DISPLAY`: the very
+/// symptom #3075 reported, still live for anyone driving aoe from the browser.
+/// Routing both views through
+/// [`crate::session::environment::inherited_host_env`] is what keeps them from
+/// drifting again.
+///
+/// Applied first, so `ALWAYS_FORWARD_ENV` (and its `PATH` prepend), the agent
+/// allowlist, `provider_env`, and the operator's `environment` list all still
+/// win on a shared key.
+/// Returns pairs rather than taking a `Command` because the two spawn sites use
+/// different `Command` types (`std` on the runner path, `tokio` in-proc).
+fn inherited_host_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
+    // A sandboxed agent's environment is `sandbox.environment` by contract; the
+    // host's desktop and toolchain vars mean nothing inside the container.
+    if config.sandbox_info.is_some() {
+        return Vec::new();
+    }
+    let profile = config.source_profile.as_deref().unwrap_or_default();
+    crate::session::environment::inherited_host_env(profile)
+}
+
 /// Apply the env_clear + allowlist + provider_env filtering used by both
 /// the detached-runner path and the in-proc stdio path. Pulled out so
 /// the two spawn sites share the same security posture.
 fn apply_env_filter(cmd: &mut std::process::Command, config: &SpawnConfig) {
+    for (key, value) in inherited_host_env_pairs(config) {
+        cmd.env(key, value);
+    }
     for name in ALWAYS_FORWARD_ENV {
         if let Ok(value) = std::env::var(name) {
             cmd.env(name, value);
@@ -4216,6 +4361,13 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
     // sites cannot drift; provider auth (`ANTHROPIC_API_KEY`, etc.) and
     // `SSH_AUTH_SOCK` for git-over-SSH ride along in that list.
     cmd.env_clear();
+    // Under the allowlist, so ALWAYS_FORWARD_ENV's PATH prepend still wins.
+    // Same layer the runner path applies in `apply_env_filter`; see #3262.
+    let mut inherited_keys: Vec<String> = Vec::new();
+    for (key, value) in inherited_host_env_pairs(config) {
+        cmd.env(&key, value);
+        inherited_keys.push(key);
+    }
     let mut forwarded_keys: Vec<&str> = Vec::new();
     for &name in ALWAYS_FORWARD_ENV {
         if let Ok(mut value) = std::env::var(name) {
@@ -4301,6 +4453,10 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
         transport = if config.socket_path.is_some() { "socket" } else { "stdio" },
         socket = ?config.socket_path,
         env_forwarded = ?forwarded_keys,
+        // Key names only, like every other env field here: the whole point of
+        // the layer is that it can carry the operator's secrets under
+        // `session.inherit_host_environment`.
+        env_inherited = ?inherited_keys,
         provider_env = ?provider_keys,
         host_environment = ?host_env_keys,
         "spawning ACP agent subprocess"
@@ -4455,6 +4611,20 @@ fn is_transcript_event(event: &Event) -> bool {
             // create a running record with nothing to ever complete it.
             | Event::BackgroundAgentLaunched { .. }
             | Event::PromptRuntimeError { .. }
+            // Both halves of a `/compact` cycle are synthesized from
+            // `AgentMessageChunk` text, which is itself dropped here, so
+            // they must drop with their source chunk. Letting the
+            // completion through (the pre-#3219 behavior) re-ran its
+            // side effects on every reattach: a duplicate "conversation
+            // compacted" divider, and on the web a re-based
+            // `usageBaseline` plus a nulled usage snapshot. Its sibling
+            // `PlanUpdated` was already suppressed, so the pair was
+            // internally inconsistent too. A replayed start is worse
+            // still: the reloaded adapter cannot resume that historical
+            // summarization, so the flag would latch with nothing left
+            // to clear it before the turn's own `Stopped`.
+            | Event::ConversationCompactionStarted
+            | Event::ConversationCompacted
     )
 }
 
@@ -4479,6 +4649,8 @@ fn transcript_event_kind(event: &Event) -> &'static str {
         Event::ApprovalResolved { .. } => "approval_resolved",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
         Event::PromptRuntimeError { .. } => "prompt_runtime_error",
+        Event::ConversationCompactionStarted => "conversation_compaction_started",
+        Event::ConversationCompacted => "conversation_compacted",
         _ => "other",
     }
 }
@@ -4720,6 +4892,19 @@ fn is_compact_start(text: &str) -> bool {
     text.contains("Compacting...")
 }
 
+/// Heuristic detector for a `/compact` cycle that ended without replacing
+/// the context. The adapter emits `\n\nCompacting failed{reason}` for a
+/// user cancel ("API Error: Request was aborted."), an API error, or too
+/// little to summarize, as another bare `agent_message_chunk`.
+///
+/// Matching the prefix rather than a full sentence because the reason is
+/// interpolated. Same fragility trade-off as the other two markers: a
+/// missed match only reverts to the pre-fix behavior of reading the tail
+/// as a fresh agent-initiated turn.
+fn is_compact_failure(text: &str) -> bool {
+    text.contains("Compacting failed")
+}
+
 /// Tracks the in-flight assistant text block so claude-agent-acp's leaked
 /// consolidated `agent_message_chunk` restatement can be dropped before it
 /// reaches the watchdog, the event store, or any client. The adapter streams a
@@ -4852,6 +5037,14 @@ fn map_update_to_events(
                 let mut events = vec![Event::AgentMessageChunk {
                     text: text.text.clone(),
                 }];
+                if is_compact_start(&text.text) {
+                    // The adapter goes silent for 90 to 170 seconds from
+                    // here. Publish the phase so the clients relabel the
+                    // spinner and park follow-ups instead of reading the
+                    // quiet as a wedge. Same marker the silent-orphan
+                    // watchdog already latches (#2898). See #3219.
+                    events.push(Event::ConversationCompactionStarted);
+                }
                 if is_compact_completion(&text.text) {
                     events.push(Event::ConversationCompacted);
                     // /compact wipes the model's tool-state alongside the
@@ -6809,14 +7002,28 @@ async fn run_connection_task<W, R>(
             // both Fresh and Resume connects, so this re-emits on every
             // reconnect and replay always carries a current copy. See
             // #1000 / #965.
+            // Derived here rather than cached across connections: a
+            // respawn can land on a different adapter build, and this
+            // runs on every connect. Emitted even when false so replay
+            // cannot leave a client holding a stale `true` after a
+            // downgrade. See #2805.
+            let steering_capable = agent_compat::supports_steering(expected_agent, &init);
             let prompt_caps = &init.agent_capabilities.prompt_capabilities;
             let _ = event_tx_for_block
                 .send(Event::PromptCapabilities {
                     image: prompt_caps.image,
                     audio: prompt_caps.audio,
                     embedded_context: prompt_caps.embedded_context,
+                    steering: steering_capable,
                 })
                 .await;
+            if steering_capable {
+                info!(
+                    target: "acp.protocol",
+                    session = %session_label,
+                    "agent supports _session/steering; mid-turn prompts will be injected into the running turn"
+                );
+            }
             // Snapshot the watchdog-arming flag before `mode` is moved
             // into the match below.
             let arm_resume_watchdog = matches!(
@@ -7508,8 +7715,22 @@ async fn run_connection_task<W, R>(
                 tokio::time::interval(BETWEEN_PROMPT_IDLE_CHECK_INTERVAL);
             between_prompt_idle_tick
                 .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Mid-turn prompts a steer handed back unconsumed (#2805).
+            // The adapter answers `promptRequired` when the turn it was
+            // meant to steer had already settled, so the message runs as
+            // an ordinary next turn instead. Kept here rather than
+            // self-sent through `cmd_tx`: this task holds only the
+            // receiver, and sending into the bounded channel it is the
+            // sole consumer of deadlocks once that channel fills.
+            let mut pending_prompts: VecDeque<Vec<ContentBlock>> = VecDeque::new();
             loop {
-                let cmd = tokio::select! {
+                // Drain the fallback queue ahead of the channel so a
+                // message the user sent first cannot be overtaken by one
+                // they sent after it.
+                let cmd = if let Some(blocks) = pending_prompts.pop_front() {
+                    Some(ClientCmd::Prompt(blocks))
+                } else {
+                    tokio::select! {
                     cmd = cmd_rx.recv() => cmd,
                     _ = between_prompt_idle_tick.tick() => {
                         let now = chrono::Utc::now().timestamp_millis();
@@ -7582,6 +7803,7 @@ async fn run_connection_task<W, R>(
                             }
                         }
                         continue;
+                    }
                     }
                 };
                 match cmd {
@@ -7811,6 +8033,59 @@ async fn run_connection_task<W, R>(
                         let cancel_grace = tokio::time::sleep(CANCEL_ESCALATION_GRACE);
                         tokio::pin!(cancel_grace);
 
+                        // Mid-turn steering (#2805). At most one
+                        // `_session/steering` request is outstanding at a
+                        // time, with any further mid-turn prompts waiting
+                        // in `steer_backlog`. Running them concurrently
+                        // would let two steers that both race the turn's
+                        // end come back out of order, and the
+                        // `promptRequired` fallback would then replay the
+                        // user's messages in the wrong order. The future
+                        // is polled as a select arm rather than awaited
+                        // inline so Cancel and ForceStop stay responsive
+                        // for the whole round trip.
+                        #[allow(clippy::type_complexity)]
+                        let mut steer_fut: Option<
+                            std::pin::Pin<
+                                Box<
+                                    dyn std::future::Future<
+                                            Output = (
+                                                Vec<ContentBlock>,
+                                                Result<
+                                                    serde_json::Value,
+                                                    agent_client_protocol::Error,
+                                                >,
+                                            ),
+                                        > + Send,
+                                >,
+                            >,
+                        > = None;
+                        let mut steer_backlog: VecDeque<Vec<ContentBlock>> = VecDeque::new();
+                        // Issue a steer for `blocks`, or park it behind the
+                        // one already in flight.
+                        macro_rules! steer_or_backlog {
+                            ($blocks:expr) => {{
+                                let blocks: Vec<ContentBlock> = $blocks;
+                                if steer_fut.is_some() {
+                                    steer_backlog.push_back(blocks);
+                                } else {
+                                    info!(
+                                        target: "acp.protocol",
+                                        session = %session_label,
+                                        "sending _session/steering during in-flight prompt ({} content blocks)",
+                                        blocks.len()
+                                    );
+                                    let sent = connection.send_request(SteerRequest::new(
+                                        acp_session_id.clone(),
+                                        blocks.clone(),
+                                    ));
+                                    steer_fut = Some(Box::pin(async move {
+                                        (blocks, sent.block_task().await)
+                                    }));
+                                }
+                            }};
+                        }
+
                         loop {
                             tokio::select! {
                                 res = &mut prompt_fut, if !simulate_orphan => {
@@ -7993,6 +8268,115 @@ async fn run_connection_task<W, R>(
                                     shutdown = true;
                                     break;
                                 }
+                                (blocks, res) = async {
+                                    steer_fut.as_mut().expect("guarded by the arm condition").await
+                                }, if steer_fut.is_some() => {
+                                    steer_fut = None;
+                                    match res {
+                                        Ok(value) => match SteerOutcome::from_response(&value) {
+                                            SteerOutcome::Injected => {
+                                                info!(
+                                                    target: "acp.protocol",
+                                                    session = %session_label,
+                                                    "_session/steering injected into the running turn"
+                                                );
+                                                // No event: the prompt handler
+                                                // already published this text as
+                                                // `UserPromptSent` before it
+                                                // reached the daemon, and the
+                                                // running turn's own
+                                                // `PromptResponse` still owns the
+                                                // terminal Stopped.
+                                                //
+                                                // An accepted steer proves the
+                                                // agent is alive and took new
+                                                // work, so it counts as progress.
+                                                // Injection pre-empts the current
+                                                // generation, which can swallow an
+                                                // update the silent-orphan
+                                                // watchdog was waiting on; without
+                                                // this the watchdog could kill a
+                                                // healthy agent right after a
+                                                // successful course correction.
+                                                watchdog.apply_signal(
+                                                    LifecycleSignal::Progress,
+                                                    tokio::time::Instant::now(),
+                                                    chrono::Utc::now(),
+                                                    watchdog_cfg,
+                                                );
+                                            }
+                                            SteerOutcome::PromptRequired => {
+                                                // The turn settled in the race
+                                                // window. The adapter kept its
+                                                // hands off the content, so run it
+                                                // as an ordinary next turn. The
+                                                // in-flight turn is over in all but
+                                                // bookkeeping, so the outer loop
+                                                // picks this up as soon as
+                                                // `prompt_fut` resolves.
+                                                info!(
+                                                    target: "acp.protocol",
+                                                    session = %session_label,
+                                                    "_session/steering raced the turn's end; re-dispatching as a normal prompt"
+                                                );
+                                                pending_prompts.push_back(blocks);
+                                                // Anything still parked raced the
+                                                // same boundary, so it follows the
+                                                // same path, in order.
+                                                pending_prompts.extend(steer_backlog.drain(..));
+                                            }
+                                            outcome @ (SteerOutcome::StartedNewTurn
+                                            | SteerOutcome::Unknown) => {
+                                                // The adapter cleared the version
+                                                // gate yet ignored the
+                                                // `promptRequired` opt-in, so it
+                                                // consumed the content into a turn
+                                                // no request owns. Resending would
+                                                // duplicate the user's message, and
+                                                // `PromptRejected` would offer a
+                                                // Retry that does the same. Leave
+                                                // the already-published
+                                                // `UserPromptSent` standing and let
+                                                // the between-prompt idle watchdog
+                                                // synthesize the detached turn's
+                                                // terminal Stopped once this turn's
+                                                // own Stopped clears
+                                                // `prompt_in_flight`.
+                                                warn!(
+                                                    target: "acp.protocol",
+                                                    session = %session_label,
+                                                    ?outcome,
+                                                    "_session/steering returned an outcome that consumed the message without an owning request; the between-prompt watchdog will close the detached turn"
+                                                );
+                                            }
+                                        },
+                                        Err(e) => {
+                                            // Transport or agent error. Nothing
+                                            // proves the message landed, but
+                                            // nothing proves it did not either, so
+                                            // surface it as the same retryable
+                                            // rejection a non-steering agent gives
+                                            // and let the user decide.
+                                            warn!(
+                                                target: "acp.protocol",
+                                                session = %session_label,
+                                                error = %e,
+                                                "_session/steering failed; falling back to agent_busy rejection"
+                                            );
+                                            let _ = event_tx_for_block
+                                                .send(Event::PromptRejected {
+                                                    reason: "agent_busy".into(),
+                                                    text: first_text_block(&blocks),
+                                                })
+                                                .await;
+                                        }
+                                    }
+                                    // Start the next parked steer, if the
+                                    // outcome above left any parked.
+                                    if let Some(next) = steer_backlog.pop_front() {
+                                        steer_or_backlog!(next);
+                                    }
+                                }
                                 cmd = cmd_rx.recv() => {
                                     match cmd {
                                         Some(ClientCmd::Cancel) => {
@@ -8075,40 +8459,7 @@ async fn run_connection_task<W, R>(
                                                 respond_to,
                                             );
                                         }
-                                        Some(ClientCmd::Prompt(rejected_blocks)) => {
-                                            // Surface the dropped prompt
-                                            // to the UI so the user can
-                                            // retry from a Rejected pill
-                                            // instead of having their
-                                            // message vanish silently.
-                                            // Client-side composer queueing
-                                            // is tracked separately in
-                                            // #1031; this event covers the
-                                            // server-side gap when a prompt
-                                            // does make it to the daemon
-                                            // while another is in flight.
-                                            // Recover the text from the
-                                            // first text block; attachments
-                                            // aren't carried back into the
-                                            // retry pill (rare agent-busy
-                                            // edge, text is the retry hook).
-                                            let rejected_text = rejected_blocks
-                                                .iter()
-                                                .find_map(|b| match b {
-                                                    ContentBlock::Text(t) => Some(t.text.clone()),
-                                                    _ => None,
-                                                })
-                                                .unwrap_or_default();
-                                            warn!(
-                                                target: "acp.protocol",
-                                                "received Prompt while one is in flight; rejecting"
-                                            );
-                                            let _ = event_tx_for_block
-                                                .send(Event::PromptRejected {
-                                                    reason: "agent_busy".into(),
-                                                    text: rejected_text,
-                                                })
-                                                .await;
+                                        Some(ClientCmd::Prompt(followup_blocks)) => {
                                             // A follow-up arriving while
                                             // a cancel is in flight means
                                             // the user has clicked Force
@@ -8120,15 +8471,81 @@ async fn run_connection_task<W, R>(
                                             // wedged; escalate immediately
                                             // without waiting for the 10s
                                             // grace.
+                                            //
+                                            // Checked ahead of steering
+                                            // (#2805): this turn is on its way
+                                            // to forced termination, so
+                                            // injecting into it would strand
+                                            // the message in a turn nobody
+                                            // finishes. Reject first so it is
+                                            // never lost, then escalate.
                                             if cancelling {
                                                 warn!(
                                                     target: "acp.protocol",
                                                     session = %session_label,
                                                     "follow-up prompt arrived while cancel pending; escalating to runner restart"
                                                 );
+                                                let _ = event_tx_for_block
+                                                    .send(Event::PromptRejected {
+                                                        reason: "agent_busy".into(),
+                                                        text: first_text_block(&followup_blocks),
+                                                    })
+                                                    .await;
                                                 agent_unresponsive = true;
                                                 shutdown = true;
                                                 break;
+                                            }
+                                            // Same reasoning as the cancel arm
+                                            // above, for the same reason: a
+                                            // `/compact` turn only summarizes
+                                            // context, so there is nothing in it
+                                            // to steer. The adapter would answer
+                                            // `Injected` and swallow the message
+                                            // into a turn that never replies to
+                                            // it, and unlike the `PromptRequired`
+                                            // and error outcomes that path emits
+                                            // no Retry pill and re-dispatches
+                                            // nothing. Reject so it is never
+                                            // lost. Backstop only: both
+                                            // composers park a mid-compaction
+                                            // send locally, so this catches the
+                                            // POST that was already in flight
+                                            // when the marker landed, plus
+                                            // direct API callers. No escalation,
+                                            // the turn is healthy. See #3219.
+                                            let compacting = watchdog
+                                                .off_protocol_work_seen()
+                                                == Some(OffProtocolWorkKind::Compaction);
+                                            if steering_capable && !compacting {
+                                                // Hand it to the running turn
+                                                // instead of refusing it. The
+                                                // adapter decides whether a turn
+                                                // is still running; the outcome
+                                                // arm above applies its answer.
+                                                steer_or_backlog!(followup_blocks);
+                                            } else {
+                                                // Surface the dropped prompt
+                                                // to the UI so the user can
+                                                // retry from a Rejected pill
+                                                // instead of having their
+                                                // message vanish silently.
+                                                // Client-side composer queueing
+                                                // is tracked separately in
+                                                // #1031; this event covers the
+                                                // server-side gap when a prompt
+                                                // does make it to the daemon
+                                                // while another is in flight.
+                                                warn!(
+                                                    target: "acp.protocol",
+                                                    compacting,
+                                                    "received Prompt while one is in flight and it cannot be steered into; rejecting"
+                                                );
+                                                let _ = event_tx_for_block
+                                                    .send(Event::PromptRejected {
+                                                        reason: "agent_busy".into(),
+                                                        text: first_text_block(&followup_blocks),
+                                                    })
+                                                    .await;
                                             }
                                         }
                                         Some(ClientCmd::ResetSession {
@@ -9412,6 +9829,56 @@ async fn handle_elicitation_request(
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// The steer wire contract (#2805). `sessionId` must be camelCase and
+    /// the `_meta` opt-in must be spelled exactly as the adapter reads it:
+    /// a typo in either silently degrades a racing steer back to
+    /// `startedNewTurn`, the detached-turn bug the version floor exists to
+    /// avoid, with no error to notice.
+    #[test]
+    fn steer_request_carries_the_prompt_required_opt_in() {
+        let req = SteerRequest::new(
+            SessionId::new("sess-1"),
+            vec![ContentBlock::Text(TextContent::new("also check the tests"))],
+        );
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(wire["sessionId"], "sess-1");
+        assert_eq!(wire["_meta"]["steering"]["idleBehavior"], "promptRequired");
+        assert_eq!(wire["prompt"][0]["text"], "also check the tests");
+    }
+
+    /// An unrecognized outcome must land on `Unknown`, not on a success
+    /// arm: `Unknown` is treated as "consumed, do not resend", which is
+    /// the only safe reading when a future adapter adds an outcome this
+    /// build has never seen.
+    #[test]
+    fn steer_outcome_maps_every_wire_form() {
+        let cases = [
+            (
+                serde_json::json!({"outcome": "injected"}),
+                SteerOutcome::Injected,
+            ),
+            (
+                serde_json::json!({"outcome": "promptRequired", "reason": "noRunningTurn"}),
+                SteerOutcome::PromptRequired,
+            ),
+            (
+                serde_json::json!({"outcome": "startedNewTurn"}),
+                SteerOutcome::StartedNewTurn,
+            ),
+            // Forward-compat and malformed shapes both fall to Unknown.
+            (
+                serde_json::json!({"outcome": "teleported"}),
+                SteerOutcome::Unknown,
+            ),
+            (serde_json::json!({"outcome": 7}), SteerOutcome::Unknown),
+            (serde_json::json!({}), SteerOutcome::Unknown),
+            (serde_json::json!(null), SteerOutcome::Unknown),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(SteerOutcome::from_response(&value), expected, "{value}");
+        }
+    }
 
     #[test]
     fn reset_request_deadline_precedes_the_outer_guard() {
@@ -11146,6 +11613,7 @@ mod tests {
         };
         let config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: AgentSpec {
                 command: "claude-agent-acp".into(),
                 args: vec!["--stdio".into()],
@@ -11219,6 +11687,7 @@ mod tests {
         };
         let config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: AgentSpec {
                 command: "claude-agent-acp".into(),
                 args: vec![],
@@ -11296,6 +11765,7 @@ mod tests {
         };
         let config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: AgentSpec {
                 command: "claude-agent-acp".into(),
                 args: vec![],
@@ -11514,6 +11984,7 @@ done
     fn reset_fake_spawn_config(script: &std::path::Path, cwd: &std::path::Path) -> SpawnConfig {
         SpawnConfig {
             agent_key: "codex".into(),
+            tool: "codex".into(),
             spec: AgentSpec {
                 command: script.to_string_lossy().into_owned(),
                 args: vec![],
@@ -11976,10 +12447,141 @@ done
         let _ = client.shutdown().await;
     }
 
+    /// A steering-capable fake that emits the `/compact` start marker and
+    /// then goes silent, mirroring what claude-agent-acp does for the 90
+    /// to 170 seconds it spends summarizing. It answers `_session/steering`
+    /// with the normal `Injected`-shaped success, so a daemon that DID
+    /// steer would look like it worked; the test proves the request was
+    /// never sent at all.
+    #[cfg(unix)]
+    fn write_compacting_fake_agent(
+        dir: &std::path::Path,
+        prompt_delay_secs: u32,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let capture = dir.join("capture.ndjson");
+        let script_path = dir.join("fake-compacting-agent.sh");
+        let script = r#"#!/bin/sh
+CAPTURE=__CAPTURE__
+DELAY=__DELAY__
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CAPTURE"
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":false},"_meta":{"steering":{"supported":true}}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-1"}}\n' "$id"
+      ;;
+    *'"method":"_session/steering"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"outcome":"injected"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sid-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Compacting..."}}}}\n'
+      if [ "$DELAY" -gt 0 ]; then sleep "$DELAY"; fi
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
+  esac
+done
+"#
+        .replace("__CAPTURE__", capture.to_str().expect("utf8 tmp path"))
+        .replace("__DELAY__", &prompt_delay_secs.to_string());
+        std::fs::write(&script_path, script).expect("write fake agent script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake agent script");
+        (script_path, capture)
+    }
+
+    /// #3219: a `/compact` turn only summarizes context, so a follow-up
+    /// must not be steered into it. The adapter would answer `Injected`
+    /// and swallow the message into a turn that never replies, and that
+    /// outcome emits no Retry pill and re-dispatches nothing, so the
+    /// message is simply gone. Both composers park a mid-compaction send
+    /// locally; this covers the POST already in flight when the marker
+    /// landed, and direct API callers.
+    ///
+    /// Asserting through the live prompt loop rather than a unit test on
+    /// the predicate: the thing that can actually break is whether the
+    /// compaction latch is applied by the time the follow-up reaches the
+    /// `cmd_rx` arm, and only the real signal plumbing exercises that.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn follow_up_during_compaction_is_rejected_instead_of_steered() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        // 3s prompt delay: long enough to land the follow-up inside the
+        // silent compaction window, short enough to keep the test snappy.
+        let (script, capture) = write_compacting_fake_agent(tmp.path(), 3);
+        let mut config = reset_fake_spawn_config(&script, tmp.path());
+        config.spec.description = "scripted compacting fake".into();
+        let mut client = AcpClient::spawn(config, AcpSessionId("compact-3219".into()))
+            .await
+            .expect("spawn scripted fake agent");
+
+        client
+            .send_prompt("/compact", &[])
+            .await
+            .expect("send /compact");
+
+        // Wait for the typed start event, not just the chunk: it proves
+        // the lifecycle signal reached the watchdog and latched the
+        // compaction phase, so the follow-up below cannot race ahead of
+        // the latch and pass the steering gate for the wrong reason.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for the compaction to start")
+                .expect("event channel closed");
+            if matches!(&ev, Event::ConversationCompactionStarted) {
+                break;
+            }
+        }
+
+        client
+            .send_prompt("also check the tests", &[])
+            .await
+            .expect("send follow-up");
+
+        let mut saw_rejected = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for PromptRejected + Stopped")
+                .expect("event channel closed");
+            match &ev {
+                Event::PromptRejected { reason, text } => {
+                    assert_eq!(reason, "agent_busy");
+                    assert_eq!(
+                        text, "also check the tests",
+                        "the retry pill needs the text"
+                    );
+                    saw_rejected = true;
+                }
+                Event::Stopped { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_rejected,
+            "a follow-up refused during compaction must emit PromptRejected so the \
+             user gets a Retry pill instead of a silently swallowed message"
+        );
+
+        let wire = std::fs::read_to_string(&capture).expect("read capture");
+        assert!(
+            !wire.contains("\"method\":\"_session/steering\""),
+            "the follow-up must not be steered into the compaction turn;\nwire capture:\n{wire}"
+        );
+        let _ = client.shutdown().await;
+    }
+
     #[tokio::test]
     async fn spawn_with_nonexistent_command_errors_cleanly() {
         let config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: AgentSpec {
                 command: "/nonexistent/agent/binary/aoe-test".into(),
                 args: vec![],
@@ -12017,6 +12619,7 @@ done
         let _ = std::fs::remove_dir_all(&missing);
         let config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: AgentSpec {
                 command: "/bin/true".into(),
                 args: vec![],
@@ -12440,6 +13043,72 @@ done
             classify_lifecycle_signal(&text_chunk("regular assistant output", Some("m3"))),
             Some(LifecycleSignal::Progress)
         ));
+        // Every shape of the failure marker the adapter interpolates a
+        // reason into. Classifying these as Progress is what left a
+        // cancelled compaction's session stuck Running.
+        for text in [
+            "\n\nCompacting failed: API Error: Request was aborted.",
+            "\n\nCompacting failed: Not enough messages to compact.",
+            "\n\nCompacting failed.",
+        ] {
+            assert!(
+                matches!(
+                    classify_lifecycle_signal(&text_chunk(text, Some("m4"))),
+                    Some(LifecycleSignal::CompactionFailed)
+                ),
+                "{text:?}"
+            );
+        }
+        // Prose that merely mentions compaction must stay plain progress.
+        assert!(matches!(
+            classify_lifecycle_signal(&text_chunk("the compaction failed earlier", Some("m5"))),
+            Some(LifecycleSignal::Progress)
+        ));
+    }
+
+    /// The reported bug: on a cancel the adapter emits its
+    /// "Compacting failed" marker AFTER the turn's own terminal, so the
+    /// between-prompt watchdog claimed a turn that had already ended and
+    /// the session read Running until the stall grace expired.
+    #[test]
+    fn compaction_terminals_do_not_arm_the_between_prompt_watchdog() {
+        // (signal, arms a between-prompt turn)
+        let cases = [
+            (LifecycleSignal::CompactionFailed, false),
+            (LifecycleSignal::CompactionCompleted, false),
+            // A compaction genuinely starting between prompts is real work
+            // and still has to claim a terminal.
+            (LifecycleSignal::CompactionStarted, true),
+            (LifecycleSignal::Progress, true),
+        ];
+        for (sig, expected_arm) in cases {
+            let armed = between_prompt_signal_update(Some(&sig), None, 1_000, 0).is_some();
+            assert_eq!(armed, expected_arm, "{sig:?}");
+        }
+    }
+
+    /// A cancelled or failed compaction is as over as a completed one, so
+    /// it must drop the 30-minute off-protocol floor. Before this only the
+    /// success marker cleared it.
+    #[tokio::test]
+    async fn compaction_failure_clears_the_off_protocol_floor() {
+        let cfg = watchdog_test_cfg();
+        for terminal in [
+            LifecycleSignal::CompactionCompleted,
+            LifecycleSignal::CompactionFailed,
+        ] {
+            let t0 = tokio::time::Instant::now();
+            let wall = chrono::Utc::now();
+            let mut w = SilentOrphanWatchdog::new();
+            w.apply_signal(LifecycleSignal::CompactionStarted, t0, wall, cfg);
+            assert_eq!(
+                w.off_protocol_work_seen(),
+                Some(OffProtocolWorkKind::Compaction),
+                "the start marker must latch the floor"
+            );
+            w.apply_signal(terminal.clone(), t0, wall, cfg);
+            assert_eq!(w.off_protocol_work_seen(), None, "{terminal:?}");
+        }
     }
 
     #[test]
@@ -13393,6 +14062,85 @@ done
                 assert!(attachments.is_empty());
             }
             other => panic!("expected UserPromptSent, got {other:?}"),
+        }
+    }
+
+    /// `/compact` surfaces only as text chunks, so the mapper turns both
+    /// markers into typed lifecycle events alongside the visible chunk.
+    /// The start half is what tells the clients to stop reading the 90 to
+    /// 170 second silence as a wedged agent (#3219); the completion half
+    /// keeps its pre-existing divider plus plan wipe (#1050).
+    #[test]
+    fn map_agent_message_chunk_emits_compaction_lifecycle_events() {
+        use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
+        // (chunk text, expected event kinds after the chunk itself)
+        let cases: [(&str, &[&str]); 4] = [
+            ("just some prose", &[]),
+            ("Compacting...", &["conversation_compaction_started"]),
+            (
+                "\n\nCompacting completed.",
+                &["conversation_compacted", "plan_updated"],
+            ),
+            // Near-miss prose must not latch the phase.
+            ("I am compacting the list", &[]),
+        ];
+        for (text, expected_tail) in cases {
+            let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+            let events = map_update_to_events(
+                SessionUpdate::AgentMessageChunk(chunk),
+                &agent_profiles::CLAUDE,
+            );
+            let kinds: Vec<&str> = events.iter().map(transcript_event_kind).collect();
+            let mut want = vec!["agent_message_chunk"];
+            want.extend_from_slice(expected_tail);
+            assert_eq!(kinds, want, "chunk {text:?}");
+        }
+    }
+
+    /// The wire form the web reducer matches on. `Event` is untagged for
+    /// unit variants, so a rename here silently breaks the TypeScript
+    /// side rather than failing to compile.
+    #[test]
+    fn compaction_started_serializes_as_a_bare_string() {
+        assert_eq!(
+            serde_json::to_string(&Event::ConversationCompactionStarted).unwrap(),
+            "\"ConversationCompactionStarted\""
+        );
+    }
+
+    /// Both halves of a compaction are synthesized from an
+    /// `AgentMessageChunk` that the suppression window drops, so they
+    /// must drop with it. Before #3219 the completion leaked through and
+    /// re-ran its side effects on every reattach.
+    #[test]
+    fn compaction_events_are_suppressed_during_load_replay() {
+        // (event, suppressed during the post-session/load window)
+        let cases = [
+            (Event::ConversationCompactionStarted, true),
+            (Event::ConversationCompacted, true),
+            (
+                Event::AgentMessageChunk {
+                    text: "Compacting...".into(),
+                },
+                true,
+            ),
+            // Ambient and lifecycle state must still reach the UI on
+            // resume, or the composer footer stays stale.
+            (Event::SessionCleared, false),
+            (
+                Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+                false,
+            ),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(
+                is_transcript_event(&event),
+                expected,
+                "{}",
+                transcript_event_kind(&event)
+            );
         }
     }
 
@@ -14368,6 +15116,117 @@ done
         // this one const, so its membership is also the parity guarantee
         // between the runner path and the in-proc stdio path.
         assert!(ALWAYS_FORWARD_ENV.contains(&"SSH_AUTH_SOCK"));
+    }
+
+    /// Build a minimal host (non-sandboxed) `SpawnConfig` for env tests.
+    fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
+        SpawnConfig {
+            agent_key: "claude".into(),
+            tool: "claude".into(),
+            spec: AgentSpec {
+                command: "claude-agent-acp".into(),
+                args: vec![],
+                description: "test".into(),
+                env_allowlist: None,
+            },
+            cwd,
+            additional_dirs: vec![],
+            provider_env: vec![],
+            host_environment: vec![],
+            default_effort: None,
+            default_mode: None,
+            socket_path: None,
+            stored_acp_session_id: None,
+            fork_from: None,
+            seed_history_replay: false,
+            artifact_dir: None,
+            sandbox_info: None,
+            source_profile: None,
+            mcp_servers: Vec::new(),
+        }
+    }
+
+    /// Regression test for #3262. The structured view spawns its agent with
+    /// `env_clear()` plus `ALWAYS_FORWARD_ENV`, and #3079 wired desktop-env
+    /// forwarding into the tmux paths only. So a browser-view agent still had
+    /// no `DISPLAY` and could not open an OIDC login, the original #3075
+    /// symptom. Before the fix this asserted set was exactly
+    /// `{CLAUDE_CONFIG_DIR, HOME, PATH, TERM}`.
+    ///
+    /// `#[serial]` because it mutates the process-wide env, which parallel
+    /// readers of `std::env::var` would race.
+    #[test]
+    #[serial_test::serial]
+    fn apply_env_filter_forwards_desktop_env_to_structured_view_agents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // An isolated app dir keeps the operator's real env snapshot (and
+        // `inherit_host_environment` setting) out of the assertion.
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("DISPLAY", ":99"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+        ]);
+
+        let config = env_test_spawn_config(tmp.path().to_path_buf());
+        let mut cmd = std::process::Command::new("/bin/true");
+        cmd.env_clear();
+        apply_env_filter(&mut cmd, &config);
+
+        let applied: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        for (key, expected) in [
+            ("DISPLAY", ":99"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+        ] {
+            assert_eq!(
+                applied.get(key).map(String::as_str),
+                Some(expected),
+                "{key} must reach a structured-view agent, got {applied:#?}"
+            );
+        }
+    }
+
+    /// A sandboxed agent's environment is `sandbox.environment` by contract:
+    /// host desktop vars mean nothing inside the container, and forwarding them
+    /// would silently widen what the sandbox exposes.
+    #[test]
+    #[serial_test::serial]
+    fn inherited_host_env_pairs_skips_sandboxed_agents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[("DISPLAY", ":99")]);
+
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        assert!(
+            inherited_host_env_pairs(&config)
+                .iter()
+                .any(|(k, _)| k == "DISPLAY"),
+            "host agents get the desktop env"
+        );
+
+        config.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-envtest".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        assert!(
+            inherited_host_env_pairs(&config).is_empty(),
+            "sandboxed agents get sandbox.environment instead"
+        );
     }
 
     #[test]

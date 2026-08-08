@@ -1718,10 +1718,14 @@ impl EventStore {
         let (_, json) =
             events::latest_by_discriminant(&conn, &self.schema, session_id, "PromptCapabilities")?;
         match serde_json::from_str::<Event>(&json).ok()? {
+            // `steering` is deliberately not returned: this getter feeds
+            // the attachment gate, and the steering decision lives in the
+            // connection task, which holds the capability directly.
             Event::PromptCapabilities {
                 image,
                 audio,
                 embedded_context,
+                ..
             } => Some((image, audio, embedded_context)),
             _ => None,
         }
@@ -1902,6 +1906,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::AcpSessionAssigned { .. } => "acp_session_assigned",
         Event::SessionContextReset { .. } => "session_context_reset",
         Event::SessionCleared => "session_cleared",
+        Event::ConversationCompactionStarted => "conversation_compaction_started",
         Event::ConversationCompacted => "conversation_compacted",
         Event::ConversationSummary { .. } => "conversation_summary",
         Event::WakeupScheduled { .. } => "wakeup_scheduled",
@@ -2269,6 +2274,7 @@ mod tests {
                     image: true,
                     audio: false,
                     embedded_context: true,
+                    steering: false,
                 },
             )
             .unwrap();
@@ -2285,6 +2291,7 @@ mod tests {
                     image: false,
                     audio: false,
                     embedded_context: false,
+                    steering: false,
                 },
             )
             .unwrap();
@@ -4091,6 +4098,7 @@ mod tests {
                     image: true,
                     audio: false,
                     embedded_context: true,
+                    steering: false,
                 },
             )
             .unwrap();

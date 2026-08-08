@@ -10,14 +10,13 @@ use super::{
     composite::{CapturedPane, PaneGeom, WindowLayout},
     probe_session_existence, refresh_session_cache,
     utils::{
-        append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
-        append_remain_on_exit_args, append_window_size_args, is_pane_dead, is_pane_running_shell,
+        append_pane_base_index_args, append_remain_on_exit_args, append_tmux_setting_args,
+        append_window_size_args, is_pane_dead, is_pane_running_shell,
     },
     SessionExistence, SESSION_PREFIX,
 };
 use crate::cli::truncate_id;
 use crate::process;
-use crate::session::config::should_apply_tmux_clipboard;
 use crate::session::Status;
 use crate::util::now_ms;
 
@@ -334,38 +333,63 @@ impl Session {
         probe_session_existence(&self.name)
     }
 
-    pub fn create(&self, working_dir: &str, command: Option<&str>) -> Result<()> {
-        self.create_with_size(working_dir, command, None)
+    pub fn create(&self, working_dir: &str, command: Option<&str>, profile: &str) -> Result<()> {
+        self.create_with_size(working_dir, command, None, profile)
     }
 
+    /// `profile` selects which config layer governs the `[tmux]` options this
+    /// applies (see `crate::tmux::tmux_option_config`); pass the session's own
+    /// profile so its overrides win over the global config.
     pub fn create_with_size(
         &self,
         working_dir: &str,
         command: Option<&str>,
         size: Option<(u16, u16)>,
+        profile: &str,
+    ) -> Result<()> {
+        self.create_with_size_env(working_dir, command, size, profile, &[])
+    }
+
+    /// Like [`Self::create_with_size`], but also sets `extra_env` on the new
+    /// session via `new-session -e KEY=VALUE`.
+    ///
+    /// This is the channel for values that must not appear in the pane
+    /// command's argv: `host_hooks.before_session` mints secrets, and the
+    /// shell-assignment prefix used for the static `environment` list would
+    /// publish them to `ps` for the pane's whole lifetime. The `-e` flags ride
+    /// the short-lived `tmux` client invocation instead, and the tmux server
+    /// hands the value to the pane's process environment.
+    pub fn create_with_size_env(
+        &self,
+        working_dir: &str,
+        command: Option<&str>,
+        size: Option<(u16, u16)>,
+        profile: &str,
+        extra_env: &[(String, String)],
     ) -> Result<()> {
         if self.exists() {
             return Ok(());
         }
+        let config = super::tmux_option_config(profile);
 
-        // Forward the daemon's desktop/session env (DISPLAY, XDG_*, DBUS, ...)
-        // so an agent (and any browser it launches, e.g. for OIDC) can reach
-        // the user's desktop. tmux otherwise carries only its narrow
-        // `update-environment` set plus the server's frozen base env (#3075).
-        let desktop_env = crate::session::environment::forwarded_desktop_env();
-        let env_refs: Vec<(&str, &str)> = desktop_env
+        // Forward the inherited host env (DISPLAY, XDG_*, DBUS, ... plus every
+        // other var when `session.inherit_host_environment` is on) so an agent
+        // and any browser it launches, e.g. for OIDC, can reach the user's
+        // desktop. tmux otherwise carries only its narrow `update-environment`
+        // set plus the server's frozen base env (#3075, #3262).
+        let inherited_env = crate::session::environment::inherited_host_env(profile);
+        let mut env_refs: Vec<(&str, &str)> = inherited_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
+        // Appended last so a minted value overrides a same-keyed desktop entry.
+        env_refs.extend(extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
 
         let mut args = build_create_args(&self.name, working_dir, &env_refs, command, size);
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
-        append_mouse_on_args(&mut args, &self.name);
         append_window_size_args(&mut args, &self.name);
-        if should_apply_tmux_clipboard() {
-            append_clipboard_passthrough_args(&mut args, &self.name);
-        }
+        append_tmux_setting_args(&mut args, &self.name, &config);
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 
@@ -2257,7 +2281,7 @@ mod tests {
 
         let guard = TmuxTestSession::new("aoe_test_env_fwd");
         let session = super::Session::from_name(guard.name());
-        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)));
+        let created = session.create_with_size("/tmp", Some("sleep 5"), Some((80, 24)), "default");
 
         let shown = crate::tmux::tmux_command()
             .args(["show-environment", "-t", guard.name(), key])
@@ -3202,6 +3226,34 @@ mod tests {
         assert!(e_idx < args.iter().position(|a| a == "'/bin/zsh' -l").unwrap());
         // `-c` still precedes the env flags.
         assert!(args.iter().position(|a| a == "-c").unwrap() < e_idx);
+    }
+
+    /// `create_with_size_env` appends the caller's `extra_env` after the
+    /// forwarded desktop env precisely so a `host_hooks.before_session` value
+    /// overrides a same-keyed desktop entry. Arg construction must preserve that
+    /// order rather than dedupe or reorder, or the intent is lost before tmux
+    /// ever sees it.
+    #[test]
+    fn test_build_create_args_preserves_duplicate_key_order() {
+        let args = build_create_args(
+            "s",
+            "/tmp/work",
+            &[
+                ("CLAUDE_CONFIG_DIR", "/desktop"),
+                ("CLAUDE_CONFIG_DIR", "/minted"),
+            ],
+            Some("claude"),
+            None,
+        );
+        let values: Vec<&String> = args
+            .iter()
+            .filter(|a| a.starts_with("CLAUDE_CONFIG_DIR="))
+            .collect();
+        assert_eq!(
+            values,
+            vec!["CLAUDE_CONFIG_DIR=/desktop", "CLAUDE_CONFIG_DIR=/minted"],
+            "both -e flags must survive, minted last"
+        );
     }
 
     #[test]

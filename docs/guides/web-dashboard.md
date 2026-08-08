@@ -133,6 +133,43 @@ AOE_CITYHALL_MODE=1 aoe serve --host 0.0.0.0
 
 The flag and the env var are equivalent; the daemon replays `--cityhall` to its child and persists it in `serve.launch`, so the mode survives `aoe serve --restart` and the post-`aoe update` re-exec (it is not silently dropped when the restart shell lacks the env var).
 
+#### The CityHall config bundle
+
+A locked-down client cannot configure itself: `PATCH /api/settings`, the project CRUD routes, and `POST /api/git/clone` are all closed in CityHall mode, and the project registry starts empty, so a fresh workspace has no project to launch a session against. The config bundle fills that gap. It is one TOML document describing how a workspace should be set up:
+
+```toml
+schema_version = 1
+
+[meta]
+generated_by = "aoe 1.13.2"
+
+# Sparse settings overrides: only the fields that differ from the defaults.
+[settings.acp]
+default_agent = "claude-code"
+
+[[projects]]
+name = "cityhall"
+remote = "https://github.com/agent-of-empires/cityhall.git"
+default_base_branch = "main"
+```
+
+Projects are addressed by **git remote**, not by path: an admin's local checkout path means nothing inside a workspace, so `apply` clones each remote into `<app_dir>/repos/<name>` and registers that path. Settings are a sparse patch keyed by section then field, the same shape a `PATCH /api/settings` body takes, so they go through the same validation.
+
+Produce one from a configured install with `aoe cityhall export --out cityhall.toml`, or from the dashboard's **Settings → CityHall** tab. The export deliberately omits host-specific fields (the ones marked local-only in the settings schema, such as binary paths) and never contains a credential. Apply one by hand with `aoe cityhall apply cityhall.toml`.
+
+Applying is idempotent, because a workspace does it on every boot: an existing checkout is left untouched so uncommitted work survives a restart, and an already-registered project is not re-added. A repo that fails to clone is reported without taking the other projects down. A bundle sets values; it cannot unset them.
+
+To have a workspace fetch its bundle at startup, point it at the URL that serves one:
+
+| Variable | Meaning |
+| --- | --- |
+| `AOE_CITYHALL_BUNDLE_URL` | URL to fetch the bundle from at `aoe serve` startup. Unset disables the fetch entirely. |
+| `AOE_CITYHALL_BUNDLE_TOKEN` | Bearer token sent with that request. |
+
+The fetch happens before the server reads any config, and its failure handling is asymmetric on purpose. On a first boot there is no cached bundle, so a fetch failure fails the startup rather than leaving the user in a workspace with default settings and no projects. Once a bundle has been applied it is cached in the app dir, and a later fetch failure only logs a warning and serves the cached configuration, so a transient outage cannot brick a working workspace. A bundle that arrives but is malformed, or names a setting this aoe does not know, is fatal either way.
+
+The document the bundle carries is also where a git identity and credential arrive (`[git]`), which is what makes clone, pull, and push work inside a workspace. That section is never written by `export`; the host serving the bundle composes it per user.
+
 ### Behind a reverse proxy
 
 When TLS is terminated by an external proxy (Traefik, nginx, Caddy) forwarding to `aoe serve` on loopback (often through an SSH reverse tunnel), use `--behind-proxy` so cookies carry `; Secure` and the rate limiter keys by the real client IP:
@@ -161,7 +198,7 @@ The upstream must set `X-Forwarded-For` (or `cf-connecting-ip`); aoe reads the l
 - **Token rotation**: in `--remote` mode the token rotates every 4 hours with a 5-minute grace period for active sessions.
 - **Device tracking**: connected devices (the signed-in login sessions, with browser, origin IP, and last seen) are visible in Settings > Web Dashboard > Connected Devices, where you can revoke one device or sign every device out.
 - **Session persistence**: login sessions are persisted to an owner-only `login_sessions.toml` in the app dir, so signed-in devices survive an `aoe serve` restart instead of being re-prompted for the passphrase. A passphrase change drops every persisted session; set `auth.persist_sessions = false` to force re-authentication on every restart.
-- **Step-up elevation**: a "Confirm passphrase" prompt appears on writes that can plant code for the next session spawn (the `sandbox` and `worktree` sections); confirmation lasts 15 minutes. User-preference writes (theme, sound, notifications, etc.) save without it. Localhost browsers skip the prompt entirely; the same-host caller already passes the filesystem trust boundary. See [Settings & profiles](web/settings.md#step-up-elevation).
+- **Step-up elevation**: a "Confirm passphrase" prompt appears on writes that can plant code for, or widen what is exposed to, the next session spawn. That covers the `sandbox` and `worktree` sections plus individual fields that carry the same risk, currently `acp.restrict_agents`, `skills.auto_propagate`, `session.smart_rename_model`, and `session.inherit_host_environment`; the gate is per field, so the rest of a section saves without it. Confirmation lasts 15 minutes. User-preference writes (theme, sound, notifications, etc.) save without it. Localhost browsers skip the prompt entirely; the same-host caller already passes the filesystem trust boundary. See [Settings & profiles](web/settings.md#step-up-elevation).
 - **Local-only fields**: the agent-command surface and status-hook shell commands map names to arbitrary host commands, so the server rejects any PATCH touching them; they are editable only in the TUI on the host.
 
 The server also sets `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer` (the last prevents token leaks via Referer).

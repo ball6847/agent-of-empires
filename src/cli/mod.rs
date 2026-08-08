@@ -4,6 +4,7 @@
 pub mod acp;
 pub mod add;
 pub mod agents;
+pub mod cityhall;
 pub mod definition;
 pub mod extract_session_id;
 pub mod graft;
@@ -26,6 +27,7 @@ pub mod send;
 pub mod serve;
 pub mod session;
 pub mod settings;
+pub mod skill;
 pub mod sounds;
 pub mod status;
 pub mod telemetry;

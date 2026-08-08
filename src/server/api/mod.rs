@@ -23,6 +23,7 @@ pub(crate) mod plugin_settings;
 pub mod plugins;
 mod projects;
 pub(crate) mod sessions;
+mod skills;
 pub(crate) mod system;
 mod telemetry;
 
@@ -61,6 +62,9 @@ pub use sessions::{
     update_session_notifications, update_session_pin, update_session_snooze, update_session_unread,
     update_workspace_ordering, CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
 };
+pub use skills::{
+    adopt_skill, create_skill, delete_skill, edit_skill, list_skills, read_skill, sync_skills,
+};
 // Shared by the status poll loop's auto-unread persistence; not a route handler.
 pub(crate) use sessions::persist_session_update;
 // Trash retention sweep, driven by the daemon's hourly loop; not a route handler.
@@ -71,12 +75,12 @@ pub(crate) use sessions::purge_expired_trash;
 pub(crate) use sessions::reconcile_trashed_worktrees;
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, dismiss_update,
-    docker_status, filesystem_home, get_about, get_current_theme, get_profile_settings,
-    get_resolved_theme, get_settings, get_settings_resolved, get_settings_schema, get_tips,
-    get_update_status, get_web_ui_state, list_agents, list_groups, list_profiles, list_sounds,
-    list_themes, mark_tip_seen, mark_volume_ignores_globs_acknowledged, mark_web_tour_seen,
-    patch_web_ui_state, rename_profile, serve_sound_file, set_show_tips, update_profile_settings,
-    update_settings, update_theme,
+    docker_status, filesystem_home, get_about, get_cityhall_bundle, get_current_theme,
+    get_profile_settings, get_resolved_theme, get_settings, get_settings_resolved,
+    get_settings_schema, get_tips, get_update_status, get_web_ui_state, list_agents, list_groups,
+    list_profiles, list_sounds, list_themes, mark_tip_seen, mark_volume_ignores_globs_acknowledged,
+    mark_web_tour_seen, patch_web_ui_state, post_dashboard_presence, rename_profile,
+    serve_sound_file, set_show_tips, update_profile_settings, update_settings, update_theme,
 };
 pub use telemetry::{
     get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,
@@ -135,6 +139,25 @@ pub(crate) fn cityhall_response() -> axum::response::Response {
 /// `if let Some(resp) = cityhall_block(&state) { return resp; }`.
 pub(crate) fn cityhall_block(state: &AppState) -> Option<axum::response::Response> {
     state.cityhall_mode.then(cityhall_response)
+}
+
+/// The operator agent allowlist, read off the async runtime because it touches
+/// disk. Handlers use it to answer up front instead of letting a disallowed
+/// agent fail at spawn time, which is the complaint #3241 opens with.
+///
+/// One load per request. Two requests can observe different policies if the
+/// operator edits it in between, which is fine: each response is internally
+/// consistent, and the supervisor re-checks at spawn regardless, so a handler
+/// preflight is never the thing standing between a disallowed agent and a
+/// process.
+pub(crate) async fn agent_policy() -> crate::acp::agent_policy::AgentPolicy {
+    tokio::task::spawn_blocking(crate::acp::agent_policy::AgentPolicy::load)
+        .await
+        .unwrap_or_else(|e| {
+            // A panicked load task must not read as "everything is permitted".
+            tracing::error!("agent policy load task failed: {e}");
+            crate::acp::agent_policy::AgentPolicy::deny_all()
+        })
 }
 
 /// 404 for the persist-then-apply race: the write was persisted to disk, but

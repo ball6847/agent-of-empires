@@ -205,6 +205,7 @@ export type ElicitationFieldKind = "free_text" | "single_select" | "multi_select
 export interface ElicitationOption {
   value: string;
   label: string;
+  description?: string | null;
 }
 
 /** A pre-fill / submitted value. Mirror of `AnswerValue` (untagged): a
@@ -460,6 +461,7 @@ export type AcpEvent =
       };
     }
   | "SessionCleared"
+  | "ConversationCompactionStarted"
   | "ConversationCompacted"
   | { DiffEmitted: { diff: DiffPreview } }
   | "ThinkingStarted"
@@ -540,6 +542,9 @@ export type AcpEvent =
         image: boolean;
         audio: boolean;
         embedded_context: boolean;
+        /** Absent on events persisted before #2805; the Rust side
+         *  defaults it to false, so treat a missing value the same. */
+        steering?: boolean;
       };
     }
   | { AcpSessionAssigned: { acp_session_id: string } }
@@ -569,6 +574,12 @@ export interface PromptCapabilities {
   image: boolean;
   audio: boolean;
   embeddedContext: boolean;
+  /** Whether the agent accepts `_session/steering`, so a prompt sent
+   *  mid-turn is injected into the running turn instead of parked in
+   *  the composer queue. Re-emitted on every connect, including as
+   *  false, so it cannot go stale after a respawn onto an adapter
+   *  without the capability. See #2805. */
+  steering: boolean;
 }
 
 /** One attachment as the composer hands it to `sendPrompt`: the raw
@@ -637,6 +648,21 @@ export interface AcpState {
    *  the full event-store replay, since boundary events are applied in
    *  seq order. See #1354. */
   usageBaseline: { cost: number } | null;
+  /** Usage snapshot captured when the user dismissed the compaction
+   *  reminder, or null while the reminder is armed. Lives on reducer
+   *  state rather than component state so one dismissal survives a
+   *  session switch and a reload, the same reason `contextPrimerAvailable`
+   *  does (#1110).
+   *
+   *  Re-armed in the `UsageUpdated` arm whenever the previous snapshot was
+   *  null, which every context boundary already guarantees: compact,
+   *  clear, `SessionContextReset`, `AgentSwitched`, and a model change all
+   *  null `sessionUsage`. Latching there rather than deriving "used went
+   *  down" at render time is deliberate: the drop is visible only on the
+   *  first post-boundary snapshot, so a derived check would re-suppress
+   *  the reminder as soon as usage climbed back past the dismissed value.
+   *  See #3253. */
+  compactionReminderDismissed: SessionUsage | null;
   /** Most recent assistant message chunks accumulated as a single
    *  text body. Cleared each time a new prompt is sent. */
   assistantMessage: string;
@@ -800,6 +826,18 @@ export interface AcpState {
    *  SIGTERM the worker if the agent keeps ignoring the cancel. Lets the
    *  UI show an honest countdown. Null when not cancelling. See #1727. */
   cancelEscalatesAt: string | null;
+  /** True between `ConversationCompactionStarted` and the matching
+   *  `ConversationCompacted`, or the turn's `Stopped` if the completion
+   *  marker never lands. The adapter goes silent for 90 to 170 seconds in
+   *  that window, so this keeps the stall watchdog from relabelling the
+   *  spinner "Waiting on model" and offering a Force-end-turn button that
+   *  would kill the compaction, and parks a follow-up in the queue
+   *  instead of steering it into a turn that never answers it.
+   *
+   *  Deliberately NOT cleared by `applyNewTurnResets`: that runs on every
+   *  server-confirmed `UserPromptSent`, so a prompt confirmed mid-window
+   *  would drop the phase while compaction is still running. See #3219. */
+  compacting: boolean;
   /** Set when the agent emitted `SessionContextReset` after a prior
    *  user prompt: the model's context is empty but the visible
    *  transcript is intact, so the user can opt in to fetching a
@@ -1022,6 +1060,7 @@ export function emptyAcpState(): AcpState {
     rateLimit: null,
     sessionUsage: null,
     usageBaseline: null,
+    compactionReminderDismissed: null,
     assistantMessage: "",
     activity: [],
     lastSeq: 0,
@@ -1049,6 +1088,7 @@ export function emptyAcpState(): AcpState {
     monitorDescription: null,
     cancelling: false,
     cancelEscalatesAt: null,
+    compacting: false,
     contextPrimerAvailable: null,
     rejectedPrompts: [],
     agentUnresponsive: false,
@@ -1066,6 +1106,23 @@ export function emptyAcpState(): AcpState {
  *  event (a plain `UserPromptSent` and a `UserDiffCommentsPrompt`).
  *  Mutates `next` in place; the caller has already appended the
  *  activity row and bumped `pendingUserPromptSeq`. */
+/** Whether a `UserPromptSent` is a message steered into the turn already
+ *  running rather than the start of a new one (#2805).
+ *
+ *  The daemon injects a mid-turn prompt via `_session/steering` instead of
+ *  starting a turn for it, so the same condition the composer used to send
+ *  it identifies it on the way back. Such a prompt must NOT run
+ *  {@link applyNewTurnResets}: there is no new turn, and the running
+ *  turn's single `Stopped` still has to see the output flag and the
+ *  pending-cancel state the turn actually accumulated.
+ *
+ *  Takes the pre-event state, since the arms bump `pendingUserPromptSeq`
+ *  (which feeds `isTurnActive`) before they reach the reset.
+ */
+function isSteeredContinuation(state: AcpState): boolean {
+  return state.turnActive && !!state.promptCapabilities?.steering;
+}
+
 function applyNewTurnResets(next: AcpState): void {
   next.assistantMessage = "";
   next.startupError = null;
@@ -1142,6 +1199,12 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.turnHasOutput = true;
     } else if (event === "ThinkingEnded") {
       next.thinking = false;
+    } else if (event === "ConversationCompactionStarted") {
+      // The adapter is about to go silent for 90 to 170 seconds. No
+      // activity row: it already emitted a visible "Compacting..." chunk.
+      // This only latches the phase so the spinner stops reading the
+      // quiet as a wedge and the composer parks a follow-up. See #3219.
+      next.compacting = true;
     } else if (event === "ConversationCompacted") {
       // /compact replaced the model's context with a summary. The
       // model still has continuity through the summary so no primer
@@ -1158,6 +1221,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       const compactCumulative = compactPriorUsage + compactPriorBaseline;
       next.usageBaseline = { cost: compactCumulative };
       next.sessionUsage = null;
+      next.compacting = false;
       next.activity = [
         ...next.activity,
         {
@@ -1487,6 +1551,13 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // which resets the latch to the next raw value. Drop once upstream
     // stops emitting the downgraded mid-turn guess.
     const size = Math.max(incoming.size, next.sessionUsage?.size ?? 0);
+    // Re-arm the compaction reminder on the first snapshot after a context
+    // boundary. Every boundary nulls sessionUsage (see the latch comment
+    // above), so a null previous snapshot IS the boundary signal and this
+    // needs no per-boundary bookkeeping in those five arms. See #3253.
+    if (next.compactionReminderDismissed && next.sessionUsage === null) {
+      next.compactionReminderDismissed = null;
+    }
     if (next.usageBaseline && incoming.cost) {
       const rebasedAmount = Math.max(0, incoming.cost.amount - next.usageBaseline.cost);
       const rebasedCost = {
@@ -1611,6 +1682,10 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // clear the "Stopping..." state regardless of reason. See #1727.
     next.cancelling = false;
     next.cancelEscalatesAt = null;
+    // Same for any compaction the turn was running. This is the
+    // self-healing clear: a dropped completion marker, a killed worker
+    // and a user cancel all arrive here. See #3219.
+    next.compacting = false;
     next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
     next.turnActive = isTurnActive(next);
     // Clear the "monitoring" badge once the monitor has fired and that turn
@@ -1764,6 +1839,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       image: c.image,
       audio: c.audio,
       embeddedContext: c.embedded_context,
+      steering: c.steering ?? false,
     };
     return next;
   }
@@ -1832,7 +1908,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       });
       next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
     }
-    applyNewTurnResets(next);
+    if (!isSteeredContinuation(state)) {
+      applyNewTurnResets(next);
+    }
     return next;
   }
   if ("UserDiffCommentsPrompt" in event) {
@@ -1855,7 +1933,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       at: new Date().toISOString(),
     });
     next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
-    applyNewTurnResets(next);
+    if (!isSteeredContinuation(state)) {
+      applyNewTurnResets(next);
+    }
     return next;
   }
   if ("AcpSessionAssigned" in event) {
@@ -2357,6 +2437,30 @@ export function isTurnActive(state: Pick<AcpState, "pendingUserPromptSeq" | "las
   return state.pendingUserPromptSeq > state.lastStoppedSeq;
 }
 
+/** Whether the structured view should show the compaction reminder.
+ *  Single source of truth for the gate so the banner and its tests
+ *  cannot drift.
+ *
+ *  Capability gates the whole reminder, not just its button: telling a
+ *  user to run a command their agent never advertised is noise. A
+ *  zero-size window means the agent has not reported a real window yet,
+ *  so there is no percentage to compare; `used > size` (which some agents
+ *  report transiently) is past any legal threshold and counts. See #3253.
+ */
+export function isCompactionReminderDue(
+  state: Pick<AcpState, "sessionUsage" | "compacting" | "compactionReminderDismissed" | "availableCommands">,
+  prefs: { compactionReminder: boolean; compactionReminderPercent: number },
+): boolean {
+  if (!prefs.compactionReminder) return false;
+  if (state.compacting || state.compactionReminderDismissed) return false;
+  const usage = state.sessionUsage;
+  if (!usage || !Number.isFinite(usage.used) || !Number.isFinite(usage.size) || usage.size <= 0) {
+    return false;
+  }
+  if (!state.availableCommands.some((c) => c.name === "compact")) return false;
+  return (usage.used / usage.size) * 100 >= prefs.compactionReminderPercent;
+}
+
 /** Normalise a partial AcpState so the turn counters are populated.
  *  Used by the localStorage loader after the #1170 schema change: pre-
  *  schema persisted entries have no counters, so we backfill from the
@@ -2374,6 +2478,7 @@ export function normaliseTurnCounters(
     configOptions?: ConfigOptionDescriptor[];
     configOptionSwitchFailed?: ConfigOptionSwitchFailure | null;
     pendingConfigOption?: { configId: string; value: string } | null;
+    compactionReminderDismissed?: SessionUsage | null;
   },
 ): AcpState {
   const pendingUserPromptSeq =
@@ -2400,6 +2505,11 @@ export function normaliseTurnCounters(
   const configOptions = Array.isArray(state.configOptions) ? state.configOptions : [];
   const configOptionSwitchFailed = state.configOptionSwitchFailed === undefined ? null : state.configOptionSwitchFailed;
   const pendingConfigOption = state.pendingConfigOption === undefined ? null : state.pendingConfigOption;
+  // Pre-#3253 persisted entries lack the compaction-reminder dismissal;
+  // backfill to null so a warm hydrate starts armed rather than reading
+  // `undefined` as "not dismissed" by luck.
+  const compactionReminderDismissed =
+    state.compactionReminderDismissed === undefined ? null : state.compactionReminderDismissed;
   // Pre-#2236 persisted entries lack oldestSeq; backfill to 0 (nothing
   // older loaded) so the recent-first `before=<oldestSeq>` paging contract
   // never sees undefined on a warm hydrate.
@@ -2417,6 +2527,7 @@ export function normaliseTurnCounters(
     configOptions,
     configOptionSwitchFailed,
     pendingConfigOption,
+    compactionReminderDismissed,
     pendingUserPromptSeq,
     lastStoppedSeq,
     turnActive: isTurnActive({ pendingUserPromptSeq, lastStoppedSeq }),

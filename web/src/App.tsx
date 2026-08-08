@@ -1,9 +1,20 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { Puzzle } from "lucide-react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
+import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
@@ -42,9 +53,11 @@ import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
 import {
   deleteWorkspaceSessions,
+  type Notifier,
   restoreSessions,
   trashedWorkspaceRestoreIds,
   trashSessions,
+  workspaceCleanupDefaults,
 } from "./lib/trashActions";
 import {
   loginStatus,
@@ -84,6 +97,7 @@ import { toastBus, reportError } from "./lib/toastBus";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
+import { clearMobileKeyboardProxyInput, deliverMobileKeyboardProxyInput } from "./lib/mobileKeyboardProxy";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
 import { WorkspaceSidebar, SnoozeModal } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
@@ -288,6 +302,7 @@ function AppContent({
   onLogout: () => void;
   onSettingsRefresh: () => Promise<void> | void;
 }) {
+  useDashboardPresence();
   // Wire the localStorage write chokepoint and pull the server-side UI-state
   // blob into localStorage. AppContent only mounts past auth, so this runs as
   // the authenticated user. Background (does NOT gate render): blocking first
@@ -693,6 +708,11 @@ function AppContent({
   const [telemetryConsentKnown, setTelemetryConsentKnown] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
   const keyboardProxyRef = useRef<HTMLTextAreaElement>(null);
+  const [keyboardProxy, setKeyboardProxy] = useState<HTMLTextAreaElement | null>(null);
+  const setKeyboardProxyRef = useCallback((element: HTMLTextAreaElement | null) => {
+    keyboardProxyRef.current = element;
+    setKeyboardProxy(element);
+  }, []);
 
   const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
   // CityHall client mode collapses the dashboard to a locked-down end-user
@@ -815,6 +835,55 @@ function AppContent({
       keyboardProxyRef.current?.focus();
     }
   };
+  const closeKeyboardProxy = () => {
+    if (window.innerWidth < 768 && navigator.maxTouchPoints > 0) {
+      keyboardProxyRef.current?.blur();
+      if (document.activeElement instanceof HTMLTextAreaElement) document.activeElement.blur();
+    }
+  };
+
+  // The keyboard proxy survives terminal mounts so iOS can retain the focus
+  // authorized by a sidebar tap. Drop its receiver only at a real session
+  // boundary: clearing it while reselecting the active session leaves that
+  // still-mounted terminal without anything to re-register it.
+  const keyboardProxySessionIdRef = useRef(activeSessionId);
+  const transitionKeyboardProxy = useCallback((nextSessionId: string | null) => {
+    if (keyboardProxySessionIdRef.current === nextSessionId) return;
+    keyboardProxySessionIdRef.current = nextSessionId;
+    clearMobileKeyboardProxyInput();
+  }, []);
+
+  // Sidebar selection clears before the proxy can accept another edit. This
+  // also covers browser history and every other route change before the next
+  // input event, without clearing an unchanged session.
+  useLayoutEffect(() => {
+    transitionKeyboardProxy(activeSessionId);
+  }, [activeSessionId, transitionKeyboardProxy]);
+
+  useEffect(() => {
+    const proxy = keyboardProxy;
+    if (!proxy) return;
+    const onBeforeInput = (e: InputEvent) => {
+      switch (e.inputType) {
+        case "insertText":
+        case "insertLineBreak":
+        case "insertParagraph":
+        case "deleteContentBackward":
+        case "insertFromPaste":
+          e.preventDefault();
+          deliverMobileKeyboardProxyInput({
+            inputType: e.inputType,
+            data: e.data,
+            isComposing: e.isComposing,
+          });
+          break;
+        default:
+          break;
+      }
+    };
+    proxy.addEventListener("beforeinput", onBeforeInput);
+    return () => proxy.removeEventListener("beforeinput", onBeforeInput);
+  }, [keyboardProxy]);
 
   // Selecting a session in the sidebar should land focus on its canonical
   // "type here" target so the user can start typing without a second click:
@@ -831,15 +900,23 @@ function AppContent({
       const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
       if (ws) {
         const picked = ws.sessions.find((s) => s.id === sessionId);
+        transitionKeyboardProxy(sessionId);
         navigate(`/session/${encodeURIComponent(sessionId)}`);
-        // On touch devices, raise the soft keyboard within the tap gesture and
-        // latch the terminal/composer to take focus once it mounts (keeping the
-        // keyboard up) — but only when the user opted into auto-open keyboard.
-        // On desktop the proxy is a no-op and we focus the real input directly.
+        // iOS does not permit a session's asynchronously mounted terminal
+        // input to inherit this sidebar tap's keyboard authorization. The
+        // persistent keyboard input keeps the gesture-authorized focus while
+        // a terminal is starting; the terminal consumes its input directly
+        // rather than attempting a second, unreliable focus transfer.
         if (isCoarse) {
-          if (webSettings.autoOpenKeyboard) {
+          // Claude's alternate-screen startup still loses the first keyboard
+          // input on iOS (#3285). Start it as a monitoring view until that
+          // separate transport race is fixed; other terminal agents remain
+          // safe to auto-open.
+          if (picked?.tool === "claude" && picked.view !== "structured") {
+            closeKeyboardProxy();
+          } else if (webSettings.autoOpenKeyboard) {
             focusKeyboardProxy();
-            setPendingTerminalFocus(picked?.view === "structured" ? "composer" : "agent");
+            if (picked?.view === "structured") setPendingTerminalFocus("composer");
           }
         } else {
           focusKeyboardProxy();
@@ -848,7 +925,7 @@ function AppContent({
         if (window.innerWidth < 768) setSidebarOpen(false);
       }
     },
-    [navigate, workspaces, focusAgentInput, isCoarse, webSettings.autoOpenKeyboard],
+    [navigate, workspaces, focusAgentInput, isCoarse, transitionKeyboardProxy, webSettings.autoOpenKeyboard],
   );
 
   const handleSelectWorkspace = (workspaceId: string) => {
@@ -857,19 +934,23 @@ function AppContent({
       const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
       const picked = running ?? ws.sessions[0] ?? null;
       if (picked) {
+        transitionKeyboardProxy(picked.id);
         navigate(`/session/${encodeURIComponent(picked.id)}`);
-        // Mirror handleSelectSession: on touch, raise the keyboard + latch focus
-        // only when auto-open keyboard is enabled; on desktop focus directly.
+        // See handleSelectSession: keep focus on the persistent keyboard input
+        // until the selected surface can receive it.
         if (isCoarse) {
-          if (webSettings.autoOpenKeyboard) {
+          if (picked.tool === "claude" && picked.view !== "structured") {
+            closeKeyboardProxy();
+          } else if (webSettings.autoOpenKeyboard) {
             focusKeyboardProxy();
-            setPendingTerminalFocus(picked.view === "structured" ? "composer" : "agent");
+            if (picked.view === "structured") setPendingTerminalFocus("composer");
           }
         } else {
           focusKeyboardProxy();
           focusAgentInput(picked);
         }
       } else {
+        transitionKeyboardProxy(null);
         navigate("/");
       }
     }
@@ -968,15 +1049,7 @@ function AppContent({
   const deletingCleanupDefaults = deletingSession
     ? {
         delete_to_trash: deletingDefaultToTrash,
-        delete_worktree: deletingSessions.some(
-          (session) => (session.has_cleanable_worktree ?? false) && session.cleanup_defaults.delete_worktree,
-        ),
-        delete_branch: deletingSessions.some(
-          (session) => (session.has_cleanable_worktree ?? false) && session.cleanup_defaults.delete_branch,
-        ),
-        delete_sandbox: deletingSessions.some(
-          (session) => session.is_sandboxed && session.cleanup_defaults.delete_sandbox,
-        ),
+        ...workspaceCleanupDefaults(deletingSessions),
       }
     : null;
   const deletingBranchName =
@@ -1006,6 +1079,61 @@ function AppContent({
       notify: toastBus.handler,
     });
   };
+
+  // Empty Trash (#3167): purge every trashed workspace in one action, mirroring
+  // the TUI's `empty_trash_all`. Reuses the atomic per-workspace delete loop, so
+  // partial failures stay consistent (each call flags only its own failed ids).
+  // Per-workspace toasts are suppressed for one summary; force_delete matches
+  // the TUI so a dirty worktree cannot block a bulk purge.
+  // Rows stay in `trashedWorkspaces` (as Deleting) until the next /api/sessions
+  // poll drops them, so the Trash panel and its Empty Trash button are still
+  // clickable while this loop runs. Without the guard a second confirm starts a
+  // concurrent loop that re-issues a DELETE for every workspace and fires a
+  // second summary toast.
+  const emptyingTrashRef = useRef(false);
+  const handleEmptyTrash = useCallback(async () => {
+    if (trashedWorkspaces.length === 0 || emptyingTrashRef.current) return;
+    emptyingTrashRef.current = true;
+    let anyFailed = false;
+    const notify: Notifier = {
+      error: () => {
+        anyFailed = true;
+      },
+      info: () => {},
+    };
+    // Purge one workspace at a time, matching the CLI's sequential
+    // `for inst in &trashed` loop (src/cli/session.rs) and the TUI's single
+    // shared deletion poller. Running teardowns in series keeps the summary
+    // toast trivially ordered and stops N git worktree removals from racing on
+    // one source repo, the same sequential-await idiom trashActions.ts uses.
+    try {
+      for (const ws of trashedWorkspaces) {
+        await deleteWorkspaceSessions(
+          ws.sessions,
+          {
+            ...workspaceCleanupDefaults(ws.sessions),
+            force_delete: true,
+          },
+          activeSessionId,
+          {
+            setStatus: setSessionStatus,
+            purgeLocal: (id) => {
+              clearAcpCache(id);
+              clearDraft(id);
+              clearStoredComments(id);
+            },
+            navigateHome: () => navigate("/"),
+            notify,
+          },
+        );
+      }
+    } finally {
+      emptyingTrashRef.current = false;
+    }
+    toastBus.handler?.[anyFailed ? "error" : "info"](
+      anyFailed ? "Some trashed sessions could not be deleted" : "Emptied trash",
+    );
+  }, [trashedWorkspaces, activeSessionId, setSessionStatus, navigate]);
 
   // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
   // deliberately KEEPS the per-session acp cache, draft, and stored comments
@@ -1848,8 +1976,15 @@ function AppContent({
     () => ({
       showToolDurations: serverAbout?.acp_show_tool_durations ?? true,
       replayEvents: serverAbout?.acp_replay_events ?? 0,
+      compactionReminder: serverAbout?.acp_compaction_reminder ?? false,
+      compactionReminderPercent: serverAbout?.acp_compaction_reminder_percent ?? 75,
     }),
-    [serverAbout?.acp_show_tool_durations, serverAbout?.acp_replay_events],
+    [
+      serverAbout?.acp_show_tool_durations,
+      serverAbout?.acp_replay_events,
+      serverAbout?.acp_compaction_reminder,
+      serverAbout?.acp_compaction_reminder_percent,
+    ],
   );
 
   const tourScope: TourScope =
@@ -2054,6 +2189,7 @@ function AppContent({
               onSettings={handleOpenSettings}
               onDeleteSession={handleDeleteSession}
               onRestoreSession={handleRestoreSession}
+              onEmptyTrash={handleEmptyTrash}
               onStopSession={handleStopSession}
               onStartSession={handleStartSession}
               onSwitchView={handleSwitchView}
@@ -2199,11 +2335,16 @@ function AppContent({
         )}
 
         <textarea
-          ref={keyboardProxyRef}
+          ref={setKeyboardProxyRef}
+          data-keyboard-proxy
           aria-hidden="true"
           tabIndex={-1}
-          className="fixed opacity-0 w-0 h-0 pointer-events-none"
-          style={{ top: -9999, left: -9999 }}
+          // Keep the element in the visual viewport. Focusing a zero-size
+          // textarea thousands of pixels above an iOS PWA can leave WebKit's
+          // focus scroll in a broken state until the keyboard is toggled.
+          // This matches the live terminal's hidden input geometry.
+          className="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
+          style={{ caretColor: "transparent", color: "transparent" }}
         />
       </div>
     </AcpPrefsProvider>

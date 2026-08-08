@@ -74,6 +74,7 @@ export type Action =
   | { kind: "edit_queued_prompt"; id: string; text: string }
   | { kind: "clear_queue" }
   | { kind: "dismiss_primer" }
+  | { kind: "dismiss_compaction_reminder" }
   | { kind: "dismiss_rejected_prompt"; id: string }
   | { kind: "dismiss_mode_switch_failed" }
   | { kind: "set_pending_config_option"; configId: string; value: string }
@@ -707,6 +708,12 @@ export function reducer(state: AcpState, action: Action): AcpState {
     // with a new `resetSeq`, which the banner reads as a fresh
     // incident and shows again. See #1110.
     return { ...state, contextPrimerAvailable: null };
+  }
+  if (action.kind === "dismiss_compaction_reminder") {
+    // Latch the snapshot the user dismissed at. The `UsageUpdated` arm
+    // re-arms on the first snapshot after any context boundary, so this
+    // stays set only for the life of the current context. See #3253.
+    return { ...state, compactionReminderDismissed: state.sessionUsage };
   }
   if (action.kind === "dismiss_rejected_prompt") {
     return {
@@ -1703,7 +1710,29 @@ export function useAcpSession(
       // "absent" until the respawn lands); parking would leave it in the
       // local queue forever and the worker would never come back. Only a
       // non-dormant cold worker (genuine mid-resume) still parks. See #1689.
-      const blockedAsideFromWorker = wsClosed || state.turnActive || state.workerStopped || state.workerRestarting;
+      // A steerable agent takes a mid-turn prompt directly: the daemon
+      // injects it into the running turn via `_session/steering` rather
+      // than refusing it, so parking here would put back the queue-after
+      // behavior steering replaces. Only the turn-active term is dropped;
+      // the socket and worker gates below still park, because steering
+      // does nothing for a prompt that cannot reach the daemon. See #2805.
+      //
+      // A pending cancel is the exception: the daemon refuses a prompt
+      // that arrives while it is cancelling AND escalates to a runner
+      // restart, reading it as "the user hit Stop and re-typed, so the
+      // agent is wedged". Steering must not route the composer into that
+      // path, or Stop-then-type would respawn the worker where it used
+      // to just queue. That turn is ending either way, so park and let
+      // the drain fire it as the next turn.
+      //
+      // A running `/compact` is the same shape of exception: that turn is
+      // only summarizing context, so the adapter answers `Injected` and
+      // swallows the message into a turn that never replies to it, with no
+      // retry affordance. Park it and let the drain fire it as the next
+      // turn, against the freshly compacted context. See #3219.
+      const turnBlocks =
+        state.turnActive && !(state.promptCapabilities?.steering && !state.cancelling && !state.compacting);
+      const blockedAsideFromWorker = wsClosed || turnBlocks || state.workerStopped || state.workerRestarting;
       const shouldEnqueue = state.workerIdleStopped
         ? blockedAsideFromWorker
         : blockedAsideFromWorker || workerNotRunning;
@@ -1738,6 +1767,9 @@ export function useAcpSession(
     [
       sessionId,
       state.turnActive,
+      state.promptCapabilities?.steering,
+      state.cancelling,
+      state.compacting,
       state.workerStopped,
       state.workerRestarting,
       state.workerIdleStopped,
@@ -1853,6 +1885,10 @@ export function useAcpSession(
 
   const dismissPrimer = useCallback(() => {
     dispatch({ kind: "dismiss_primer" });
+  }, []);
+
+  const dismissCompactionReminder = useCallback(() => {
+    dispatch({ kind: "dismiss_compaction_reminder" });
   }, []);
 
   const dismissRejectedPrompt = useCallback((id: string) => {
@@ -2042,6 +2078,7 @@ export function useAcpSession(
     lastActivityRef,
     dismissError,
     dismissPrimer,
+    dismissCompactionReminder,
     removeQueuedPrompt,
     editQueuedPrompt,
     clearQueue,

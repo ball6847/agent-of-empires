@@ -9,6 +9,7 @@ use clap_complete::Shell;
 #[cfg(feature = "serve")]
 use super::acp::AcpCommands;
 use super::add::AddArgs;
+use super::cityhall::CityHallCommands;
 use super::extract_session_id::ExtractSessionIdArgs;
 use super::group::GroupCommands;
 use super::init::InitArgs;
@@ -28,6 +29,7 @@ use super::send::SendArgs;
 use super::serve::ServeArgs;
 use super::session::SessionCommands;
 use super::settings::SettingsCommands;
+use super::skill::SkillCommands;
 use super::sounds::SoundsCommands;
 use super::status::StatusArgs;
 use super::telemetry::TelemetryCommands;
@@ -181,6 +183,12 @@ pub enum Commands {
         command: SettingsCommands,
     },
 
+    /// Export and apply the CityHall config bundle (settings + projects)
+    Cityhall {
+        #[command(subcommand)]
+        command: CityHallCommands,
+    },
+
     /// Manage anonymous opt-in usage telemetry
     Telemetry {
         #[command(subcommand)]
@@ -191,6 +199,12 @@ pub enum Commands {
     Mcp {
         #[command(subcommand)]
         command: McpCommands,
+    },
+
+    /// Query and manage agent skills
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommands,
     },
 
     /// Start a web dashboard for remote session access
@@ -266,8 +280,10 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "sounds",
     "theme",
     "settings",
+    "cityhall",
     "telemetry",
     "mcp",
+    "skill",
     "serve",
     "url",
     "acp",
@@ -312,8 +328,10 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Sounds { .. } => "sounds",
         Commands::Theme { .. } => "theme",
         Commands::Settings { .. } => "settings",
+        Commands::Cityhall { .. } => "cityhall",
         Commands::Telemetry { .. } => "telemetry",
         Commands::Mcp { .. } => "mcp",
+        Commands::Skill { .. } => "skill",
         #[cfg(feature = "serve")]
         Commands::Serve(_) => "serve",
         #[cfg(feature = "serve")]

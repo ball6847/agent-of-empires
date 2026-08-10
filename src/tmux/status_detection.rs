@@ -73,9 +73,6 @@ fn matches_input_prompt(non_empty_lines: &[&str], take_n: usize, tool_prompts: &
         if tool_prompts.iter().any(|p| clean_line == *p) {
             return true;
         }
-        if clean_line.starts_with("> ") && !clean_line.contains("esc") && clean_line.len() < 100 {
-            return true;
-        }
     }
     false
 }
@@ -4746,6 +4743,24 @@ Done.
         assert_eq!(detect_prime_agent_status("file saved"), Status::Idle);
         assert_eq!(
             detect_prime_agent_status("random output text"),
+            Status::Idle
+        );
+        // Output lines starting with `> ` (reasoning traces, tool output)
+        // must not be mistaken for the input prompt. See #3295.
+        assert_eq!(
+            detect_prime_agent_status(
+                "> thinking about the problem
+Done!"
+            ),
+            Status::Idle
+        );
+        assert_eq!(
+            detect_prime_agent_status(
+                "> analyzing codebase
+> found 3 issues
+> applying fixes
+Done!"
+            ),
             Status::Idle
         );
     }

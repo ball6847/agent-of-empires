@@ -46,8 +46,10 @@ fn compose_list_title(
     sort_order: SortOrder,
 ) -> String {
     let mut suffix = String::new();
-    if group_by == GroupByMode::Project {
-        suffix.push_str(" · project");
+    match group_by {
+        GroupByMode::Project => suffix.push_str(" · project"),
+        GroupByMode::Org => suffix.push_str(" · org"),
+        GroupByMode::Manual => {}
     }
     if sort_order != SortOrder::default() {
         suffix.push_str(" · ");
@@ -715,6 +717,9 @@ impl HomeView {
         if let Some(ref mut diff) = self.diff_view {
             // Compute diff for selected file if not cached
             let _ = diff.get_current_diff();
+            if diff.selected_file_is_markdown() {
+                let _ = diff.get_current_file_contents();
+            }
 
             // No list/preview divider exists while the diff takeover owns
             // the screen; clear it so a stale value from the previous frame
@@ -1993,10 +1998,15 @@ impl HomeView {
         }
         if self.preview_capture_worker.is_none() {
             let worker = live_send::LiveCaptureWorker::spawn(self.preview_wake.clone());
-            // The worker spawns VT-enabled; hand it the real `[tmux] vt_live`
-            // value (cached on the view, refreshed with the config) before it
-            // can arm a channel.
-            worker.set_vt_enabled(self.vt_live_enabled);
+            // Shell terminals use capture-pane's authoritative cell snapshot.
+            // Their prompt repaint can transiently expose a PROMPT_EOL_MARK to
+            // a pipe-pane seed, producing a visible false frame before the
+            // grid reconciles. The capture path is slower but has no seed
+            // handoff, and live input still uses the existing send-keys path.
+            worker.set_vt_enabled(
+                self.vt_live_enabled && !matches!(self.view_mode, ViewMode::Terminal),
+            );
+            worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
             self.preview_capture_worker = Some(worker);
         }
         if self.preview_capture_target != desired {
@@ -2025,6 +2035,8 @@ impl HomeView {
         if let Some(worker) = self.preview_capture_worker.as_ref() {
             worker.set_live(live);
             worker.set_forward_empty(forward_empty);
+            worker.set_vt_enabled(self.vt_live_enabled && !forward_empty);
+            worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
         }
     }
 
@@ -4218,6 +4230,19 @@ mod tests {
     fn compose_list_title_shows_by_project_only() {
         let title = compose_list_title("aoe", None, GroupByMode::Project, SortOrder::Newest);
         assert_eq!(title, " aoe · project ");
+    }
+
+    #[test]
+    fn compose_list_title_group_by_suffix_per_mode() {
+        let cases = [
+            (GroupByMode::Manual, ""),
+            (GroupByMode::Project, " · project"),
+            (GroupByMode::Org, " · org"),
+        ];
+        for (mode, suffix) in cases {
+            let title = compose_list_title("aoe", None, mode, SortOrder::Newest);
+            assert_eq!(title, format!(" aoe{suffix} "), "{mode:?}");
+        }
     }
 
     #[test]
